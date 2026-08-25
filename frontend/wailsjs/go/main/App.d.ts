@@ -9,6 +9,8 @@ export function CreateTunnel(arg1:config.Tunnel):Promise<void>;
 
 export function DeleteTunnel(arg1:string):Promise<void>;
 
+export function HomeDir():Promise<string>;
+
 export function ImportCommand(arg1:string):Promise<Array<config.Tunnel>>;
 
 export function Init(arg1:any):Promise<void>;

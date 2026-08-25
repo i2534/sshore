@@ -275,6 +275,16 @@ func (a *App) PickLocalDir() (string, error) {
 	return path, nil
 }
 
+// HomeDir returns the current user's home directory (used as the initial
+// local pane path).
+func (a *App) HomeDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return home, nil
+}
+
 func (a *App) OnShutdown() {
 	a.forward.OnShutdown()
 	_ = a.saveConfig()
