@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -228,6 +229,45 @@ func (a *App) PickLocalFile() (string, error) {
 	}
 	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
 		Title: "选择要上传的文件",
+	})
+	if err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// ListLocal reads a local directory and returns its entries (dirs + files).
+// It reuses sftp.Item for a uniform frontend shape.
+func (a *App) ListLocal(path string) ([]sftp.Item, error) {
+	if path == "" {
+		path = "."
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	var items []sftp.Item
+	for _, e := range entries {
+		info, _ := e.Info()
+		item := sftp.Item{Name: e.Name(), IsDir: e.IsDir()}
+		if info != nil {
+			item.Size = info.Size()
+			item.ModTime = info.ModTime().Format("2006-01-02 15:04")
+			item.Mode = info.Mode().String()
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// PickLocalDir opens a native directory picker and returns the chosen local
+// directory ("" if cancelled). Used as the download destination.
+func (a *App) PickLocalDir() (string, error) {
+	if a.ctx == nil {
+		return "", errors.New("no context")
+	}
+	path, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "选择下载保存目录",
 	})
 	if err != nil {
 		return "", err

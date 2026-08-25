@@ -26,12 +26,20 @@ export function ListHosts() {
   return window['go']['main']['App']['ListHosts']();
 }
 
+export function ListLocal(arg1) {
+  return window['go']['main']['App']['ListLocal'](arg1);
+}
+
 export function ListTunnels() {
   return window['go']['main']['App']['ListTunnels']();
 }
 
 export function OnShutdown() {
   return window['go']['main']['App']['OnShutdown']();
+}
+
+export function PickLocalDir() {
+  return window['go']['main']['App']['PickLocalDir']();
 }
 
 export function PickLocalFile() {
