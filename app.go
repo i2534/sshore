@@ -16,6 +16,7 @@ type App struct {
 	forward *forward.Ctrl
 	sftp    *sftp.Ctrl
 	cfg     *config.AppConfig
+	cfgPath string
 }
 
 func NewApp() *App {
@@ -24,6 +25,12 @@ func NewApp() *App {
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	p, _ := config.DefaultConfigPath()
+	a.cfgPath = p
+	cfg, err := config.LoadConfig(p)
+	if err == nil {
+		a.cfg = cfg
+	}
 }
 
 // Init wires controllers. emit forwards subsystem events to the frontend.
@@ -31,7 +38,9 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) Init(emit func(forward.Event)) {
 	a.forward = forward.NewCtrl(osutil.NewSpawner(), emit)
 	a.sftp = sftp.NewCtrl(osutil.NewRunner(), emit)
-	a.cfg = &config.AppConfig{}
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
 }
 
 func (a *App) ListHosts() []string {
@@ -68,7 +77,7 @@ func (a *App) CreateTunnel(t config.Tunnel) error {
 		t.ID = config.NewTunnelID()
 	}
 	a.cfg.Tunnels = append(a.cfg.Tunnels, t)
-	return nil
+	return a.saveConfig()
 }
 
 func (a *App) ImportCommand(cmd string) ([]config.Tunnel, error) {
@@ -87,11 +96,55 @@ func (a *App) StartTunnel(id string) error {
 	if !ok {
 		return errors.New("tunnel not found")
 	}
-	return a.forward.Start(t)
+	if err := a.forward.Start(t); err != nil {
+		return err
+	}
+	t.Enabled = true
+	a.updateTunnel(t)
+	return a.saveConfig()
 }
 
 func (a *App) StopTunnel(id string) error {
-	return a.forward.Stop(id)
+	if err := a.forward.Stop(id); err != nil {
+		return err
+	}
+	if t, ok := a.findTunnel(id); ok {
+		t.Enabled = false
+		a.updateTunnel(t)
+		return a.saveConfig()
+	}
+	return nil
+}
+
+func (a *App) saveConfig() error {
+	if a.cfgPath == "" {
+		p, err := config.DefaultConfigPath()
+		if err != nil {
+			return err
+		}
+		a.cfgPath = p
+	}
+	return config.SaveConfig(a.cfgPath, a.cfg)
+}
+
+func (a *App) updateTunnel(u config.Tunnel) {
+	for i := range a.cfg.Tunnels {
+		if a.cfg.Tunnels[i].ID == u.ID {
+			a.cfg.Tunnels[i] = u
+		}
+	}
+}
+
+// AutoStartEnabled starts all tunnels that were enabled at last run.
+func (a *App) AutoStartEnabled() error {
+	for _, t := range a.cfg.Tunnels {
+		if t.Enabled {
+			if err := a.forward.Start(t); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (a *App) findTunnel(id string) (config.Tunnel, bool) {
@@ -123,4 +176,5 @@ func (a *App) SftpMkdir(host, user, path string) error {
 }
 func (a *App) OnShutdown() {
 	a.forward.OnShutdown()
+	_ = a.saveConfig()
 }

@@ -31,6 +31,7 @@ func main() {
 			app.Init(func(e forward.Event) {
 				runtime.EventsEmit(ctx, "log", e)
 			})
+			_ = app.AutoStartEnabled()
 		},
 		OnShutdown: func(ctx context.Context) {
 			app.OnShutdown()
