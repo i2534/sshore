@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, PickLocalFile, PickLocalDir, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, PickLocalFile, PickLocalDir, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
@@ -24,6 +24,9 @@ const localLoading = ref(false)
 
 // shared "show hidden files" toggle (both panes)
 const showAll = ref(false)
+
+// explicit connect/disconnect state for the remote host
+const connected = ref(false)
 
 const transfers = ref([])
 
@@ -49,6 +52,31 @@ async function loadRemote() {
   try { remoteItems.value = await SftpList(host.value, '', remotePath.value || '/') }
   catch (e) { err(e) }
   finally { remoteLoading.value = false }
+}
+
+// Host dropdown change: reset connection state, do NOT auto-connect.
+function onHostChange() {
+  connected.value = false
+  remoteItems.value = []
+  remoteSel.value = null
+}
+
+async function connect() {
+  if (!host.value) return
+  try {
+    await SftpConnect(host.value)
+    try { remotePath.value = await SftpHome(host.value) } catch (e) { remotePath.value = '/' }
+    connected.value = true
+    await loadRemote()
+  } catch (e) { err(e); connected.value = false }
+}
+
+async function disconnect() {
+  if (!host.value) return
+  try { await SftpDisconnect(host.value) } catch (e) { err(e) }
+  connected.value = false
+  remoteItems.value = []
+  remoteSel.value = null
 }
 async function loadLocal() {
   localLoading.value = true
@@ -84,6 +112,8 @@ function parentOf(p) {
 }
 
 function showMenu(pane, { item, event }) {
+  // Remote pane requires an explicit connection before any action.
+  if (pane === 'remote' && !connected.value) return
   const rect = window.innerWidth
   menu.value = {
     visible: true,
@@ -199,24 +229,22 @@ async function doAction(name) {
 
 onMounted(async () => {
   await loadHosts()
-  // local starts at current working dir; remote at that host's home dir
+  // local starts at current working dir
   try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
-  if (host.value) {
-    try { remotePath.value = await SftpHome(host.value) } catch (e) { remotePath.value = '/' }
-  }
-  await loadRemote()
   await loadLocal()
+  // remote requires explicit connect; set initial home once host chosen
 })
 </script>
 
 <template>
   <div class="sftp">
     <div class="toolbar">
-      <select v-model="host" @change="loadRemote">
+      <select v-model="host" @change="onHostChange">
         <option v-for="h in hosts" :key="h" :value="h">{{ h }}</option>
       </select>
-      <button @click="upload">⬆ 上传</button>
-      <button @click="loadRemote">刷新</button>
+      <button v-if="!connected" @click="connect" :disabled="!host">🔌 连接</button>
+      <button v-else @click="disconnect">⏏ 断开</button>
+      <button @click="loadRemote" :disabled="!connected">刷新</button>
       <label class="hidden-toggle">
         <input type="checkbox" v-model="showAll" /> 显示隐藏文件
       </label>

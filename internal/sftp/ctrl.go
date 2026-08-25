@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"sshkit/internal/forward"
 	"sshkit/internal/osutil"
@@ -46,7 +47,7 @@ func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
 	args := []string{
 		"-o", "BatchMode=yes",
 		"-o", "IdentitiesOnly=yes",
-		"-o", "ControlMaster=auto",
+		"-o", "ControlMaster=no",
 		"-o", "ControlPersist=30",
 		"-o", "ControlPath=" + cp,
 		"-b", batchPath,
@@ -65,7 +66,62 @@ func (c *Ctrl) CloseAll() {
 	if c.controlDir == "" {
 		return
 	}
+	entries, _ := os.ReadDir(c.controlDir)
+	for _, e := range entries {
+		name := strings.TrimPrefix(e.Name(), "cm-")
+		name = strings.TrimSuffix(name, ".sock")
+		if unescaped, err := url.PathUnescape(name); err == nil {
+			_ = c.disconnectLocked(unescaped)
+		}
+	}
 	_ = os.RemoveAll(c.controlDir)
+}
+
+// Connect establishes a ControlMaster SSH connection for host so subsequent
+// sftp ops reuse it. This is the explicit "connect" action.
+func (c *Ctrl) Connect(host, user string) error {
+	cp := c.controlPathFor(host)
+	args := []string{"-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ControlMaster=yes", "-o", "ControlPersist=30", "-o", "ControlPath=" + cp, "-N", "-f"}
+	if user != "" {
+		args = append(args, "-o", "User="+user)
+	}
+	args = append(args, host)
+	out, err := c.runner("ssh", args...)
+	if err != nil {
+		return fmt.Errorf("sftp connect %s: %w (%s)", host, err, out.Stderr)
+	}
+	// Confirm the master socket exists (the -f ssh may fork and return before binding).
+	for i := 0; i < 20; i++ {
+		if _, statErr := os.Stat(cp); statErr == nil {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("sftp connect %s: ControlPath not created", host)
+}
+
+// Disconnect closes the ControlMaster connection for host.
+func (c *Ctrl) Disconnect(host string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.disconnectLocked(host)
+}
+
+func (c *Ctrl) disconnectLocked(host string) error {
+	cp := c.controlPathFor(host)
+	out, err := c.runner("ssh", "-O", "exit", "-o", "ControlPath="+cp, host)
+	if err != nil {
+		return fmt.Errorf("sftp disconnect %s: %w (%s)", host, err, out.Stderr)
+	}
+	_ = os.Remove(cp)
+	return nil
+}
+
+// Connected reports whether a ControlMaster connection exists for host.
+func (c *Ctrl) Connected(host string) bool {
+	cp := c.controlPathFor(host)
+	_, err := os.Stat(cp)
+	return err == nil
 }
 
 func (c *Ctrl) buildBatch(op, remote, local string) []byte {
