@@ -29,9 +29,10 @@ type Event struct {
 
 type EmitFunc func(Event)
 
-var hostRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+var hostRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // ValidateHost returns true if host is a safe SSH alias (anti-injection).
+// It forbids a leading '-', which would be parsed as an ssh option flag.
 func ValidateHost(host string) bool {
 	return hostRe.MatchString(host)
 }
