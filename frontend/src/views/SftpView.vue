@@ -138,6 +138,7 @@ async function download() {
     transfers.value.push(t)
     await SftpGet(host.value, '', join(remotePath.value, it.name), join(dir, it.name))
     t.status = '完成'
+    t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
     await loadLocal()
   } catch (e) { err(e) }
   closeMenu()
@@ -219,6 +220,7 @@ async function upload() {
     transfers.value.push(t)
     await SftpPut(host.value, '', local, join(remotePath.value, name))
     t.status = '完成'
+    t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
     await loadRemote()
   } catch (e) { err(e) }
 }

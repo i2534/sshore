@@ -13,9 +13,12 @@ function fmtSize(bytes) {
   return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + ' ' + units[i]
 }
 
-function fmtElapsed(startedAt) {
-  if (!startedAt) return ''
-  const s = Math.max(0, Math.floor((props.now - startedAt) / 1000))
+function fmtElapsed(t) {
+  // Finished/failed items freeze their duration (t.elapsed); only in-progress
+  // items tick with the live clock.
+  const s = t.status === '处理中'
+    ? Math.max(0, Math.floor((props.now - t.startedAt) / 1000))
+    : (t.elapsed || 0)
   if (s < 60) return s + 's'
   const m = Math.floor(s / 60)
   return m + 'm ' + (s % 60) + 's'
@@ -32,7 +35,7 @@ function statusClass(status) {
   <div class="queue">
     <div v-for="(t, i) in transfers" :key="i" class="t">
       <span class="name">{{ t.name }}</span>
-      <span class="meta">{{ fmtSize(t.size) }} | {{ fmtElapsed(t.startedAt) }}</span>
+      <span class="meta">{{ fmtSize(t.size) }} | {{ fmtElapsed(t) }}</span>
       <span class="status" :class="statusClass(t.status)">{{ t.status }}</span>
     </div>
     <div v-if="!transfers.length" class="empty">无传输任务</div>
