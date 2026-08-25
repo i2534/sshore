@@ -223,6 +223,15 @@ func (a *App) SftpMkdir(host, user, path string) error {
 func (a *App) SftpRename(host, user, oldPath, newPath string) error {
 	return a.sftp.Rename(host, user, oldPath, newPath)
 }
+func (a *App) SftpConnect(host string) error {
+	return a.sftp.Connect(host, "")
+}
+func (a *App) SftpDisconnect(host string) error {
+	return a.sftp.Disconnect(host)
+}
+func (a *App) SftpConnected(host string) bool {
+	return a.sftp.Connected(host)
+}
 
 // DeleteLocal removes a local file or directory (recursively for dirs).
 func (a *App) DeleteLocal(path string) error {

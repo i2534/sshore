@@ -66,6 +66,18 @@ export function RenameLocal(arg1, arg2) {
   return window['go']['main']['App']['RenameLocal'](arg1, arg2);
 }
 
+export function SftpConnect(arg1) {
+  return window['go']['main']['App']['SftpConnect'](arg1);
+}
+
+export function SftpConnected(arg1) {
+  return window['go']['main']['App']['SftpConnected'](arg1);
+}
+
+export function SftpDisconnect(arg1) {
+  return window['go']['main']['App']['SftpDisconnect'](arg1);
+}
+
 export function SftpGet(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['SftpGet'](arg1, arg2, arg3, arg4);
 }

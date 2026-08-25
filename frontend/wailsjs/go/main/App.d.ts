@@ -35,6 +35,12 @@ export function PickLocalFile():Promise<string>;
 
 export function RenameLocal(arg1:string,arg2:string):Promise<void>;
 
+export function SftpConnect(arg1:string):Promise<void>;
+
+export function SftpConnected(arg1:string):Promise<boolean>;
+
+export function SftpDisconnect(arg1:string):Promise<void>;
+
 export function SftpGet(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
 export function SftpHome(arg1:string):Promise<string>;
