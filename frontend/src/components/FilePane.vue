@@ -4,7 +4,7 @@ defineProps({
   items: { type: Array, default: () => [] },
   selected: String,
 })
-defineEmits(['select'])
+defineEmits(['select', 'open'])
 </script>
 
 <template>
@@ -16,6 +16,7 @@ defineEmits(['select'])
         :key="it.name"
         :class="{ sel: it.name === selected }"
         @click="$emit('select', it)"
+        @dblclick="$emit('open', it)"
       >
         {{ it.isDir ? '📁' : '📄' }} {{ it.name }}
       </li>

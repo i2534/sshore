@@ -19,6 +19,8 @@ export function ListTunnels():Promise<Array<config.Tunnel>>;
 
 export function OnShutdown():Promise<void>;
 
+export function PickLocalFile():Promise<string>;
+
 export function SftpGet(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
 export function SftpList(arg1:string,arg2:string,arg3:string):Promise<Array<sftp.Item>>;

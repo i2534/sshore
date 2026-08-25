@@ -34,6 +34,10 @@ export function OnShutdown() {
   return window['go']['main']['App']['OnShutdown']();
 }
 
+export function PickLocalFile() {
+  return window['go']['main']['App']['PickLocalFile']();
+}
+
 export function SftpGet(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['SftpGet'](arg1, arg2, arg3, arg4);
 }

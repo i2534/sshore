@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 
+	"github.com/wailsapp/wails/v2/pkg/runtime"
+
 	"sshkit/internal/config"
 	"sshkit/internal/forward"
 	"sshkit/internal/importer"
@@ -217,6 +219,22 @@ func (a *App) SftpRemove(host, user, path string) error {
 func (a *App) SftpMkdir(host, user, path string) error {
 	return a.sftp.Mkdir(host, user, path)
 }
+
+// PickLocalFile opens a native file picker and returns the chosen local path
+// ("" if cancelled). Used as the upload source for SftpPut.
+func (a *App) PickLocalFile() (string, error) {
+	if a.ctx == nil {
+		return "", errors.New("no context")
+	}
+	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "选择要上传的文件",
+	})
+	if err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 func (a *App) OnShutdown() {
 	a.forward.OnShutdown()
 	_ = a.saveConfig()
