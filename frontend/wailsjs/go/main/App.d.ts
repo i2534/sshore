@@ -7,6 +7,8 @@ export function AutoStartEnabled():Promise<void>;
 
 export function CreateTunnel(arg1:config.Tunnel):Promise<void>;
 
+export function Cwd():Promise<string>;
+
 export function DeleteTunnel(arg1:string):Promise<void>;
 
 export function HomeDir():Promise<string>;
@@ -28,6 +30,8 @@ export function PickLocalDir():Promise<string>;
 export function PickLocalFile():Promise<string>;
 
 export function SftpGet(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+
+export function SftpHome(arg1:string):Promise<string>;
 
 export function SftpList(arg1:string,arg2:string,arg3:string):Promise<Array<sftp.Item>>;
 

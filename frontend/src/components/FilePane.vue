@@ -22,21 +22,24 @@ const visible = computed(() => {
     <div class="head">
       <span class="title">{{ title }}</span>
       <span class="curpath">{{ path }}</span>
-      <span class="count">{{ loading ? '…' : visible.length + ' 项' }}</span>
+      <span class="count">{{ visible.length }} 项</span>
     </div>
-    <ul class="list">
-      <li class="up" @click="$emit('open', { name: '..', isDir: true })">📁 ..</li>
-      <li
-        v-for="it in visible"
-        :key="it.name"
-        :class="{ sel: it.name === selected }"
-        @click="$emit('select', it)"
-        @dblclick="$emit('open', it)"
-        @contextmenu.prevent="$emit('context', { item: it, event: $event })"
-      >
-        {{ it.isDir ? '📁' : '📄' }} {{ it.name }}
-      </li>
-    </ul>
+    <div class="list-holder">
+      <ul class="list" :class="{ busy: loading }">
+        <li class="up" @click="$emit('open', { name: '..', isDir: true })">📁 ..</li>
+        <li
+          v-for="it in visible"
+          :key="it.name"
+          :class="{ sel: it.name === selected }"
+          @click="$emit('select', it)"
+          @dblclick="$emit('open', it)"
+          @contextmenu.prevent="$emit('context', { item: it, event: $event })"
+        >
+          {{ it.isDir ? '📁' : '📄' }} {{ it.name }}
+        </li>
+      </ul>
+      <div v-if="loading" class="loading">加载中…</div>
+    </div>
   </div>
 </template>
 
@@ -47,6 +50,9 @@ const visible = computed(() => {
 .curpath { font-weight: 400; font-size: 11px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px; flex: 1; text-align: center; }
 .count { font-weight: 400; font-size: 11px; color: var(--text-faint); }
 .list { list-style: none; margin: 0; padding: 0; overflow: auto; flex: 1; }
+.list.busy { opacity: 0.4; pointer-events: none; }
+.list-holder { flex: 1; display: flex; flex-direction: column; position: relative; min-height: 0; }
+.loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-faint); font-size: 12px; }
 .list li { padding: 4px 8px; cursor: pointer; font-family: monospace; font-size: 13px; color: var(--text); white-space: nowrap; }
 .list li:hover { background: var(--surface-hover); }
 .list li.sel { background: var(--surface-hover); color: var(--accent); }

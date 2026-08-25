@@ -10,6 +10,10 @@ export function CreateTunnel(arg1) {
   return window['go']['main']['App']['CreateTunnel'](arg1);
 }
 
+export function Cwd() {
+  return window['go']['main']['App']['Cwd']();
+}
+
 export function DeleteTunnel(arg1) {
   return window['go']['main']['App']['DeleteTunnel'](arg1);
 }
@@ -52,6 +56,10 @@ export function PickLocalFile() {
 
 export function SftpGet(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['SftpGet'](arg1, arg2, arg3, arg4);
+}
+
+export function SftpHome(arg1) {
+  return window['go']['main']['App']['SftpHome'](arg1);
 }
 
 export function SftpList(arg1, arg2, arg3) {
