@@ -1,0 +1,13 @@
+services:
+  sshd:
+    image: linuxserver/openssh-server:latest
+    container_name: sshkit-e2e-sshd
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: "UTC"
+      USER_NAME: "e2e"
+      PUBLIC_KEY: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI..."
+      PASSWORD_ACCESS: "false"
+    ports:
+      - "22222:2222"
