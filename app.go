@@ -248,6 +248,18 @@ func (a *App) RenameLocal(oldPath, newPath string) error {
 	return os.Rename(oldPath, newPath)
 }
 
+// StatLocal returns the size in bytes of a local file (0 for dirs/missing).
+func (a *App) StatLocal(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	if info.IsDir() {
+		return 0, nil
+	}
+	return info.Size(), nil
+}
+
 // PickLocalFile opens a native file picker and returns the chosen local path
 // ("" if cancelled). Used as the upload source for SftpPut.
 func (a *App) PickLocalFile() (string, error) {

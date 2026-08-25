@@ -57,6 +57,8 @@ export function SftpRename(arg1:string,arg2:string,arg3:string,arg4:string):Prom
 
 export function StartTunnel(arg1:string):Promise<void>;
 
+export function StatLocal(arg1:string):Promise<number>;
+
 export function StopTunnel(arg1:string):Promise<void>;
 
 export function UpdateTunnel(arg1:config.Tunnel):Promise<void>;

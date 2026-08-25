@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, PickLocalFile, PickLocalDir, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, PickLocalDir, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
@@ -29,6 +29,10 @@ const showAll = ref(false)
 const connected = ref(false)
 
 const transfers = ref([])
+
+// clock ticks every second so the transfer queue's elapsed times repaint.
+const now = ref(Date.now())
+let clockTimer = null
 
 // context menu state
 const menu = ref({ visible: false, x: 0, y: 0, pane: 'remote', item: null })
@@ -130,7 +134,7 @@ async function download() {
   try {
     const dir = await PickLocalDir()
     if (!dir) { closeMenu(); return }
-    const t = { name: it.name, status: '处理中' }
+    const t = { name: it.name, size: it.size || 0, status: '处理中', startedAt: Date.now() }
     transfers.value.push(t)
     await SftpGet(host.value, '', join(remotePath.value, it.name), join(dir, it.name))
     t.status = '完成'
@@ -209,7 +213,8 @@ async function upload() {
       if (!local) return
       name = local.split(/[\\/]/).pop()
     }
-    const t = { name, status: '处理中' }
+    const t = { name, size: 0, status: '处理中', startedAt: Date.now() }
+    try { t.size = await StatLocal(local) } catch (e) { t.size = 0 }
     transfers.value.push(t)
     await SftpPut(host.value, '', local, join(remotePath.value, name))
     t.status = '完成'
@@ -233,6 +238,12 @@ onMounted(async () => {
   try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
   await loadLocal()
   // remote requires explicit connect; set initial home once host chosen
+
+  clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
+})
+
+onUnmounted(() => {
+  if (clockTimer) clearInterval(clockTimer)
 })
 </script>
 
@@ -255,7 +266,7 @@ onMounted(async () => {
       <FilePane title="远程" :path="remotePath" :items="remoteItems" :selected="remoteSel && remoteSel.name" :show-hidden="showAll" :loading="remoteLoading"
         @select="remoteSel = $event" @open="openRemote" @context="showMenu('remote', $event)" />
     </div>
-    <TransferQueue :transfers="transfers" />
+    <TransferQueue :transfers="transfers" :now="now" />
 
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
       <template v-if="menu.pane === 'remote'">
