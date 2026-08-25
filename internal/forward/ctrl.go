@@ -46,6 +46,7 @@ func BuildArgs(t config.Tunnel) []string {
 		"ssh", "-N",
 		"-o", "ConnectTimeout=10",
 		"-o", "BatchMode=yes",
+		"-o", "IdentitiesOnly=yes",
 	}
 	fwd := fmt.Sprintf("%s:%d", t.ListenBind, t.ListenPort)
 	switch t.Mode {

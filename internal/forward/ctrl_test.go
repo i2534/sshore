@@ -27,7 +27,7 @@ func expect(t *testing.T, got, want []string) {
 
 func TestBuildArgsLocal(t *testing.T) {
 	expect(t, BuildArgs(base()),
-		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
 			"-L", "127.0.0.1:5432:127.0.0.1:5432", "prod-db"})
 }
 
@@ -35,7 +35,7 @@ func TestBuildArgsRemote(t *testing.T) {
 	c := base()
 	c.Mode = "remote"
 	expect(t, BuildArgs(c),
-		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
 			"-R", "127.0.0.1:5432:127.0.0.1:5432", "prod-db"})
 }
 
@@ -43,7 +43,7 @@ func TestBuildArgsDynamic(t *testing.T) {
 	c := base()
 	c.Mode = "dynamic"
 	expect(t, BuildArgs(c),
-		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
 			"-D", "127.0.0.1:5432", "prod-db"})
 }
 
@@ -51,7 +51,7 @@ func TestBuildArgsProxyJump(t *testing.T) {
 	c := base()
 	c.ProxyJump = "bastion"
 	expect(t, BuildArgs(c),
-		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
 			"-L", "127.0.0.1:5432:127.0.0.1:5432", "-J", "bastion", "prod-db"})
 }
 
