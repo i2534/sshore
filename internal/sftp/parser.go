@@ -7,11 +7,11 @@ import (
 )
 
 type Item struct {
-	Name    string
-	Size    int64
-	IsDir   bool
-	Mode    string
-	ModTime string
+	Name    string `json:"name"`
+	Size    int64  `json:"size"`
+	IsDir   bool   `json:"isDir"`
+	Mode    string `json:"mode"`
+	ModTime string `json:"modTime"`
 }
 
 // ParseLsLf parses `ls -l` output. The leading "total N" line is skipped.
