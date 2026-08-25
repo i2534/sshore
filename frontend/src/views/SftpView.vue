@@ -116,8 +116,6 @@ function parentOf(p) {
 }
 
 function showMenu(pane, { item, event }) {
-  // Remote pane requires an explicit connection before any action.
-  if (pane === 'remote' && !connected.value) return
   const rect = window.innerWidth
   menu.value = {
     visible: true,
