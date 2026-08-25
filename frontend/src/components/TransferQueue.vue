@@ -11,6 +11,6 @@ defineProps({ transfers: { type: Array, default: () => [] } })
 </template>
 
 <style scoped>
-.queue { border-top: 1px solid #ddd; max-height: 120px; overflow: auto; font-family: monospace; font-size: 12px; }
+.queue { border-top: 1px solid var(--border); max-height: 120px; overflow: auto; font-family: monospace; font-size: 12px; color: var(--text-dim); }
 .t { padding: 2px 8px; }
 </style>

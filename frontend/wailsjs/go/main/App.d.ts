@@ -3,6 +3,8 @@
 import {config} from '../models';
 import {sftp} from '../models';
 
+export function AutoStartEnabled():Promise<void>;
+
 export function CreateTunnel(arg1:config.Tunnel):Promise<void>;
 
 export function ImportCommand(arg1:string):Promise<Array<config.Tunnel>>;

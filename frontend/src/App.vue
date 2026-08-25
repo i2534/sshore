@@ -30,12 +30,12 @@ onMounted(() => {
 </template>
 
 <style>
-body { margin: 0; font-family: system-ui, sans-serif; }
 .app { display: flex; flex-direction: column; height: 100vh; }
-.topbar { padding: 12px; border-bottom: 1px solid #ddd; font-weight: 600; }
+.topbar { padding: 12px; border-bottom: 1px solid var(--border); font-weight: 600; text-align: left; }
 .body { display: flex; flex: 1; }
-.sidebar { width: 140px; border-right: 1px solid #ddd; padding-top: 8px; }
-.sidebar button { display: block; width: 100%; text-align: left; padding: 10px 16px; border: none; background: none; cursor: pointer; }
-.sidebar button.active { background: #eef; }
-.workspace { flex: 1; padding: 12px; overflow: auto; }
+.sidebar { width: 140px; border-right: 1px solid var(--border); padding-top: 8px; }
+.sidebar button { display: block; width: 100%; text-align: left; padding: 10px 16px; border: none; background: none; cursor: pointer; color: var(--text-dim); }
+.sidebar button:hover { background: var(--surface); color: var(--text); }
+.sidebar button.active { background: var(--surface-hover); color: var(--text); border-left: 3px solid var(--accent); }
+.workspace { flex: 1; padding: 12px; overflow: auto; text-align: left; }
 </style>

@@ -28,10 +28,10 @@ async function toggle() {
 </template>
 
 <style scoped>
-.rule { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid #f0f0f0; }
+.rule { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
 .dot { width: 10px; height: 10px; border-radius: 50%; }
-.dot.on { background: #2a2; }
-.dot.off { background: #aaa; }
-.name { font-weight: 600; }
-.meta { color: #888; font-size: 12px; flex: 1; }
+.dot.on { background: var(--success); }
+.dot.off { background: var(--text-faint); }
+.name { font-weight: 600; color: var(--text); }
+.meta { color: var(--text-dim); font-size: 12px; flex: 1; }
 </style>
