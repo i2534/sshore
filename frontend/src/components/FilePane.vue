@@ -3,9 +3,11 @@ import { computed } from 'vue'
 
 const props = defineProps({
   title: String,
+  path: String,
   items: { type: Array, default: () => [] },
   selected: String,
   showHidden: { type: Boolean, default: true },
+  loading: { type: Boolean, default: false },
 })
 const emit = defineEmits(['select', 'open', 'context'])
 
@@ -19,7 +21,8 @@ const visible = computed(() => {
   <div class="pane">
     <div class="head">
       <span class="title">{{ title }}</span>
-      <span class="count">{{ visible.length }} 项</span>
+      <span class="curpath">{{ path }}</span>
+      <span class="count">{{ loading ? '…' : visible.length + ' 项' }}</span>
     </div>
     <ul class="list">
       <li class="up" @click="$emit('open', { name: '..', isDir: true })">📁 ..</li>
@@ -41,6 +44,7 @@ const visible = computed(() => {
 .pane { flex: 1; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
 .head { padding: 6px 8px; background: var(--bg-elev); font-weight: 600; color: var(--text-dim); display: flex; justify-content: space-between; align-items: center; }
 .title { font-weight: 600; }
+.curpath { font-weight: 400; font-size: 11px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px; flex: 1; text-align: center; }
 .count { font-weight: 400; font-size: 11px; color: var(--text-faint); }
 .list { list-style: none; margin: 0; padding: 0; overflow: auto; flex: 1; }
 .list li { padding: 4px 8px; cursor: pointer; font-family: monospace; font-size: 13px; color: var(--text); white-space: nowrap; }

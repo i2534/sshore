@@ -14,6 +14,10 @@ export function DeleteTunnel(arg1) {
   return window['go']['main']['App']['DeleteTunnel'](arg1);
 }
 
+export function HomeDir() {
+  return window['go']['main']['App']['HomeDir']();
+}
+
 export function ImportCommand(arg1) {
   return window['go']['main']['App']['ImportCommand'](arg1);
 }
