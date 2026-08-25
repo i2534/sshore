@@ -2,7 +2,6 @@ package sftp
 
 import (
 	"bufio"
-	"errors"
 	"strconv"
 	"strings"
 )
@@ -22,7 +21,7 @@ func ParseLsLf(output string) ([]Item, error) {
 	sc := bufio.NewScanner(strings.NewReader(output))
 	for sc.Scan() {
 		line := strings.TrimRight(sc.Text(), "\r")
-		if line == "" || strings.HasPrefix(line, "total ") {
+		if line == "" || strings.HasPrefix(line, "total ") || strings.HasPrefix(line, "sftp> ") {
 			continue
 		}
 		fields := strings.Fields(line)
@@ -45,9 +44,7 @@ func ParseLsLf(output string) ([]Item, error) {
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	if len(items) == 0 {
-		return nil, errors.New("no parseable entries")
-	}
+	// An empty/error-only listing is a valid empty directory, not an error.
 	return items, nil
 }
 
