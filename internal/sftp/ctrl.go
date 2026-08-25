@@ -2,20 +2,70 @@ package sftp
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"sshkit/internal/forward"
 	"sshkit/internal/osutil"
 )
 
 type Ctrl struct {
-	runner osutil.Runner
-	emit   forward.EmitFunc
+	runner     osutil.Runner
+	emit       forward.EmitFunc
+	controlDir string
+	mu         sync.Mutex
 }
 
 func NewCtrl(r osutil.Runner, emit forward.EmitFunc) *Ctrl {
-	return &Ctrl{runner: r, emit: emit}
+	return &Ctrl{runner: r, emit: emit, controlDir: filepath.Join(os.TempDir(), "sshkit-sftp-ctrl")}
+}
+
+// controlPathFor returns a per-host ControlMaster socket path (URL-encoded so
+// arbitrary host strings map to a safe filename). Reusing this socket lets
+// successive sftp commands share one SSH connection (ControlMaster=auto).
+func (c *Ctrl) controlPathFor(host string) string {
+	_ = os.MkdirAll(c.controlDir, 0700)
+	name := url.PathEscape(host)
+	return filepath.Join(c.controlDir, "cm-"+name+".sock")
+}
+
+func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
+	dir, err := os.MkdirTemp("", "sshkit-sftp")
+	if err != nil {
+		return osutil.Outcome{}, err
+	}
+	defer os.RemoveAll(dir)
+	batchPath, err := c.writeBatch(dir, batch)
+	if err != nil {
+		return osutil.Outcome{}, err
+	}
+	cp := c.controlPathFor(host)
+	args := []string{
+		"-o", "BatchMode=yes",
+		"-o", "IdentitiesOnly=yes",
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPersist=30",
+		"-o", "ControlPath=" + cp,
+		"-b", batchPath,
+	}
+	if user != "" {
+		args = append(args, "-o", "User="+user)
+	}
+	args = append(args, host)
+	return c.runner("sftp", args...)
+}
+
+// CloseAll closes any lingering ControlMaster connections and removes sockets.
+func (c *Ctrl) CloseAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.controlDir == "" {
+		return
+	}
+	_ = os.RemoveAll(c.controlDir)
 }
 
 func (c *Ctrl) buildBatch(op, remote, local string) []byte {
@@ -50,24 +100,6 @@ func (c *Ctrl) writeBatch(dir string, content []byte) (string, error) {
 	return f.Name(), nil
 }
 
-func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
-	dir, err := os.MkdirTemp("", "sshkit-sftp")
-	if err != nil {
-		return osutil.Outcome{}, err
-	}
-	defer os.RemoveAll(dir)
-	batchPath, err := c.writeBatch(dir, batch)
-	if err != nil {
-		return osutil.Outcome{}, err
-	}
-	args := []string{"-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-b", batchPath}
-	if user != "" {
-		args = append(args, "-o", "User="+user)
-	}
-	args = append(args, host)
-	return c.runner("sftp", args...)
-}
-
 func (c *Ctrl) List(host, user, path string) ([]Item, error) {
 	out, err := c.run(host, user, c.buildBatch("ls", path, ""))
 	if err != nil {
@@ -77,6 +109,32 @@ func (c *Ctrl) List(host, user, path string) ([]Item, error) {
 		return nil, fmt.Errorf("sftp ls failed: %s", commandErr(out))
 	}
 	return ParseLsLf(out.Stdout)
+}
+
+// Home returns the remote user's home directory by running `pwd`. The output
+// is the sftp prompt line followed by the absolute home path, which we extract.
+func (c *Ctrl) Home(host, user string) (string, error) {
+	out, err := c.run(host, user, []byte("pwd\n"))
+	if err != nil {
+		return "", fmt.Errorf("sftp pwd %s: %w (%s)", host, err, commandErr(out))
+	}
+	if out.ExitCode != 0 {
+		return "", fmt.Errorf("sftp pwd failed: %s", commandErr(out))
+	}
+	// pwd output: "sftp> pwd\nRemote working directory: <abs>\n" (or bare "<abs>")
+	for _, line := range strings.Split(out.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Remote working directory: ") {
+			p := strings.TrimSpace(strings.TrimPrefix(line, "Remote working directory: "))
+			if p != "" {
+				return p, nil
+			}
+		}
+		if strings.HasPrefix(line, "/") && !strings.HasPrefix(line, "sftp>") {
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("sftp pwd: no absolute path in output %q", out.Stdout)
 }
 
 // commandErr returns stderr (or stdout) trimmed, preferring stderr, so the

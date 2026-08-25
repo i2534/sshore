@@ -275,8 +275,7 @@ func (a *App) PickLocalDir() (string, error) {
 	return path, nil
 }
 
-// HomeDir returns the current user's home directory (used as the initial
-// local pane path).
+// HomeDir returns the current user's home directory.
 func (a *App) HomeDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -285,7 +284,21 @@ func (a *App) HomeDir() (string, error) {
 	return home, nil
 }
 
+// Cwd returns the process's current working directory (used as the initial
+// local pane path).
+func (a *App) Cwd() (string, error) {
+	return os.Getwd()
+}
+
+// SftpHome returns the remote user's home directory as an absolute path, by
+// running `pwd` over a fresh, reused sftp connection. Used as the initial
+// remote pane path.
+func (a *App) SftpHome(host string) (string, error) {
+	return a.sftp.Home(host, "")
+}
+
 func (a *App) OnShutdown() {
 	a.forward.OnShutdown()
+	a.sftp.CloseAll()
 	_ = a.saveConfig()
 }

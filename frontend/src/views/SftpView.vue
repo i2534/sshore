@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, ListLocal, PickLocalFile, PickLocalDir, HomeDir } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, ListLocal, PickLocalFile, PickLocalDir, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
@@ -161,7 +161,11 @@ async function doAction(name) {
 
 onMounted(async () => {
   await loadHosts()
-  try { localPath.value = await HomeDir() } catch (e) { localPath.value = '/' }
+  // local starts at current working dir; remote at that host's home dir
+  try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
+  if (host.value) {
+    try { remotePath.value = await SftpHome(host.value) } catch (e) { remotePath.value = '/' }
+  }
   await loadRemote()
   await loadLocal()
 })
