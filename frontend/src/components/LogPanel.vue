@@ -26,7 +26,7 @@ const logStore = useLogStore()
 <style scoped>
 .logpanel { display: flex; flex-direction: column; height: 100%; }
 .logbar { display: flex; gap: 8px; margin-bottom: 6px; }
-.loglines { flex: 1; overflow: auto; font-family: monospace; font-size: 12px; }
-.level-error { color: #c00; }
-.level-warn { color: #b60; }
+.loglines { flex: 1; overflow: auto; font-family: monospace; font-size: 12px; color: var(--text-dim); }
+.level-error { color: var(--danger); }
+.level-warn { color: var(--warning); }
 </style>
