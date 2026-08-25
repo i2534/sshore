@@ -14,7 +14,11 @@ WEBKIT_TAG ?= webkit2_41
 BINDIR   := build/bin
 OUTNAME  := sshkit
 
-.PHONY: all dev build run linux windows clean test vet fmt
+.PHONY: help all dev build run linux windows clean test vet fmt
+
+## Show available targets and their descriptions.
+help:
+	@awk 'BEGIN{printf "  %-12s %s\n", "Target", "Description"} /^## /{if(d=="")d=substr($$0,4); next} /^[A-Za-z_][A-Za-z0-9_.-]*:.*=/{next} /^[A-Za-z_][A-Za-z0-9_.-]*:/{printf "  \033[36m%-12s\033[0m %s\n", substr($$1,1,length($$1)-1), d; d=""}' $(MAKEFILE_LIST)
 
 ## Build for the current platform.
 all: build
