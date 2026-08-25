@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, ListLocal, PickLocalFile, PickLocalDir, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, PickLocalFile, PickLocalDir, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
@@ -13,16 +13,17 @@ const host = ref('')
 // remote pane — start at filesystem root so '..' can navigate the whole tree
 const remotePath = ref('/')
 const remoteItems = ref([])
-const remoteHidden = ref(true)
 const remoteSel = ref(null)
 const remoteLoading = ref(false)
 
-// local pane — start at home dir so '..' can navigate up to '/'
+// local pane — start at cwd so '..' can navigate up to '/'
 const localPath = ref('')
 const localItems = ref([])
-const localHidden = ref(true)
 const localSel = ref(null)
 const localLoading = ref(false)
+
+// shared "show hidden files" toggle (both panes)
+const showAll = ref(false)
 
 const transfers = ref([])
 
@@ -107,20 +108,6 @@ async function download() {
   closeMenu()
 }
 
-async function upload() {
-  closeMenu()
-  try {
-    const local = await PickLocalFile()
-    if (!local) return
-    const name = local.split('/').pop()
-    const t = { name, status: '处理中' }
-    transfers.value.push(t)
-    await SftpPut(host.value, '', local, join(remotePath.value, name))
-    t.status = '完成'
-    await loadRemote()
-  } catch (e) { err(e) }
-}
-
 async function remove() {
   const it = menu.value.item || remoteSel.value
   const pane = menu.value.pane
@@ -128,8 +115,8 @@ async function remove() {
   if (!window.confirm(`删除${pane === 'local' ? '本地' : '远程'}「${it.name}」？`)) { closeMenu(); return }
   try {
     if (pane === 'local') {
-      // local delete via os is not exposed; skip
-      err('本地删除暂不支持')
+      await DeleteLocal(join(localPath.value, it.name))
+      await loadLocal()
     } else {
       await SftpRemove(host.value, '', join(remotePath.value, it.name))
       await loadRemote()
@@ -138,12 +125,54 @@ async function remove() {
   closeMenu()
 }
 
+async function rename() {
+  const it = menu.value.item || remoteSel.value
+  if (!it || it.name === '..') { closeMenu(); return }
+  const newName = window.prompt('新名称：', it.name)
+  if (!newName || newName === it.name) { closeMenu(); return }
+  try {
+    if (menu.value.pane === 'local') {
+      await renameLocal(join(localPath.value, it.name), join(localPath.value, newName))
+      await loadLocal()
+    } else {
+      await SftpRename(host.value, '', join(remotePath.value, it.name), join(remotePath.value, newName))
+      await loadRemote()
+    }
+  } catch (e) { err(e) }
+  closeMenu()
+}
+
+// renameLocal renames a local file/dir via the Go binding.
+async function renameLocal(oldPath, newPath) {
+  await RenameLocal(oldPath, newPath)
+}
+
 async function mkdir() {
+  const pane = menu.value.pane
   closeMenu()
   const name = window.prompt('新建文件夹名称：')
   if (!name) return
   try {
-    await SftpMkdir(host.value, '', join(remotePath.value, name))
+    if (pane === 'local') {
+      await MkdirLocal(join(localPath.value, name))
+      await loadLocal()
+    } else {
+      await SftpMkdir(host.value, '', join(remotePath.value, name))
+      await loadRemote()
+    }
+  } catch (e) { err(e) }
+}
+
+async function upload() {
+  closeMenu()
+  try {
+    const local = await PickLocalFile()
+    if (!local) return
+    const name = local.split(/[\\/]/).pop()
+    const t = { name, status: '处理中' }
+    transfers.value.push(t)
+    await SftpPut(host.value, '', local, join(remotePath.value, name))
+    t.status = '完成'
     await loadRemote()
   } catch (e) { err(e) }
 }
@@ -154,8 +183,7 @@ async function doAction(name) {
     case 'upload': return upload()
     case 'remove': return remove()
     case 'mkdir': return mkdir()
-    case 'toggleRemote': remoteHidden.value = !remoteHidden.value; closeMenu(); return
-    case 'toggleLocal': localHidden.value = !localHidden.value; closeMenu(); return
+    case 'rename': return rename()
   }
 }
 
@@ -179,11 +207,14 @@ onMounted(async () => {
       </select>
       <button @click="upload">⬆ 上传</button>
       <button @click="loadRemote">刷新</button>
+      <label class="hidden-toggle">
+        <input type="checkbox" v-model="showAll" /> 显示隐藏文件
+      </label>
     </div>
     <div class="panes">
-      <FilePane title="本地" :path="localPath || '/'" :items="localItems" :selected="localSel && localSel.name" :show-hidden="localHidden" :loading="localLoading"
+      <FilePane title="本地" :path="localPath || '/'" :items="localItems" :selected="localSel && localSel.name" :show-hidden="showAll" :loading="localLoading"
         @select="localSel = $event" @open="openLocal" @context="showMenu('local', $event)" />
-      <FilePane title="远程" :path="remotePath" :items="remoteItems" :selected="remoteSel && remoteSel.name" :show-hidden="remoteHidden" :loading="remoteLoading"
+      <FilePane title="远程" :path="remotePath" :items="remoteItems" :selected="remoteSel && remoteSel.name" :show-hidden="showAll" :loading="remoteLoading"
         @select="remoteSel = $event" @open="openRemote" @context="showMenu('remote', $event)" />
     </div>
     <TransferQueue :transfers="transfers" />
@@ -192,13 +223,15 @@ onMounted(async () => {
       <template v-if="menu.pane === 'remote'">
         <button @click="doAction('download')">⬇ 下载…</button>
         <button @click="doAction('upload')">⬆ 上传…</button>
+        <button @click="doAction('rename')">✏️ 重命名</button>
         <button class="sep" @click="doAction('remove')">🗑 删除</button>
         <button @click="doAction('mkdir')">📁 新建文件夹</button>
-        <button class="sep" @click="doAction('toggleRemote')">{{ remoteHidden ? '🙈 隐藏文件' : '👁 显示隐藏文件' }}</button>
       </template>
       <template v-else>
-        <button @click="doAction('remove')">🗑 删除</button>
-        <button class="sep" @click="doAction('toggleLocal')">{{ localHidden ? '🙈 隐藏文件' : '👁 显示隐藏文件' }}</button>
+        <button @click="doAction('upload')">⬆ 上传到远程</button>
+        <button @click="doAction('rename')">✏️ 重命名</button>
+        <button class="sep" @click="doAction('remove')">🗑 删除</button>
+        <button @click="doAction('mkdir')">📁 新建文件夹</button>
       </template>
     </ContextMenu>
   </div>
@@ -208,4 +241,5 @@ onMounted(async () => {
 .sftp { display: flex; flex-direction: column; height: 100%; gap: 8px; }
 .toolbar { display: flex; gap: 8px; align-items: center; }
 .panes { display: flex; gap: 8px; flex: 1; min-height: 0; }
+.hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-dim); }
 </style>

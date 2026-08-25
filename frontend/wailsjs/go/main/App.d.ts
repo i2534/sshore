@@ -9,6 +9,8 @@ export function CreateTunnel(arg1:config.Tunnel):Promise<void>;
 
 export function Cwd():Promise<string>;
 
+export function DeleteLocal(arg1:string):Promise<void>;
+
 export function DeleteTunnel(arg1:string):Promise<void>;
 
 export function HomeDir():Promise<string>;
@@ -23,11 +25,15 @@ export function ListLocal(arg1:string):Promise<Array<sftp.Item>>;
 
 export function ListTunnels():Promise<Array<config.Tunnel>>;
 
+export function MkdirLocal(arg1:string):Promise<void>;
+
 export function OnShutdown():Promise<void>;
 
 export function PickLocalDir():Promise<string>;
 
 export function PickLocalFile():Promise<string>;
+
+export function RenameLocal(arg1:string,arg2:string):Promise<void>;
 
 export function SftpGet(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
@@ -40,6 +46,8 @@ export function SftpMkdir(arg1:string,arg2:string,arg3:string):Promise<void>;
 export function SftpPut(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
 export function SftpRemove(arg1:string,arg2:string,arg3:string):Promise<void>;
+
+export function SftpRename(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
 export function StartTunnel(arg1:string):Promise<void>;
 

@@ -195,3 +195,16 @@ func (c *Ctrl) Mkdir(host, user, path string) error {
 	}
 	return nil
 }
+
+// Rename renames/moves a remote file or directory.
+func (c *Ctrl) Rename(host, user, oldPath, newPath string) error {
+	batch := []byte(fmt.Sprintf("rename %s %s\n", oldPath, newPath))
+	out, err := c.run(host, user, batch)
+	if err != nil {
+		return err
+	}
+	if out.ExitCode != 0 {
+		return fmt.Errorf("sftp rename failed: %s", out.Stderr)
+	}
+	return nil
+}
