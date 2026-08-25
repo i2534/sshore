@@ -42,11 +42,11 @@ export namespace config {
 export namespace sftp {
 	
 	export class Item {
-	    Name: string;
-	    Size: number;
-	    IsDir: boolean;
-	    Mode: string;
-	    ModTime: string;
+	    name: string;
+	    size: number;
+	    isDir: boolean;
+	    mode: string;
+	    modTime: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Item(source);
@@ -54,11 +54,11 @@ export namespace sftp {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.Name = source["Name"];
-	        this.Size = source["Size"];
-	        this.IsDir = source["IsDir"];
-	        this.Mode = source["Mode"];
-	        this.ModTime = source["ModTime"];
+	        this.name = source["name"];
+	        this.size = source["size"];
+	        this.isDir = source["isDir"];
+	        this.mode = source["mode"];
+	        this.modTime = source["modTime"];
 	    }
 	}
 
