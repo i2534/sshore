@@ -5,6 +5,7 @@ import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
 import ContextMenu from '../components/ContextMenu.vue'
+import AppDialog from '../components/AppDialog.vue'
 
 const logStore = useLogStore()
 const hosts = ref([])
@@ -36,6 +37,31 @@ let clockTimer = null
 
 // context menu state
 const menu = ref({ visible: false, x: 0, y: 0, pane: 'remote', item: null })
+
+// modal dialog state (replaces native window.confirm/prompt)
+const dialog = ref({ visible: false, mode: 'confirm', title: '', message: '', placeholder: '', initial: '' })
+let dialogResolve = null
+
+function openConfirm(title, message) {
+  return new Promise((resolve) => {
+    dialog.value = { visible: true, mode: 'confirm', title, message, placeholder: '', initial: '' }
+    dialogResolve = resolve
+  })
+}
+function openPrompt(title, message, initial) {
+  return new Promise((resolve) => {
+    dialog.value = { visible: true, mode: 'prompt', title, message, placeholder: '', initial: initial || '' }
+    dialogResolve = resolve
+  })
+}
+function onDialogOk(value) {
+  dialog.value.visible = false
+  if (dialogResolve) { dialogResolve(value || true); dialogResolve = null }
+}
+function onDialogCancel() {
+  dialog.value.visible = false
+  if (dialogResolve) { dialogResolve(null); dialogResolve = null }
+}
 
 function closeMenu() { menu.value.visible = false }
 function outsideClick() { closeMenu() }
@@ -146,7 +172,8 @@ async function remove() {
   const it = menu.value.item || remoteSel.value
   const pane = menu.value.pane
   if (!it || it.name === '..') { closeMenu(); return }
-  if (!window.confirm(`删除${pane === 'local' ? '本地' : '远程'}「${it.name}」？`)) { closeMenu(); return }
+  const ok = await openConfirm('确认删除', `删除${pane === 'local' ? '本地' : '远程'}「${it.name}」？`)
+  if (!ok) { closeMenu(); return }
   try {
     if (pane === 'local') {
       await DeleteLocal(join(localPath.value, it.name))
@@ -162,7 +189,7 @@ async function remove() {
 async function rename() {
   const it = menu.value.item || remoteSel.value
   if (!it || it.name === '..') { closeMenu(); return }
-  const newName = window.prompt('新名称：', it.name)
+  const newName = await openPrompt('重命名', '新名称：', it.name)
   if (!newName || newName === it.name) { closeMenu(); return }
   try {
     if (menu.value.pane === 'local') {
@@ -184,7 +211,7 @@ async function renameLocal(oldPath, newPath) {
 async function mkdir() {
   const pane = menu.value.pane
   closeMenu()
-  const name = window.prompt('新建文件夹名称：')
+  const name = await openPrompt('新建文件夹', '新建文件夹名称：', '')
   if (!name) return
   try {
     if (pane === 'local') {
@@ -284,6 +311,16 @@ onUnmounted(() => {
         <button @click="doAction('mkdir')"><span class="ic">📁</span>新建文件夹</button>
       </template>
     </ContextMenu>
+
+    <AppDialog
+      :visible="dialog.visible"
+      :mode="dialog.mode"
+      :title="dialog.title"
+      :message="dialog.message"
+      :initial="dialog.initial"
+      @ok="onDialogOk"
+      @cancel="onDialogCancel"
+    />
   </div>
 </template>
 
