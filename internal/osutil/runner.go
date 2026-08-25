@@ -29,7 +29,7 @@ func NewRunner() Runner {
 
 // Process is a handle to a running long-lived subprocess (e.g. `ssh -N`).
 type Process struct {
-	cmd *exec.Cmd
+	cmd  *exec.Cmd
 	done chan Outcome
 }
 
