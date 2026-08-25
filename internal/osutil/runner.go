@@ -19,6 +19,7 @@ type Runner func(name string, args ...string) (Outcome, error)
 func NewRunner() Runner {
 	return func(name string, args ...string) (Outcome, error) {
 		cmd := exec.Command(name, args...)
+		procAttrHideConsole(cmd)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
@@ -48,6 +49,7 @@ type realSpawner struct{}
 
 func (realSpawner) Start(name string, args ...string) (*Process, error) {
 	cmd := exec.Command(name, args...)
+	procAttrHideConsole(cmd)
 	p := &Process{cmd: cmd, done: make(chan Outcome, 1)}
 	if err := cmd.Start(); err != nil {
 		return p, err
