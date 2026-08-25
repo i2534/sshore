@@ -49,22 +49,22 @@ func (a *App) Init(emit func(forward.Event)) {
 func (a *App) ListHosts() []string {
 	path, err := config.FindSSHConfigPath()
 	if err != nil {
-		return nil
+		return []string{}
 	}
 	hosts, err := config.EnumerateHosts(path)
 	if err != nil {
-		return nil
+		return []string{}
 	}
-	out := make([]string, len(hosts))
-	for i, h := range hosts {
-		out[i] = h.Alias
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		out = append(out, h.Alias)
 	}
 	return out
 }
 
 func (a *App) ListTunnels() []config.Tunnel {
 	if a.cfg == nil {
-		return nil
+		return []config.Tunnel{}
 	}
 	return a.cfg.Tunnels
 }

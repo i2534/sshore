@@ -43,7 +43,7 @@ onMounted(() => window.addEventListener('click', outsideClick))
 onUnmounted(() => window.removeEventListener('click', outsideClick))
 
 async function loadHosts() {
-  hosts.value = await ListHosts()
+  hosts.value = (await ListHosts()) || []
   if (hosts.value.length && !host.value) host.value = hosts.value[0]
 }
 async function err(e) {
@@ -53,7 +53,7 @@ async function err(e) {
 async function loadRemote() {
   if (!host.value) return
   remoteLoading.value = true
-  try { remoteItems.value = await SftpList(host.value, '', remotePath.value || '/') }
+  try { remoteItems.value = (await SftpList(host.value, '', remotePath.value || '/')) || [] }
   catch (e) { err(e) }
   finally { remoteLoading.value = false }
 }
@@ -84,7 +84,7 @@ async function disconnect() {
 }
 async function loadLocal() {
   localLoading.value = true
-  try { localItems.value = await ListLocal(localPath.value || '/') }
+  try { localItems.value = (await ListLocal(localPath.value || '/')) || [] }
   catch (e) { err(e) }
   finally { localLoading.value = false }
 }

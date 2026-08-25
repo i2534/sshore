@@ -28,10 +28,10 @@ function newTunnel() {
 }
 
 async function refresh() {
-  try { tunnels.value = await ListTunnels() } catch (e) { loadError.value = String(e) }
+  try { tunnels.value = (await ListTunnels()) || [] } catch (e) { loadError.value = String(e) }
 }
 async function loadHosts() {
-  try { hosts.value = await ListHosts() } catch (e) { loadError.value = String(e) }
+  try { hosts.value = (await ListHosts()) || [] } catch (e) { loadError.value = String(e) }
 }
 async function doImport() {
   await ImportCommand(cmd.value)
