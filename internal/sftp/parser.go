@@ -2,8 +2,10 @@ package sftp
 
 import (
 	"bufio"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Item struct {
@@ -38,7 +40,7 @@ func ParseLsLf(output string) ([]Item, error) {
 			Size:    size,
 			IsDir:   strings.HasPrefix(mode, "d"),
 			Mode:    mode,
-			ModTime: strings.TrimSpace(strings.Join(fields[5:], " ")),
+			ModTime: parseModTime(rest),
 		})
 	}
 	if err := sc.Err(); err != nil {
@@ -56,4 +58,41 @@ func nameAfterDate(rest string) string {
 	}
 	// parts[0]=MMM, parts[1]=DD, parts[2]=time|YYYY, parts[3:]=name
 	return strings.TrimSpace(strings.Join(parts[3:], " "))
+}
+
+var monthNum = map[string]int{
+	"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+	"Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
+// parseModTime converts sftp's `ls -l` date field ("MMM DD [HH:MM|YYYY]",
+// without the trailing filename) into the canonical "YYYY-MM-DD HH:MM" form.
+// A time token means this year; a bare year token means that year (old files).
+func parseModTime(rest string) string {
+	parts := strings.Split(rest, " ")
+	if len(parts) < 3 {
+		return ""
+	}
+	mon := monthNum[parts[0]]
+	if mon == 0 {
+		return ""
+	}
+	day, _ := strconv.Atoi(parts[1])
+	third := parts[2] // "HH:MM" or "YYYY"
+	year := 0
+	clock := ""
+	if strings.Contains(third, ":") {
+		year = time.Now().Year()
+		clock = third
+	} else {
+		year, _ = strconv.Atoi(third)
+	}
+	if year == 0 || day == 0 {
+		return ""
+	}
+	date := fmt.Sprintf("%04d-%02d-%02d", year, mon, day)
+	if clock != "" {
+		return date + " " + clock
+	}
+	return date
 }

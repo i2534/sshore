@@ -78,7 +78,7 @@ function fmtSize(bytes) {
 .list li:hover { background: var(--surface-hover); }
 .list li.sel { background: var(--surface-hover); color: var(--accent); }
 .list li.up { color: var(--text-dim); border-bottom: 1px solid var(--border); }
-.col-name, .cell-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-.col-size, .cell-size { width: 72px; text-align: right; color: var(--text-dim); }
-.col-time, .cell-time { width: 120px; text-align: right; color: var(--text-faint); }
+.col-name, .cell-name { flex: 1; overflow: hidden; text-overflow: ellipsis; padding-right: 16px; }
+.col-size, .cell-size { width: 88px; text-align: right; padding-right: 16px; color: var(--text-dim); }
+.col-time, .cell-time { width: 140px; text-align: right; color: var(--text-faint); }
 </style>

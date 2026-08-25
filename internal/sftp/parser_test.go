@@ -50,3 +50,20 @@ func TestParseLsLfEmptyIsEmptyList(t *testing.T) {
 		t.Fatalf("want 0 items got %d", len(items))
 	}
 }
+
+func TestParseLsLfModTime(t *testing.T) {
+	out := "-rw-r--r--    1 lan      lan             6 Aug 25 15:34 a.txt\n" +
+		"-rw-r--r--    1 lan      lan            10 Aug 25 2024 old.log\n"
+	items, err := ParseLsLf(out)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	// Current-year file gets HH:MM; must NOT include the filename.
+	if items[0].ModTime != "2026-08-25 15:34" {
+		t.Fatalf("this-year modTime wrong (should be YYYY-MM-DD HH:MM, no filename): %q", items[0].ModTime)
+	}
+	// Old file shows a bare year.
+	if items[1].ModTime != "2024-08-25" {
+		t.Fatalf("old-file modTime wrong: %q", items[1].ModTime)
+	}
+}
