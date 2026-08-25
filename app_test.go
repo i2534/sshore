@@ -55,3 +55,40 @@ func TestSaveConfigPersistsTunnels(t *testing.T) {
 		t.Fatalf("tunnel not persisted: %+v", got.Tunnels)
 	}
 }
+
+func TestUpdateTunnelReplacesById(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	if err := a.CreateTunnel(config.Tunnel{ID: "abc", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 5432, TargetHost: "127.0.0.1", TargetPort: 5432}); err != nil {
+		t.Fatal(err)
+	}
+	upd := config.Tunnel{ID: "abc", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 9090, TargetHost: "127.0.0.1", TargetPort: 9090}
+	if err := a.UpdateTunnel(upd); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if len(a.cfg.Tunnels) != 1 {
+		t.Fatalf("expected 1 tunnel, got %d", len(a.cfg.Tunnels))
+	}
+	if a.cfg.Tunnels[0].ListenPort != 9090 {
+		t.Fatalf("port not updated: %+v", a.cfg.Tunnels[0])
+	}
+}
+
+func TestDeleteTunnelRemovesAndStops(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	if err := a.CreateTunnel(config.Tunnel{ID: "abc", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 5432, TargetHost: "127.0.0.1", TargetPort: 5432}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.DeleteTunnel("abc"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if len(a.cfg.Tunnels) != 0 {
+		t.Fatalf("expected 0 tunnels, got %+v", a.cfg.Tunnels)
+	}
+	if _, ok := a.findTunnel("abc"); ok {
+		t.Fatal("tunnel should be removed")
+	}
+}
