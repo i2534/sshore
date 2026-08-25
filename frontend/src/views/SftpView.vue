@@ -164,11 +164,21 @@ async function mkdir() {
 }
 
 async function upload() {
+  const it = menu.value.item
+  const pane = menu.value.pane
   closeMenu()
   try {
-    const local = await PickLocalFile()
-    if (!local) return
-    const name = local.split(/[\\/]/).pop()
+    // If a specific local file was right-clicked, upload it directly
+    // (no system dialog). Otherwise (toolbar / remote pane) pick a file.
+    let local, name
+    if (pane === 'local' && it && it.name !== '..' && !it.isDir) {
+      local = join(localPath.value, it.name)
+      name = it.name
+    } else {
+      local = await PickLocalFile()
+      if (!local) return
+      name = local.split(/[\\/]/).pop()
+    }
     const t = { name, status: '处理中' }
     transfers.value.push(t)
     await SftpPut(host.value, '', local, join(remotePath.value, name))
