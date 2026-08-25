@@ -170,11 +170,17 @@ func (c *Ctrl) Stop(sourceID string) error {
 	}
 	p.mu.Lock()
 	if p.proc != nil {
-		_ = p.proc.Signal()
-		go func(proc *osutil.Process) {
-			<-time.After(5 * time.Second)
-			_ = proc.Kill()
-		}(p.proc)
+		// On Windows Process.Signal is unsupported (returns an error), so kill
+		// immediately rather than waiting the grace period for a signal that
+		// will never arrive.
+		if err := p.proc.Signal(); err != nil {
+			_ = p.proc.Kill()
+		} else {
+			go func(proc *osutil.Process) {
+				<-time.After(5 * time.Second)
+				_ = proc.Kill()
+			}(p.proc)
+		}
 	}
 	p.mu.Unlock()
 	p.state = StateStopped
