@@ -14,7 +14,7 @@ WEBKIT_TAG ?= webkit2_41
 BINDIR   := build/bin
 OUTNAME  := sshkit
 
-.PHONY: all dev build linux windows clean test vet fmt
+.PHONY: all dev build run linux windows clean test vet fmt
 
 ## Build for the current platform.
 all: build
@@ -25,7 +25,11 @@ dev:
 
 ## Build for the current platform (with webkit tag on linux; no re-package).
 build:
-	$(WAILS) build -skipbindings -clean $(if $(WEBKIT_TAG),-tags $(WEBKIT_TAG),)
+	$(WAILS) build -skipbindings -clean -nopackage $(if $(WEBKIT_TAG),-tags $(WEBKIT_TAG),)
+
+## Build and run the app for the current platform's binary.
+run: build
+	./$(BINDIR)/$(OUTNAME)
 
 ## Build Linux amd64 binary.
 linux:
