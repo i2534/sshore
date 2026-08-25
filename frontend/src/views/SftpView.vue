@@ -271,17 +271,17 @@ onUnmounted(() => {
 
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
       <template v-if="menu.pane === 'remote'">
-        <button @click="doAction('download')">⬇ 下载…</button>
-        <button @click="doAction('upload')">⬆ 上传…</button>
-        <button @click="doAction('rename')">✏️ 重命名</button>
-        <button class="sep" @click="doAction('remove')">🗑 删除</button>
-        <button @click="doAction('mkdir')">📁 新建文件夹</button>
+        <button @click="doAction('download')"><span class="ic">⬇</span>下载…</button>
+        <button @click="doAction('upload')"><span class="ic">⬆</span>上传…</button>
+        <button @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
+        <button class="sep" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
+        <button @click="doAction('mkdir')"><span class="ic">📁</span>新建文件夹</button>
       </template>
       <template v-else>
-        <button @click="doAction('upload')">⬆ 上传到远程</button>
-        <button @click="doAction('rename')">✏️ 重命名</button>
-        <button class="sep" @click="doAction('remove')">🗑 删除</button>
-        <button @click="doAction('mkdir')">📁 新建文件夹</button>
+        <button @click="doAction('upload')"><span class="ic">⬆</span>上传到远程</button>
+        <button @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
+        <button class="sep" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
+        <button @click="doAction('mkdir')"><span class="ic">📁</span>新建文件夹</button>
       </template>
     </ContextMenu>
   </div>
