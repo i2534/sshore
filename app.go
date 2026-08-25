@@ -220,6 +220,24 @@ func (a *App) SftpRemove(host, user, path string) error {
 func (a *App) SftpMkdir(host, user, path string) error {
 	return a.sftp.Mkdir(host, user, path)
 }
+func (a *App) SftpRename(host, user, oldPath, newPath string) error {
+	return a.sftp.Rename(host, user, oldPath, newPath)
+}
+
+// DeleteLocal removes a local file or directory (recursively for dirs).
+func (a *App) DeleteLocal(path string) error {
+	return os.RemoveAll(path)
+}
+
+// MkdirLocal creates a local directory (and parents).
+func (a *App) MkdirLocal(path string) error {
+	return os.MkdirAll(path, 0755)
+}
+
+// RenameLocal renames/moves a local file or directory.
+func (a *App) RenameLocal(oldPath, newPath string) error {
+	return os.Rename(oldPath, newPath)
+}
 
 // PickLocalFile opens a native file picker and returns the chosen local path
 // ("" if cancelled). Used as the upload source for SftpPut.

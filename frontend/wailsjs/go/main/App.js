@@ -14,6 +14,10 @@ export function Cwd() {
   return window['go']['main']['App']['Cwd']();
 }
 
+export function DeleteLocal(arg1) {
+  return window['go']['main']['App']['DeleteLocal'](arg1);
+}
+
 export function DeleteTunnel(arg1) {
   return window['go']['main']['App']['DeleteTunnel'](arg1);
 }
@@ -42,6 +46,10 @@ export function ListTunnels() {
   return window['go']['main']['App']['ListTunnels']();
 }
 
+export function MkdirLocal(arg1) {
+  return window['go']['main']['App']['MkdirLocal'](arg1);
+}
+
 export function OnShutdown() {
   return window['go']['main']['App']['OnShutdown']();
 }
@@ -52,6 +60,10 @@ export function PickLocalDir() {
 
 export function PickLocalFile() {
   return window['go']['main']['App']['PickLocalFile']();
+}
+
+export function RenameLocal(arg1, arg2) {
+  return window['go']['main']['App']['RenameLocal'](arg1, arg2);
 }
 
 export function SftpGet(arg1, arg2, arg3, arg4) {
@@ -76,6 +88,10 @@ export function SftpPut(arg1, arg2, arg3, arg4) {
 
 export function SftpRemove(arg1, arg2, arg3) {
   return window['go']['main']['App']['SftpRemove'](arg1, arg2, arg3);
+}
+
+export function SftpRename(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['SftpRename'](arg1, arg2, arg3, arg4);
 }
 
 export function StartTunnel(arg1) {
