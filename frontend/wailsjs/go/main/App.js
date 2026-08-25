@@ -110,6 +110,10 @@ export function StartTunnel(arg1) {
   return window['go']['main']['App']['StartTunnel'](arg1);
 }
 
+export function StatLocal(arg1) {
+  return window['go']['main']['App']['StatLocal'](arg1);
+}
+
 export function StopTunnel(arg1) {
   return window['go']['main']['App']['StopTunnel'](arg1);
 }
