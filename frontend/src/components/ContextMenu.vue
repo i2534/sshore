@@ -15,5 +15,5 @@ defineEmits(['action', 'close'])
 .menu :deep(button) { display: flex; width: 100%; align-items: center; gap: 8px; text-align: left; background: none; border: none; padding: 6px 10px; color: var(--text); cursor: pointer; }
 .menu :deep(button:hover) { background: var(--surface-hover); }
 .menu :deep(button.sep) { border-top: 1px solid var(--border); margin-top: 2px; }
-.menu :deep(.ic) { display: inline-block; min-width: 16px; text-align: center; flex-shrink: 0; }
+.menu :deep(.ic) { display: inline-block; width: 20px; text-align: center; flex-shrink: 0; }
 </style>
