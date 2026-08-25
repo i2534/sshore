@@ -15,9 +15,13 @@ export function Init(arg1:any):Promise<void>;
 
 export function ListHosts():Promise<Array<string>>;
 
+export function ListLocal(arg1:string):Promise<Array<sftp.Item>>;
+
 export function ListTunnels():Promise<Array<config.Tunnel>>;
 
 export function OnShutdown():Promise<void>;
+
+export function PickLocalDir():Promise<string>;
 
 export function PickLocalFile():Promise<string>;
 
