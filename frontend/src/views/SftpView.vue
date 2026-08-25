@@ -8,7 +8,7 @@ import TransferQueue from '../components/TransferQueue.vue'
 const logStore = useLogStore()
 const hosts = ref([])
 const host = ref('')
-const remotePath = ref('~')
+const remotePath = ref('.')
 const remoteItems = ref([])
 const localPath = ref('.')
 const localItems = ref([])
