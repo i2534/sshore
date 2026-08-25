@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"time"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -30,6 +31,13 @@ func main() {
 			app.startup(ctx)
 			app.Init(func(e forward.Event) {
 				runtime.EventsEmit(ctx, "log", e)
+			})
+			runtime.EventsEmit(ctx, "log", forward.Event{
+				SourceType: "system",
+				SourceID:   "app",
+				TS:         time.Now().Format(time.RFC3339),
+				Level:      "info",
+				Message:    "sshkit 已就绪",
 			})
 			_ = app.AutoStartEnabled()
 		},

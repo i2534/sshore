@@ -20,11 +20,11 @@ const (
 )
 
 type Event struct {
-	SourceType string
-	SourceID   string
-	TS         string
-	Level      string
-	Message    string
+	SourceType string `json:"source_type"`
+	SourceID   string `json:"source_id"`
+	TS         string `json:"ts"`
+	Level      string `json:"level"`
+	Message    string `json:"message"`
 }
 
 type EmitFunc func(Event)
