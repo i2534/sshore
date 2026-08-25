@@ -3,11 +3,23 @@ import { ref, onMounted } from 'vue'
 import { ListTunnels, ListHosts, CreateTunnel, UpdateTunnel, DeleteTunnel, ImportCommand } from '../../wailsjs/go/main/App'
 import RuleCard from '../components/RuleCard.vue'
 import LogPanel from '../components/LogPanel.vue'
+import AppDialog from '../components/AppDialog.vue'
 
 const tunnels = ref([])
 const hosts = ref([])
 const cmd = ref('')
 const loadError = ref('')
+
+const dialog = ref({ visible: false, mode: 'confirm', title: '', message: '', initial: '' })
+let dialogResolve = null
+function openConfirm(title, message) {
+  return new Promise((resolve) => {
+    dialog.value = { visible: true, mode: 'confirm', title, message, initial: '' }
+    dialogResolve = resolve
+  })
+}
+function onDialogOk() { dialog.value.visible = false; if (dialogResolve) { dialogResolve(true); dialogResolve = null } }
+function onDialogCancel() { dialog.value.visible = false; if (dialogResolve) { dialogResolve(null); dialogResolve = null } }
 
 const showForm = ref(false)
 const editingId = ref(null)
@@ -58,7 +70,8 @@ async function submit() {
   await refresh()
 }
 async function remove(t) {
-  if (!window.confirm(`删除规则「${t.name || t.host}」？`)) return
+  const ok = await openConfirm('确认删除', `删除规则「${t.name || t.host}」？`)
+  if (!ok) return
   await DeleteTunnel(t.id)
   await refresh()
 }
@@ -117,6 +130,15 @@ onMounted(async () => { await loadHosts(); await refresh() })
       </div>
     </div>
     <div class="panel"><LogPanel /></div>
+
+    <AppDialog
+      :visible="dialog.visible"
+      :mode="dialog.mode"
+      :title="dialog.title"
+      :message="dialog.message"
+      @ok="onDialogOk"
+      @cancel="onDialogCancel"
+    />
   </div>
 </template>
 
