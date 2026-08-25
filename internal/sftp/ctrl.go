@@ -3,6 +3,7 @@ package sftp
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"sshkit/internal/forward"
 	"sshkit/internal/osutil"
@@ -70,12 +71,27 @@ func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
 func (c *Ctrl) List(host, user, path string) ([]Item, error) {
 	out, err := c.run(host, user, c.buildBatch("ls", path, ""))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("sftp ls %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
-		return nil, fmt.Errorf("sftp ls failed: %s", out.Stderr)
+		return nil, fmt.Errorf("sftp ls failed: %s", commandErr(out))
 	}
 	return ParseLsLf(out.Stdout)
+}
+
+// commandErr returns stderr (or stdout) trimmed, preferring stderr, so the
+// original sftp/ssh message (e.g. "Host key verification failed", "Permission
+// denied") is surfaced to the user instead of a bare exit code.
+func commandErr(out osutil.Outcome) string {
+	s := out.Stderr
+	if s == "" {
+		s = out.Stdout
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return fmt.Sprintf("exit %d", out.ExitCode)
+	}
+	return s
 }
 
 func (c *Ctrl) Get(host, user, remote, local string) error {
