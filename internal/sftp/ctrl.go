@@ -60,7 +60,7 @@ func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
 	if err != nil {
 		return osutil.Outcome{}, err
 	}
-	args := []string{"-o", "BatchMode=yes", "-b", batchPath}
+	args := []string{"-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-b", batchPath}
 	if user != "" {
 		args = append(args, "-o", "User="+user)
 	}
