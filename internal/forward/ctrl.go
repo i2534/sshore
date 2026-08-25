@@ -128,12 +128,97 @@ func (c *Ctrl) Start(t config.Tunnel) error {
 		c.setState(t.ID, StateError)
 		return fmt.Errorf("could not build args for %q", t.Host)
 	}
-	c.setState(t.ID, StateConnecting)
-	c.setState(t.ID, StateConnected)
+	// port pre-check for local/dynamic
+	if t.Mode != "remote" && t.ListenPort > 0 && !CheckLocalPort(t.ListenBind, t.ListenPort) {
+		c.setState(t.ID, StateError)
+		err := fmt.Errorf("local port %s:%d already in use", t.ListenBind, t.ListenPort)
+		c.emitEvent(t.ID, "error", err.Error())
+		return err
+	}
+
+	spawnArgs := args[1:] // drop the leading "ssh"
+	c.mu.Lock()
+	c.procs[t.ID] = &process{state: StateConnecting, args: args}
+	c.mu.Unlock()
+	c.emitEvent(t.ID, "info", "connecting")
+
+	proc, err := c.spawner.Start("ssh", spawnArgs...)
+	if err != nil {
+		msg := classifyError(osutil.Outcome{Stderr: err.Error(), ExitCode: -1})
+		c.mu.Lock()
+		c.procs[t.ID] = &process{state: StateError, args: args}
+		c.mu.Unlock()
+		c.emitEvent(t.ID, "error", msg)
+		return fmt.Errorf("%s: %s", t.Name, msg)
+	}
+
+	c.mu.Lock()
+	c.procs[t.ID] = &process{state: StateConnected, args: args, proc: proc}
+	c.mu.Unlock()
+	c.emitEvent(t.ID, "info", "connected")
 	return nil
 }
 
 func (c *Ctrl) Stop(sourceID string) error {
-	c.setState(sourceID, StateStopped)
+	c.mu.Lock()
+	p, ok := c.procs[sourceID]
+	c.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	p.mu.Lock()
+	if p.proc != nil {
+		_ = p.proc.Signal()
+		go func(proc *osutil.Process) {
+			<-time.After(5 * time.Second)
+			_ = proc.Kill()
+		}(p.proc)
+	}
+	p.mu.Unlock()
+	p.state = StateStopped
+	c.emitEvent(sourceID, "info", "stopped")
 	return nil
+}
+
+// OnShutdown reaps all managed child processes. Called from Wails OnShutdown.
+func (c *Ctrl) OnShutdown() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, p := range c.procs {
+		if p.proc != nil {
+			_ = p.proc.Kill()
+		}
+		p.proc = nil
+		p.state = StateStopped
+	}
+}
+
+// classifyError maps a ssh/sftp outcome's stderr to a level-appropriate message.
+func classifyError(out osutil.Outcome) string {
+	s := out.Stderr
+	if s == "" {
+		s = out.Stdout
+	}
+	switch {
+	case contains(s, "Address already in use"):
+		return "port already in use"
+	case contains(s, "Permission denied"):
+		return "authentication failed — configure key/agent auth for this host"
+	case contains(s, "Could not resolve hostname"):
+		return "host not resolvable"
+	default:
+		if s == "" {
+			return "unknown error (exit " + fmt.Sprintf("%d", out.ExitCode) + ")"
+		}
+		return s
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }
