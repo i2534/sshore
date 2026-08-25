@@ -3,6 +3,8 @@ package sftp
 import (
 	"os"
 	"testing"
+
+	"sshkit/internal/osutil"
 )
 
 func TestBuildBatchAndWrite(t *testing.T) {
@@ -26,5 +28,20 @@ func TestBuildBatchAndWrite(t *testing.T) {
 	data, _ := os.ReadFile(p)
 	if string(data) != string(b) {
 		t.Fatalf("file content mismatch")
+	}
+}
+
+func TestCommandErr(t *testing.T) {
+	// stderr takes priority
+	if got := commandErr(osutil.Outcome{Stderr: "  Host key verification failed.  ", ExitCode: 255}); got != "Host key verification failed." {
+		t.Fatalf("stderr trimmed wrong: %q", got)
+	}
+	// stderr empty falls back to stdout
+	if got := commandErr(osutil.Outcome{Stdout: "Permission denied (publickey).", ExitCode: 255}); got != "Permission denied (publickey)." {
+		t.Fatalf("stdout fallback wrong: %q", got)
+	}
+	// both empty -> exit code
+	if got := commandErr(osutil.Outcome{ExitCode: 255}); got != "exit 255" {
+		t.Fatalf("exit fallback wrong: %q", got)
 	}
 }
