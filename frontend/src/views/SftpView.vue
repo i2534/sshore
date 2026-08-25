@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, PickLocalDir, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
@@ -132,12 +132,13 @@ async function download() {
   const it = menu.value.item || remoteSel.value
   if (!it || it.isDir || it.name === '..') { closeMenu(); return }
   try {
-    const dir = await PickLocalDir()
-    if (!dir) { closeMenu(); return }
+    // Save directly to the local pane's current directory (no picker dialog).
+    const dir = localPath.value || '.'
     const t = { name: it.name, size: it.size || 0, status: '处理中', startedAt: Date.now() }
     transfers.value.push(t)
     await SftpGet(host.value, '', join(remotePath.value, it.name), join(dir, it.name))
     t.status = '完成'
+    await loadLocal()
   } catch (e) { err(e) }
   closeMenu()
 }
