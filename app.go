@@ -80,6 +80,49 @@ func (a *App) CreateTunnel(t config.Tunnel) error {
 	return a.saveConfig()
 }
 
+// UpdateTunnel replaces an existing tunnel (matched by ID) with updated fields.
+// If the tunnel is running, it is stopped first because the config changed.
+func (a *App) UpdateTunnel(t config.Tunnel) error {
+	if !forward.ValidateHost(t.Host) {
+		return errors.New("invalid host alias")
+	}
+	idx := -1
+	for i, e := range a.cfg.Tunnels {
+		if e.ID == t.ID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return errors.New("tunnel not found")
+	}
+	if a.cfg.Tunnels[idx].Enabled {
+		_ = a.forward.Stop(t.ID)
+		t.Enabled = false
+	}
+	a.cfg.Tunnels[idx] = t
+	return a.saveConfig()
+}
+
+// DeleteTunnel removes a tunnel (matched by ID), stopping it if running.
+func (a *App) DeleteTunnel(id string) error {
+	idx := -1
+	for i, e := range a.cfg.Tunnels {
+		if e.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return errors.New("tunnel not found")
+	}
+	if a.cfg.Tunnels[idx].Enabled {
+		_ = a.forward.Stop(id)
+	}
+	a.cfg.Tunnels = append(a.cfg.Tunnels[:idx], a.cfg.Tunnels[idx+1:]...)
+	return a.saveConfig()
+}
+
 func (a *App) ImportCommand(cmd string) ([]config.Tunnel, error) {
 	tunnels, err := importer.Parse(cmd)
 	if err != nil {

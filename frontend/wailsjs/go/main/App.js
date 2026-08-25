@@ -10,6 +10,10 @@ export function CreateTunnel(arg1) {
   return window['go']['main']['App']['CreateTunnel'](arg1);
 }
 
+export function DeleteTunnel(arg1) {
+  return window['go']['main']['App']['DeleteTunnel'](arg1);
+}
+
 export function ImportCommand(arg1) {
   return window['go']['main']['App']['ImportCommand'](arg1);
 }
@@ -56,4 +60,8 @@ export function StartTunnel(arg1) {
 
 export function StopTunnel(arg1) {
   return window['go']['main']['App']['StopTunnel'](arg1);
+}
+
+export function UpdateTunnel(arg1) {
+  return window['go']['main']['App']['UpdateTunnel'](arg1);
 }
