@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"sshkit/internal/config"
@@ -29,5 +31,27 @@ func TestImportCommandCreatesTunnels(t *testing.T) {
 	got, ok := a.findTunnel(ts[0].ID)
 	if !ok || got.Mode != "local" || got.ListenPort != 5432 {
 		t.Fatalf("tunnel not stored: %+v", got)
+	}
+}
+
+func TestSaveConfigPersistsTunnels(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	if err := a.CreateTunnel(config.Tunnel{ID: "abc", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 5432, TargetHost: "127.0.0.1", TargetPort: 5432}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := a.saveConfig(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if _, err := os.Stat(a.cfgPath); err != nil {
+		t.Fatalf("config file should exist: %v", err)
+	}
+	got, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(got.Tunnels) != 1 || got.Tunnels[0].ID != "abc" {
+		t.Fatalf("tunnel not persisted: %+v", got.Tunnels)
 	}
 }
