@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
 import { useLogStore } from './stores/logs'
 import ForwardView from './views/ForwardView.vue'
@@ -7,10 +7,14 @@ import SftpView from './views/SftpView.vue'
 
 const active = ref('forward')
 const logStore = useLogStore()
+const fatal = ref('')
 
+function onErr(evt) { fatal.value = evt.detail }
 onMounted(() => {
   EventsOn('log', (evt) => logStore.add(evt))
+  window.addEventListener('sshkit:error', onErr)
 })
+onUnmounted(() => window.removeEventListener('sshkit:error', onErr))
 </script>
 
 <template>
@@ -20,6 +24,7 @@ onMounted(() => {
       <button :class="{ active: active === 'sftp' }" @click="active = 'sftp'">SFTP</button>
     </nav>
     <main class="workspace">
+      <div v-if="fatal" class="fatal">⚠ 界面错误: {{ fatal }}</div>
       <ForwardView v-if="active === 'forward'" />
       <SftpView v-else />
     </main>
@@ -33,4 +38,5 @@ onMounted(() => {
 .sidebar button:hover { background: var(--surface); color: var(--text); }
 .sidebar button.active { background: var(--surface-hover); color: var(--text); border-left: 3px solid var(--accent); }
 .workspace { flex: 1; padding: 12px; overflow: auto; text-align: left; }
+.fatal { background: var(--danger); color: #fff; padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; }
 </style>

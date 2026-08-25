@@ -7,6 +7,7 @@ import LogPanel from '../components/LogPanel.vue'
 const tunnels = ref([])
 const hosts = ref([])
 const cmd = ref('')
+const loadError = ref('')
 
 const showForm = ref(false)
 const editingId = ref(null)
@@ -27,10 +28,10 @@ function newTunnel() {
 }
 
 async function refresh() {
-  tunnels.value = await ListTunnels()
+  try { tunnels.value = await ListTunnels() } catch (e) { loadError.value = String(e) }
 }
 async function loadHosts() {
-  hosts.value = await ListHosts()
+  try { hosts.value = await ListHosts() } catch (e) { loadError.value = String(e) }
 }
 async function doImport() {
   await ImportCommand(cmd.value)
@@ -107,7 +108,8 @@ onMounted(async () => { await loadHosts(); await refresh() })
 
       <RuleCard v-for="t in tunnels" :key="t.id" :tunnel="t"
         @edit="openEdit" @delete="remove" @changed="refresh" />
-      <p v-if="!tunnels.length" class="empty">暂无规则，点「+ 新建规则」或导入 ssh 命令</p>
+      <p v-if="loadError" class="empty err">加载失败: {{ loadError }}</p>
+      <p v-else-if="!tunnels.length" class="empty">暂无规则，点「+ 新建规则」或导入 ssh 命令</p>
 
       <div class="import">
         <input v-model="cmd" placeholder="ssh -N -L 5432:127.0.0.1:5432 prod-db">
@@ -128,4 +130,5 @@ onMounted(async () => { await loadHosts(); await refresh() })
 .import { display: flex; gap: 6px; margin-top: 12px; }
 .import input { flex: 1; }
 .empty { color: var(--text-faint); }
+.empty.err { color: var(--danger); }
 </style>
