@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -13,15 +14,20 @@ import (
 	"sshkit/internal/osutil"
 )
 
+// isWindows: Windows OpenSSH has no ControlMaster/-f support, so connection
+// reuse (mux) is Linux/macOS only. Windows falls back to per-command connects.
+var isWindows = runtime.GOOS == "windows"
+
 type Ctrl struct {
 	runner     osutil.Runner
 	emit       forward.EmitFunc
 	controlDir string
+	active     map[string]bool // hosts marked connected (Windows per-command mode)
 	mu         sync.Mutex
 }
 
 func NewCtrl(r osutil.Runner, emit forward.EmitFunc) *Ctrl {
-	return &Ctrl{runner: r, emit: emit, controlDir: filepath.Join(os.TempDir(), "sshkit-sftp-ctrl")}
+	return &Ctrl{runner: r, emit: emit, controlDir: filepath.Join(os.TempDir(), "sshkit-sftp-ctrl"), active: map[string]bool{}}
 }
 
 // controlPathFor returns a per-host ControlMaster socket path (URL-encoded so
@@ -47,10 +53,15 @@ func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
 	args := []string{
 		"-o", "BatchMode=yes",
 		"-o", "IdentitiesOnly=yes",
-		"-o", "ControlMaster=no",
-		"-o", "ControlPersist=30",
-		"-o", "ControlPath=" + cp,
 		"-b", batchPath,
+	}
+	if !isWindows {
+		// Linux/macOS reuse one SSH connection via ControlMaster.
+		args = append(args,
+			"-o", "ControlMaster=no",
+			"-o", "ControlPersist=30",
+			"-o", "ControlPath="+cp,
+		)
 	}
 	if user != "" {
 		args = append(args, "-o", "User="+user)
@@ -79,7 +90,24 @@ func (c *Ctrl) CloseAll() {
 
 // Connect establishes a ControlMaster SSH connection for host so subsequent
 // sftp ops reuse it. This is the explicit "connect" action.
+// On Windows (no ControlMaster/-f) it instead verifies connectivity by
+// running a throwaway sftp command, and marks the host as connected.
 func (c *Ctrl) Connect(host, user string) error {
+	if isWindows {
+		// Per-command mode: prove connectivity with a quick `sftp ls .`.
+		out, err := c.run(host, user, c.buildBatch("ls", ".", ""))
+		if err != nil {
+			return fmt.Errorf("sftp connect %s: %w (%s)", host, err, commandErr(out))
+		}
+		if out.ExitCode != 0 {
+			return fmt.Errorf("sftp connect %s failed: %s", host, commandErr(out))
+		}
+		c.mu.Lock()
+		c.active[host] = true
+		c.mu.Unlock()
+		return nil
+	}
+
 	cp := c.controlPathFor(host)
 	args := []string{"-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ControlMaster=yes", "-o", "ControlPersist=30", "-o", "ControlPath=" + cp, "-N", "-f"}
 	if user != "" {
@@ -101,9 +129,14 @@ func (c *Ctrl) Connect(host, user string) error {
 }
 
 // Disconnect closes the ControlMaster connection for host.
+// On Windows it just clears the connected mark (per-command mode).
 func (c *Ctrl) Disconnect(host string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if isWindows {
+		delete(c.active, host)
+		return nil
+	}
 	return c.disconnectLocked(host)
 }
 
@@ -118,7 +151,13 @@ func (c *Ctrl) disconnectLocked(host string) error {
 }
 
 // Connected reports whether a ControlMaster connection exists for host.
+// On Windows it reports the in-memory connected mark instead.
 func (c *Ctrl) Connected(host string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if isWindows {
+		return c.active[host]
+	}
 	cp := c.controlPathFor(host)
 	_, err := os.Stat(cp)
 	return err == nil
