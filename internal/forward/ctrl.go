@@ -75,10 +75,15 @@ func BuildArgs(t config.Tunnel) []string {
 }
 
 type process struct {
-	state State
-	args  []string
-	proc  *osutil.Process
-	mu    sync.Mutex
+	state        State
+	args         []string
+	proc         *osutil.Process
+	cancel       chan struct{} // spawn 成功即创建；Stop/OnShutdown close（置 nil 防双关）
+	tunnel       config.Tunnel // spawn 时的配置快照，重连只认快照
+	lastStableAt time.Time     // 最近一次进入 connected 的时刻（防抖基准）
+	attempts     int           // 连续失败计数
+	lastErr      string        // 最近一次意外退出的 classifyError 结果
+	mu           sync.Mutex
 }
 
 type Ctrl struct {
@@ -143,7 +148,6 @@ func (c *Ctrl) State(sourceID string) State {
 	return p.state
 }
 
-// Start validates the host; the real spawn lifecycle is completed in Task 6.
 func (c *Ctrl) Start(t config.Tunnel) error {
 	// H4: 已有存活进程时直接拒绝，绝不替换 map 条目——替换会丢弃正在运行
 	// 的进程句柄，导致其永远无法 Stop、端口持续被占。
@@ -163,42 +167,50 @@ func (c *Ctrl) Start(t config.Tunnel) error {
 		c.setState(t.ID, StateError)
 		return fmt.Errorf("invalid host alias %q", t.Host)
 	}
-	args := BuildArgs(t)
-	if args == nil {
-		c.setState(t.ID, StateError)
-		return fmt.Errorf("could not build args for %q", t.Host)
-	}
-	// port pre-check for local/dynamic
-	if t.Mode != "remote" && t.ListenPort > 0 && !CheckLocalPort(t.ListenBind, t.ListenPort) {
-		c.setState(t.ID, StateError)
-		err := fmt.Errorf("local port %s:%d already in use", t.ListenBind, t.ListenPort)
-		c.emitEvent(t.ID, "error", err.Error())
-		return err
-	}
 
-	spawnArgs := args[1:] // drop the leading "ssh"
 	c.mu.Lock()
-	c.procs[t.ID] = &process{state: StateConnecting, args: args}
+	entry := &process{
+		state:        StateConnecting,
+		cancel:       make(chan struct{}),
+		tunnel:       t,
+		lastStableAt: time.Now(),
+	}
+	c.procs[t.ID] = entry
 	c.mu.Unlock()
 	c.emitEvent(t.ID, "info", "connecting")
 
-	proc, err := c.spawner.Start("ssh", spawnArgs...)
+	proc, err := c.trySpawn(t)
 	if err != nil {
 		msg := classifyError(osutil.Outcome{Stderr: err.Error(), ExitCode: -1})
-		c.mu.Lock()
-		c.procs[t.ID] = &process{state: StateError, args: args}
-		c.mu.Unlock()
+		c.setState(t.ID, StateError)
 		c.emitEvent(t.ID, "error", msg)
 		return fmt.Errorf("%s: %s", t.Name, msg)
 	}
 
-	c.mu.Lock()
-	entry := &process{state: StateConnected, args: args, proc: proc}
-	c.procs[t.ID] = entry
-	c.mu.Unlock()
+	// 原地升级到 connected：身份不变，watchExit 持有同一指针。
+	entry.mu.Lock()
+	entry.args = BuildArgs(t)
+	entry.proc = proc
+	entry.state = StateConnected
+	entry.lastStableAt = time.Now()
+	entry.mu.Unlock()
 	c.emitEvent(t.ID, "info", "connected")
 	go c.watchExit(t.ID, entry, proc)
 	return nil
+}
+
+// trySpawn 执行参数构建、本地端口预检与进程 spawn，返回进程句柄。
+// 失败时的状态处理由调用方决定（首启→setError 替换；重连→计数后退避）。
+func (c *Ctrl) trySpawn(t config.Tunnel) (*osutil.Process, error) {
+	args := BuildArgs(t)
+	if args == nil {
+		return nil, fmt.Errorf("could not build args for %q", t.Host)
+	}
+	if t.Mode != "remote" && t.ListenPort > 0 && !CheckLocalPort(t.ListenBind, t.ListenPort) {
+		return nil, fmt.Errorf("local port %s:%d already in use", t.ListenBind, t.ListenPort)
+	}
+	spawnArgs := args[1:]
+	return c.spawner.Start("ssh", spawnArgs...)
 }
 
 // watchExit 监控一次成功 spawn 的进程（H3）：进程自行退出（认证失败、断网等）
@@ -233,6 +245,11 @@ func (c *Ctrl) Stop(sourceID string) error {
 		return nil
 	}
 	p.mu.Lock()
+	// 关闭取消通道：重连循环（若在退避等待）立即收尾为 stopped。
+	if p.cancel != nil {
+		close(p.cancel)
+		p.cancel = nil
+	}
 	if p.proc != nil {
 		// On Windows Process.Signal is unsupported (returns an error), so kill
 		// immediately rather than waiting the grace period for a signal that
@@ -260,6 +277,11 @@ func (c *Ctrl) OnShutdown() {
 	defer c.mu.Unlock()
 	for _, p := range c.procs {
 		p.mu.Lock()
+		// 关闭取消通道：重连循环（若在退避等待）立即收尾为 stopped。
+		if p.cancel != nil {
+			close(p.cancel)
+			p.cancel = nil
+		}
 		if p.proc != nil {
 			_ = p.proc.Kill()
 			p.proc = nil
