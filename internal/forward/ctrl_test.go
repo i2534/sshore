@@ -556,3 +556,138 @@ func TestAutoReconnectStopDuringBackoff(t *testing.T) {
 		t.Fatalf("no retry spawn may happen after stop, calls=%d", calls)
 	}
 }
+
+// post-spawn 终检·孤儿分支：重连 spawn 成功瞬间条目已被外部 Start 替换，
+// 循环必须 Kill 自己刚 spawn 的进程并退出——绝不允许不可停止的孤儿进程存活。
+func TestRespawnOrphanKilledWhenEntryReplaced(t *testing.T) {
+	calls := 0
+	var secondProc *osutil.Process
+	var mu sync.Mutex
+	ctrl := NewCtrl(
+		fakeSpawner{}, // startFunc 稍后注入（需要引用 ctrl）
+		func(e Event) {},
+		func(d time.Duration) <-chan struct{} {
+			ch := make(chan struct{})
+			close(ch)
+			return ch
+		},
+	)
+	sp := fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			return exitProcess(t, 1)
+		}
+		p, err := aliveProcess(t)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		secondProc = p
+		mu.Unlock()
+		// 在重连 spawn 成功的同时，模拟外部 Start 已抢先整体替换了条目
+		ctrl.mu.Lock()
+		ctrl.procs["o1"] = &process{state: StateError, args: nil}
+		ctrl.mu.Unlock()
+		return p, nil
+	}}
+	ctrl.spawner = sp
+
+	tr := base()
+	tr.ID = "o1"
+	tr.AutoReconnect = true
+	tr.ListenPort = freePort(t)
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// 等待重连循环因身份失配退出
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		c, p := calls, secondProc
+		mu.Unlock()
+		if c >= 2 && p != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	p := secondProc
+	mu.Unlock()
+	if p == nil {
+		t.Fatal("retry spawn never happened")
+	}
+	// 被 adopt 失败的新进程必须已被 Kill：Wait 应在短时间内返回
+	// （osutil.Process.Wait 是阻塞函数而非通道，用 goroutine + done 通道转成可超时等待）。
+	done := make(chan struct{})
+	go func() {
+		p.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// killed as expected
+	case <-time.After(3 * time.Second):
+		t.Fatal("orphaned respawn process was not killed")
+	}
+	if got := ctrl.State("o1"); got != StateError {
+		t.Fatalf("map entry should remain the external replacement (error), got %s", got)
+	}
+}
+
+// post-spawn 终检·复活分支：trySpawn 执行期间 Stop 关闭 cancel，
+// 循环不得写回 connected——用户刚停掉的隧道不允许原地复活。
+func TestRespawnNoResurrectionAfterStopDuringSpawn(t *testing.T) {
+	calls := 0
+	stopCalled := false
+	var mu sync.Mutex
+	ctrl := NewCtrl(
+		fakeSpawner{},
+		func(e Event) {},
+		func(d time.Duration) <-chan struct{} {
+			ch := make(chan struct{})
+			close(ch)
+			return ch
+		},
+	)
+	sp := fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			return exitProcess(t, 1)
+		}
+		// 第二次 spawn（重连尝试）进行中触发 Stop：关闭 cancel + 状态改写
+		mu.Lock()
+		if !stopCalled {
+			stopCalled = true
+			mu.Unlock()
+			_ = ctrl.Stop("r1") // 原地变更：指针不变，仅凭身份校验发现不了
+		} else {
+			mu.Unlock()
+		}
+		return aliveProcess(t)
+	}}
+	ctrl.spawner = sp
+
+	tr := base()
+	tr.ID = "r1"
+	tr.AutoReconnect = true
+	tr.ListenPort = freePort(t)
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// 等 Stop 生效后的最终态
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && ctrl.State(tr.ID) != StateStopped {
+		time.Sleep(5 * time.Millisecond)
+	}
+	// 给可能错误的"复活写入"留出暴露时间
+	time.Sleep(100 * time.Millisecond)
+	if got := ctrl.State(tr.ID); got != StateStopped {
+		t.Fatalf("stopped tunnel must not resurrect, got %s", got)
+	}
+}
