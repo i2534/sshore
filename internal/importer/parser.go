@@ -23,7 +23,7 @@ func Parse(command string) ([]config.Tunnel, error) {
 	var argv []string
 	i := 0
 	for i < len(fields) {
-		tok := fields[i]
+		tok := unquote(fields[i])
 		switch {
 		case tok == "-N" || tok == "-f":
 			i++
@@ -31,25 +31,25 @@ func Parse(command string) ([]config.Tunnel, error) {
 			if i+1 >= len(fields) {
 				return nil, fmt.Errorf("missing value for %s", tok)
 			}
-			argv = append(argv, tok, fields[i+1])
+			argv = append(argv, tok, unquote(fields[i+1]))
 			i += 2
 		case tok == "-J":
 			if i+1 >= len(fields) {
 				return nil, fmt.Errorf("missing value for -J")
 			}
-			argv = append(argv, tok, fields[i+1])
+			argv = append(argv, tok, unquote(fields[i+1]))
 			i += 2
 		case tok == "-p":
 			if i+1 >= len(fields) {
 				return nil, fmt.Errorf("missing value for -p")
 			}
-			argv = append(argv, tok, fields[i+1])
+			argv = append(argv, tok, unquote(fields[i+1]))
 			i += 2
 		case tok == "-l":
 			if i+1 >= len(fields) {
 				return nil, fmt.Errorf("missing value for -l")
 			}
-			argv = append(argv, tok, fields[i+1])
+			argv = append(argv, tok, unquote(fields[i+1]))
 			i += 2
 		case strings.HasPrefix(tok, "-"):
 			return nil, fmt.Errorf("unsupported/malicious flag %q", tok)
@@ -61,13 +61,52 @@ func Parse(command string) ([]config.Tunnel, error) {
 	if host == "" {
 		return nil, fmt.Errorf("no host given")
 	}
+	// M8: host 可能以 user@host 形式出现，按最后一个 @ 拆分
+	hostUser := ""
+	if idx := strings.LastIndex(host, "@"); idx >= 0 {
+		hostUser = host[:idx]
+		host = host[idx+1:]
+	}
 	if !forward.ValidateHost(host) {
 		return nil, fmt.Errorf("invalid host %q", host)
 	}
-	return buildTunnels(argv, host)
+	return buildTunnels(argv, host, hostUser)
 }
 
-func buildTunnels(argv []string, host string) ([]config.Tunnel, error) {
+// unquote strips ONE pair of surrounding double quotes from a shell-pasted
+// token, e.g. `"8080:localhost:80"` from `ssh -L "8080:localhost:80" host`.
+func unquote(tok string) string {
+	if len(tok) >= 2 && tok[0] == '"' && tok[len(tok)-1] == '"' {
+		return tok[1 : len(tok)-1]
+	}
+	return tok
+}
+
+// splitSpec splits a forward spec on colons that are outside square brackets,
+// so bracketed IPv6 addresses stay intact: "[::1]:8080:db:80" ->
+// ["[::1]", "8080", "db", "80"].
+func splitSpec(spec string) []string {
+	var parts []string
+	start := 0
+	inBrackets := false
+	for i := 0; i < len(spec); i++ {
+		switch spec[i] {
+		case '[':
+			inBrackets = true
+		case ']':
+			inBrackets = false
+		case ':':
+			if !inBrackets {
+				parts = append(parts, spec[start:i])
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, spec[start:])
+	return parts
+}
+
+func buildTunnels(argv []string, host, hostUser string) ([]config.Tunnel, error) {
 	proxyJump := ""
 	user := ""
 	port := 0
@@ -87,6 +126,10 @@ func buildTunnels(argv []string, host string) ([]config.Tunnel, error) {
 				user = argv[i+1]
 			}
 		}
+	}
+	// An explicit -l wins over a user@host user (same precedence as ssh itself).
+	if user == "" {
+		user = hostUser
 	}
 	var out []config.Tunnel
 	for i := 0; i < len(argv); i += 2 {
@@ -119,7 +162,7 @@ func makeTunnel(flag, spec, host, jump, user string, port int) (config.Tunnel, e
 		ProxyJump: jump, User: user, Port: port,
 		ListenBind: "127.0.0.1",
 	}
-	parts := strings.Split(spec, ":")
+	parts := splitSpec(spec)
 	if mode == "dynamic" {
 		if len(parts) == 1 {
 			t.ListenPort, _ = strconv.Atoi(parts[0])
