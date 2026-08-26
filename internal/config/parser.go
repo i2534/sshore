@@ -2,22 +2,27 @@ package config
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/kevinburke/ssh_config"
 )
 
 // Host represents a resolved SSH host entry from ~/.ssh/config.
+// json 字段名是前端契约（wailsjs 绑定返回该结构）。
 type Host struct {
-	Alias        string
-	HostName     string
-	User         string
-	Port         int
-	IdentityFile string
-	ProxyJump    string
+	Alias        string `json:"alias"`
+	HostName     string `json:"host_name"`
+	User         string `json:"user"`
+	Port         int    `json:"port"`
+	IdentityFile string `json:"identity_file"`
+	ProxyJump    string `json:"proxy_jump"`
 }
 
 // FindSSHConfigPath returns the user's SSH config path (~/.ssh/config).
@@ -66,6 +71,75 @@ func EnumerateHosts(configPath string) ([]Host, error) {
 		hosts = append(hosts, host)
 	}
 	return hosts, nil
+}
+
+// sshGTimeout 限制单次 ssh -G 调用的时间（契约：每 alias ≤5s）。
+const sshGTimeout = 5 * time.Second
+
+// defaultSSHGRun 以 5s 超时运行 `ssh -G <alias>` 并返回其 stdout。
+// 声明为变量而非函数，便于测试在不依赖真实 ssh 二进制的情况下验证接线。
+var defaultSSHGRun = func(alias string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), sshGTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "ssh", "-G", alias).Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// EnumerateHostsDetailed 在 EnumerateHosts 基础上，用 ssh -G 的权威值富化每个
+// Host：hostname/port/user/proxyjump 非空时覆盖库解析值（port 经 atoiOrZero）。
+// 富化以 ≤8 个 worker 并发执行；单个 alias 的 ssh -G 失败/超时静默回退库值。
+// runner 为 nil 时使用默认的 exec 包装（见 defaultSSHGRun）。
+func EnumerateHostsDetailed(configPath string, runner func(string) (string, error)) ([]Host, error) {
+	hosts, err := EnumerateHosts(configPath)
+	if err != nil {
+		return nil, err
+	}
+	if runner == nil {
+		runner = defaultSSHGRun
+	}
+	const maxWorkers = 8
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < maxWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				enrichHostViaSSH_G(&hosts[i], runner)
+			}
+		}()
+	}
+	for i := range hosts {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return hosts, nil
+}
+
+// enrichHostViaSSH_G 就地富化单个 Host；ssh -G 失败时保持库值不变。
+func enrichHostViaSSH_G(h *Host, runner func(string) (string, error)) {
+	res, err := ResolveViaSSH_G(h.Alias, runner)
+	if err != nil {
+		return
+	}
+	if v := res["hostname"]; v != "" {
+		h.HostName = v
+	}
+	if v := res["user"]; v != "" {
+		h.User = v
+	}
+	if v := res["port"]; v != "" {
+		if p := atoiOrZero(v); p > 0 {
+			h.Port = p
+		}
+	}
+	if v := res["proxyjump"]; v != "" {
+		h.ProxyJump = v
+	}
 }
 
 // ResolveViaSSH_G runs `ssh -G <alias>` and returns the parsed key/value map.
