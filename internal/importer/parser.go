@@ -161,6 +161,7 @@ func makeTunnel(flag, spec, host, jump, user string, port int) (config.Tunnel, e
 		ID: config.NewTunnelID(), Mode: mode, Host: host,
 		ProxyJump: jump, User: user, Port: port,
 		ListenBind: "127.0.0.1",
+		AutoReconnect: true, // 导入规则与手建规则默认一致（前端 newTunnel 同为 true）
 	}
 	parts := splitSpec(spec)
 	if mode == "dynamic" {
