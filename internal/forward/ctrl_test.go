@@ -501,3 +501,58 @@ func nextAttemptAfterCrash(e *process) int {
 	e.attempts++
 	return e.attempts
 }
+
+// 自动重连取消：退避等待期间 Stop 必须令循环立即收尾为 stopped，
+// 且不再发起任何重试 spawn。
+func TestAutoReconnectStopDuringBackoff(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	release := make(chan struct{}) // 手控第一段退避等待
+	ctrl := NewCtrl(
+		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+			mu.Lock()
+			calls++
+			n := calls
+			mu.Unlock()
+			if n == 1 {
+				return exitProcess(t, 1)
+			}
+			t.Fatal("must not spawn again after stop")
+			return nil, nil
+		}},
+		func(e Event) {},
+		func(d time.Duration) <-chan struct{} {
+			return release // 第一段退避挂起直到测试放行
+		},
+	)
+	tr := base()
+	tr.AutoReconnect = true
+	tr.ListenPort = freePort(t)
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// 等待进入 reconnecting
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && ctrl.State(tr.ID) != StateReconnecting {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ctrl.State(tr.ID); got != StateReconnecting {
+		t.Fatalf("should be reconnecting, got %s", got)
+	}
+	if err := ctrl.Stop(tr.ID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	close(release) // 放行被挂起的等待
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && ctrl.State(tr.ID) != StateStopped {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ctrl.State(tr.ID); got != StateStopped {
+		t.Fatalf("state should be stopped after cancel, got %s", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("no retry spawn may happen after stop, calls=%d", calls)
+	}
+}
