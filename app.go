@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -222,15 +223,28 @@ func (a *App) updateTunnel(u config.Tunnel) {
 }
 
 // AutoStartEnabled starts all tunnels that were enabled at last run.
+// M10: 单个隧道失败不得中止循环——逐项收集失败、经事件管道上报，最后汇总返回。
 func (a *App) AutoStartEnabled() error {
+	var errs []error
 	for _, t := range a.cfg.Tunnels {
-		if t.Enabled {
-			if err := a.forward.Start(t); err != nil {
-				return err
+		if !t.Enabled {
+			continue
+		}
+		if err := a.forward.Start(t); err != nil {
+			msg := fmt.Sprintf("自动启动隧道 %s 失败: %v", t.ID, err)
+			if a.emit != nil {
+				a.emit(forward.Event{
+					SourceType: "tunnel",
+					SourceID:   t.ID,
+					TS:         time.Now().Format(time.RFC3339),
+					Level:      "error",
+					Message:    msg,
+				})
 			}
+			errs = append(errs, errors.New(msg))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (a *App) findTunnel(id string) (config.Tunnel, bool) {
@@ -275,7 +289,36 @@ func (a *App) SftpConnected(host string) bool {
 
 // DeleteLocal removes a local file or directory (recursively for dirs).
 func (a *App) DeleteLocal(path string) error {
-	return os.RemoveAll(path)
+	p, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if err := checkDeletablePath(p); err != nil {
+		return err
+	}
+	return os.RemoveAll(p)
+}
+
+// checkDeletablePath is the M9 defense-in-depth gate: these paths are never
+// handed to os.RemoveAll — the Unix filesystem root, Windows volume roots
+// (e.g. "C:\"), and the user's home directory itself (exact match only).
+func checkDeletablePath(p string) error {
+	if p == string(filepath.Separator) {
+		return fmt.Errorf("拒绝删除文件系统根目录: %s", p)
+	}
+	if isVolumeRoot(p) {
+		return fmt.Errorf("拒绝删除磁盘根目录: %s", p)
+	}
+	if home, err := os.UserHomeDir(); err == nil && p == filepath.Clean(home) {
+		return fmt.Errorf("拒绝删除用户主目录: %s", p)
+	}
+	return nil
+}
+
+// isVolumeRoot reports whether p is a Windows volume root such as "C:\" or "C:".
+func isVolumeRoot(p string) bool {
+	return (len(p) == 2 && p[1] == ':') ||
+		(len(p) == 3 && p[1] == ':' && (p[2] == '\\' || p[2] == '/'))
 }
 
 // MkdirLocal creates a local directory (and parents).
