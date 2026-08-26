@@ -1,18 +1,29 @@
 <script setup>
 import { ref } from 'vue'
 import { StartTunnel, StopTunnel } from '../../wailsjs/go/main/App'
+import { useLogStore } from '../stores/logs'
 
 const props = defineProps({ tunnel: { type: Object, required: true } })
 const emit = defineEmits(['edit', 'delete', 'changed'])
 const busy = ref(false)
+const logStore = useLogStore()
 
 async function toggle() {
   busy.value = true
   try {
     if (props.tunnel.enabled) await StopTunnel(props.tunnel.id)
     else await StartTunnel(props.tunnel.id)
-    emit('changed')
+  } catch (e) {
+    // 启停失败不再冒泡到全局 fatal 横幅：写入日志面板（转发视图可见），
+    // 并照常刷新列表以同步后端真实状态。
+    logStore.add({
+      source_id: 'rule',
+      level: 'error',
+      message: `${props.tunnel.name || props.tunnel.host}: ${String(e)}`,
+      ts: new Date().toISOString(),
+    })
   } finally {
+    emit('changed')
     busy.value = false
   }
 }
