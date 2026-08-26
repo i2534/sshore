@@ -39,3 +39,83 @@ func TestParseMaliciousHostRejected(t *testing.T) {
 		t.Fatal("expected error for malicious/unknown flag")
 	}
 }
+
+func TestParseQuotedSpecToken(t *testing.T) {
+	tunnels, err := Parse(`ssh -L "8080:localhost:80" host`)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(tunnels) != 1 {
+		t.Fatalf("want 1 tunnel got %d: %+v", len(tunnels), tunnels)
+	}
+	t0 := tunnels[0]
+	if t0.Mode != "local" || t0.ListenPort != 8080 || t0.TargetHost != "localhost" || t0.TargetPort != 80 || t0.Host != "host" {
+		t.Fatalf("tunnel wrong: %+v", t0)
+	}
+}
+
+func TestParseBracketedIPv6Specs(t *testing.T) {
+	tunnels, err := Parse(`ssh -D "[::1]:1080" host`)
+	if err != nil {
+		t.Fatalf("dynamic ipv6: %v", err)
+	}
+	if len(tunnels) != 1 {
+		t.Fatalf("want 1 tunnel got %d: %+v", len(tunnels), tunnels)
+	}
+	t0 := tunnels[0]
+	if t0.Mode != "dynamic" || t0.ListenBind != "[::1]" || t0.ListenPort != 1080 {
+		t.Fatalf("dynamic ipv6 tunnel wrong: %+v", t0)
+	}
+
+	tunnels, err = Parse(`ssh -L "[::1]:8080:db:80" host`)
+	if err != nil {
+		t.Fatalf("local 4-part ipv6: %v", err)
+	}
+	if len(tunnels) != 1 {
+		t.Fatalf("want 1 tunnel got %d: %+v", len(tunnels), tunnels)
+	}
+	t0 = tunnels[0]
+	if t0.Mode != "local" || t0.ListenBind != "[::1]" || t0.ListenPort != 8080 || t0.TargetHost != "db" || t0.TargetPort != 80 {
+		t.Fatalf("local 4-part ipv6 tunnel wrong: %+v", t0)
+	}
+
+	tunnels, err = Parse(`ssh -L "8080:[::1]:80" host`)
+	if err != nil {
+		t.Fatalf("local 3-part ipv6: %v", err)
+	}
+	if len(tunnels) != 1 {
+		t.Fatalf("want 1 tunnel got %d: %+v", len(tunnels), tunnels)
+	}
+	t0 = tunnels[0]
+	if t0.Mode != "local" || t0.ListenPort != 8080 || t0.TargetHost != "[::1]" || t0.TargetPort != 80 {
+		t.Fatalf("local 3-part ipv6 tunnel wrong: %+v", t0)
+	}
+}
+
+func TestParseUserAtHost(t *testing.T) {
+	tunnels, err := Parse("ssh -L 8080:localhost:80 bob@myhost")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(tunnels) != 1 {
+		t.Fatalf("want 1 tunnel got %d: %+v", len(tunnels), tunnels)
+	}
+	t0 := tunnels[0]
+	if t0.Host != "myhost" || t0.User != "bob" {
+		t.Fatalf("user@host split wrong: %+v", t0)
+	}
+}
+
+func TestParseCombinedQuotedIPv6UserAtHost(t *testing.T) {
+	tunnels, err := Parse(`ssh -L "8080:[::1]:80" alice@myhost`)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(tunnels) != 1 {
+		t.Fatalf("want 1 tunnel got %d: %+v", len(tunnels), tunnels)
+	}
+	t0 := tunnels[0]
+	if t0.Mode != "local" || t0.ListenPort != 8080 || t0.TargetHost != "[::1]" || t0.TargetPort != 80 || t0.Host != "myhost" || t0.User != "alice" {
+		t.Fatalf("combined tunnel wrong: %+v", t0)
+	}
+}
