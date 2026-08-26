@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/BurntSushi/toml"
 )
@@ -43,6 +44,8 @@ type AppConfig struct {
 	RecentSFTP []RecentSFTP `toml:"recent_sftp" json:"recent_sftp"`
 }
 
+var tmpSeq int64
+
 // DefaultAppConfig returns a fresh config with safe defaults.
 func DefaultAppConfig() *AppConfig {
 	return &AppConfig{App: AppSettings{AutoReconnectDefault: true}}
@@ -63,19 +66,40 @@ func LoadConfig(path string) (*AppConfig, error) {
 }
 
 // SaveConfig writes the config to path with 0600 perms, creating parents.
+// M11: 原子写——先写 <path>.tmp-<pid> 再 rename 覆盖，读者任何时刻只能看到
+// 完整的旧文件或完整的新文件，并发保存不会撕裂目标文件。
 func SaveConfig(path string, cfg *AppConfig) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	// 同一进程内多个 goroutine 共享 PID，需要序列号保证 tmp 名唯一
+	tmp := fmt.Sprintf("%s.tmp-%d-%d", path, os.Getpid(), atomic.AddInt64(&tmpSeq, 1))
+	if err := writeConfigFile(tmp, cfg); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp) // rename 失败也不遗留临时文件
+		return err
+	}
+	return nil
+}
+
+// writeConfigFile encodes cfg as TOML into a fresh file at path with mode 0600.
+func writeConfigFile(path string, cfg *AppConfig) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	if err := toml.NewEncoder(f).Encode(cfg); err != nil {
+		f.Close()
 		return err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // DefaultConfigPath returns the per-OS config path.
