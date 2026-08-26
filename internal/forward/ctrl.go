@@ -3,6 +3,7 @@ package forward
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"sync"
 	"time"
 
@@ -47,6 +48,13 @@ func BuildArgs(t config.Tunnel) []string {
 		"-o", "ConnectTimeout=10",
 		"-o", "BatchMode=yes",
 		"-o", "IdentitiesOnly=yes",
+	}
+	// H1: 导入规则可能携带非默认端口/用户，需在转发参数前生效
+	if t.Port != 0 {
+		args = append(args, "-p", strconv.Itoa(t.Port))
+	}
+	if t.User != "" {
+		args = append(args, "-l", t.User)
 	}
 	fwd := fmt.Sprintf("%s:%d", t.ListenBind, t.ListenPort)
 	switch t.Mode {
@@ -112,15 +120,33 @@ func (c *Ctrl) setState(id string, s State) {
 
 func (c *Ctrl) State(sourceID string) State {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if p, ok := c.procs[sourceID]; ok {
-		return p.state
+	p, ok := c.procs[sourceID]
+	c.mu.Unlock()
+	if !ok {
+		return StateStopped
 	}
-	return StateStopped
+	// 与所有 state 写入端（Start/watchExit/Stop/OnShutdown）保持同一把锁
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.state
 }
 
 // Start validates the host; the real spawn lifecycle is completed in Task 6.
 func (c *Ctrl) Start(t config.Tunnel) error {
+	// H4: 已有存活进程时直接拒绝，绝不替换 map 条目——替换会丢弃正在运行
+	// 的进程句柄，导致其永远无法 Stop、端口持续被占。
+	c.mu.Lock()
+	if p, ok := c.procs[t.ID]; ok {
+		p.mu.Lock()
+		live := p.proc != nil && (p.state == StateConnecting || p.state == StateConnected)
+		p.mu.Unlock()
+		if live {
+			c.mu.Unlock()
+			return fmt.Errorf("tunnel already running: %s", t.ID)
+		}
+	}
+	c.mu.Unlock()
+
 	if !ValidateHost(t.Host) {
 		c.setState(t.ID, StateError)
 		return fmt.Errorf("invalid host alias %q", t.Host)
@@ -155,10 +181,36 @@ func (c *Ctrl) Start(t config.Tunnel) error {
 	}
 
 	c.mu.Lock()
-	c.procs[t.ID] = &process{state: StateConnected, args: args, proc: proc}
+	entry := &process{state: StateConnected, args: args, proc: proc}
+	c.procs[t.ID] = entry
 	c.mu.Unlock()
 	c.emitEvent(t.ID, "info", "connected")
+	go c.watchExit(t.ID, entry, proc)
 	return nil
+}
+
+// watchExit 监控一次成功 spawn 的进程（H3）：进程自行退出（认证失败、断网等）
+// 时把状态迁移到 StateError 并发 error 事件。指针身份比较保证：条目已被替换、
+// 或 Stop/OnShutdown 已接管该进程（proc 句柄被清空）时不做任何处理。
+func (c *Ctrl) watchExit(id string, entry *process, proc *osutil.Process) {
+	out := proc.Wait()
+	c.mu.Lock()
+	cur, ok := c.procs[id]
+	fire := ok && cur == entry
+	if fire {
+		cur.mu.Lock()
+		if cur.proc == proc {
+			cur.proc = nil
+			cur.state = StateError
+		} else {
+			fire = false
+		}
+		cur.mu.Unlock()
+	}
+	c.mu.Unlock()
+	if fire {
+		c.emitEvent(id, "error", classifyError(out))
+	}
 }
 
 func (c *Ctrl) Stop(sourceID string) error {
@@ -181,9 +233,11 @@ func (c *Ctrl) Stop(sourceID string) error {
 				_ = proc.Kill()
 			}(p.proc)
 		}
+		// 清空句柄：退出由我们触发，watchExit 不得再改写状态
+		p.proc = nil
 	}
-	p.mu.Unlock()
 	p.state = StateStopped
+	p.mu.Unlock()
 	c.emitEvent(sourceID, "info", "stopped")
 	return nil
 }
@@ -193,11 +247,13 @@ func (c *Ctrl) OnShutdown() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, p := range c.procs {
+		p.mu.Lock()
 		if p.proc != nil {
 			_ = p.proc.Kill()
+			p.proc = nil
 		}
-		p.proc = nil
 		p.state = StateStopped
+		p.mu.Unlock()
 	}
 }
 

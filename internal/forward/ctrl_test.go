@@ -4,7 +4,11 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"runtime"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"sshkit/internal/config"
 	"sshkit/internal/osutil"
@@ -45,6 +49,27 @@ func TestBuildArgsDynamic(t *testing.T) {
 	expect(t, BuildArgs(c),
 		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
 			"-D", "127.0.0.1:5432", "prod-db"})
+}
+
+// H1: 导入规则携带 User/Port 时 BuildArgs 必须输出 -l/-p。
+func TestBuildArgsUserAndPort(t *testing.T) {
+	c := base()
+	c.User = "bob"
+	c.Port = 2222
+	expect(t, BuildArgs(c),
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+			"-p", "2222", "-l", "bob",
+			"-L", "127.0.0.1:5432:127.0.0.1:5432", "prod-db"})
+}
+
+// H1: User/Port 为零值时不得出现 -l/-p 参数。
+func TestBuildArgsNoUserNoPort(t *testing.T) {
+	got := BuildArgs(base())
+	for i, a := range got {
+		if a == "-p" || a == "-l" {
+			t.Fatalf("unexpected %q at index %d: %v", a, i, got)
+		}
+	}
 }
 
 func TestBuildArgsProxyJump(t *testing.T) {
@@ -91,6 +116,114 @@ type fakeSpawner struct {
 
 func (f fakeSpawner) Start(name string, args ...string) (*osutil.Process, error) {
 	return f.startFunc(name, args...)
+}
+
+// exitProcess 通过真实 spawner 启动一个立即以指定退出码结束的真实进程。
+// fakeSpawner 受 osutil.Spawner 接口约束只能返回 *osutil.Process，其 done
+// 通道不可注入，故用真实短命进程模拟“立即退出”的进程（同时覆盖真实 Wait 路径）。
+func exitProcess(t *testing.T, code int) (*osutil.Process, error) {
+	t.Helper()
+	name, args := "sh", []string{"-c", fmt.Sprintf("exit %d", code)}
+	if runtime.GOOS == "windows" {
+		name, args = "cmd", []string{"/c", "exit", strconv.Itoa(code)}
+	}
+	return osutil.NewSpawner().Start(name, args...)
+}
+
+// aliveProcess 启动一个存活约 30s 的真实进程，用于测试“仍在运行”的隧道。
+func aliveProcess(t *testing.T) (*osutil.Process, error) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return osutil.NewSpawner().Start("cmd", "/c", "timeout", "/t", "30", "/nobreak")
+	}
+	return osutil.NewSpawner().Start("sh", "-c", "sleep 30")
+}
+
+// freePort 返回一个当前空闲的本地端口（与既有端口测试同款取法）。
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	return port
+}
+
+// H3: spawn 后进程自行退出（如认证失败）必须被监控到——
+// 状态迁移到 StateError 并发出 error 事件，而不是永远停留在 connected。
+func TestStartMonitorsProcessExit(t *testing.T) {
+	var mu sync.Mutex
+	var emitted []Event
+	ctrl := NewCtrl(
+		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+			return exitProcess(t, 1)
+		}},
+		func(e Event) {
+			mu.Lock()
+			emitted = append(emitted, e)
+			mu.Unlock()
+		},
+	)
+	tr := base()
+	tr.ListenPort = freePort(t)
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if got := ctrl.State(tr.ID); got != StateConnected {
+		t.Fatalf("state right after start: %s", got)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && ctrl.State(tr.ID) != StateError {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := ctrl.State(tr.ID); got != StateError {
+		t.Fatalf("state should be error after process exit, got %s", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, e := range emitted {
+		if e.SourceID == tr.ID && e.Level == "error" {
+			return
+		}
+	}
+	t.Fatalf("no error event emitted: %v", emitted)
+}
+
+// H4: 对已在运行的隧道再次 Start 必须直接报错且不动 map 条目——
+// 替换条目会丢失正在运行的进程句柄（永远无法 Stop、端口持续被占）。
+func TestStartTwiceRejectsSecond(t *testing.T) {
+	var mu sync.Mutex
+	var emitted []Event
+	ctrl := NewCtrl(
+		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+			return aliveProcess(t)
+		}},
+		func(e Event) {
+			mu.Lock()
+			emitted = append(emitted, e)
+			mu.Unlock()
+		},
+	)
+	tr := base()
+	tr.ListenPort = freePort(t)
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	if got := ctrl.State(tr.ID); got != StateConnected {
+		t.Fatalf("state after first start: %s", got)
+	}
+	if err := ctrl.Start(tr); err == nil {
+		t.Fatal("second start of a running tunnel must fail")
+	}
+	// 第一个进程仍必须可被 Stop 且状态迁移到 stopped
+	if err := ctrl.Stop(tr.ID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if got := ctrl.State(tr.ID); got != StateStopped {
+		t.Fatalf("state after stop: %s", got)
+	}
 }
 
 func TestCheckLocalPortFreeAndBusy(t *testing.T) {
