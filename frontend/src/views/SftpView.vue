@@ -4,6 +4,7 @@ import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRenam
 import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
+import LogPanel from '../components/LogPanel.vue'
 import ContextMenu from '../components/ContextMenu.vue'
 import AppDialog from '../components/AppDialog.vue'
 
@@ -155,16 +156,20 @@ function showMenu(pane, { item, event }) {
 async function download() {
   const it = menu.value.item || remoteSel.value
   if (!it || it.isDir || it.name === '..') { closeMenu(); return }
+  // Save directly to the local pane's current directory (no picker dialog).
+  const dir = localPath.value || '.'
+  const t = { name: it.name, size: it.size || 0, status: '处理中', startedAt: Date.now() }
   try {
-    // Save directly to the local pane's current directory (no picker dialog).
-    const dir = localPath.value || '.'
-    const t = { name: it.name, size: it.size || 0, status: '处理中', startedAt: Date.now() }
     transfers.value.push(t)
     await SftpGet(host.value, '', join(remotePath.value, it.name), join(dir, it.name))
     t.status = '完成'
     t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
     await loadLocal()
-  } catch (e) { err(e) }
+  } catch (e) {
+    err(e)
+    t.status = '失败'
+    t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
+  }
   closeMenu()
 }
 
@@ -228,6 +233,7 @@ async function upload() {
   const it = menu.value.item
   const pane = menu.value.pane
   closeMenu()
+  let t = null
   try {
     // If a specific local file was right-clicked, upload it directly
     // (no system dialog). Otherwise (toolbar / remote pane) pick a file.
@@ -240,14 +246,20 @@ async function upload() {
       if (!local) return
       name = local.split(/[\\/]/).pop()
     }
-    const t = { name, size: 0, status: '处理中', startedAt: Date.now() }
+    t = { name, size: 0, status: '处理中', startedAt: Date.now() }
     try { t.size = await StatLocal(local) } catch (e) { t.size = 0 }
     transfers.value.push(t)
     await SftpPut(host.value, '', local, join(remotePath.value, name))
     t.status = '完成'
     t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
     await loadRemote()
-  } catch (e) { err(e) }
+  } catch (e) {
+    err(e)
+    if (t) {
+      t.status = '失败'
+      t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
+    }
+  }
 }
 
 async function doAction(name) {
@@ -295,6 +307,7 @@ onUnmounted(() => {
         @select="remoteSel = $event" @open="openRemote" @context="showMenu('remote', $event)" />
     </div>
     <TransferQueue :transfers="transfers" :now="now" />
+    <div class="logpane"><LogPanel /></div>
 
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
       <template v-if="menu.pane === 'remote'">
@@ -328,5 +341,6 @@ onUnmounted(() => {
 .sftp { display: flex; flex-direction: column; height: 100%; gap: 8px; }
 .toolbar { display: flex; gap: 8px; align-items: center; }
 .panes { display: flex; gap: 8px; flex: 1; min-height: 0; }
+.logpane { height: 140px; flex-shrink: 0; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 12px; overflow: auto; }
 .hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-dim); }
 </style>
