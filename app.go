@@ -68,7 +68,7 @@ func (a *App) startup(ctx context.Context) {
 // forward needs a Spawner (long-lived ssh -N); sftp needs a blocking Runner (one-shot ops).
 func (a *App) Init(emit func(forward.Event)) {
 	a.emit = emit
-	a.forward = forward.NewCtrl(osutil.NewSpawner(), emit)
+	a.forward = forward.NewCtrl(osutil.NewSpawner(), emit, nil)
 	a.sftp = sftp.NewCtrl(osutil.NewRunner(), emit)
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}

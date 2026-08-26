@@ -86,10 +86,22 @@ type Ctrl struct {
 	emit    EmitFunc
 	mu      sync.Mutex
 	procs   map[string]*process
+	// after 产生可被 cancel 竞争的等待通道；nil 时用生产默认（真实计时）。
+	after func(time.Duration) <-chan struct{}
 }
 
-func NewCtrl(sp osutil.Spawner, emit EmitFunc) *Ctrl {
-	return &Ctrl{spawner: sp, emit: emit, procs: map[string]*process{}}
+func NewCtrl(sp osutil.Spawner, emit EmitFunc, after func(time.Duration) <-chan struct{}) *Ctrl {
+	if after == nil {
+		after = func(d time.Duration) <-chan struct{} {
+			ch := make(chan struct{})
+			go func() {
+				time.Sleep(d)
+				close(ch)
+			}()
+			return ch
+		}
+	}
+	return &Ctrl{spawner: sp, emit: emit, procs: map[string]*process{}, after: after}
 }
 
 func (c *Ctrl) emitEvent(id, level, msg string) {
@@ -255,6 +267,19 @@ func (c *Ctrl) OnShutdown() {
 		p.state = StateStopped
 		p.mu.Unlock()
 	}
+}
+
+// backoffDelay 返回第 attempt 次（从 1 计）重试前的等待时长：
+// 1s 起倍增，30s 封顶（spec §3.2）。
+func backoffDelay(attempt int) time.Duration {
+	const max = 30 * time.Second
+	if attempt <= 0 {
+		return time.Second
+	}
+	if attempt >= 6 {
+		return max
+	}
+	return time.Second << uint(attempt-1)
 }
 
 // classifyError maps a ssh/sftp outcome's stderr to a level-appropriate message.
