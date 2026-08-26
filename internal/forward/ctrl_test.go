@@ -372,3 +372,94 @@ func TestAutoReconnectSuccessAfterFirstRetry(t *testing.T) {
 		t.Fatalf("missing events; warn=%v reconnected=%v all=%+v", sawWarn, sawReconnected, emitted)
 	}
 }
+
+// 自动重连：死→死→活 两轮失败后退避序列应为 [1s,2s]，
+// warn 事件逐次携带尝试序号，最终 connected。
+func TestAutoReconnectBackoffSequenceAcrossRetries(t *testing.T) {
+	var mu sync.Mutex
+	var emitted []Event
+	var slept []time.Duration
+	calls := 0
+	ctrl := NewCtrl(
+		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+			mu.Lock()
+			calls++
+			n := calls
+			mu.Unlock()
+			switch n {
+			case 1, 2:
+				return exitProcess(t, 1)
+			default:
+				return aliveProcess(t)
+			}
+		}},
+		func(e Event) {
+			mu.Lock()
+			emitted = append(emitted, e)
+			mu.Unlock()
+		},
+		func(d time.Duration) <-chan struct{} {
+			mu.Lock()
+			slept = append(slept, d)
+			mu.Unlock()
+			ch := make(chan struct{})
+			close(ch)
+			return ch
+		},
+	)
+	tr := base()
+	tr.AutoReconnect = true
+	tr.ListenPort = freePort(t)
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// 轮询与最终断言均在 mu 内快照读取（Task 3 同款锁快照），避免 -race 数据竞争；
+	// 额外等待 reconnected 事件落账，保证随后的事件顺序断言读到完整序列。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		reached := calls >= 3
+		hasReconnected := false
+		for _, e := range emitted {
+			if e.Level == "info" && strings.Contains(e.Message, "reconnected") {
+				hasReconnected = true
+				break
+			}
+		}
+		mu.Unlock()
+		if reached && hasReconnected {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls < 3 {
+		t.Fatalf("expected third spawn (successful retry), calls=%d", calls)
+	}
+	if len(slept) < 2 || slept[0] != time.Second || slept[1] != 2*time.Second {
+		t.Fatalf("backoff sleeps should be [1s,2s,...], got %v", slept)
+	}
+	warnCount := 0
+	firstWarnIdx := -1
+	reconnectedIdx := -1
+	for i, e := range emitted {
+		if e.Level == "warn" && strings.Contains(e.Message, "次重连") {
+			if firstWarnIdx == -1 {
+				firstWarnIdx = i
+			}
+			warnCount++
+		}
+		if e.Level == "info" && strings.Contains(e.Message, "reconnected") && reconnectedIdx == -1 {
+			reconnectedIdx = i
+		}
+	}
+	if warnCount < 2 {
+		t.Fatalf("expected >=2 entering-reconnect warns, got %d in %+v", warnCount, emitted)
+	}
+	// 事件顺序（spec §7.1）：首个进入重连 warn 必须先于对应的 reconnected info。
+	if firstWarnIdx == -1 || reconnectedIdx == -1 || firstWarnIdx >= reconnectedIdx {
+		t.Fatalf("first entering-reconnect warn must precede the reconnected info; warnIdx=%d reconnectedIdx=%d emitted=%+v",
+			firstWarnIdx, reconnectedIdx, emitted)
+	}
+}
