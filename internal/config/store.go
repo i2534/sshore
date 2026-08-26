@@ -43,9 +43,14 @@ type AppConfig struct {
 	RecentSFTP []RecentSFTP `toml:"recent_sftp" json:"recent_sftp"`
 }
 
+// DefaultAppConfig returns a fresh config with safe defaults.
+func DefaultAppConfig() *AppConfig {
+	return &AppConfig{App: AppSettings{AutoReconnectDefault: true}}
+}
+
 // LoadConfig reads the TOML config; returns safe defaults if the file doesn't exist.
 func LoadConfig(path string) (*AppConfig, error) {
-	cfg := &AppConfig{App: AppSettings{AutoReconnectDefault: true}}
+	cfg := DefaultAppConfig()
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return cfg, nil
 	} else if err != nil {
