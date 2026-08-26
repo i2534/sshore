@@ -1,6 +1,6 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ref, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
+import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
@@ -64,13 +64,15 @@ function onDialogCancel() {
   if (dialogResolve) { dialogResolve(null); dialogResolve = null }
 }
 
+// remote pane request sequence：任何新请求或切换主机都自增，
+// 过期响应直接丢弃，防止旧主机/旧目录的结果污染当前视图（M3）。
+let remoteSeq = 0
+
 function closeMenu() { menu.value.visible = false }
 function outsideClick() { closeMenu() }
-onMounted(() => window.addEventListener('click', outsideClick))
-onUnmounted(() => window.removeEventListener('click', outsideClick))
 
 async function loadHosts() {
-  hosts.value = (await ListHosts()) || []
+  try { hosts.value = (await ListHosts()) || [] } catch (e) { err(e) }
   if (hosts.value.length && !host.value) host.value = hosts.value[0]
 }
 async function err(e) {
@@ -79,27 +81,39 @@ async function err(e) {
 
 async function loadRemote() {
   if (!host.value) return
+  const seq = ++remoteSeq
   remoteLoading.value = true
-  try { remoteItems.value = (await SftpList(host.value, '', remotePath.value || '/')) || [] }
+  try {
+    const items = (await SftpList(host.value, '', remotePath.value || '/')) || []
+    if (seq === remoteSeq) remoteItems.value = items // 已被更新请求取代则丢弃
+  }
   catch (e) { err(e) }
-  finally { remoteLoading.value = false }
+  finally { if (seq === remoteSeq) remoteLoading.value = false }
 }
 
 // Host dropdown change: reset connection state, do NOT auto-connect.
 function onHostChange() {
+  remoteSeq++ // 使在途的远程请求全部过期
   connected.value = false
   remoteItems.value = []
   remoteSel.value = null
 }
 
 async function connect() {
-  if (!host.value) return
+  const h = host.value
+  if (!h) return
   try {
-    await SftpConnect(host.value)
-    try { remotePath.value = await SftpHome(host.value) } catch (e) { remotePath.value = '/' }
+    await SftpConnect(h)
+    let home = '/'
+    try { home = await SftpHome(h) } catch { home = '/' }
+    if (host.value !== h) return // await 期间已切换主机，丢弃结果
+    remotePath.value = home
     connected.value = true
     await loadRemote()
-  } catch (e) { err(e); connected.value = false }
+  } catch (e) {
+    err(e)
+    if (host.value === h) connected.value = false
+  }
 }
 
 async function disconnect() {
@@ -277,13 +291,43 @@ onMounted(async () => {
   // local starts at current working dir
   try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
   await loadLocal()
-  // remote requires explicit connect; set initial home once host chosen
-
-  clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
 })
 
+function startClock() {
+  if (!clockTimer) clockTimer = setInterval(() => { now.value = Date.now() }, 1000)
+}
+function stopClock() {
+  if (clockTimer) { clearInterval(clockTimer); clockTimer = null }
+}
+
+// syncConnection 用后端 SftpConnected 校正本地状态（M6）：KeepAlive 下切标签
+// 不再销毁视图，但首次挂载/后端 ControlPersist 过期时 UI 可能与真实连接不符。
+async function syncConnection() {
+  const h = host.value
+  if (!h || connected.value) return
+  try {
+    const ok = await SftpConnected(h)
+    if (host.value !== h || connected.value) return // await 期间状态已变
+    if (!ok) { connected.value = false; return }
+    connected.value = true
+    try { remotePath.value = await SftpHome(h) } catch { remotePath.value = '/' }
+    await loadRemote()
+  } catch { /* 状态查询失败时保持现状 */ }
+}
+
+// KeepAlive 生命周期：切入时挂菜单监听、重启时钟并同步连接状态；切出时停时钟。
+onActivated(() => {
+  window.addEventListener('click', outsideClick)
+  startClock()
+  syncConnection()
+})
+onDeactivated(() => {
+  window.removeEventListener('click', outsideClick)
+  stopClock()
+})
 onUnmounted(() => {
-  if (clockTimer) clearInterval(clockTimer)
+  window.removeEventListener('click', outsideClick)
+  stopClock()
 })
 </script>
 
