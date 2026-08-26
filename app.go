@@ -124,6 +124,11 @@ func (a *App) ListTunnels() []config.Tunnel {
 	return a.cfg.Tunnels
 }
 
+// TunnelStates 返回各隧道运行态（id → state 字符串），供前端四态圆点渲染。
+func (a *App) TunnelStates() map[string]string {
+	return a.forward.States()
+}
+
 func (a *App) CreateTunnel(t config.Tunnel) error {
 	if !forward.ValidateHost(t.Host) {
 		return errors.New("invalid host alias")

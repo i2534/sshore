@@ -126,6 +126,10 @@ export function StopTunnel(arg1) {
   return window['go']['main']['App']['StopTunnel'](arg1);
 }
 
+export function TunnelStates() {
+  return window['go']['main']['App']['TunnelStates']();
+}
+
 export function UpdateTunnel(arg1) {
   return window['go']['main']['App']['UpdateTunnel'](arg1);
 }

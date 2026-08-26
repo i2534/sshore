@@ -568,3 +568,17 @@ func TestDeleteTunnelRemovesAndStops(t *testing.T) {
 		t.Fatal("tunnel should be removed")
 	}
 }
+
+// 自动重连配套：TunnelStates 暴露各隧道运行态（id → state 字符串），
+// 前端据此渲染四态圆点。用非法 host 路径制造一条 error 态条目（不产生真实 ssh 进程）。
+func TestTunnelStates(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	if err := a.forward.Start(config.Tunnel{ID: "s1", Host: "-bad", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 1}); err == nil {
+		t.Fatal("invalid host must fail")
+	}
+	got := a.TunnelStates()
+	if got["s1"] != "error" {
+		t.Fatalf(`states["s1"]=%q want "error"`, got["s1"])
+	}
+}
