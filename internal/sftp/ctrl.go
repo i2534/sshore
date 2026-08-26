@@ -54,6 +54,7 @@ func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
 	args := []string{
 		"-o", "BatchMode=yes",
 		"-o", "IdentitiesOnly=yes",
+		"-o", "ConnectTimeout=10",
 		"-b", batchPath,
 	}
 	if !isWindows {
@@ -114,7 +115,7 @@ func (c *Ctrl) Connect(host, user string) error {
 	}
 
 	cp := c.controlPathFor(host)
-	args := []string{"-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ControlMaster=yes", "-o", "ControlPersist=30", "-o", "ControlPath=" + cp, "-N", "-f"}
+	args := []string{"-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=10", "-o", "ControlMaster=yes", "-o", "ControlPersist=30", "-o", "ControlPath=" + cp, "-N", "-f"}
 	if user != "" {
 		args = append(args, "-o", "User="+user)
 	}
@@ -147,7 +148,7 @@ func (c *Ctrl) Disconnect(host string) error {
 
 func (c *Ctrl) disconnectLocked(host string) error {
 	cp := c.controlPathFor(host)
-	out, err := c.runner("ssh", "-O", "exit", "-o", "ControlPath="+cp, host)
+	out, err := c.runner("ssh", "-O", "exit", "-o", "ControlPath="+cp, "-o", "ConnectTimeout=10", host)
 	if err != nil {
 		return fmt.Errorf("sftp disconnect %s: %w (%s)", host, err, out.Stderr)
 	}

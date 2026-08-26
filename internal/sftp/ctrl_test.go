@@ -3,10 +3,45 @@ package sftp
 import (
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"sshkit/internal/osutil"
 )
+
+// fakeRunner records every (name, args) invocation so tests can assert on the
+// exact ssh/sftp argument list. It also creates the ControlPath socket file on
+// demand so Connect's post-spawn poll succeeds without a real ssh master.
+type fakeRunner struct {
+	mu    sync.Mutex
+	calls []runnerCall
+}
+
+type runnerCall struct {
+	name string
+	args []string
+}
+
+func (f *fakeRunner) run(name string, args ...string) (osutil.Outcome, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, runnerCall{name: name, args: args})
+	f.mu.Unlock()
+	for _, a := range args {
+		if strings.HasPrefix(a, "ControlPath=") {
+			_ = os.WriteFile(strings.TrimPrefix(a, "ControlPath="), nil, 0600)
+		}
+	}
+	return osutil.Outcome{ExitCode: 0}, nil
+}
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
 
 func TestBuildBatchAndWrite(t *testing.T) {
 	c := NewCtrl(nil, nil)
@@ -99,6 +134,66 @@ func TestBuildBatchRejectsControlChars(t *testing.T) {
 	}
 	if b, err := c.buildBatch("nope", "/a", "/b"); err != nil || b != nil {
 		t.Fatalf("unknown op should return nil,nil; got %q,%v", b, err)
+	}
+}
+
+func TestConnectArgsIncludeConnectTimeout(t *testing.T) {
+	if isWindows {
+		t.Skip("ControlMaster connect path is unix-only")
+	}
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	if err := c.Connect("myhost", ""); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if len(fr.calls) == 0 {
+		t.Fatal("runner not invoked")
+	}
+	if fr.calls[0].name != "ssh" {
+		t.Fatalf("want ssh, got %q", fr.calls[0].name)
+	}
+	if !hasArg(fr.calls[0].args, "ConnectTimeout=10") {
+		t.Fatalf("ssh args missing ConnectTimeout=10: %v", fr.calls[0].args)
+	}
+}
+
+func TestRunArgsIncludeConnectTimeout(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	if _, err := c.run("myhost", "", []byte("ls -l \"/\"\n")); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(fr.calls) == 0 {
+		t.Fatal("runner not invoked")
+	}
+	if fr.calls[0].name != "sftp" {
+		t.Fatalf("want sftp, got %q", fr.calls[0].name)
+	}
+	if !hasArg(fr.calls[0].args, "ConnectTimeout=10") {
+		t.Fatalf("sftp args missing ConnectTimeout=10: %v", fr.calls[0].args)
+	}
+}
+
+func TestDisconnectArgsIncludeConnectTimeout(t *testing.T) {
+	if isWindows {
+		t.Skip("Windows is per-command mode; no ssh -O exit call")
+	}
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	if err := c.Disconnect("myhost"); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	if len(fr.calls) == 0 {
+		t.Fatal("runner not invoked")
+	}
+	if fr.calls[0].name != "ssh" {
+		t.Fatalf("want ssh, got %q", fr.calls[0].name)
+	}
+	if !hasArg(fr.calls[0].args, "-O") || !hasArg(fr.calls[0].args, "exit") {
+		t.Fatalf("want -O exit, got %v", fr.calls[0].args)
+	}
+	if !hasArg(fr.calls[0].args, "ConnectTimeout=10") {
+		t.Fatalf("ssh -O exit args missing ConnectTimeout=10: %v", fr.calls[0].args)
 	}
 }
 
