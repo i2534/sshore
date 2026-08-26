@@ -97,7 +97,7 @@ func TestStartInvalidHost(t *testing.T) {
 		called = true
 		return &osutil.Process{}, nil
 	}}
-	ctrl := NewCtrl(sp, func(e Event) { emitted = append(emitted, e) })
+	ctrl := NewCtrl(sp, func(e Event) { emitted = append(emitted, e) }, nil)
 	if err := ctrl.Start(tr); err == nil {
 		t.Fatal("expected error for malicious host")
 	}
@@ -165,6 +165,7 @@ func TestStartMonitorsProcessExit(t *testing.T) {
 			emitted = append(emitted, e)
 			mu.Unlock()
 		},
+		nil,
 	)
 	tr := base()
 	tr.ListenPort = freePort(t)
@@ -205,6 +206,7 @@ func TestStartTwiceRejectsSecond(t *testing.T) {
 			emitted = append(emitted, e)
 			mu.Unlock()
 		},
+		nil,
 	)
 	tr := base()
 	tr.ListenPort = freePort(t)
@@ -272,5 +274,21 @@ func TestClassifyError(t *testing.T) {
 		if got := classifyError(c.in); got != c.want {
 			t.Fatalf("classifyError(%+v)=%q want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// 自动重连：退避序列 1s,2s,4s,8s,16s 之后固定 30s 封顶（spec §3.2）。
+func TestBackoffDelaySequence(t *testing.T) {
+	want := []time.Duration{
+		time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
+		16 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second,
+	}
+	for i, w := range want {
+		if got := backoffDelay(i + 1); got != w {
+			t.Fatalf("backoffDelay(%d)=%s want %s", i+1, got, w)
+		}
+	}
+	if backoffDelay(0) != time.Second {
+		t.Fatal("attempt<=0 should fall back to 1s")
 	}
 }
