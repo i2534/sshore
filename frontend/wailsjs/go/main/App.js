@@ -38,8 +38,16 @@ export function ListHosts() {
   return window['go']['main']['App']['ListHosts']();
 }
 
+export function ListHostsDetailed() {
+  return window['go']['main']['App']['ListHostsDetailed']();
+}
+
 export function ListLocal(arg1) {
   return window['go']['main']['App']['ListLocal'](arg1);
+}
+
+export function ListRecentSFTP() {
+  return window['go']['main']['App']['ListRecentSFTP']();
 }
 
 export function ListTunnels() {

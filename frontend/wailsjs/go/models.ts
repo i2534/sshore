@@ -1,5 +1,47 @@
 export namespace config {
 	
+	export class Host {
+	    alias: string;
+	    host_name: string;
+	    user: string;
+	    port: number;
+	    identity_file: string;
+	    proxy_jump: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Host(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.alias = source["alias"];
+	        this.host_name = source["host_name"];
+	        this.user = source["user"];
+	        this.port = source["port"];
+	        this.identity_file = source["identity_file"];
+	        this.proxy_jump = source["proxy_jump"];
+	    }
+	}
+
+	export class RecentSFTP {
+	    host: string;
+	    remote_dir: string;
+	    local_dir: string;
+	    ts: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new RecentSFTP(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.host = source["host"];
+	        this.remote_dir = source["remote_dir"];
+	        this.local_dir = source["local_dir"];
+	        this.ts = source["ts"];
+	    }
+	}
+
 	export class Tunnel {
 	    id: string;
 	    name: string;
