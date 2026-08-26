@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -290,5 +291,84 @@ func TestBackoffDelaySequence(t *testing.T) {
 	}
 	if backoffDelay(0) != time.Second {
 		t.Fatal("attempt<=0 should fall back to 1s")
+	}
+}
+
+// 自动重连：AutoReconnect=true 的隧道意外退出后进入 reconnecting，
+// 退避 1s 后首次重试即成功 → 最终 connected，事件含进入重连与 reconnected。
+func TestAutoReconnectSuccessAfterFirstRetry(t *testing.T) {
+	var mu sync.Mutex
+	var emitted []Event
+	var slept []time.Duration
+	calls := 0
+	ctrl := NewCtrl(
+		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+			mu.Lock()
+			calls++
+			n := calls
+			mu.Unlock()
+			if n == 1 {
+				return exitProcess(t, 1) // 首启进程立即死亡
+			}
+			return aliveProcess(t) // 第一次重试即成功
+		}},
+		func(e Event) {
+			mu.Lock()
+			emitted = append(emitted, e)
+			mu.Unlock()
+		},
+		func(d time.Duration) <-chan struct{} { // 假时钟：零等待，记录序列
+			mu.Lock()
+			slept = append(slept, d)
+			mu.Unlock()
+			ch := make(chan struct{})
+			close(ch)
+			return ch
+		},
+	)
+	tr := base()
+	tr.AutoReconnect = true
+	tr.ListenPort = freePort(t)
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && ctrl.State(tr.ID) != StateConnected {
+		time.Sleep(5 * time.Millisecond)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		reached := calls >= 2
+		mu.Unlock()
+		if reached {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	if calls < 2 {
+		t.Fatalf("expected a retry spawn, calls=%d", calls)
+	}
+	mu.Unlock()
+	if got := ctrl.State(tr.ID); got != StateConnected {
+		t.Fatalf("state should be connected after successful retry, got %s", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(slept) < 1 || slept[0] != time.Second {
+		t.Fatalf("first backoff sleep should be 1s, got %v", slept)
+	}
+	var sawWarn, sawReconnected bool
+	for _, e := range emitted {
+		if e.Level == "warn" && strings.Contains(e.Message, "第 1 次重连") {
+			sawWarn = true
+		}
+		if e.Level == "info" && strings.Contains(e.Message, "reconnected") {
+			sawReconnected = true
+		}
+	}
+	if !sawWarn || !sawReconnected {
+		t.Fatalf("missing events; warn=%v reconnected=%v all=%+v", sawWarn, sawReconnected, emitted)
 	}
 }
