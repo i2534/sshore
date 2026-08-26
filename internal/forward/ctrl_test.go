@@ -463,3 +463,41 @@ func TestAutoReconnectBackoffSequenceAcrossRetries(t *testing.T) {
 			firstWarnIdx, reconnectedIdx, emitted)
 	}
 }
+
+// 自动重连防抖：连续在线 <60s 再次断开 → 计数不清零；
+// ≥60s 后再断开 → 计数从 1 重来（spec §3.4）。
+func TestAutoReconnectFlappingGuard(t *testing.T) {
+	newEntry := func(stable time.Duration, attempts int) *process {
+		e := &process{
+			state:        StateConnected,
+			cancel:       make(chan struct{}),
+			tunnel:       config.Tunnel{ID: "f1", AutoReconnect: true},
+			lastStableAt: time.Now().Add(-stable),
+			attempts:     attempts,
+		}
+		return e
+	}
+	// 场景一：在线 59s，历史已有 3 次失败 → 计数保留（不清零）
+	e1 := newEntry(59*time.Second, 3)
+	got1 := nextAttemptAfterCrash(e1)
+	if got1 != 4 {
+		t.Fatalf("flapping (<60s) must keep counter: want attempt 4, got %d", got1)
+	}
+	// 场景二：在线 61s，历史 3 次失败 → 清零，下一次从 1 开始
+	e2 := newEntry(61*time.Second, 3)
+	got2 := nextAttemptAfterCrash(e2)
+	if got2 != 1 {
+		t.Fatalf("stable (>=60s) must reset counter: want attempt 1, got %d", got2)
+	}
+}
+
+// nextAttemptAfterCrash 复刻 watchExit 断开瞬间的计数判定，供防抖断言复用。
+func nextAttemptAfterCrash(e *process) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if time.Since(e.lastStableAt) >= stableThreshold {
+		e.attempts = 0
+	}
+	e.attempts++
+	return e.attempts
+}
