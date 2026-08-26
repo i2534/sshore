@@ -119,3 +119,14 @@ func TestParseCombinedQuotedIPv6UserAtHost(t *testing.T) {
 		t.Fatalf("combined tunnel wrong: %+v", t0)
 	}
 }
+
+// M7 配套：导入的隧道默认开启自动重连，与前端 newTunnel() 默认一致。
+func TestParseSetsAutoReconnectDefault(t *testing.T) {
+	tunnels, err := Parse(`ssh -L 8080:localhost:80 myhost`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(tunnels) != 1 || !tunnels[0].AutoReconnect {
+		t.Fatalf("imported tunnel must default AutoReconnect=true, got %+v", tunnels)
+	}
+}
