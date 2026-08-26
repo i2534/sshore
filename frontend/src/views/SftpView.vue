@@ -1,6 +1,6 @@
 <script setup>
 import { ref, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, ListRecentSFTP, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
@@ -29,6 +29,10 @@ const showAll = ref(false)
 
 // explicit connect/disconnect state for the remote host
 const connected = ref(false)
+
+// M7: 最近 SFTP 位置（后端在 connect/传输成功时记录），用于一键回到上次目录
+const recents = ref([])
+const pendingPath = ref('')
 
 const transfers = ref([])
 
@@ -75,6 +79,9 @@ async function loadHosts() {
   try { hosts.value = (await ListHosts()) || [] } catch (e) { err(e) }
   if (hosts.value.length && !host.value) host.value = hosts.value[0]
 }
+async function loadRecents() {
+  try { recents.value = (await ListRecentSFTP()) || [] } catch { recents.value = [] }
+}
 async function err(e) {
   logStore.add({ source_id: 'sftp', level: 'error', message: String(e), ts: new Date().toISOString() })
 }
@@ -104,16 +111,46 @@ async function connect() {
   if (!h) return
   try {
     await SftpConnect(h)
-    let home = '/'
-    try { home = await SftpHome(h) } catch { home = '/' }
+    let dest = '/'
+    try { dest = await SftpHome(h) } catch { dest = '/' }
     if (host.value !== h) return // await 期间已切换主机，丢弃结果
-    remotePath.value = home
+    // 「最近位置」预设了目标目录时优先进它，否则落到 home
+    remotePath.value = pendingPath.value && pendingPath.value !== '/' ? pendingPath.value : dest
+    pendingPath.value = ''
     connected.value = true
     await loadRemote()
   } catch (e) {
     err(e)
     if (host.value === h) connected.value = false
   }
+}
+
+// 选中最近位置：预填主机与目录。同机已连接则直接跳转，
+// 否则触发 connect()——它会优先消费 pendingPath 而不是落 home。
+function applyRecent(e) {
+  const idx = Number(e.target.value)
+  e.target.value = ''
+  if (!Number.isInteger(idx) || idx < 0 || !recents.value[idx]) return
+  const r = recents.value[idx]
+  if (host.value !== r.host) {
+    host.value = r.host // 程序化切换：手动执行与 @change 一致的重置
+    remoteSeq++
+    remoteItems.value = []
+    remoteSel.value = null
+    connected.value = false
+  }
+  pendingPath.value = r.remote_dir || '/'
+  if (r.local_dir && r.local_dir !== localPath.value) {
+    localPath.value = r.local_dir
+    loadLocal()
+  }
+  if (connected.value) {
+    remotePath.value = pendingPath.value
+    pendingPath.value = ''
+    loadRemote()
+    return
+  }
+  connect()
 }
 
 async function disconnect() {
@@ -291,6 +328,7 @@ onMounted(async () => {
   // local starts at current working dir
   try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
   await loadLocal()
+  loadRecents()
 })
 
 function startClock() {
@@ -320,6 +358,7 @@ onActivated(() => {
   window.addEventListener('click', outsideClick)
   startClock()
   syncConnection()
+  loadRecents()
 })
 onDeactivated(() => {
   window.removeEventListener('click', outsideClick)
@@ -343,6 +382,10 @@ onUnmounted(() => {
       <label class="hidden-toggle">
         <input type="checkbox" v-model="showAll" /> 显示隐藏文件
       </label>
+      <select v-if="recents.length" class="recent" @change="applyRecent">
+        <option value="" disabled selected>🕘 最近位置</option>
+        <option v-for="(r, i) in recents" :key="i" :value="String(i)">{{ r.host }} · {{ r.remote_dir || '/' }}</option>
+      </select>
     </div>
     <div class="panes">
       <FilePane title="本地" :path="localPath || '/'" :items="localItems" :selected="localSel && localSel.name" :show-hidden="showAll" :loading="localLoading"
@@ -387,4 +430,5 @@ onUnmounted(() => {
 .panes { display: flex; gap: 8px; flex: 1; min-height: 0; }
 .logpane { height: 140px; flex-shrink: 0; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 12px; overflow: auto; }
 .hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-dim); }
+.recent { max-width: 280px; font-size: 12px; color: var(--text-dim); margin-left: auto; }
 </style>
