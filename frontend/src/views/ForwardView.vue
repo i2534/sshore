@@ -9,6 +9,7 @@ const tunnels = ref([])
 const hosts = ref([])
 const cmd = ref('')
 const loadError = ref('')
+const opError = ref('')
 
 const dialog = ref({ visible: false, mode: 'confirm', title: '', message: '', initial: '' })
 let dialogResolve = null
@@ -46,9 +47,12 @@ async function loadHosts() {
   try { hosts.value = (await ListHosts()) || [] } catch (e) { loadError.value = String(e) }
 }
 async function doImport() {
-  await ImportCommand(cmd.value)
-  cmd.value = ''
-  await refresh()
+  opError.value = ''
+  try {
+    await ImportCommand(cmd.value)
+    cmd.value = ''
+    await refresh()
+  } catch (e) { opError.value = String(e) }
 }
 function openCreate() {
   editingId.value = null
@@ -62,18 +66,24 @@ function openEdit(t) {
 }
 async function submit() {
   if (!form.value.host) return
-  if (editingId.value) await UpdateTunnel(form.value)
-  else await CreateTunnel(form.value)
-  showForm.value = false
-  editingId.value = null
-  form.value = newTunnel()
-  await refresh()
+  opError.value = ''
+  try {
+    if (editingId.value) await UpdateTunnel(form.value)
+    else await CreateTunnel(form.value)
+    showForm.value = false
+    editingId.value = null
+    form.value = newTunnel()
+    await refresh()
+  } catch (e) { opError.value = String(e) }
 }
 async function remove(t) {
   const ok = await openConfirm('确认删除', `删除规则「${t.name || t.host}」？`)
   if (!ok) return
-  await DeleteTunnel(t.id)
-  await refresh()
+  opError.value = ''
+  try {
+    await DeleteTunnel(t.id)
+    await refresh()
+  } catch (e) { opError.value = String(e) }
 }
 onMounted(async () => { await loadHosts(); await refresh() })
 </script>
@@ -122,6 +132,7 @@ onMounted(async () => { await loadHosts(); await refresh() })
       <RuleCard v-for="t in tunnels" :key="t.id" :tunnel="t"
         @edit="openEdit" @delete="remove" @changed="refresh" />
       <p v-if="loadError" class="empty err">加载失败: {{ loadError }}</p>
+      <p v-if="opError" class="empty err">操作失败: {{ opError }}</p>
       <p v-else-if="!tunnels.length" class="empty">暂无规则，点「+ 新建规则」或导入 ssh 命令</p>
 
       <div class="import">
