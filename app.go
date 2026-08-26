@@ -103,6 +103,20 @@ func (a *App) ListHosts() []string {
 	return out
 }
 
+// ListHostsDetailed 返回经 ssh -G 权威富化（hostname/user/port/proxyjump）的
+// 主机列表。单个 alias 的 -G 失败/超时静默回退库值；≤8 并发、单次 ≤5s。
+func (a *App) ListHostsDetailed() []config.Host {
+	path, err := config.FindSSHConfigPath()
+	if err != nil {
+		return []config.Host{}
+	}
+	hosts, err := config.EnumerateHostsDetailed(path, nil)
+	if err != nil {
+		return []config.Host{}
+	}
+	return hosts
+}
+
 func (a *App) ListTunnels() []config.Tunnel {
 	if a.cfg == nil {
 		return []config.Tunnel{}
@@ -119,6 +133,11 @@ func (a *App) CreateTunnel(t config.Tunnel) error {
 	}
 	if t.ID == "" {
 		t.ID = config.NewTunnelID()
+	}
+	// M7: 接线远端转发端口冲突检查——(host, bind, port) 已被其他规则占用即拒绝，
+	// 与 mode 无关（spec §4.5）。
+	if err := forward.CheckRemoteConflict(a.cfg.Tunnels, t); err != nil {
+		return err
 	}
 	a.cfg.Tunnels = append(a.cfg.Tunnels, t)
 	return a.saveConfig()
@@ -139,6 +158,10 @@ func (a *App) UpdateTunnel(t config.Tunnel) error {
 	}
 	if idx < 0 {
 		return errors.New("tunnel not found")
+	}
+	// M7: 改动前查重——CheckRemoteConflict 跳过 e.ID==t.ID，保留自身键可放行。
+	if err := forward.CheckRemoteConflict(a.cfg.Tunnels, t); err != nil {
+		return err
 	}
 	if a.cfg.Tunnels[idx].Enabled {
 		_ = a.forward.Stop(t.ID)
@@ -263,10 +286,18 @@ func (a *App) SftpList(host, user, path string) ([]sftp.Item, error) {
 	return a.sftp.List(host, user, path)
 }
 func (a *App) SftpGet(host, user, remote, local string) error {
-	return a.sftp.Get(host, user, remote, local)
+	if err := a.sftp.Get(host, user, remote, local); err != nil {
+		return err
+	}
+	a.recordRecentSFTP(host, filepath.Dir(remote), filepath.Dir(local))
+	return nil
 }
 func (a *App) SftpPut(host, user, local, remote string) error {
-	return a.sftp.Put(host, user, local, remote)
+	if err := a.sftp.Put(host, user, local, remote); err != nil {
+		return err
+	}
+	a.recordRecentSFTP(host, filepath.Dir(remote), filepath.Dir(local))
+	return nil
 }
 func (a *App) SftpRemove(host, user, path string) error {
 	return a.sftp.Remove(host, user, path)
@@ -416,7 +447,51 @@ func (a *App) Cwd() (string, error) {
 // running `pwd` over a fresh, reused sftp connection. Used as the initial
 // remote pane path.
 func (a *App) SftpHome(host string) (string, error) {
-	return a.sftp.Home(host, "")
+	home, err := a.sftp.Home(host, "")
+	if err != nil {
+		return "", err
+	}
+	a.recordRecentSFTP(host, home, "")
+	return home, nil
+}
+
+// recordRecentSFTP 记录一次成功的 SFTP 操作到最近使用列表：
+// 相同 (host, remoteDir, localDir) 的旧条目移除后新条目置顶，上限 10 条，
+// 最新在前；落盘沿用 saveConfig 的 fire-and-forget 模式（见 OnShutdown）。
+func (a *App) recordRecentSFTP(host, remoteDir, localDir string) {
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	rec := config.RecentSFTP{
+		Host:      host,
+		RemoteDir: remoteDir,
+		LocalDir:  localDir,
+		TS:        time.Now().Format(time.RFC3339),
+	}
+	kept := a.cfg.RecentSFTP[:0]
+	for _, e := range a.cfg.RecentSFTP {
+		if e.Host == host && e.RemoteDir == remoteDir && e.LocalDir == localDir {
+			continue // 去重：旧条目丢弃，由新条目顶替并置顶
+		}
+		kept = append(kept, e)
+	}
+	a.cfg.RecentSFTP = append([]config.RecentSFTP{rec}, kept...)
+	if len(a.cfg.RecentSFTP) > 10 {
+		a.cfg.RecentSFTP = a.cfg.RecentSFTP[:10]
+	}
+	_ = a.saveConfig()
+}
+
+// ListRecentSFTP 返回 SFTP 最近使用列表（最新在前，最多 10 条）；
+// 无数据时返回空切片而非 nil（前端契约）。
+func (a *App) ListRecentSFTP() []config.RecentSFTP {
+	if a.cfg == nil {
+		return []config.RecentSFTP{}
+	}
+	if a.cfg.RecentSFTP == nil {
+		return []config.RecentSFTP{}
+	}
+	return a.cfg.RecentSFTP
 }
 
 func (a *App) OnShutdown() {

@@ -21,7 +21,11 @@ export function Init(arg1:any):Promise<void>;
 
 export function ListHosts():Promise<Array<string>>;
 
+export function ListHostsDetailed():Promise<Array<config.Host>>;
+
 export function ListLocal(arg1:string):Promise<Array<sftp.Item>>;
+
+export function ListRecentSFTP():Promise<Array<config.RecentSFTP>>;
 
 export function ListTunnels():Promise<Array<config.Tunnel>>;
 

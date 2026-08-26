@@ -3,15 +3,33 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"sshkit/internal/config"
 	"sshkit/internal/forward"
+	"sshkit/internal/osutil"
+	"sshkit/internal/sftp"
 )
+
+// appWithFakeSFTP 返回一个 sftp 控制器由假 runner 支撑的 App：
+// 所有 sftp 调用成功，stdout 为给定的固定输出（不启动真实进程）。
+func appWithFakeSFTP(t *testing.T, stdout string) *App {
+	t.Helper()
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	a.sftp = sftp.NewCtrl(func(name string, args ...string) (osutil.Outcome, error) {
+		return osutil.Outcome{Stdout: stdout, ExitCode: 0}, nil
+	}, func(forward.Event) {})
+	return a
+}
 
 func TestCreateAndStartInvalidHost(t *testing.T) {
 	a := NewApp()
@@ -194,6 +212,54 @@ func TestInitEmitsConfigLoadError(t *testing.T) {
 	a2.Init(func(forward.Event) { t.Fatal("unexpected event without load error") })
 }
 
+// M7: ListHostsDetailed 端到端——HOME 重定向让 FindSSHConfigPath 命中隔离配置，
+// PATH 前置 shim 让默认 exec 包装（真实 ssh 二进制）也解析同一份隔离配置
+// （OpenSSH 从 passwd 而非 $HOME 解析 ~/.ssh/config，故需 -F 注入）。
+// 配置块未设 User 时库解析为空——User 非空即可证明 ssh -G 权威富化真实生效。
+func TestListHostsDetailedEnrichesViaSSH_G(t *testing.T) {
+	realSSH, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skip("ssh binary not available")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfgPath := filepath.Join(home, ".ssh", "config")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte("Host prod-db\n  HostName 10.9.9.9\n  Port 2222\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(home, "bin")
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	shim := fmt.Sprintf("#!/bin/sh\nexec %s -F %q \"$@\"\n", realSSH, cfgPath)
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(shim), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	hosts := a.ListHostsDetailed()
+	var prod *config.Host
+	for i := range hosts {
+		if hosts[i].Alias == "prod-db" {
+			prod = &hosts[i]
+		}
+	}
+	if prod == nil {
+		t.Fatalf("prod-db missing from %d hosts: %+v", len(hosts), hosts)
+	}
+	if prod.HostName != "10.9.9.9" || prod.Port != 2222 {
+		t.Fatalf("host fields wrong: %+v", prod)
+	}
+	if prod.User == "" {
+		t.Fatal("user should be enriched by ssh -G (library has none)")
+	}
+}
+
 // M9: DeleteLocal 纵深防御——拒绝删除用户 home 目录本身，
 // 避免 JS 侧传入的危险路径直接落到 os.RemoveAll。
 // HOME 重定向到隔离临时目录，防止未加防护的实现误删真实 home。
@@ -276,6 +342,212 @@ func TestUpdateTunnelReplacesById(t *testing.T) {
 	}
 	if a.cfg.Tunnels[0].ListenPort != 9090 {
 		t.Fatalf("port not updated: %+v", a.cfg.Tunnels[0])
+	}
+}
+
+// M7: 远端转发端口冲突必须在创建时拒绝（spec §4.5 对所有 mode 生效，
+// 与规则自身的 mode 无关）：错误信息点名冲突规则，且列表保持不变。
+func TestCreateTunnelRejectsRemoteConflict(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	first := config.Tunnel{ID: "t1", Name: "prod-6000", Host: "prod-db", Mode: "remote",
+		ListenBind: "127.0.0.1", ListenPort: 6000, TargetHost: "127.0.0.1", TargetPort: 80}
+	if err := a.CreateTunnel(first); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	// 同 (host, bind, port)、不同 mode、不同 ID → 必须拒绝
+	dup := config.Tunnel{ID: "t2", Name: "dup", Host: "prod-db", Mode: "local",
+		ListenBind: "127.0.0.1", ListenPort: 6000, TargetHost: "127.0.0.1", TargetPort: 80}
+	err := a.CreateTunnel(dup)
+	if err == nil {
+		t.Fatal("duplicate (host,bind,port) must be rejected")
+	}
+	if !strings.Contains(err.Error(), "prod-6000") {
+		t.Fatalf("error should name the conflicting rule: %v", err)
+	}
+	if len(a.cfg.Tunnels) != 1 {
+		t.Fatalf("list must be unchanged after rejection, got %d tunnels: %+v", len(a.cfg.Tunnels), a.cfg.Tunnels)
+	}
+}
+
+// M7: UpdateTunnel 保留自身 (host, bind, port) 必须放行——
+// CheckRemoteConflict 会跳过 e.ID==candidate.ID，改名/改目标不应被自己的键拦住。
+func TestUpdateTunnelKeepingOwnKeySucceeds(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	orig := config.Tunnel{ID: "t1", Name: "old-name", Host: "prod-db", Mode: "remote",
+		ListenBind: "127.0.0.1", ListenPort: 6000, TargetHost: "127.0.0.1", TargetPort: 80}
+	if err := a.CreateTunnel(orig); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	upd := orig
+	upd.Name = "new-name"
+	upd.TargetPort = 8080
+	if err := a.UpdateTunnel(upd); err != nil {
+		t.Fatalf("update keeping own key must succeed: %v", err)
+	}
+	if len(a.cfg.Tunnels) != 1 || a.cfg.Tunnels[0].Name != "new-name" || a.cfg.Tunnels[0].TargetPort != 8080 {
+		t.Fatalf("update not applied: %+v", a.cfg.Tunnels)
+	}
+}
+
+// M7: 相同 (bind, port) 但不同 host 不冲突，必须允许创建。
+func TestCreateTunnelSamePortDifferentHostAllowed(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	for _, host := range []string{"prod-db", "staging"} {
+		tl := config.Tunnel{ID: host, Name: host, Host: host, Mode: "local",
+			ListenBind: "127.0.0.1", ListenPort: 6000, TargetHost: "127.0.0.1", TargetPort: 80}
+		if err := a.CreateTunnel(tl); err != nil {
+			t.Fatalf("same port on different host %q must be allowed: %v", host, err)
+		}
+	}
+	if len(a.cfg.Tunnels) != 2 {
+		t.Fatalf("want 2 tunnels, got %d", len(a.cfg.Tunnels))
+	}
+}
+
+// M7: SftpGet 成功后记录 (host, dir(remote), dir(local))，且持久化落盘。
+func TestSftpGetRecordsRecent(t *testing.T) {
+	a := appWithFakeSFTP(t, "")
+	if err := a.SftpGet("prod-db", "alice", "/var/log/app.log", "/tmp/dl/app.log"); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	cfg, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RecentSFTP) != 1 {
+		t.Fatalf("want 1 recent entry, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	}
+	e := cfg.RecentSFTP[0]
+	if e.Host != "prod-db" || e.RemoteDir != "/var/log" || e.LocalDir != "/tmp/dl" {
+		t.Fatalf("wrong entry: %+v", e)
+	}
+	if _, perr := time.Parse(time.RFC3339, e.TS); perr != nil || e.TS == "" {
+		t.Fatalf("TS must be RFC3339, got %q", e.TS)
+	}
+}
+
+// M7: SftpPut 成功后同样记录（remote/local 目录与 Get 对称）。
+func TestSftpPutRecordsRecent(t *testing.T) {
+	a := appWithFakeSFTP(t, "")
+	if err := a.SftpPut("prod-db", "alice", "/tmp/dl/app.log", "/var/log/app.log"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	cfg, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RecentSFTP) != 1 {
+		t.Fatalf("want 1 recent entry, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	}
+	e := cfg.RecentSFTP[0]
+	if e.Host != "prod-db" || e.RemoteDir != "/var/log" || e.LocalDir != "/tmp/dl" {
+		t.Fatalf("wrong entry: %+v", e)
+	}
+}
+
+// M7: SftpHome 成功后记录 (host, home, "")。
+func TestSftpHomeRecordsRecent(t *testing.T) {
+	a := appWithFakeSFTP(t, "sftp> pwd\nRemote working directory: /home/alice\n")
+	home, err := a.SftpHome("prod-db")
+	if err != nil {
+		t.Fatalf("home: %v", err)
+	}
+	if home != "/home/alice" {
+		t.Fatalf("wrong home %q", home)
+	}
+	cfg, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RecentSFTP) != 1 {
+		t.Fatalf("want 1 recent entry, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	}
+	e := cfg.RecentSFTP[0]
+	if e.Host != "prod-db" || e.RemoteDir != "/home/alice" || e.LocalDir != "" {
+		t.Fatalf("wrong entry: %+v", e)
+	}
+}
+
+// M7: 重复记录同一 (host, remoteDir, localDir) 时旧条目被移除、新条目置顶，
+// 不产生重复项。
+func TestRecordRecentSFTPDedupMovesToFront(t *testing.T) {
+	a := appWithFakeSFTP(t, "")
+	if err := a.SftpGet("h1", "", "/a/x", "/l1/x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SftpGet("h2", "", "/b/y", "/l2/y"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SftpGet("h1", "", "/a/x", "/l1/x"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RecentSFTP) != 2 {
+		t.Fatalf("want 2 entries (dedup), got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	}
+	if cfg.RecentSFTP[0].Host != "h1" || cfg.RecentSFTP[1].Host != "h2" {
+		t.Fatalf("re-recorded entry must move to front: %+v", cfg.RecentSFTP)
+	}
+}
+
+// M7: 最近使用列表上限 10 条，最旧的被挤出。
+func TestRecordRecentSFTPCapsAtTen(t *testing.T) {
+	a := appWithFakeSFTP(t, "")
+	for i := 0; i < 12; i++ {
+		host := "host" + string(rune('a'+i))
+		if err := a.SftpGet(host, "", "/r"+string(rune('0'+i)), "/local"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RecentSFTP) != 10 {
+		t.Fatalf("want cap 10, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	}
+	if cfg.RecentSFTP[0].Host != "hostl" || cfg.RecentSFTP[9].Host != "hostc" {
+		t.Fatalf("newest-first order broken: %+v", cfg.RecentSFTP)
+	}
+}
+
+// M7: ListRecentSFTP 契约——最新在前；无任何记录时返回空切片而非 nil。
+func TestListRecentSFTPNewestFirstAndEmptyNotNil(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	if got := a.ListRecentSFTP(); got == nil || len(got) != 0 {
+		t.Fatalf("no-data must return empty slice (not nil), got %#v", got)
+	}
+	a2 := NewApp()
+	a2.cfg = &config.AppConfig{}
+	if got := a2.ListRecentSFTP(); got == nil || len(got) != 0 {
+		t.Fatalf("empty config must return empty slice (not nil), got %#v", got)
+	}
+
+	a3 := appWithFakeSFTP(t, "")
+	for _, host := range []string{"h1", "h2", "h3"} {
+		if err := a3.SftpGet(host, "", "/r/"+host, "/l/"+host); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := a3.ListRecentSFTP()
+	if len(got) != 3 {
+		t.Fatalf("want 3 entries, got %d: %+v", len(got), got)
+	}
+	want := []string{"h3", "h2", "h1"}
+	for i, h := range want {
+		if got[i].Host != h {
+			t.Fatalf("index %d: want %s got %+v", i, h, got[i])
+		}
 	}
 }
 
