@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -20,29 +22,67 @@ type App struct {
 	sftp    *sftp.Ctrl
 	cfg     *config.AppConfig
 	cfgPath string
+	// H2: startup 早于 Init 注入 emit，加载错误先记录于此，Init 时补发事件
+	emit       func(forward.Event)
+	cfgLoadErr error
 }
 
 func NewApp() *App {
 	return &App{}
 }
 
+// loadOrBackupConfig loads the config; on parse failure it first backs up the
+// original file to <path>.bak-<unix-ts> (byte-for-byte), then returns a usable
+// empty config plus the error, so a later saveConfig can never overwrite the
+// user's corrupt-but-recoverable file without a backup in place (H2).
+func (a *App) loadOrBackupConfig(path string) (*config.AppConfig, error) {
+	cfg, err := config.LoadConfig(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if data, rerr := os.ReadFile(path); rerr == nil {
+		bak := fmt.Sprintf("%s.bak-%d", path, time.Now().Unix())
+		werr := os.WriteFile(bak, data, 0600)
+		if werr == nil {
+			return config.DefaultAppConfig(), fmt.Errorf("配置文件 %s 解析失败，已备份到 %s，本次以空配置启动: %w", path, bak, err)
+		}
+		return config.DefaultAppConfig(), fmt.Errorf("配置文件 %s 解析失败且备份失败（%v），本次以空配置启动: %w", path, werr, err)
+	}
+	// 文件不存在或不可读：没有内容可备份
+	return config.DefaultAppConfig(), err
+}
+
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	p, _ := config.DefaultConfigPath()
 	a.cfgPath = p
-	cfg, err := config.LoadConfig(p)
-	if err == nil {
-		a.cfg = cfg
+	cfg, err := a.loadOrBackupConfig(p)
+	a.cfg = cfg
+	if err != nil {
+		a.cfgLoadErr = err
 	}
 }
 
 // Init wires controllers. emit forwards subsystem events to the frontend.
 // forward needs a Spawner (long-lived ssh -N); sftp needs a blocking Runner (one-shot ops).
 func (a *App) Init(emit func(forward.Event)) {
+	a.emit = emit
 	a.forward = forward.NewCtrl(osutil.NewSpawner(), emit)
 	a.sftp = sftp.NewCtrl(osutil.NewRunner(), emit)
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
+	}
+	// H2: startup 阶段发现的配置损坏延迟到这里发事件（此时 emit 已可用）。
+	// 注意：前端订阅 log 事件可能更晚，该事件属尽力而为；可靠的用户可见保障
+	// 是 .bak 备份文件 + 空配置，错误详情同时保留在 cfgLoadErr 中。
+	if a.cfgLoadErr != nil && a.emit != nil {
+		a.emit(forward.Event{
+			SourceType: "system",
+			SourceID:   "app",
+			TS:         time.Now().Format(time.RFC3339),
+			Level:      "error",
+			Message:    a.cfgLoadErr.Error(),
+		})
 	}
 }
 
