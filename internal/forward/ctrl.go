@@ -14,11 +14,15 @@ import (
 type State string
 
 const (
-	StateStopped    State = "stopped"
-	StateConnecting State = "connecting"
-	StateConnected  State = "connected"
-	StateError      State = "error"
+	StateStopped      State = "stopped"
+	StateConnecting   State = "connecting"
+	StateConnected    State = "connected"
+	StateError        State = "error"
+	StateReconnecting State = "reconnecting"
 )
+
+// stableThreshold：连续在线满该时长才清零重连失败计数（防 flapping 风暴）。
+const stableThreshold = 60 * time.Second
 
 type Event struct {
 	SourceType string `json:"source_type"`
@@ -84,6 +88,13 @@ type process struct {
 	attempts     int           // 连续失败计数
 	lastErr      string        // 最近一次意外退出的 classifyError 结果
 	mu           sync.Mutex
+}
+
+// lastErrSnapshot 在持 p.mu 的前提下读取最近错误文本（watchExit 已释放锁后使用）。
+func (entry *process) lastErrSnapshot() string {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	return entry.lastErr
 }
 
 type Ctrl struct {
@@ -213,28 +224,151 @@ func (c *Ctrl) trySpawn(t config.Tunnel) (*osutil.Process, error) {
 	return c.spawner.Start("ssh", spawnArgs...)
 }
 
-// watchExit 监控一次成功 spawn 的进程（H3）：进程自行退出（认证失败、断网等）
-// 时把状态迁移到 StateError 并发 error 事件。指针身份比较保证：条目已被替换、
-// 或 Stop/OnShutdown 已接管该进程（proc 句柄被清空）时不做任何处理。
+// watchExit 监控一次成功 spawn 的进程：意外退出时按 AutoReconnect 分流——
+// false → StateError（H3 行为）；true → 置 reconnecting 并进入退避重连循环。
+// 指针身份比较保证：条目已被替换、或 Stop/OnShutdown 已接管时不做任何处理。
 func (c *Ctrl) watchExit(id string, entry *process, proc *osutil.Process) {
 	out := proc.Wait()
 	c.mu.Lock()
 	cur, ok := c.procs[id]
 	fire := ok && cur == entry
+	startLoop := false
 	if fire {
-		cur.mu.Lock()
-		if cur.proc == proc {
-			cur.proc = nil
-			cur.state = StateError
+		entry.mu.Lock()
+		if entry.proc == proc {
+			entry.proc = nil
+			entry.lastErr = classifyError(out)
+			if entry.tunnel.AutoReconnect {
+				// 防抖：稳定满阈值才清零计数（spec §3.4）
+				if time.Since(entry.lastStableAt) >= stableThreshold {
+					entry.attempts = 0
+				}
+				entry.state = StateReconnecting
+				startLoop = true
+			} else {
+				entry.state = StateError
+			}
 		} else {
 			fire = false
 		}
-		cur.mu.Unlock()
+		entry.mu.Unlock()
 	}
 	c.mu.Unlock()
-	if fire {
-		c.emitEvent(id, "error", classifyError(out))
+	if !fire {
+		return
 	}
+	if !startLoop {
+		c.emitEvent(id, "error", entry.lastErrSnapshot())
+		return
+	}
+	go c.respawnLoop(id, entry)
+}
+
+// respawnLoop 按指数退避反复尝试重连，直到成功或取消。
+// 一切状态迁移原地变更（禁用 setState）；spawn 成功必过 post-spawn 终检闸门。
+func (c *Ctrl) respawnLoop(id string, entry *process) {
+	for {
+		// 等待前检查取消
+		if c.loopCancelled(id, entry) {
+			return
+		}
+		entry.mu.Lock()
+		attempt := entry.attempts + 1
+		entry.attempts = attempt
+		reason := entry.lastErr
+		entry.mu.Unlock()
+		delay := backoffDelay(attempt)
+		c.emitEvent(id, "warn", fmt.Sprintf("连接断开（%s），%s 后进行第 %d 次重连", reason, delay, attempt))
+
+		select {
+		case <-c.waitCancel(entry):
+			c.finishStop(id, entry, "已停止重连")
+			return
+		case <-c.after(delay):
+		}
+
+		if c.loopCancelled(id, entry) {
+			return
+		}
+		c.emitEvent(id, "info", fmt.Sprintf("第 %d 次重连中…", attempt))
+
+		proc, err := c.trySpawn(entry.tunnel)
+		if err != nil {
+			c.emitEvent(id, "warn", fmt.Sprintf("第 %d 次重连失败: %v", attempt, err))
+			continue
+		}
+
+		// ── post-spawn 终检闸门（spec §3.5）：身份 + 取消/状态双检 ──
+		adopted := false
+		c.mu.Lock()
+		if cur, _ := c.procs[id]; cur == entry {
+			entry.mu.Lock()
+			if entry.cancel != nil && entry.state == StateReconnecting {
+				entry.proc = proc
+				entry.state = StateConnected
+				now := time.Now()
+				if now.Sub(entry.lastStableAt) >= stableThreshold {
+					entry.attempts = 0
+				}
+				entry.lastStableAt = now
+				adopted = true
+			}
+			entry.mu.Unlock()
+		}
+		c.mu.Unlock()
+		if !adopted {
+			_ = proc.Kill() // 条目已被替换或已被停止：绝不让新进程成为孤儿/复活隧道
+			return
+		}
+		c.emitEvent(id, "info", fmt.Sprintf("reconnected（共尝试 %d 次）", attempt))
+		go c.watchExit(id, entry, proc)
+		return
+	}
+}
+
+// loopCancelled 报告 entry 是否已被取消或不再是当前条目。
+func (c *Ctrl) loopCancelled(id string, entry *process) bool {
+	c.mu.Lock()
+	cur, _ := c.procs[id]
+	c.mu.Unlock()
+	if cur != entry {
+		return true
+	}
+	entry.mu.Lock()
+	cancelled := entry.cancel == nil || entry.state != StateReconnecting
+	entry.mu.Unlock()
+	return cancelled
+}
+
+// waitCancel 返回 entry 的取消通道（已关/缺失时返回已关闭通道）。
+func (c *Ctrl) waitCancel(entry *process) <-chan struct{} {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.cancel == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	return entry.cancel
+}
+
+// finishStop 由重连循环在收到取消后收尾：置 stopped 并发事件。
+func (c *Ctrl) finishStop(id string, entry *process, msg string) {
+	c.mu.Lock()
+	cur, _ := c.procs[id]
+	c.mu.Unlock()
+	if cur != entry {
+		return
+	}
+	entry.mu.Lock()
+	if entry.cancel != nil {
+		close(entry.cancel)
+		entry.cancel = nil
+	}
+	entry.proc = nil
+	entry.state = StateStopped
+	entry.mu.Unlock()
+	c.emitEvent(id, "info", msg)
 }
 
 func (c *Ctrl) Stop(sourceID string) error {
