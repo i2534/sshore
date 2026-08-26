@@ -8,7 +8,8 @@
 > **修复进度（2026-08-26）**:
 > - 第一轮: **H1–H6 + M1 + M2** 已修复（见文末「已修复项」）
 > - 第二轮: **M3–M6、M6b、M8–M11 + 工程化（CI/make e2e/make ci/npm test 脚本）** 已修复
-> - 待办: M7 死代码处置（接线 or 删除，待决策）、L1–L7/L9–L11 打磨项、LICENSE（待选择）、自动重连实现（H3 关联）
+> - 第三轮: **M7 全部接线**——CheckRemoteConflict 接入 Create/UpdateTunnel；新增 ListHostsDetailed（ssh -G 权威解析，README 宣称自此为真）；RecentSFTP 完整实现（Get/Put/Home 成功后记录，去重+上限10+持久化）+ 前端「最近位置」回填
+> - 待办: L1–L7/L9–L11 打磨项、LICENSE（待选择）、自动重连实现（AutoReconnect 字段保留待接）
 
 ---
 
