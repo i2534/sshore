@@ -14,7 +14,7 @@ WEBKIT_TAG ?= webkit2_41
 BINDIR   := build/bin
 OUTNAME  := sshkit
 
-.PHONY: help all dev build run linux windows clean test vet fmt
+.PHONY: help all dev build run linux windows clean test vet fmt e2e ci
 
 ## Show available targets and their descriptions.
 help:
@@ -66,3 +66,13 @@ vet:
 ## Format Go code (gofmt -s), excluding vendor/build output.
 fmt:
 	gofmt -s -w $$(find . -name '*.go' -not -path './vendor/*' -not -path '*/build/*' -not -path './node_modules/*')
+
+## Run e2e script (throwaway local sshd; needs /usr/sbin/sshd, ssh-keygen, python3).
+e2e:
+	bash e2e/test_local.sh
+
+## Run everything CI runs: vet + Go tests (-race) + frontend tests.
+ci:
+	$(GO) vet ./...
+	$(GO) test ./... -race -count=1
+	cd frontend && npx vitest run

@@ -48,3 +48,20 @@ wails dev
 go test ./...          # Go subsystem tests (mocked ssh/sftp)
 cd frontend && npx vitest run   # log store ring-buffer tests
 ```
+
+`make ci` runs everything CI runs in one shot (vet + Go tests with `-race` + frontend tests).
+
+## E2E
+
+```bash
+make e2e    # equivalent to: bash e2e/test_local.sh
+```
+
+`e2e/test_local.sh` starts a throwaway local sshd and verifies the OpenSSH behaviors
+sshkit relies on: `ssh -G` alias resolution, `-N -L` local forward binding, and
+`sftp ls -l` output parsing. Requires `/usr/sbin/sshd`, `ssh-keygen`, and `python3`.
+
+## CI
+
+`.github/workflows/ci.yml` runs on push/PR: `go vet`, Go tests (`-race`),
+frontend tests + build, and a Linux `wails build` (webkit2gtk-4.1).
