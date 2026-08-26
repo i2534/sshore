@@ -159,6 +159,19 @@ func (c *Ctrl) State(sourceID string) State {
 	return p.state
 }
 
+// States 返回 id→state 快照（深拷贝，避免调用方触碰内部 map）。
+func (c *Ctrl) States() map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]string, len(c.procs))
+	for id, p := range c.procs {
+		p.mu.Lock()
+		out[id] = string(p.state)
+		p.mu.Unlock()
+	}
+	return out
+}
+
 func (c *Ctrl) Start(t config.Tunnel) error {
 	// H4: 已有存活进程时直接拒绝，绝不替换 map 条目——替换会丢弃正在运行
 	// 的进程句柄，导致其永远无法 Stop、端口持续被占。

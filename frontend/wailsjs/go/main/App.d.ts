@@ -65,4 +65,6 @@ export function StatLocal(arg1:string):Promise<number>;
 
 export function StopTunnel(arg1:string):Promise<void>;
 
+export function TunnelStates():Promise<{[key: string]: string}>;
+
 export function UpdateTunnel(arg1:config.Tunnel):Promise<void>;
