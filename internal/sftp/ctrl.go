@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"sshkit/internal/forward"
 	"sshkit/internal/osutil"
@@ -95,7 +96,11 @@ func (c *Ctrl) CloseAll() {
 func (c *Ctrl) Connect(host, user string) error {
 	if isWindows {
 		// Per-command mode: prove connectivity with a quick `sftp ls .`.
-		out, err := c.run(host, user, c.buildBatch("ls", ".", ""))
+		batch, err := c.buildBatch("ls", ".", "")
+		if err != nil {
+			return err
+		}
+		out, err := c.run(host, user, batch)
 		if err != nil {
 			return fmt.Errorf("sftp connect %s: %w (%s)", host, err, commandErr(out))
 		}
@@ -163,20 +168,73 @@ func (c *Ctrl) Connected(host string) bool {
 	return err == nil
 }
 
-func (c *Ctrl) buildBatch(op, remote, local string) []byte {
+// quoteArg validates a path for batch use and wraps it in double quotes so the
+// sftp batch parser treats it as a single argument. Control characters (e.g.
+// \n) are rejected outright: a newline would split the batch into two commands,
+// and sftp batch lines starting with `!` execute local shell commands.
+func quoteArg(p string) (string, error) {
+	for _, r := range p {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("路径包含非法控制字符: %q", p)
+		}
+	}
+	p = strings.ReplaceAll(p, "\\", "\\\\")
+	p = strings.ReplaceAll(p, "\"", "\\\"")
+	return "\"" + p + "\"", nil
+}
+
+func (c *Ctrl) buildBatch(op, remote, local string) ([]byte, error) {
 	switch op {
 	case "ls":
-		return []byte(fmt.Sprintf("ls -l %s\n", remote))
+		r, err := quoteArg(remote)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("ls -l %s\n", r)), nil
 	case "get":
-		return []byte(fmt.Sprintf("get %s %s\n", remote, local))
+		r, err := quoteArg(remote)
+		if err != nil {
+			return nil, err
+		}
+		l, err := quoteArg(local)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("get %s %s\n", r, l)), nil
 	case "put":
-		return []byte(fmt.Sprintf("put %s %s\n", local, remote))
+		r, err := quoteArg(remote)
+		if err != nil {
+			return nil, err
+		}
+		l, err := quoteArg(local)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("put %s %s\n", l, r)), nil
 	case "rm":
-		return []byte(fmt.Sprintf("rm %s\n", remote))
+		r, err := quoteArg(remote)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("rm %s\n", r)), nil
 	case "mkdir":
-		return []byte(fmt.Sprintf("mkdir %s\n", remote))
+		r, err := quoteArg(remote)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("mkdir %s\n", r)), nil
+	case "rename":
+		o, err := quoteArg(remote)
+		if err != nil {
+			return nil, err
+		}
+		n, err := quoteArg(local)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("rename %s %s\n", o, n)), nil
 	default:
-		return nil
+		return nil, nil
 	}
 }
 
@@ -196,7 +254,11 @@ func (c *Ctrl) writeBatch(dir string, content []byte) (string, error) {
 }
 
 func (c *Ctrl) List(host, user, path string) ([]Item, error) {
-	out, err := c.run(host, user, c.buildBatch("ls", path, ""))
+	batch, err := c.buildBatch("ls", path, "")
+	if err != nil {
+		return nil, err
+	}
+	out, err := c.run(host, user, batch)
 	if err != nil {
 		return nil, fmt.Errorf("sftp ls %s: %w (%s)", host, err, commandErr(out))
 	}
@@ -248,7 +310,11 @@ func commandErr(out osutil.Outcome) string {
 }
 
 func (c *Ctrl) Get(host, user, remote, local string) error {
-	out, err := c.run(host, user, c.buildBatch("get", remote, local))
+	batch, err := c.buildBatch("get", remote, local)
+	if err != nil {
+		return err
+	}
+	out, err := c.run(host, user, batch)
 	if err != nil {
 		return err
 	}
@@ -259,7 +325,11 @@ func (c *Ctrl) Get(host, user, remote, local string) error {
 }
 
 func (c *Ctrl) Put(host, user, local, remote string) error {
-	out, err := c.run(host, user, c.buildBatch("put", remote, local))
+	batch, err := c.buildBatch("put", remote, local)
+	if err != nil {
+		return err
+	}
+	out, err := c.run(host, user, batch)
 	if err != nil {
 		return err
 	}
@@ -270,7 +340,11 @@ func (c *Ctrl) Put(host, user, local, remote string) error {
 }
 
 func (c *Ctrl) Remove(host, user, path string) error {
-	out, err := c.run(host, user, c.buildBatch("rm", path, ""))
+	batch, err := c.buildBatch("rm", path, "")
+	if err != nil {
+		return err
+	}
+	out, err := c.run(host, user, batch)
 	if err != nil {
 		return err
 	}
@@ -281,7 +355,11 @@ func (c *Ctrl) Remove(host, user, path string) error {
 }
 
 func (c *Ctrl) Mkdir(host, user, path string) error {
-	out, err := c.run(host, user, c.buildBatch("mkdir", path, ""))
+	batch, err := c.buildBatch("mkdir", path, "")
+	if err != nil {
+		return err
+	}
+	out, err := c.run(host, user, batch)
 	if err != nil {
 		return err
 	}
@@ -293,7 +371,10 @@ func (c *Ctrl) Mkdir(host, user, path string) error {
 
 // Rename renames/moves a remote file or directory.
 func (c *Ctrl) Rename(host, user, oldPath, newPath string) error {
-	batch := []byte(fmt.Sprintf("rename %s %s\n", oldPath, newPath))
+	batch, err := c.buildBatch("rename", oldPath, newPath)
+	if err != nil {
+		return err
+	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
 		return err
