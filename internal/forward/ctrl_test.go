@@ -442,11 +442,14 @@ func TestAutoReconnectBackoffSequenceAcrossRetries(t *testing.T) {
 	}
 	warnCount := 0
 	firstWarnIdx := -1
+	secondWarnIdx := -1
 	reconnectedIdx := -1
 	for i, e := range emitted {
 		if e.Level == "warn" && strings.Contains(e.Message, "次重连") {
 			if firstWarnIdx == -1 {
 				firstWarnIdx = i
+			} else if secondWarnIdx == -1 {
+				secondWarnIdx = i
 			}
 			warnCount++
 		}
@@ -457,10 +460,18 @@ func TestAutoReconnectBackoffSequenceAcrossRetries(t *testing.T) {
 	if warnCount < 2 {
 		t.Fatalf("expected >=2 entering-reconnect warns, got %d in %+v", warnCount, emitted)
 	}
+	// <60s 计数延续（spec §3.4，真实路径）：第二条 warn 必须为「第 2 次重连」——
+	// 若实现错误地清零计数，第二条会变成「第 1 次重连」。
+	if !strings.Contains(emitted[secondWarnIdx].Message, "第 2 次重连") {
+		t.Fatalf("second warn must carry attempt 2 (<60s keeps counter), got %q", emitted[secondWarnIdx].Message)
+	}
 	// 事件顺序（spec §7.1）：首个进入重连 warn 必须先于对应的 reconnected info。
 	if firstWarnIdx == -1 || reconnectedIdx == -1 || firstWarnIdx >= reconnectedIdx {
 		t.Fatalf("first entering-reconnect warn must precede the reconnected info; warnIdx=%d reconnectedIdx=%d emitted=%+v",
 			firstWarnIdx, reconnectedIdx, emitted)
+	}
+	if got := ctrl.State(tr.ID); got != StateConnected {
+		t.Fatalf("final state should be connected, got %s", got)
 	}
 }
 
@@ -642,6 +653,7 @@ func TestRespawnOrphanKilledWhenEntryReplaced(t *testing.T) {
 func TestRespawnNoResurrectionAfterStopDuringSpawn(t *testing.T) {
 	calls := 0
 	stopCalled := false
+	var respawnedProc *osutil.Process
 	var mu sync.Mutex
 	ctrl := NewCtrl(
 		fakeSpawner{},
@@ -661,6 +673,13 @@ func TestRespawnNoResurrectionAfterStopDuringSpawn(t *testing.T) {
 			return exitProcess(t, 1)
 		}
 		// 第二次 spawn（重连尝试）进行中触发 Stop：关闭 cancel + 状态改写
+		p, err := aliveProcess(t)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		respawnedProc = p
+		mu.Unlock()
 		mu.Lock()
 		if !stopCalled {
 			stopCalled = true
@@ -669,7 +688,7 @@ func TestRespawnNoResurrectionAfterStopDuringSpawn(t *testing.T) {
 		} else {
 			mu.Unlock()
 		}
-		return aliveProcess(t)
+		return p, nil
 	}}
 	ctrl.spawner = sp
 
@@ -689,5 +708,203 @@ func TestRespawnNoResurrectionAfterStopDuringSpawn(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := ctrl.State(tr.ID); got != StateStopped {
 		t.Fatalf("stopped tunnel must not resurrect, got %s", got)
+	}
+	// Kill 子句（spec §3.5）：闸门 adopt 失败的新进程必须已被 Kill。
+	mu.Lock()
+	p := respawnedProc
+	mu.Unlock()
+	if p == nil {
+		t.Fatal("respawn spawn never happened")
+	}
+	done := make(chan struct{})
+	go func() {
+		p.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("killed process was not killed after stop-resurrection gate")
+	}
+}
+
+// 自动重连防抖真实路径：重连成功后在线 ≥60s 再次断开 →
+// 失败计数必须清零并从 1 重来（spec §3.4），而不是延续为「第 2 次重连」。
+func TestAutoReconnectStableResetAfter60s(t *testing.T) {
+	var mu sync.Mutex
+	var emitted []Event
+	calls := 0
+	ctrl := NewCtrl(
+		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+			mu.Lock()
+			calls++
+			n := calls
+			mu.Unlock()
+			if n == 1 {
+				return exitProcess(t, 1) // 首启进程立即死亡
+			}
+			return aliveProcess(t) // 重连成功存活，供构造“稳定”窗口
+		}},
+		func(e Event) {
+			mu.Lock()
+			emitted = append(emitted, e)
+			mu.Unlock()
+		},
+		func(d time.Duration) <-chan struct{} {
+			ch := make(chan struct{})
+			close(ch)
+			return ch
+		},
+	)
+	tr := base()
+	tr.AutoReconnect = true
+	tr.ListenPort = freePort(t)
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// 等待第一轮重连成功（calls 达 2 且回到 connected）
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		reached := calls >= 2
+		mu.Unlock()
+		if reached && ctrl.State(tr.ID) == StateConnected {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ctrl.State(tr.ID); got != StateConnected {
+		t.Fatalf("expected connected after first successful reconnect, got %s", got)
+	}
+	// 同包取 entry：把 lastStableAt 拨回 61s 前（模拟在线 ≥60s），再 Kill 模拟意外退出
+	ctrl.mu.Lock()
+	entry := ctrl.procs[tr.ID]
+	ctrl.mu.Unlock()
+	if entry == nil {
+		t.Fatal("entry missing after reconnect")
+	}
+	entry.mu.Lock()
+	entry.lastStableAt = time.Now().Add(-61 * time.Second)
+	proc := entry.proc
+	entry.mu.Unlock()
+	if proc == nil {
+		t.Fatal("entry has no live process to kill")
+	}
+	proc.Kill()
+	// 等待新的进入重连 warn 落账（进入 reconnecting 后由循环发出）
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		warnCount := 0
+		for _, e := range emitted {
+			if e.Level == "warn" && strings.Contains(e.Message, "次重连") {
+				warnCount++
+			}
+		}
+		enough := warnCount >= 2
+		mu.Unlock()
+		if enough {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	warnIdxs := []int{}
+	for i, e := range emitted {
+		if e.Level == "warn" && strings.Contains(e.Message, "次重连") {
+			warnIdxs = append(warnIdxs, i)
+		}
+	}
+	if len(warnIdxs) < 2 {
+		t.Fatalf("expected a new entering-reconnect warn after stable reset, got %d warns in %+v", len(warnIdxs), emitted)
+	}
+	// ≥60s 清零生效：新 warn 必须从「第 1 次重连」重来（实现未清零则会成为「第 2 次重连」）
+	last := emitted[warnIdxs[len(warnIdxs)-1]]
+	if !strings.Contains(last.Message, "第 1 次重连") {
+		t.Fatalf("warn after >=60s stable must restart from attempt 1, got %q", last.Message)
+	}
+}
+
+// §7.5 取代窗口：退避等待期间外部 Start 介入 → 条目被替换并 connected；
+// 旧循环被放行后必须经闸门退出——无第三次 spawn，外部进程不得被当作孤儿 Kill。
+func TestRespawnWaitWindowExternalStartSupersedes(t *testing.T) {
+	calls := 0
+	var extProc *osutil.Process
+	var mu sync.Mutex
+	hold := make(chan struct{}) // 手控退避等待：制造“卡在等待窗口”的窗口
+	ctrl := NewCtrl(
+		fakeSpawner{},
+		func(e Event) {},
+		func(d time.Duration) <-chan struct{} {
+			return hold
+		},
+	)
+	sp := fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			return exitProcess(t, 1) // 首启进程立即死亡
+		}
+		p, err := aliveProcess(t) // 第 2 次调用 = 外部 Start 的 spawn
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		extProc = p
+		mu.Unlock()
+		return p, nil
+	}}
+	ctrl.spawner = sp
+
+	tr := base()
+	tr.AutoReconnect = true
+	tr.ListenPort = freePort(t)
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// 等待进入 reconnecting（旧循环卡在退避等待）
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && ctrl.State(tr.ID) != StateReconnecting {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := ctrl.State(tr.ID); got != StateReconnecting {
+		t.Fatalf("should be reconnecting, got %s", got)
+	}
+	// 等待窗口内外部 Start 介入：reconnecting 态 proc==nil 不算 live，守卫不拒绝
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("external start during reconnect wait must succeed: %v", err)
+	}
+	if got := ctrl.State(tr.ID); got != StateConnected {
+		t.Fatalf("external start should be connected, got %s", got)
+	}
+	close(hold) // 放行旧循环卡住的等待
+	// 给旧循环留出唤醒并（若 bug）发起第三次 spawn 的时间
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	c := calls
+	p := extProc
+	mu.Unlock()
+	if p == nil {
+		t.Fatal("external start spawn never happened")
+	}
+	if c != 2 {
+		t.Fatalf("old loop must exit via gate without a third spawn, calls=%d", c)
+	}
+	if got := ctrl.State(tr.ID); got != StateConnected {
+		t.Fatalf("final state should be connected (external entry), got %s", got)
+	}
+	// 无孤儿：外部 Start 的存活进程必须仍活着（Wait 在 500ms 内未关闭）
+	done := make(chan struct{})
+	go func() {
+		p.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("external start's alive process was killed — must not be treated as orphan")
+	case <-time.After(500 * time.Millisecond):
 	}
 }
