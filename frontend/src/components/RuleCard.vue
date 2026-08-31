@@ -1,12 +1,20 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { StartTunnel, StopTunnel } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 
-const props = defineProps({ tunnel: { type: Object, required: true } })
+const props = defineProps({
+  tunnel: { type: Object, required: true },
+  state: { type: String, default: 'stopped' },
+})
 const emit = defineEmits(['edit', 'delete', 'changed'])
 const busy = ref(false)
 const logStore = useLogStore()
+
+const dotCls = computed(() =>
+  props.state === 'connected' ? 'on'
+  : props.state === 'reconnecting' ? 'warn'
+  : props.state === 'error' ? 'err' : 'off')
 
 async function toggle() {
   busy.value = true
@@ -31,9 +39,9 @@ async function toggle() {
 
 <template>
   <div class="rule">
-    <span :class="['dot', tunnel.enabled ? 'on' : 'off']"></span>
+    <span :class="['dot', dotCls]"></span>
     <span class="name">{{ tunnel.name || tunnel.host }}</span>
-    <span class="meta">{{ tunnel.mode }} {{ tunnel.listen_bind }}:{{ tunnel.listen_port }}</span>
+    <span class="meta">{{ tunnel.mode }} {{ tunnel.listen_bind }}:{{ tunnel.listen_port }}<template v-if="props.state === 'reconnecting'"> · 重连中</template></span>
     <div class="actions">
       <button class="ghost" @click="emit('edit', tunnel)">编辑</button>
       <button class="ghost danger" @click="emit('delete', tunnel)">删除</button>
@@ -49,6 +57,8 @@ async function toggle() {
 .dot { width: 10px; height: 10px; border-radius: 50%; }
 .dot.on { background: var(--success); }
 .dot.off { background: var(--text-faint); }
+.dot.warn { background: #f0ad4e; }
+.dot.err { background: var(--danger); }
 .name { font-weight: 600; color: var(--text); }
 .meta { color: var(--text-dim); font-size: 12px; flex: 1; }
 .actions { display: flex; gap: 6px; }
