@@ -1,15 +1,18 @@
 <script setup>
-import { ref, onMounted } from 'vue'
-import { ListTunnels, ListHosts, CreateTunnel, UpdateTunnel, DeleteTunnel, ImportCommand } from '../../wailsjs/go/main/App'
+import { ref, onMounted, onUnmounted } from 'vue'
+import { ListTunnels, ListHosts, CreateTunnel, UpdateTunnel, DeleteTunnel, ImportCommand, TunnelStates } from '../../wailsjs/go/main/App'
 import RuleCard from '../components/RuleCard.vue'
 import LogPanel from '../components/LogPanel.vue'
 import AppDialog from '../components/AppDialog.vue'
+import { useLogStore } from '../stores/logs'
 
 const tunnels = ref([])
 const hosts = ref([])
 const cmd = ref('')
 const loadError = ref('')
 const opError = ref('')
+const logStore = useLogStore()
+const states = ref({})
 
 const dialog = ref({ visible: false, mode: 'confirm', title: '', message: '', initial: '' })
 let dialogResolve = null
@@ -41,7 +44,10 @@ function newTunnel() {
 }
 
 async function refresh() {
-  try { tunnels.value = (await ListTunnels()) || [] } catch (e) { loadError.value = String(e) }
+  try {
+    tunnels.value = (await ListTunnels()) || []
+    states.value = (await TunnelStates()) || {}
+  } catch (e) { loadError.value = String(e) }
 }
 async function loadHosts() {
   try { hosts.value = (await ListHosts()) || [] } catch (e) { loadError.value = String(e) }
@@ -86,6 +92,25 @@ async function remove(t) {
   } catch (e) { opError.value = String(e) }
 }
 onMounted(async () => { await loadHosts(); await refresh() })
+
+// 状态转换经 'log' 事件流到达（source_type==='tunnel'）；App.vue 已持有全局订阅，
+// 这里只订 pinia store，过滤后防抖刷新——不二次 EventsOn、不轮询。
+// 本地 RuleCard 错误日志无 source_type（source_id==='rule'），被此过滤自然跳过。
+let unsubLogs = null
+let refreshTimer = null
+onMounted(() => {
+  unsubLogs = logStore.$subscribe((mutation, state) => {
+    const logs = state.logs
+    const last = logs[logs.length - 1]
+    if (!last || last.source_type !== 'tunnel') return
+    clearTimeout(refreshTimer)
+    refreshTimer = setTimeout(refresh, 300)
+  })
+})
+onUnmounted(() => {
+  if (unsubLogs) unsubLogs()
+  clearTimeout(refreshTimer)
+})
 </script>
 
 <template>
@@ -129,7 +154,7 @@ onMounted(async () => { await loadHosts(); await refresh() })
         </div>
       </form>
 
-      <RuleCard v-for="t in tunnels" :key="t.id" :tunnel="t"
+      <RuleCard v-for="t in tunnels" :key="t.id" :tunnel="t" :state="states[t.id]"
         @edit="openEdit" @delete="remove" @changed="refresh" />
       <p v-if="loadError" class="empty err">加载失败: {{ loadError }}</p>
       <p v-if="opError" class="empty err">操作失败: {{ opError }}</p>
