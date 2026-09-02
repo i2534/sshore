@@ -10,16 +10,16 @@ jobs:
   go:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
       - name: Build frontend (embed assets for go:embed)
         working-directory: frontend
         run: |
           npm ci
           npm run build
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Vet
@@ -33,10 +33,10 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
       - name: Install dependencies
         run: npm ci
       - name: Test
@@ -47,12 +47,12 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install webkit2gtk-4.1 build deps
+      - uses: actions/checkout@v7
+      - name: Install webkit2gtk-4.1 + UPX build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: actions/setup-go@v5
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev upx-ucl
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Install wails CLI
