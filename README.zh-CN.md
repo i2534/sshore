@@ -52,7 +52,13 @@ wails dev
 - **配置**：只读解析 `~/.ssh/config`（不存储凭据）；隧道规则保存在
   `~/.config/sshore/sshore.toml`（Windows 为 `%APPDATA%\sshore\sshore.toml`）
 - **命令导入**：将粘贴的 `ssh -L/-R/-D ...` 命令解析为规则
-- **实时日志面板**：隧道/SFTP 事件的内存环形缓冲（1000 条）
+- **实时日志面板**：隧道/SFTP 事件的内存环形缓冲（1000 条）；可按规则
+  单独切换过滤（规则卡片「日志」按钮 / 日志面板 chips），ssh 子进程的
+  stderr 逐行采集进面板——隧道内部错误不再被吞掉
+- **规则校验**：创建/编辑/导入时拒绝空目标主机（`-L 23080::3080` 这类
+  坏规则会让 ssh 解析空主机名失败：连接即 RST 而进程不退出，界面误报
+  connected）；本地/远程转发绑定失败时 `ExitOnForwardFailure` 使隧道
+  直接进入 error 状态
 - 认证使用系统 OpenSSH（密钥/agent/config），因此 GUI 不支持密码与
   keyboard-interactive 认证——请为你的主机配置密钥或 agent 认证
 

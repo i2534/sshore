@@ -36,7 +36,9 @@ function newTunnel() {
     host: '',
     listen_bind: '127.0.0.1',
     listen_port: 5432,
-    target_host: '',
+    // 目标主机必须有值:`-L 23080::3080`(空目标)会让 ssh 解析空主机名失败,
+    // 表现为连接即 RST 而进程不退出 → 界面误报 connected。
+    target_host: '127.0.0.1',
     target_port: 5432,
     proxy_jump: '',
     auto_reconnect: true,
@@ -143,8 +145,8 @@ onUnmounted(() => {
           <label>监听地址 <input v-model="form.listen_bind" /></label>
           <label>监听端口 <input v-model.number="form.listen_port" type="number" /></label>
           <template v-if="form.mode !== 'dynamic'">
-            <label>目标主机 <input v-model="form.target_host" placeholder="127.0.0.1" /></label>
-            <label>目标端口 <input v-model.number="form.target_port" type="number" /></label>
+            <label>目标主机 <input v-model="form.target_host" placeholder="127.0.0.1" required /></label>
+            <label>目标端口 <input v-model.number="form.target_port" type="number" required /></label>
           </template>
         </div>
         <div class="row">
@@ -165,7 +167,7 @@ onUnmounted(() => {
         <button @click="doImport">导入</button>
       </div>
     </div>
-    <div class="panel"><LogPanel /></div>
+    <div class="panel"><LogPanel :tunnels="tunnels" /></div>
 
     <AppDialog
       :visible="dialog.visible"

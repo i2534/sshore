@@ -582,3 +582,40 @@ func TestTunnelStates(t *testing.T) {
 		t.Fatalf(`states["s1"]=%q want "error"`, got["s1"])
 	}
 }
+
+// 空目标主机必须被创建/编辑拒绝——历史坏规则(
+// `-L 127.0.0.1:23080::3080` → ssh 解析空主机失败 → 连接即 RST)由此防止复现。
+func TestCreateTunnelRejectsEmptyTargetHost(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	err := a.CreateTunnel(config.Tunnel{ID: "x", Name: "DSH", Host: "ai", Mode: "local",
+		ListenBind: "127.0.0.1", ListenPort: 23080, TargetPort: 3080})
+	if err == nil {
+		t.Fatal("empty target host must be rejected on create")
+	}
+	if !strings.Contains(err.Error(), "target host") {
+		t.Fatalf("error should mention target host: %v", err)
+	}
+	if len(a.cfg.Tunnels) != 0 {
+		t.Fatalf("rejected tunnel must not be stored: %+v", a.cfg.Tunnels)
+	}
+}
+
+func TestUpdateTunnelRejectsEmptyTargetHost(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
+	ok := config.Tunnel{ID: "abc", Host: "prod-db", Mode: "local",
+		ListenBind: "127.0.0.1", ListenPort: 5432, TargetHost: "127.0.0.1", TargetPort: 5432}
+	if err := a.CreateTunnel(ok); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	bad := ok
+	bad.TargetHost = ""
+	if err := a.UpdateTunnel(bad); err == nil {
+		t.Fatal("empty target host must be rejected on update")
+	}
+	if got := a.cfg.Tunnels[0].TargetHost; got != "127.0.0.1" {
+		t.Fatalf("rejected update must not mutate stored rule, got %q", got)
+	}
+}

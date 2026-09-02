@@ -130,8 +130,8 @@ func (a *App) TunnelStates() map[string]string {
 }
 
 func (a *App) CreateTunnel(t config.Tunnel) error {
-	if !forward.ValidateHost(t.Host) {
-		return errors.New("invalid host alias")
+	if err := forward.ValidateTunnel(t); err != nil {
+		return err
 	}
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
@@ -151,8 +151,8 @@ func (a *App) CreateTunnel(t config.Tunnel) error {
 // UpdateTunnel replaces an existing tunnel (matched by ID) with updated fields.
 // If the tunnel is running, it is stopped first because the config changed.
 func (a *App) UpdateTunnel(t config.Tunnel) error {
-	if !forward.ValidateHost(t.Host) {
-		return errors.New("invalid host alias")
+	if err := forward.ValidateTunnel(t); err != nil {
+		return err
 	}
 	idx := -1
 	for i, e := range a.cfg.Tunnels {
@@ -297,6 +297,7 @@ func (a *App) SftpGet(host, user, remote, local string) error {
 	a.recordRecentSFTP(host, filepath.Dir(remote), filepath.Dir(local))
 	return nil
 }
+
 // SftpGetDir recursively downloads a remote directory tree (`sftp get -r`).
 func (a *App) SftpGetDir(host, user, remote, local string) error {
 	if err := a.sftp.GetRecursive(host, user, remote, local); err != nil {
