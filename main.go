@@ -39,7 +39,14 @@ func main() {
 				Level:      "info",
 				Message:    "sshore 已就绪",
 			})
-			_ = app.AutoStartEnabled()
+			// Wails 的 OnStartup 早于前端页面加载:此时前端尚未订阅 log 事件,
+			// 同步 AutoStart 的所有隧道事件(connecting/reconnecting/...)都会
+			// 被丢弃,表现为"启动后自动重连无日志"。延迟 1s 再自动开启,
+			// 保证日志面板已就绪;启动失败仍可通过规则状态圆点反映。
+			go func() {
+				time.Sleep(time.Second)
+				_ = app.AutoStartEnabled()
+			}()
 		},
 		OnShutdown: func(ctx context.Context) {
 			app.OnShutdown()

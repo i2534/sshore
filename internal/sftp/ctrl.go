@@ -90,11 +90,26 @@ func (c *Ctrl) CloseAll() {
 	_ = os.RemoveAll(c.controlDir)
 }
 
+// logEvent 记录一条 SFTP 操作日志(SourceType=sftp, SourceID=host),
+// 供前端日志面板展示/按主机过滤。emit 为 nil(测试/未接线)时静默。
+func (c *Ctrl) logEvent(host, level, msg string) {
+	if c.emit != nil {
+		c.emit(forward.Event{
+			SourceType: "sftp",
+			SourceID:   host,
+			TS:         time.Now().Format(time.RFC3339),
+			Level:      level,
+			Message:    msg,
+		})
+	}
+}
+
 // Connect establishes a ControlMaster SSH connection for host so subsequent
 // sftp ops reuse it. This is the explicit "connect" action.
 // On Windows (no ControlMaster/-f) it instead verifies connectivity by
 // running a throwaway sftp command, and marks the host as connected.
 func (c *Ctrl) Connect(host, user string) error {
+	c.logEvent(host, "info", "sftp connect "+host)
 	if isWindows {
 		// Per-command mode: prove connectivity with a quick `sftp ls .`.
 		batch, err := c.buildBatch("ls", ".", "")
@@ -111,6 +126,7 @@ func (c *Ctrl) Connect(host, user string) error {
 		c.mu.Lock()
 		c.active[host] = true
 		c.mu.Unlock()
+		c.logEvent(host, "info", "sftp connect "+host+" ok")
 		return nil
 	}
 
@@ -127,6 +143,7 @@ func (c *Ctrl) Connect(host, user string) error {
 	// Confirm the master socket exists (the -f ssh may fork and return before binding).
 	for i := 0; i < 20; i++ {
 		if _, statErr := os.Stat(cp); statErr == nil {
+			c.logEvent(host, "info", "sftp connect "+host+" ok")
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -137,6 +154,7 @@ func (c *Ctrl) Connect(host, user string) error {
 // Disconnect closes the ControlMaster connection for host.
 // On Windows it just clears the connected mark (per-command mode).
 func (c *Ctrl) Disconnect(host string) error {
+	c.logEvent(host, "info", "sftp disconnect "+host)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if isWindows {
@@ -267,28 +285,41 @@ func (c *Ctrl) writeBatch(dir string, content []byte) (string, error) {
 }
 
 func (c *Ctrl) List(host, user, path string) ([]Item, error) {
+	c.logEvent(host, "info", "sftp ls "+path)
 	batch, err := c.buildBatch("ls", path, "")
 	if err != nil {
+		c.logEvent(host, "error", "sftp ls failed: "+err.Error())
 		return nil, err
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
+		c.logEvent(host, "error", "sftp ls failed: "+commandErr(out))
 		return nil, fmt.Errorf("sftp ls %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp ls failed: "+commandErr(out))
 		return nil, fmt.Errorf("sftp ls failed: %s", commandErr(out))
 	}
-	return ParseLsLf(out.Stdout)
+	items, err := ParseLsLf(out.Stdout)
+	if err != nil {
+		c.logEvent(host, "error", "sftp ls parse failed: "+err.Error())
+		return nil, err
+	}
+	c.logEvent(host, "info", fmt.Sprintf("sftp ls done (%d items)", len(items)))
+	return items, nil
 }
 
 // Home returns the remote user's home directory by running `pwd`. The output
 // is the sftp prompt line followed by the absolute home path, which we extract.
 func (c *Ctrl) Home(host, user string) (string, error) {
+	c.logEvent(host, "info", "sftp pwd")
 	out, err := c.run(host, user, []byte("pwd\n"))
 	if err != nil {
+		c.logEvent(host, "error", "sftp pwd failed: "+commandErr(out))
 		return "", fmt.Errorf("sftp pwd %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp pwd failed: "+commandErr(out))
 		return "", fmt.Errorf("sftp pwd failed: %s", commandErr(out))
 	}
 	// pwd output: "sftp> pwd\nRemote working directory: <abs>\n" (or bare "<abs>")
@@ -322,94 +353,178 @@ func commandErr(out osutil.Outcome) string {
 	return s
 }
 
+// humanSize 将字节数格式化为可读大小(B/KB/MB/GB,保留 1 位小数)。
+func humanSize(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%d B", n)
+	}
+	v := float64(n)
+	for _, u := range []string{"KB", "MB", "GB", "TB"} {
+		v /= 1024
+		if v < 1024 {
+			return fmt.Sprintf("%.1f %s", v, u)
+		}
+	}
+	return fmt.Sprintf("%.1f PB", v/1024)
+}
+
+// remoteSize 通过一次 `sftp ls -la <file>` 查询远端单文件大小;
+// 路径不存在/是目录/查询失败时返回错误(日志降级为不带大小,不阻塞传输)。
+func (c *Ctrl) remoteSize(host, user, path string) (int64, error) {
+	batch, err := c.buildBatch("ls", path, "")
+	if err != nil {
+		return -1, err
+	}
+	out, err := c.run(host, user, batch)
+	if err != nil {
+		return -1, err
+	}
+	if out.ExitCode != 0 {
+		return -1, fmt.Errorf("ls exit %d", out.ExitCode)
+	}
+	items, err := ParseLsLf(out.Stdout)
+	if err != nil || len(items) != 1 || items[0].IsDir {
+		return -1, fmt.Errorf("not a regular file")
+	}
+	return items[0].Size, nil
+}
+
 func (c *Ctrl) Get(host, user, remote, local string) error {
+	msg := "sftp get " + remote + " → " + local
+	if size, err := c.remoteSize(host, user, remote); err == nil {
+		msg += fmt.Sprintf(" (%s)", humanSize(size))
+	}
+	c.logEvent(host, "info", msg)
 	batch, err := c.buildBatch("get", remote, local)
 	if err != nil {
+		c.logEvent(host, "error", "sftp get failed: "+err.Error())
 		return err
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
+		c.logEvent(host, "error", "sftp get failed: "+commandErr(out))
 		return fmt.Errorf("sftp get %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp get failed: "+commandErr(out))
 		return fmt.Errorf("sftp get failed: %s", commandErr(out))
 	}
+	done := "sftp get done"
+	if st, statErr := os.Stat(local); statErr == nil {
+		done += fmt.Sprintf(" (%s)", humanSize(st.Size()))
+	}
+	c.logEvent(host, "info", done)
 	return nil
 }
 
 // GetRecursive downloads a remote directory tree with `sftp get -r`.
 func (c *Ctrl) GetRecursive(host, user, remote, local string) error {
+	c.logEvent(host, "info", "sftp get -r "+remote+" → "+local+" (directory)")
 	batch, err := c.buildBatch("getr", remote, local)
 	if err != nil {
+		c.logEvent(host, "error", "sftp get -r failed: "+err.Error())
 		return err
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
+		c.logEvent(host, "error", "sftp get -r failed: "+commandErr(out))
 		return fmt.Errorf("sftp get -r %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp get -r failed: "+commandErr(out))
 		return fmt.Errorf("sftp get -r failed: %s", commandErr(out))
 	}
+	c.logEvent(host, "info", "sftp get -r done")
 	return nil
 }
 
 func (c *Ctrl) Put(host, user, local, remote string) error {
+	msg := "sftp put " + local + " → " + remote
+	size := int64(-1)
+	if st, err := os.Stat(local); err == nil {
+		size = st.Size()
+		msg += fmt.Sprintf(" (%s)", humanSize(size))
+	}
+	c.logEvent(host, "info", msg)
 	batch, err := c.buildBatch("put", remote, local)
 	if err != nil {
+		c.logEvent(host, "error", "sftp put failed: "+err.Error())
 		return err
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
+		c.logEvent(host, "error", "sftp put failed: "+commandErr(out))
 		return fmt.Errorf("sftp put %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp put failed: "+commandErr(out))
 		return fmt.Errorf("sftp put failed: %s", commandErr(out))
 	}
+	done := "sftp put done"
+	if size >= 0 {
+		done += fmt.Sprintf(" (%s)", humanSize(size))
+	}
+	c.logEvent(host, "info", done)
 	return nil
 }
 
 func (c *Ctrl) Remove(host, user, path string) error {
+	c.logEvent(host, "info", "sftp rm "+path)
 	batch, err := c.buildBatch("rm", path, "")
 	if err != nil {
+		c.logEvent(host, "error", "sftp rm failed: "+err.Error())
 		return err
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
+		c.logEvent(host, "error", "sftp rm failed: "+commandErr(out))
 		return fmt.Errorf("sftp rm %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp rm failed: "+commandErr(out))
 		return fmt.Errorf("sftp rm failed: %s", commandErr(out))
 	}
+	c.logEvent(host, "info", "sftp rm done")
 	return nil
 }
 
 func (c *Ctrl) Mkdir(host, user, path string) error {
+	c.logEvent(host, "info", "sftp mkdir "+path)
 	batch, err := c.buildBatch("mkdir", path, "")
 	if err != nil {
+		c.logEvent(host, "error", "sftp mkdir failed: "+err.Error())
 		return err
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
+		c.logEvent(host, "error", "sftp mkdir failed: "+commandErr(out))
 		return fmt.Errorf("sftp mkdir %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp mkdir failed: "+commandErr(out))
 		return fmt.Errorf("sftp mkdir failed: %s", commandErr(out))
 	}
+	c.logEvent(host, "info", "sftp mkdir done")
 	return nil
 }
 
 // Rename renames/moves a remote file or directory.
 func (c *Ctrl) Rename(host, user, oldPath, newPath string) error {
+	c.logEvent(host, "info", "sftp rename "+oldPath+" → "+newPath)
 	batch, err := c.buildBatch("rename", oldPath, newPath)
 	if err != nil {
+		c.logEvent(host, "error", "sftp rename failed: "+err.Error())
 		return err
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
+		c.logEvent(host, "error", "sftp rename failed: "+commandErr(out))
 		return fmt.Errorf("sftp rename %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp rename failed: "+commandErr(out))
 		return fmt.Errorf("sftp rename failed: %s", commandErr(out))
 	}
+	c.logEvent(host, "info", "sftp rename done")
 	return nil
 }

@@ -2,10 +2,12 @@ package sftp
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
+	"sshore/internal/forward"
 	"sshore/internal/osutil"
 )
 
@@ -50,7 +52,7 @@ func TestBuildBatchAndWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(b); got != `get "/remote/path" "/local/path"` + "\n" {
+	if got := string(b); got != `get "/remote/path" "/local/path"`+"\n" {
 		t.Fatalf("get batch wrong: %q", got)
 	}
 	p, err := c.writeBatch(dir, b)
@@ -239,5 +241,95 @@ func TestGetSurfacesStderr(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("recursive error should carry stderr detail, got: %v", err)
+	}
+}
+
+// SFTP 操作必须产生开始/完成事件(source_type=sftp, source_id=host),
+// 供日志面板展示——否则 SFTP 视图的日志面板形同虚设。
+func TestSftpEventsEmitted(t *testing.T) {
+	var mu sync.Mutex
+	var events []forward.Event
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, func(e forward.Event) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	})
+	if _, err := c.List("ai", "", "/home/lan"); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	mu.Lock()
+	got := append([]forward.Event(nil), events...)
+	mu.Unlock()
+	if len(got) < 2 {
+		t.Fatalf("expected start+done events, got %+v", got)
+	}
+	first := got[0]
+	if first.SourceType != "sftp" || first.SourceID != "ai" || first.Level != "info" || first.Message != "sftp ls /home/lan" {
+		t.Fatalf("unexpected first event: %+v", first)
+	}
+	last := got[len(got)-1]
+	if last.Level != "info" || !strings.HasPrefix(last.Message, "sftp ls done") {
+		t.Fatalf("expected done event, got %+v", last)
+	}
+}
+
+// 失败事件必须携带 sftp/ssh 的真实 stderr(如 Permission denied),
+// 而不是裸退出码。
+func TestSftpFailedEventCarriesStderr(t *testing.T) {
+	var events []forward.Event
+	c := NewCtrl(func(name string, args ...string) (osutil.Outcome, error) {
+		return osutil.Outcome{ExitCode: 1, Stderr: "Permission denied (publickey)"}, nil
+	}, func(e forward.Event) { events = append(events, e) })
+	if err := c.Get("ai", "", "/r/f", "/l/f"); err == nil {
+		t.Fatal("expected error")
+	}
+	if len(events) < 2 {
+		t.Fatalf("expected start+error events, got %+v", events)
+	}
+	last := events[len(events)-1]
+	if last.Level != "error" || !strings.Contains(last.Message, "Permission denied") {
+		t.Fatalf("expected error with stderr detail, got %+v", last)
+	}
+}
+
+func TestHumanSize(t *testing.T) {
+	cases := map[int64]string{
+		0:                  "0 B",
+		1023:               "1023 B",
+		2048:               "2.0 KB",
+		1024 * 1024:        "1.0 MB",
+		1536 * 1024:        "1.5 MB",
+		1024 * 1024 * 1024: "1.0 GB",
+	}
+	for in, want := range cases {
+		if got := humanSize(in); got != want {
+			t.Fatalf("humanSize(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// 路线 B(增强日志):put 的开始/完成日志携带本地文件大小。
+func TestPutLogsCarrySize(t *testing.T) {
+	var events []forward.Event
+	dir := t.TempDir()
+	local := filepath.Join(dir, "upload.bin")
+	if err := os.WriteFile(local, make([]byte, 2048), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, func(e forward.Event) { events = append(events, e) })
+	if err := c.Put("ai", "", local, "/remote/upload.bin"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("expected start+done events, got %+v", events)
+	}
+	if !strings.Contains(events[0].Message, "(2.0 KB)") {
+		t.Fatalf("start should carry size, got %q", events[0].Message)
+	}
+	last := events[len(events)-1]
+	if !strings.Contains(last.Message, "(2.0 KB)") {
+		t.Fatalf("done should carry size, got %q", last.Message)
 	}
 }

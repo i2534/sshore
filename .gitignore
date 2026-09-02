@@ -3,6 +3,9 @@ node_modules
 frontend/dist
 /sshkit
 
+# 本地 Go 构建缓存(绕过被污染的只读 GOMODCACHE)
+.gocache/
+
 # tool/index dirs
 .codegraph
 .omo
