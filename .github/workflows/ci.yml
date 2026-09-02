@@ -6,6 +6,12 @@ on:
     tags: ['v*']
   pull_request:
     branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '手动发布：构建后上传二进制到该 release tag'
+        required: false
+        type: string
 
 jobs:
   go:
@@ -86,7 +92,7 @@ jobs:
           path: build/bin/sshore.exe
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
     permissions:
@@ -98,12 +104,17 @@ jobs:
       - name: Publish binaries to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
+          if [ -z "$RELEASE_TAG" ]; then
+            echo "workflow_dispatch 需要 release_tag 输入" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
             --generate-notes \
             artifacts/sshore-linux/sshore \
             artifacts/sshore-windows/sshore.exe 2>/dev/null \
-          || gh release upload "$GITHUB_REF_NAME" \
+          || gh release upload "$RELEASE_TAG" \
             artifacts/sshore-linux/sshore \
             artifacts/sshore-windows/sshore.exe --clobber
