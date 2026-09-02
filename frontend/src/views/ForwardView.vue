@@ -167,7 +167,7 @@ onUnmounted(() => {
         <button @click="doImport">导入</button>
       </div>
     </div>
-    <div class="panel"><LogPanel :tunnels="tunnels" /></div>
+    <div class="panel"><LogPanel :tunnels="tunnels" :source-types="['tunnel', 'system']" /></div>
 
     <AppDialog
       :visible="dialog.visible"

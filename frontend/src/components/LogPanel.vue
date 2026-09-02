@@ -7,6 +7,10 @@ const props = defineProps({
   // 可选:隧道规则列表(forward 视图传入)。有值时显示"按规则过滤"chips,
   // 每个规则可单独切换到只看它自己的日志;SFTP 视图不传则仅保留手动过滤。
   tunnels: { type: Array, default: () => [] },
+  // 可选:只显示这些 source_type 的事件(如 ['tunnel'] / ['sftp']);
+  // 空数组 = 不过滤(全部类型)。无 source_type 的事件(视图本地错误)
+  // 始终显示。
+  sourceTypes: { type: Array, default: () => [] },
 })
 
 const logStore = useLogStore()
@@ -25,6 +29,13 @@ const displaySource = computed(() => {
   return t ? (t.name || t.host) : s
 })
 
+// 视图内可见日志:按 source_type 过滤(转发面板看不到 SFTP 日志,反之亦然)。
+const visibleLogs = computed(() => {
+  const out = logStore.filtered
+  if (!props.sourceTypes.length) return out
+  return out.filter(l => !l.source_type || props.sourceTypes.includes(l.source_type))
+})
+
 function toggleChip(id) {
   logStore.filterSource = logStore.filterSource === id ? '' : id
 }
@@ -40,8 +51,8 @@ function scrollToBottom() {
   if (el) el.scrollTop = el.scrollHeight
 }
 
-// 日志数量变化(filtered)时自动滚到底部(仅当用户停留在底部)。
-watch(() => logStore.filtered.length, async () => {
+// 日志数量变化(可见日志)时自动滚到底部(仅当用户停留在底部)。
+watch(() => visibleLogs.value.length, async () => {
   if (!stick.value) return
   await nextTick()
   scrollToBottom()
@@ -80,7 +91,7 @@ watch(() => [logStore.filterSource, logStore.filterLevel], async () => {
       <button @click="logStore.clear()">清空</button>
     </div>
     <div ref="linesEl" class="loglines" @scroll="onScroll">
-      <div v-for="(l, i) in logStore.filtered" :key="i" :class="'level-' + l.level">
+      <div v-for="(l, i) in visibleLogs" :key="i" :class="'level-' + l.level">
         {{ fmtLogTime(l.ts) }} [{{ l.level.toUpperCase() }}] {{ l.message }}
       </div>
     </div>

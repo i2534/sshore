@@ -401,7 +401,7 @@ onUnmounted(() => {
         @select="remoteSel = $event" @open="openRemote" @context="showMenu('remote', $event)" />
     </div>
     <TransferQueue :transfers="transfers" :now="now" />
-    <div class="logpane"><LogPanel /></div>
+    <div class="logpane"><LogPanel :source-types="['sftp', 'system']" /></div>
 
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
       <template v-if="menu.pane === 'remote'">
