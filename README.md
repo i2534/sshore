@@ -1,11 +1,13 @@
 # sshore
 
+**English** | [简体中文](README.zh-CN.md)
+
 Cross-platform SSH port-forward + SFTP manager. Built with Wails v2 (Go) + Vue 3.
 
 ## Requirements
 
 - Go 1.26
-- Node.js 20+
+- Node.js 22+ (LTS)
 - OpenSSH (`ssh`, `sftp`) on `PATH`
 - wails CLI (`go install github.com/wailsapp/wails/v2/cmd/wails@latest`)
 
@@ -47,7 +49,7 @@ wails dev
 ## Features
 
 - **SSH port forwarding**: local `-L`, remote `-R`, dynamic SOCKS `-D`, jump host `-J`
-- **SFTP file management**: browse / upload / download / delete / rename / mkdir
+- **SFTP file management**: browse / upload / download / recursive download / delete / rename / mkdir
 - **Config**: reads `~/.ssh/config` read-only (no credential storage); tunnel rules stored in
   `~/.config/sshore/sshore.toml` (`%APPDATA%\sshore\sshore.toml` on Windows)
 - **Import** a pasted `ssh -L/-R/-D ...` command into rules
@@ -61,7 +63,7 @@ wails dev
   authoritative fields via `ssh -G`) and read/write TOML config store
 - `internal/forward` — spawn/manage long-lived `ssh -N` subprocesses, lifecycle state
   machine, port pre-check, error classification
-- `internal/sftp` — one `sftp -b` process per operation, `ls -l` parsing
+- `internal/sftp` — one `sftp -b` process per operation, `ls -la` parsing
 - `internal/importer` — tokenize `ssh -L/-R/-D` command lines into rules (inject-safe)
 - `frontend/src` — Vue 3 UI (left-nav module switcher: Forward / SFTP) + Pinia log store
 
@@ -87,4 +89,4 @@ sshore relies on: `ssh -G` alias resolution, `-N -L` local forward binding, and
 ## CI
 
 `.github/workflows/ci.yml` runs on push/PR: `go vet`, Go tests (`-race`),
-frontend tests + build, and a Linux `wails build` (webkit2gtk-4.1).
+frontend tests + build, and a Linux `wails build` (webkit2gtk-4.1, UPX-compressed).
