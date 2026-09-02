@@ -6,4 +6,5 @@ frontend/dist
 # tool/index dirs
 .codegraph
 .omo
+.superpowers
 frontend/package.json.md5
