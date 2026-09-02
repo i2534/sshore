@@ -160,7 +160,7 @@ func makeTunnel(flag, spec, host, jump, user string, port int) (config.Tunnel, e
 	t := config.Tunnel{
 		ID: config.NewTunnelID(), Mode: mode, Host: host,
 		ProxyJump: jump, User: user, Port: port,
-		ListenBind: "127.0.0.1",
+		ListenBind:    "127.0.0.1",
 		AutoReconnect: true, // 导入规则与手建规则默认一致（前端 newTunnel 同为 true）
 	}
 	parts := splitSpec(spec)
@@ -185,6 +185,11 @@ func makeTunnel(flag, spec, host, jump, user string, port int) (config.Tunnel, e
 		t.TargetPort, _ = strconv.Atoi(parts[3])
 	default:
 		return t, fmt.Errorf("malformed %s spec %q", mode, spec)
+	}
+	// 空目标主机(如 `-L 23080::3080`)是历史坏规则来源:
+	// ssh 会解析空主机名失败 → 连接即 RST,而进程不退出 → 界面误报 connected。
+	if t.TargetHost == "" {
+		return t, fmt.Errorf("malformed %s spec %q: empty target host", mode, spec)
 	}
 	return t, nil
 }

@@ -16,6 +16,10 @@ const dotCls = computed(() =>
   : props.state === 'reconnecting' ? 'warn'
   : props.state === 'error' ? 'err' : 'off')
 
+function toggleLog() {
+  logStore.filterSource = logStore.filterSource === props.tunnel.id ? '' : props.tunnel.id
+}
+
 async function toggle() {
   busy.value = true
   try {
@@ -45,6 +49,7 @@ async function toggle() {
     <div class="actions">
       <button class="ghost" @click="emit('edit', tunnel)">编辑</button>
       <button class="ghost danger" @click="emit('delete', tunnel)">删除</button>
+      <button class="ghost" :class="{ on: logStore.filterSource === tunnel.id }" @click="toggleLog">日志</button>
       <button :disabled="busy" @click="toggle">
         {{ tunnel.enabled ? '停止' : '启动' }}
       </button>
@@ -65,4 +70,5 @@ async function toggle() {
 button.ghost { background: transparent; border-color: var(--border); color: var(--text-dim); }
 button.ghost:hover { background: var(--surface-hover); color: var(--text); }
 button.ghost.danger:hover { color: var(--danger); border-color: var(--danger); }
+button.ghost.on { color: var(--accent); border-color: var(--accent); }
 </style>

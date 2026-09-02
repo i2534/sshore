@@ -130,3 +130,14 @@ func TestParseSetsAutoReconnectDefault(t *testing.T) {
 		t.Fatalf("imported tunnel must default AutoReconnect=true, got %+v", tunnels)
 	}
 }
+
+// 空目标主机(`-L 23080::3080`)必须拒绝导入——它是历史坏规则的根源:
+// ssh 解析空主机名失败 → 连接即 RST 而进程不退出 → 界面误报 connected。
+func TestParseRejectsEmptyTargetHost(t *testing.T) {
+	if _, err := Parse("ssh -N -L 23080::3080 ai"); err == nil {
+		t.Fatal("3-part spec with empty target host must be rejected")
+	}
+	if _, err := Parse("ssh -N -L 127.0.0.1:23080::3080 ai"); err == nil {
+		t.Fatal("4-part spec with empty target host must be rejected")
+	}
+}

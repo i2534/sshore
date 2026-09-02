@@ -17,7 +17,7 @@ import (
 
 func base() config.Tunnel {
 	return config.Tunnel{
-		ID: "abc", Name: "t", Host: "prod-db",
+		ID: "abc", Name: "t", Host: "prod-db", Mode: "local",
 		ListenBind: "127.0.0.1", ListenPort: 5432,
 		TargetHost: "127.0.0.1", TargetPort: 5432,
 	}
@@ -32,7 +32,7 @@ func expect(t *testing.T, got, want []string) {
 
 func TestBuildArgsLocal(t *testing.T) {
 	expect(t, BuildArgs(base()),
-		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ExitOnForwardFailure=yes",
 			"-L", "127.0.0.1:5432:127.0.0.1:5432", "prod-db"})
 }
 
@@ -40,7 +40,7 @@ func TestBuildArgsRemote(t *testing.T) {
 	c := base()
 	c.Mode = "remote"
 	expect(t, BuildArgs(c),
-		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ExitOnForwardFailure=yes",
 			"-R", "127.0.0.1:5432:127.0.0.1:5432", "prod-db"})
 }
 
@@ -48,7 +48,7 @@ func TestBuildArgsDynamic(t *testing.T) {
 	c := base()
 	c.Mode = "dynamic"
 	expect(t, BuildArgs(c),
-		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ExitOnForwardFailure=yes",
 			"-D", "127.0.0.1:5432", "prod-db"})
 }
 
@@ -58,7 +58,7 @@ func TestBuildArgsUserAndPort(t *testing.T) {
 	c.User = "bob"
 	c.Port = 2222
 	expect(t, BuildArgs(c),
-		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ExitOnForwardFailure=yes",
 			"-p", "2222", "-l", "bob",
 			"-L", "127.0.0.1:5432:127.0.0.1:5432", "prod-db"})
 }
@@ -77,7 +77,7 @@ func TestBuildArgsProxyJump(t *testing.T) {
 	c := base()
 	c.ProxyJump = "bastion"
 	expect(t, BuildArgs(c),
-		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+		[]string{"ssh", "-N", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ExitOnForwardFailure=yes",
 			"-L", "127.0.0.1:5432:127.0.0.1:5432", "-J", "bastion", "prod-db"})
 }
 
@@ -94,7 +94,7 @@ func TestStartInvalidHost(t *testing.T) {
 	var emitted []Event
 	tr := config.Tunnel{ID: "x", Host: "-oProxyCommand=evil", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 1}
 	called := false
-	sp := fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+	sp := &fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 		called = true
 		return &osutil.Process{}, nil
 	}}
@@ -110,12 +110,18 @@ func TestStartInvalidHost(t *testing.T) {
 	}
 }
 
-// fakeSpawner implements osutil.Spawner for tests.
+// fakeSpawner implements osutil.Spawner for tests. It captures the most
+// recent stderr callback so tests can simulate child output lines.
 type fakeSpawner struct {
 	startFunc func(name string, args ...string) (*osutil.Process, error)
+	onLine    func(string)
 }
 
-func (f fakeSpawner) Start(name string, args ...string) (*osutil.Process, error) {
+func (f *fakeSpawner) Start(name string, args []string, onLine func(string)) (*osutil.Process, error) {
+	f.onLine = onLine
+	if f.startFunc == nil {
+		return &osutil.Process{}, nil
+	}
 	return f.startFunc(name, args...)
 }
 
@@ -128,16 +134,16 @@ func exitProcess(t *testing.T, code int) (*osutil.Process, error) {
 	if runtime.GOOS == "windows" {
 		name, args = "cmd", []string{"/c", "exit", strconv.Itoa(code)}
 	}
-	return osutil.NewSpawner().Start(name, args...)
+	return osutil.NewSpawner().Start(name, args, nil)
 }
 
 // aliveProcess 启动一个存活约 30s 的真实进程，用于测试“仍在运行”的隧道。
 func aliveProcess(t *testing.T) (*osutil.Process, error) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
-		return osutil.NewSpawner().Start("cmd", "/c", "timeout", "/t", "30", "/nobreak")
+		return osutil.NewSpawner().Start("cmd", []string{"/c", "timeout", "/t", "30", "/nobreak"}, nil)
 	}
-	return osutil.NewSpawner().Start("sh", "-c", "sleep 30")
+	return osutil.NewSpawner().Start("sh", []string{"-c", "sleep 30"}, nil)
 }
 
 // freePort 返回一个当前空闲的本地端口（与既有端口测试同款取法）。
@@ -158,7 +164,7 @@ func TestStartMonitorsProcessExit(t *testing.T) {
 	var mu sync.Mutex
 	var emitted []Event
 	ctrl := NewCtrl(
-		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		&fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 			return exitProcess(t, 1)
 		}},
 		func(e Event) {
@@ -199,7 +205,7 @@ func TestStartTwiceRejectsSecond(t *testing.T) {
 	var mu sync.Mutex
 	var emitted []Event
 	ctrl := NewCtrl(
-		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		&fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 			return aliveProcess(t)
 		}},
 		func(e Event) {
@@ -302,7 +308,7 @@ func TestAutoReconnectSuccessAfterFirstRetry(t *testing.T) {
 	var slept []time.Duration
 	calls := 0
 	ctrl := NewCtrl(
-		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		&fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 			mu.Lock()
 			calls++
 			n := calls
@@ -381,7 +387,7 @@ func TestAutoReconnectBackoffSequenceAcrossRetries(t *testing.T) {
 	var slept []time.Duration
 	calls := 0
 	ctrl := NewCtrl(
-		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		&fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 			mu.Lock()
 			calls++
 			n := calls
@@ -520,7 +526,7 @@ func TestAutoReconnectStopDuringBackoff(t *testing.T) {
 	calls := 0
 	release := make(chan struct{}) // 手控第一段退避等待
 	ctrl := NewCtrl(
-		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		&fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 			mu.Lock()
 			calls++
 			n := calls
@@ -575,7 +581,7 @@ func TestRespawnOrphanKilledWhenEntryReplaced(t *testing.T) {
 	var secondProc *osutil.Process
 	var mu sync.Mutex
 	ctrl := NewCtrl(
-		fakeSpawner{}, // startFunc 稍后注入（需要引用 ctrl）
+		&fakeSpawner{}, // startFunc 稍后注入（需要引用 ctrl）
 		func(e Event) {},
 		func(d time.Duration) <-chan struct{} {
 			ch := make(chan struct{})
@@ -583,7 +589,7 @@ func TestRespawnOrphanKilledWhenEntryReplaced(t *testing.T) {
 			return ch
 		},
 	)
-	sp := fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+	sp := &fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 		mu.Lock()
 		calls++
 		n := calls
@@ -656,7 +662,7 @@ func TestRespawnNoResurrectionAfterStopDuringSpawn(t *testing.T) {
 	var respawnedProc *osutil.Process
 	var mu sync.Mutex
 	ctrl := NewCtrl(
-		fakeSpawner{},
+		&fakeSpawner{},
 		func(e Event) {},
 		func(d time.Duration) <-chan struct{} {
 			ch := make(chan struct{})
@@ -664,7 +670,7 @@ func TestRespawnNoResurrectionAfterStopDuringSpawn(t *testing.T) {
 			return ch
 		},
 	)
-	sp := fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+	sp := &fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 		mu.Lock()
 		calls++
 		n := calls
@@ -735,7 +741,7 @@ func TestAutoReconnectStableResetAfter60s(t *testing.T) {
 	var emitted []Event
 	calls := 0
 	ctrl := NewCtrl(
-		fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		&fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 			mu.Lock()
 			calls++
 			n := calls
@@ -834,13 +840,13 @@ func TestRespawnWaitWindowExternalStartSupersedes(t *testing.T) {
 	var mu sync.Mutex
 	hold := make(chan struct{}) // 手控退避等待：制造“卡在等待窗口”的窗口
 	ctrl := NewCtrl(
-		fakeSpawner{},
+		&fakeSpawner{},
 		func(e Event) {},
 		func(d time.Duration) <-chan struct{} {
 			return hold
 		},
 	)
-	sp := fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+	sp := &fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 		mu.Lock()
 		calls++
 		n := calls
@@ -906,5 +912,60 @@ func TestRespawnWaitWindowExternalStartSupersedes(t *testing.T) {
 	case <-done:
 		t.Fatal("external start's alive process was killed — must not be treated as orphan")
 	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// TestSSHLineLevel 校验 ssh stderr 行的级别粗分。
+func TestSSHLineLevel(t *testing.T) {
+	cases := []struct{ line, want string }{
+		{"Warning: untrusted host key", "warn"},
+		{"channel 0: open failed: connect failed", "error"},
+		{"Permission denied (publickey)", "error"},
+		{"connect to host x port 22: Connection refused", "error"},
+		{"debug1: client_input_channel_open", "info"},
+	}
+	for _, c := range cases {
+		if got := sshLineLevel(c.line); got != c.want {
+			t.Fatalf("sshLineLevel(%q) = %q, want %q", c.line, got, c.want)
+		}
+	}
+}
+
+// TestSpawnStderrForwardedToEvents 验证 spawn 时收到的 stderr 回调
+// 以规则事件形式进入日志流,Level 按内容粗分:
+// 这正是“隧道目标失败但进程不退”场景的唯一可观测渠道。
+func TestSpawnStderrForwardedToEvents(t *testing.T) {
+	var emitted []Event
+	sp := &fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
+		return &osutil.Process{}, nil
+	}}
+	ctrl := NewCtrl(sp, func(e Event) { emitted = append(emitted, e) }, nil)
+	tr := base()
+	tr.ListenPort = freePort(t) // 预检可能被本机占用端口拦截,用空闲端口
+	if err := ctrl.Start(tr); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if sp.onLine == nil {
+		t.Fatal("spawner should have received the stderr callback")
+	}
+	sp.onLine("Warning: server host key changed")
+	sp.onLine("channel 0: open failed: connect failed")
+	var warn, errLv, info int
+	for _, e := range emitted {
+		if e.SourceID != "abc" || e.SourceType != "tunnel" {
+			t.Fatalf("unexpected event: %+v", e)
+		}
+		switch e.Level {
+		case "warn":
+			warn++
+		case "error":
+			errLv++
+		case "info":
+			info++
+		}
+	}
+	if warn < 1 || errLv < 1 || info < 1 {
+		t.Fatalf("expected info+warning+error events, got warn=%d err=%d info=%d emitted=%+v",
+			warn, errLv, info, emitted)
 	}
 }

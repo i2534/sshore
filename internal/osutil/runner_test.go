@@ -28,7 +28,7 @@ func TestExecResult(t *testing.T) {
 
 func TestSpawnerStartKill(t *testing.T) {
 	sp := NewSpawner()
-	p, err := sp.Start("sleep", "30")
+	p, err := sp.Start("sleep", []string{"30"}, nil)
 	if err != nil {
 		t.Fatalf("spawn failed: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestSpawnerStartKill(t *testing.T) {
 
 func TestProcessSignal(t *testing.T) {
 	sp := NewSpawner()
-	p, err := sp.Start("sleep", "30")
+	p, err := sp.Start("sleep", []string{"30"}, nil)
 	if err != nil {
 		t.Fatalf("spawn failed: %v", err)
 	}
@@ -53,4 +53,23 @@ func TestProcessSignal(t *testing.T) {
 	}
 	_ = p.Kill()
 	_ = p.Wait()
+}
+
+// TestSpawnerStderrLines 验证 stderr 逐行回调:每行去空白、空行被丢弃、
+// 行顺序与进程输出一致。
+func TestSpawnerStderrLines(t *testing.T) {
+	sp := NewSpawner()
+	var lines []string
+	p, err := sp.Start("sh", []string{"-c", "echo one >&2; echo >&2; echo '  two  ' >&2"},
+		func(line string) { lines = append(lines, line) })
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
+	out := p.Wait()
+	if out.ExitCode != 0 {
+		t.Fatalf("want exit 0 got %d", out.ExitCode)
+	}
+	if len(lines) != 2 || lines[0] != "one" || lines[1] != "two" {
+		t.Fatalf("unexpected lines: %#v", lines)
+	}
 }

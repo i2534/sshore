@@ -1,9 +1,11 @@
 package osutil
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"os/exec"
+	"strings"
 )
 
 type Outcome struct {
@@ -36,8 +38,10 @@ type Process struct {
 
 // Spawner abstracts starting and killing a long-lived process (forward only).
 // Start is NON-BLOCKING: it launches the process and returns immediately with a Process.
+// onLine receives each non-empty trimmed line of the child's stderr, allowing
+// callers to surface real ssh/sftp errors in the UI without waiting for exit.
 type Spawner interface {
-	Start(name string, args ...string) (*Process, error)
+	Start(name string, args []string, onLine func(string)) (*Process, error)
 }
 
 // NewSpawner returns a Spawner backed by os/exec.
@@ -47,10 +51,25 @@ func NewSpawner() Spawner {
 
 type realSpawner struct{}
 
-func (realSpawner) Start(name string, args ...string) (*Process, error) {
+func (realSpawner) Start(name string, args []string, onLine func(string)) (*Process, error) {
 	cmd := exec.Command(name, args...)
 	procAttrHideConsole(cmd)
 	p := &Process{cmd: cmd, done: make(chan Outcome, 1)}
+	if onLine != nil {
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			return p, err
+		}
+		go func() {
+			sc := bufio.NewScanner(stderr)
+			for sc.Scan() {
+				line := strings.TrimSpace(sc.Text())
+				if line != "" {
+					onLine(line)
+				}
+			}
+		}()
+	}
 	if err := cmd.Start(); err != nil {
 		return p, err
 	}

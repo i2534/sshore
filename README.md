@@ -53,7 +53,13 @@ wails dev
 - **Config**: reads `~/.ssh/config` read-only (no credential storage); tunnel rules stored in
   `~/.config/sshore/sshore.toml` (`%APPDATA%\sshore\sshore.toml` on Windows)
 - **Import** a pasted `ssh -L/-R/-D ...` command into rules
-- **Live log panel**: in-memory ring buffer (1000 entries) of tunnel/SFTP events
+- **Live log panel**: in-memory ring buffer (1000 entries) of tunnel/SFTP events;
+  per-rule log filtering (card button / panel chips), with ssh child-process
+  stderr streamed line-by-line into the panel
+- **Rule validation**: create/edit/import rejects an empty target host
+  (`-L 23080::3080` makes ssh fail name resolution: connections reset while the
+  process stays alive and the state wrongly shows connected); `ExitOnForwardFailure`
+  puts local/remote tunnels into `error` state when forwarding cannot be set up
 - Uses system OpenSSH for auth (keys/agent/config), so password/keyboard-interactive
   auth is not supported in the GUI — configure key or agent auth for your hosts
 

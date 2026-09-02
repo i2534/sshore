@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +53,9 @@ func BuildArgs(t config.Tunnel) []string {
 		"-o", "ConnectTimeout=10",
 		"-o", "BatchMode=yes",
 		"-o", "IdentitiesOnly=yes",
+		// 本地/远程转发绑定失败时直接退出(spec: 默认 no 会静默继续,
+		// 造成“进程活着但没有端口”的 connected 假象)。
+		"-o", "ExitOnForwardFailure=yes",
 	}
 	// H1: 导入规则可能携带非默认端口/用户，需在转发参数前生效
 	if t.Port != 0 {
@@ -187,9 +191,9 @@ func (c *Ctrl) Start(t config.Tunnel) error {
 	}
 	c.mu.Unlock()
 
-	if !ValidateHost(t.Host) {
+	if err := ValidateTunnel(t); err != nil {
 		c.setState(t.ID, StateError)
-		return fmt.Errorf("invalid host alias %q", t.Host)
+		return fmt.Errorf("%s: %s", t.Name, err)
 	}
 
 	c.mu.Lock()
@@ -234,7 +238,28 @@ func (c *Ctrl) trySpawn(t config.Tunnel) (*osutil.Process, error) {
 		return nil, fmt.Errorf("local port %s:%d already in use", t.ListenBind, t.ListenPort)
 	}
 	spawnArgs := args[1:]
-	return c.spawner.Start("ssh", spawnArgs...)
+	return c.spawner.Start("ssh", spawnArgs, func(line string) {
+		c.emitEvent(t.ID, sshLineLevel(line), line)
+	})
+}
+
+// sshLineLevel 对 ssh 子进程的 stderr 行做粗略分级：
+// warning 类 → warn；关键失败词(错误/失败/被拒/不可达) → error；
+// 其余(如信息性输出)保持 info。
+func sshLineLevel(line string) string {
+	l := strings.ToLower(line)
+	switch {
+	case strings.Contains(l, "warning"):
+		return "warn"
+	case strings.Contains(l, "error"),
+		strings.Contains(l, "failed"),
+		strings.Contains(l, "denied"),
+		strings.Contains(l, "refused"),
+		strings.Contains(l, "unable"):
+		return "error"
+	default:
+		return "info"
+	}
 }
 
 // watchExit 监控一次成功 spawn 的进程：意外退出时按 AutoReconnect 分流——
