@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"sshkit/internal/osutil"
+	"sshore/internal/osutil"
 )
 
 // fakeRunner records every (name, args) invocation so tests can assert on the
@@ -75,7 +75,8 @@ func TestBuildBatchQuoting(t *testing.T) {
 	cases := []struct {
 		op, remote, local, want string
 	}{
-		{"ls", "/remote/dir with spaces", "", `ls -l "/remote/dir with spaces"` + "\n"},
+		{"ls", "/remote/dir with spaces", "", `ls -la "/remote/dir with spaces"` + "\n"},
+		{"getr", "/remote/my dir", "/local/dst/my dir", `get -r "/remote/my dir" "/local/dst/my dir"` + "\n"},
 		{"get", "/remote/a\"b", "/local/c\\d", `get "/remote/a\"b" "/local/c\\d"` + "\n"},
 		{"put", "/remote/path", `C:\Users\foo bar\file.txt`, `put "C:\\Users\\foo bar\\file.txt" "/remote/path"` + "\n"},
 		{"rm", "/remote/x", "", `rm "/remote/x"` + "\n"},
@@ -198,7 +199,6 @@ func TestDisconnectArgsIncludeConnectTimeout(t *testing.T) {
 }
 
 func TestCommandErr(t *testing.T) {
-	// stderr takes priority
 	if got := commandErr(osutil.Outcome{Stderr: "  Host key verification failed.  ", ExitCode: 255}); got != "Host key verification failed." {
 		t.Fatalf("stderr trimmed wrong: %q", got)
 	}
@@ -209,5 +209,35 @@ func TestCommandErr(t *testing.T) {
 	// both empty -> exit code
 	if got := commandErr(osutil.Outcome{ExitCode: 255}); got != "exit 255" {
 		t.Fatalf("exit fallback wrong: %q", got)
+	}
+}
+
+// TestGetSurfacesStderr verifies the fix: when sftp exits non-zero, the
+// returned error must carry the real stderr (e.g. "File ... not found."),
+// not a bare "exit status 1".
+func TestGetSurfacesStderr(t *testing.T) {
+	failRunner := func(name string, args ...string) (osutil.Outcome, error) {
+		// Simulate `sftp` exiting 1 with a diagnostic on stderr.
+		return osutil.Outcome{Stderr: `File "/remote/nope.txt" not found.`, ExitCode: 1}, nil
+	}
+	c := NewCtrl(failRunner, nil)
+	err := c.Get("myhost", "", "/remote/nope.txt", "/local/nope.txt")
+	if err == nil {
+		t.Fatal("expected error for failed get")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("error should carry stderr detail, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "exit status 1") {
+		t.Fatalf("error should not be a bare exit status, got: %v", err)
+	}
+
+	// Recursive directory download failure likewise surfaces stderr.
+	err = c.GetRecursive("myhost", "", "/remote/dir", "/local/dir")
+	if err == nil {
+		t.Fatal("expected error for failed recursive get")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("recursive error should carry stderr detail, got: %v", err)
 	}
 }

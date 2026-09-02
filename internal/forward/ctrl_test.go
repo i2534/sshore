@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"sshkit/internal/config"
-	"sshkit/internal/osutil"
+	"sshore/internal/config"
+	"sshore/internal/osutil"
 )
 
 func base() config.Tunnel {

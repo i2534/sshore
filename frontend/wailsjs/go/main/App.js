@@ -90,6 +90,10 @@ export function SftpGet(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['SftpGet'](arg1, arg2, arg3, arg4);
 }
 
+export function SftpGetDir(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['SftpGetDir'](arg1, arg2, arg3, arg4);
+}
+
 export function SftpHome(arg1) {
   return window['go']['main']['App']['SftpHome'](arg1);
 }

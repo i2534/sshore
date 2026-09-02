@@ -10,11 +10,11 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
-	"sshkit/internal/config"
-	"sshkit/internal/forward"
-	"sshkit/internal/importer"
-	"sshkit/internal/osutil"
-	"sshkit/internal/sftp"
+	"sshore/internal/config"
+	"sshore/internal/forward"
+	"sshore/internal/importer"
+	"sshore/internal/osutil"
+	"sshore/internal/sftp"
 )
 
 type App struct {
@@ -292,6 +292,14 @@ func (a *App) SftpList(host, user, path string) ([]sftp.Item, error) {
 }
 func (a *App) SftpGet(host, user, remote, local string) error {
 	if err := a.sftp.Get(host, user, remote, local); err != nil {
+		return err
+	}
+	a.recordRecentSFTP(host, filepath.Dir(remote), filepath.Dir(local))
+	return nil
+}
+// SftpGetDir recursively downloads a remote directory tree (`sftp get -r`).
+func (a *App) SftpGetDir(host, user, remote, local string) error {
+	if err := a.sftp.GetRecursive(host, user, remote, local); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, filepath.Dir(remote), filepath.Dir(local))

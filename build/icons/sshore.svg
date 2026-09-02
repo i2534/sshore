@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- 背景：深海蓝 → 青绿 渐变 -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"  stop-color="#0A1F3D"/>
+      <stop offset="0.55" stop-color="#0D3A4A"/>
+      <stop offset="1"   stop-color="#157A72"/>
+    </linearGradient>
+    <!-- 右上高光 -->
+    <radialGradient id="glow" cx="0.72" cy="0.18" r="0.75">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <!-- 终端窗口背景 -->
+    <linearGradient id="win" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"  stop-color="#12314A"/>
+      <stop offset="1"  stop-color="#081B33"/>
+    </linearGradient>
+    <!-- 提示符强调色渐变 -->
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5BF0D0"/>
+      <stop offset="1" stop-color="#2EC4B6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 背景圆角方形 -->
+  <rect x="24" y="24" width="976" height="976" rx="216" fill="url(#bg)"/>
+  <rect x="24" y="24" width="976" height="976" rx="216" fill="url(#glow)"/>
+
+  <!-- 终端窗口 -->
+  <rect x="152" y="256" width="720" height="512" rx="76" fill="url(#win)" stroke="rgba(255,255,255,0.10)" stroke-width="4"/>
+
+  <!-- 窗口顶部内高光条 -->
+  <rect x="152" y="256" width="720" height="10" rx="5" fill="rgba(255,255,255,0.06)"/>
+
+  <!-- 标题栏三圆点 -->
+  <circle cx="216" cy="318" r="15" fill="#FF5F57"/>
+  <circle cx="260" cy="318" r="15" fill="#FEBC2E"/>
+  <circle cx="304" cy="318" r="15" fill="#28C840"/>
+
+  <!-- 终端提示符 ❯ (加粗 V 形) -->
+  <path d="M330 400 L502 512 L330 624" fill="none" stroke="url(#accent)"
+        stroke-width="84" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- 光标 _ (圆角块) -->
+  <rect x="556" y="560" width="206" height="88" rx="44" fill="url(#accent)"/>
+
+  <!-- 底部海岸波纹(shore) -->
+  <path d="M292 848 q44 -22 88 0 t88 0 t88 0 t88 0" fill="none"
+        stroke="#8FF0DD" stroke-opacity="0.40" stroke-width="10" stroke-linecap="round"/>
+  <path d="M260 900 q40 -18 80 0 t80 0 t80 0 t80 0 t80 0" fill="none"
+        stroke="#8FF0DD" stroke-opacity="0.24" stroke-width="8" stroke-linecap="round"/>
+</svg>

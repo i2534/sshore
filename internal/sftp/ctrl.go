@@ -11,8 +11,8 @@ import (
 	"time"
 	"unicode"
 
-	"sshkit/internal/forward"
-	"sshkit/internal/osutil"
+	"sshore/internal/forward"
+	"sshore/internal/osutil"
 )
 
 // isWindows: Windows OpenSSH has no ControlMaster/-f support, so connection
@@ -28,7 +28,7 @@ type Ctrl struct {
 }
 
 func NewCtrl(r osutil.Runner, emit forward.EmitFunc) *Ctrl {
-	return &Ctrl{runner: r, emit: emit, controlDir: filepath.Join(os.TempDir(), "sshkit-sftp-ctrl"), active: map[string]bool{}}
+	return &Ctrl{runner: r, emit: emit, controlDir: filepath.Join(os.TempDir(), "sshore-sftp-ctrl"), active: map[string]bool{}}
 }
 
 // controlPathFor returns a per-host ControlMaster socket path (URL-encoded so
@@ -41,7 +41,7 @@ func (c *Ctrl) controlPathFor(host string) string {
 }
 
 func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
-	dir, err := os.MkdirTemp("", "sshkit-sftp")
+	dir, err := os.MkdirTemp("", "sshore-sftp")
 	if err != nil {
 		return osutil.Outcome{}, err
 	}
@@ -191,7 +191,8 @@ func (c *Ctrl) buildBatch(op, remote, local string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return []byte(fmt.Sprintf("ls -l %s\n", r)), nil
+		// -a includes hidden entries (dotfiles); ParseLsLf filters out "."/"..".
+		return []byte(fmt.Sprintf("ls -la %s\n", r)), nil
 	case "get":
 		r, err := quoteArg(remote)
 		if err != nil {
@@ -202,6 +203,17 @@ func (c *Ctrl) buildBatch(op, remote, local string) ([]byte, error) {
 			return nil, err
 		}
 		return []byte(fmt.Sprintf("get %s %s\n", r, l)), nil
+	case "getr":
+		// Recursive directory download; sftp creates the local target dir.
+		r, err := quoteArg(remote)
+		if err != nil {
+			return nil, err
+		}
+		l, err := quoteArg(local)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("get -r %s %s\n", r, l)), nil
 	case "put":
 		r, err := quoteArg(remote)
 		if err != nil {
@@ -240,7 +252,7 @@ func (c *Ctrl) buildBatch(op, remote, local string) ([]byte, error) {
 }
 
 func (c *Ctrl) writeBatch(dir string, content []byte) (string, error) {
-	f, err := os.CreateTemp(dir, "sshkit-sftp-*.bat")
+	f, err := os.CreateTemp(dir, "sshore-sftp-*.bat")
 	if err != nil {
 		return "", err
 	}
@@ -317,10 +329,26 @@ func (c *Ctrl) Get(host, user, remote, local string) error {
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
-		return err
+		return fmt.Errorf("sftp get %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("sftp get failed: %s", out.Stderr)
+		return fmt.Errorf("sftp get failed: %s", commandErr(out))
+	}
+	return nil
+}
+
+// GetRecursive downloads a remote directory tree with `sftp get -r`.
+func (c *Ctrl) GetRecursive(host, user, remote, local string) error {
+	batch, err := c.buildBatch("getr", remote, local)
+	if err != nil {
+		return err
+	}
+	out, err := c.run(host, user, batch)
+	if err != nil {
+		return fmt.Errorf("sftp get -r %s: %w (%s)", host, err, commandErr(out))
+	}
+	if out.ExitCode != 0 {
+		return fmt.Errorf("sftp get -r failed: %s", commandErr(out))
 	}
 	return nil
 }
@@ -332,10 +360,10 @@ func (c *Ctrl) Put(host, user, local, remote string) error {
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
-		return err
+		return fmt.Errorf("sftp put %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("sftp put failed: %s", out.Stderr)
+		return fmt.Errorf("sftp put failed: %s", commandErr(out))
 	}
 	return nil
 }
@@ -347,10 +375,10 @@ func (c *Ctrl) Remove(host, user, path string) error {
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
-		return err
+		return fmt.Errorf("sftp rm %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("sftp rm failed: %s", out.Stderr)
+		return fmt.Errorf("sftp rm failed: %s", commandErr(out))
 	}
 	return nil
 }
@@ -362,10 +390,10 @@ func (c *Ctrl) Mkdir(host, user, path string) error {
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
-		return err
+		return fmt.Errorf("sftp mkdir %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("sftp mkdir failed: %s", out.Stderr)
+		return fmt.Errorf("sftp mkdir failed: %s", commandErr(out))
 	}
 	return nil
 }
@@ -378,10 +406,10 @@ func (c *Ctrl) Rename(host, user, oldPath, newPath string) error {
 	}
 	out, err := c.run(host, user, batch)
 	if err != nil {
-		return err
+		return fmt.Errorf("sftp rename %s: %w (%s)", host, err, commandErr(out))
 	}
 	if out.ExitCode != 0 {
-		return fmt.Errorf("sftp rename failed: %s", out.Stderr)
+		return fmt.Errorf("sftp rename failed: %s", commandErr(out))
 	}
 	return nil
 }

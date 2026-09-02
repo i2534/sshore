@@ -1,4 +1,4 @@
-module sshkit
+module sshore
 
 go 1.26
 

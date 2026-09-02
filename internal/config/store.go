@@ -108,7 +108,7 @@ func DefaultConfigPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "sshkit", "sshkit.toml"), nil
+	return filepath.Join(dir, "sshore", "sshore.toml"), nil
 }
 
 // NewTunnelID returns a random 16-byte hex id.

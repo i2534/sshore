@@ -16,7 +16,9 @@ type Item struct {
 	ModTime string `json:"modTime"`
 }
 
-// ParseLsLf parses `ls -l` output. The leading "total N" line is skipped.
+// ParseLsLf parses `ls -la` output. The leading "total N" line is skipped,
+// and the "." / ".." pseudo-entries (present with -a) are dropped — the
+// frontend renders its own ".." navigation row.
 // Format per entry: mode links owner group size MMM DD [HH:MM|YYYY] name
 func ParseLsLf(output string) ([]Item, error) {
 	var items []Item
@@ -35,6 +37,9 @@ func ParseLsLf(output string) ([]Item, error) {
 		// fields[5] onward = "MMM DD time|year name" (name may contain spaces)
 		rest := strings.TrimSpace(strings.Join(fields[5:], " "))
 		name := nameAfterDate(rest)
+		if name == "." || name == ".." {
+			continue
+		}
 		items = append(items, Item{
 			Name:    name,
 			Size:    size,

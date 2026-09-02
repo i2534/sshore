@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net"
 
-	"sshkit/internal/config"
+	"sshore/internal/config"
 )
 
 // CheckLocalPort reports whether a TCP port on bind is available (bindable).

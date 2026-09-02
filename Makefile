@@ -1,4 +1,4 @@
-# sshkit build targets (Wails v2). Cross-platform build via `wails build -platform`.
+# sshore build targets (Wails v2). Cross-platform build via `wails build -platform`.
 #
 # Linux native builds need webkit2gtk. This host only has webkit2gtk-4.1, so the
 # linux target adds the `webkit2_41` build tag (Wails picks webkit2gtk-4.1 then).
@@ -12,7 +12,22 @@ WAILS  := $(shell $(GO) env GOPATH)/bin/wails
 WEBKIT_TAG ?= webkit2_41
 
 BINDIR   := build/bin
-OUTNAME  := sshkit
+OUTNAME  := sshore
+
+# --- size optimization ------------------------------------------------------
+# Always strip symbols/DWARF (-s -w, via -ldflags) and file paths (-trimpath is
+# a go-build-level flag, passed to `wails build` as -trimpath, NOT inside
+# -ldflags — go build rejects it there): no runtime cost, small free saving.
+LDFLAGS    := -s -w
+TRIMPATH   := -trimpath
+# UPX-compress the final binaries (~63% smaller). Default on; set COMPRESS=0
+# to disable (e.g. to avoid antivirus false positives or for faster startup).
+COMPRESS ?= 1
+ifeq ($(COMPRESS),1)
+UPX_OPT  := -upx
+else
+UPX_OPT  :=
+endif
 
 .PHONY: help all dev build run linux windows clean test vet fmt e2e ci
 
@@ -29,7 +44,7 @@ dev:
 
 ## Build for the current platform (with webkit tag on linux; no re-package).
 build:
-	$(WAILS) build -skipbindings -clean -nopackage $(if $(WEBKIT_TAG),-tags $(WEBKIT_TAG),)
+	$(WAILS) build -skipbindings -clean -nopackage -ldflags "$(LDFLAGS)" $(TRIMPATH) $(UPX_OPT) $(if $(WEBKIT_TAG),-tags $(WEBKIT_TAG),)
 
 ## Build and run the app for the current platform's binary.
 run: build
@@ -37,11 +52,13 @@ run: build
 
 ## Build Linux amd64 binary.
 linux:
-	$(WAILS) build -platform linux/amd64 -nopackage -skipbindings -tags $(WEBKIT_TAG)
+	$(WAILS) build -platform linux/amd64 -nopackage -skipbindings -ldflags "$(LDFLAGS)" $(TRIMPATH) $(UPX_OPT) -tags $(WEBKIT_TAG)
 
-## Build Windows amd64 binary.
+## Build Windows amd64 binary (packaged: embeds icon via .syso resource).
+## NOTE: do NOT pass -nopackage here — Wails only generates the icon-bearing
+## .syso resource when Pack is true (see pkg/commands/build/build.go).
 windows:
-	$(WAILS) build -platform windows/amd64 -nopackage -skipbindings
+	$(WAILS) build -platform windows/amd64 -skipbindings -ldflags "$(LDFLAGS)" $(TRIMPATH) $(UPX_OPT)
 
 ## Build both Linux and Windows binaries (clean once, then both).
 ## NOTE: linux needs the webkit tag, windows does not, so these must run as

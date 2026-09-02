@@ -16,11 +16,11 @@ onMounted(() => {
   // EventsOn 返回退订函数：不保存并在卸载时调用的话，dev 模式 HMR 重挂载会
   // 叠加注册，导致每条日志重复入 store（M6b）。
   offLog = EventsOn('log', (evt) => logStore.add(evt))
-  window.addEventListener('sshkit:error', onErr)
+  window.addEventListener('sshore:error', onErr)
 })
 onUnmounted(() => {
   if (offLog) offLog()
-  window.removeEventListener('sshkit:error', onErr)
+  window.removeEventListener('sshore:error', onErr)
 })
 </script>
 

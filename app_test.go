@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"sshkit/internal/config"
-	"sshkit/internal/forward"
-	"sshkit/internal/osutil"
-	"sshkit/internal/sftp"
+	"sshore/internal/config"
+	"sshore/internal/forward"
+	"sshore/internal/osutil"
+	"sshore/internal/sftp"
 )
 
 // appWithFakeSFTP 返回一个 sftp 控制器由假 runner 支撑的 App：
@@ -24,7 +24,7 @@ func appWithFakeSFTP(t *testing.T, stdout string) *App {
 	t.Helper()
 	a := NewApp()
 	a.Init(func(forward.Event) {})
-	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 	a.sftp = sftp.NewCtrl(func(name string, args ...string) (osutil.Outcome, error) {
 		return osutil.Outcome{Stdout: stdout, ExitCode: 0}, nil
 	}, func(forward.Event) {})
@@ -48,7 +48,7 @@ func TestAutoStartEnabledContinuesAfterFirstFailure(t *testing.T) {
 	a := NewApp()
 	var events []forward.Event
 	a.Init(func(e forward.Event) { events = append(events, e) })
-	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -105,7 +105,7 @@ func TestImportCommandCreatesTunnels(t *testing.T) {
 func TestSaveConfigPersistsTunnels(t *testing.T) {
 	a := NewApp()
 	a.Init(func(forward.Event) {})
-	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 	if err := a.CreateTunnel(config.Tunnel{ID: "abc", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 5432, TargetHost: "127.0.0.1", TargetPort: 5432}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestSaveConfigPersistsTunnels(t *testing.T) {
 // 并返回可用的空配置 + 非 nil 错误（错误后续经事件展示给用户）。
 func TestLoadOrBackupConfigCorruptBacksUp(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "sshkit.toml")
+	path := filepath.Join(dir, "sshore.toml")
 	garbage := []byte("this is [[ not valid toml = =")
 	if err := os.WriteFile(path, garbage, 0600); err != nil {
 		t.Fatal(err)
@@ -155,7 +155,7 @@ func TestLoadOrBackupConfigCorruptBacksUp(t *testing.T) {
 	}
 	var bakData []byte
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "sshkit.toml.bak-") {
+		if strings.HasPrefix(e.Name(), "sshore.toml.bak-") {
 			bakData, rerr = os.ReadFile(filepath.Join(dir, e.Name()))
 			if rerr != nil {
 				t.Fatal(rerr)
@@ -329,7 +329,7 @@ func TestDeleteLocalRemovesNormalTempDir(t *testing.T) {
 func TestUpdateTunnelReplacesById(t *testing.T) {
 	a := NewApp()
 	a.Init(func(forward.Event) {})
-	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 	if err := a.CreateTunnel(config.Tunnel{ID: "abc", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 5432, TargetHost: "127.0.0.1", TargetPort: 5432}); err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestUpdateTunnelReplacesById(t *testing.T) {
 func TestCreateTunnelRejectsRemoteConflict(t *testing.T) {
 	a := NewApp()
 	a.Init(func(forward.Event) {})
-	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 	first := config.Tunnel{ID: "t1", Name: "prod-6000", Host: "prod-db", Mode: "remote",
 		ListenBind: "127.0.0.1", ListenPort: 6000, TargetHost: "127.0.0.1", TargetPort: 80}
 	if err := a.CreateTunnel(first); err != nil {
@@ -376,7 +376,7 @@ func TestCreateTunnelRejectsRemoteConflict(t *testing.T) {
 func TestUpdateTunnelKeepingOwnKeySucceeds(t *testing.T) {
 	a := NewApp()
 	a.Init(func(forward.Event) {})
-	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 	orig := config.Tunnel{ID: "t1", Name: "old-name", Host: "prod-db", Mode: "remote",
 		ListenBind: "127.0.0.1", ListenPort: 6000, TargetHost: "127.0.0.1", TargetPort: 80}
 	if err := a.CreateTunnel(orig); err != nil {
@@ -397,7 +397,7 @@ func TestUpdateTunnelKeepingOwnKeySucceeds(t *testing.T) {
 func TestCreateTunnelSamePortDifferentHostAllowed(t *testing.T) {
 	a := NewApp()
 	a.Init(func(forward.Event) {})
-	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 	for _, host := range []string{"prod-db", "staging"} {
 		tl := config.Tunnel{ID: host, Name: host, Host: host, Mode: "local",
 			ListenBind: "127.0.0.1", ListenPort: 6000, TargetHost: "127.0.0.1", TargetPort: 80}
@@ -554,7 +554,7 @@ func TestListRecentSFTPNewestFirstAndEmptyNotNil(t *testing.T) {
 func TestDeleteTunnelRemovesAndStops(t *testing.T) {
 	a := NewApp()
 	a.Init(func(forward.Event) {})
-	a.cfgPath = filepath.Join(t.TempDir(), "sshkit.toml")
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 	if err := a.CreateTunnel(config.Tunnel{ID: "abc", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 5432, TargetHost: "127.0.0.1", TargetPort: 5432}); err != nil {
 		t.Fatal(err)
 	}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# E2E for sshkit core: verifies ssh -G config resolution, -N -L forward, and sftp ls.
+# E2E for sshore core: verifies ssh -G config resolution, -N -L forward, and sftp ls.
 # Uses a throwaway local sshd in a temp dir. Run from repo root.
 set -euo pipefail
 
