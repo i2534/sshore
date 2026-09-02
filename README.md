@@ -89,4 +89,5 @@ sshore relies on: `ssh -G` alias resolution, `-N -L` local forward binding, and
 ## CI
 
 `.github/workflows/ci.yml` runs on push/PR: `go vet`, Go tests (`-race`),
-frontend tests + build, and a Linux `wails build` (webkit2gtk-4.1, UPX-compressed).
+frontend tests + build, and `wails build` for Linux (webkit2gtk-4.1) and
+Windows (icon via `.syso`), both UPX-compressed.

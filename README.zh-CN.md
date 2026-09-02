@@ -88,4 +88,5 @@ make e2e    # 等价于：bash e2e/test_local.sh
 ## CI
 
 `.github/workflows/ci.yml` 在 push/PR 时运行：`go vet`、Go 测试（`-race`）、
-前端测试与构建，以及 Linux `wails build`（webkit2gtk-4.1，含 UPX 压缩）。
+前端测试与构建，以及 Linux（webkit2gtk-4.1）与 Windows（图标经 `.syso` 嵌入）
+的 `wails build`，均含 UPX 压缩。
