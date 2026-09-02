@@ -59,3 +59,17 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: Build linux/amd64 (webkit2_41 tag via Makefile)
         run: make linux
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+      - name: Install UPX
+        run: choco install upx -y
+      - name: Build windows/amd64 (packaged, icon via .syso)
+        run: wails build -platform windows/amd64 -skipbindings -ldflags "-s -w" -trimpath -upx
