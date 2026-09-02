@@ -51,6 +51,31 @@ func TestParseLsLfEmptyIsEmptyList(t *testing.T) {
 	}
 }
 
+func TestParseLsLfFiltersDotEntries(t *testing.T) {
+	out := "total 8\n" +
+		"drwxr-xr-x    3 user group     4096 Aug 25 10:00 .\n" +
+		"drwxr-xr-x    3 user group     4096 Aug 25 10:00 ..\n" +
+		"-rw-r--r--    1 user group       10 Aug 25 10:01 .hidden\n" +
+		"drwxr-xr-x    2 user group     4096 Aug 25 10:02 .hiddendir\n" +
+		"-rw-r--r--    1 user group       20 Aug 25 10:03 visible.txt\n"
+	items, err := ParseLsLf(out)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("want 3 items (., .. dropped) got %d: %+v", len(items), items)
+	}
+	if items[0].Name != ".hidden" || items[0].Size != 10 {
+		t.Fatalf(".hidden wrong: %+v", items[0])
+	}
+	if !items[1].IsDir || items[1].Name != ".hiddendir" {
+		t.Fatalf(".hiddendir should be dir: %+v", items[1])
+	}
+	if items[2].Name != "visible.txt" {
+		t.Fatalf("visible.txt wrong: %+v", items[2])
+	}
+}
+
 func TestParseLsLfModTime(t *testing.T) {
 	out := "-rw-r--r--    1 lan      lan             6 Aug 25 15:34 a.txt\n" +
 		"-rw-r--r--    1 lan      lan            10 Aug 25 2024 old.log\n"

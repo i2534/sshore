@@ -10,7 +10,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
-	"sshkit/internal/forward"
+	"sshore/internal/forward"
 )
 
 //go:embed all:frontend/dist
@@ -20,7 +20,7 @@ func main() {
 	app := NewApp()
 
 	err := wails.Run(&options.App{
-		Title:  "sshkit",
+		Title:  "sshore",
 		Width:  1100,
 		Height: 720,
 		AssetServer: &assetserver.Options{
@@ -37,7 +37,7 @@ func main() {
 				SourceID:   "app",
 				TS:         time.Now().Format(time.RFC3339),
 				Level:      "info",
-				Message:    "sshkit 已就绪",
+				Message:    "sshore 已就绪",
 			})
 			_ = app.AutoStartEnabled()
 		},

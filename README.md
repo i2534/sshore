@@ -1,4 +1,4 @@
-# sshkit
+# sshore
 
 Cross-platform SSH port-forward + SFTP manager. Built with Wails v2 (Go) + Vue 3.
 
@@ -12,8 +12,31 @@ Cross-platform SSH port-forward + SFTP manager. Built with Wails v2 (Go) + Vue 3
 ## Build
 
 ```bash
+make both     # clean + Linux & Windows binaries (default, size-optimized)
+make linux    # Linux amd64 only
+make windows  # Windows amd64 only (packaged: icon embedded via .syso)
+make build    # current platform
+```
+
+Or directly with the Wails CLI:
+
+```bash
 wails build
 ```
+
+### Size optimization
+
+The `make` targets strip symbols/DWARF (`-ldflags "-s -w"`), pass `-trimpath`,
+and by default UPX-compress the final binaries (Linux ≈3.7 MB, Windows ≈4.5 MB).
+
+- Set `COMPRESS=0` to skip UPX (e.g. if your antivirus flags UPX-packed Go
+  binaries, or you prefer faster startup): `make both COMPRESS=0`
+- UPX must be on `PATH`; if missing, `wails build -upx` warns and skips
+  compression (Wails only compresses when UPX is installed).
+- Do **not** pass `-nopackage` when building for Windows: Wails only generates
+  the icon-bearing `.syso` resource when packaging is enabled (`Pack=true`),
+  so `-nopackage` yields an exe with no icon. The `make windows` target is
+  intentionally packaged.
 
 ## Run (dev)
 
@@ -26,7 +49,7 @@ wails dev
 - **SSH port forwarding**: local `-L`, remote `-R`, dynamic SOCKS `-D`, jump host `-J`
 - **SFTP file management**: browse / upload / download / delete / rename / mkdir
 - **Config**: reads `~/.ssh/config` read-only (no credential storage); tunnel rules stored in
-  `~/.config/sshkit/sshkit.toml` (`%APPDATA%\sshkit\sshkit.toml` on Windows)
+  `~/.config/sshore/sshore.toml` (`%APPDATA%\sshore\sshore.toml` on Windows)
 - **Import** a pasted `ssh -L/-R/-D ...` command into rules
 - **Live log panel**: in-memory ring buffer (1000 entries) of tunnel/SFTP events
 - Uses system OpenSSH for auth (keys/agent/config), so password/keyboard-interactive
@@ -58,7 +81,7 @@ make e2e    # equivalent to: bash e2e/test_local.sh
 ```
 
 `e2e/test_local.sh` starts a throwaway local sshd and verifies the OpenSSH behaviors
-sshkit relies on: `ssh -G` alias resolution, `-N -L` local forward binding, and
+sshore relies on: `ssh -G` alias resolution, `-N -L` local forward binding, and
 `sftp ls -l` output parsing. Requires `/usr/sbin/sshd`, `ssh-keygen`, and `python3`.
 
 ## CI

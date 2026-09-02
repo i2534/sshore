@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"sshkit/internal/config"
-	"sshkit/internal/osutil"
+	"sshore/internal/config"
+	"sshore/internal/osutil"
 )
 
 type State string

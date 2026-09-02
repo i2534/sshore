@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"sshkit/internal/forward"
+	"sshore/internal/forward"
 )
 
 func TestListLocal(t *testing.T) {

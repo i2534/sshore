@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"sshkit/internal/config"
-	"sshkit/internal/forward"
+	"sshore/internal/config"
+	"sshore/internal/forward"
 )
 
 // Parse tokenizes a pasted `ssh -L/-R/-D ...` command into tunnel rules.

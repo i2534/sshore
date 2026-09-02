@@ -1,7 +1,7 @@
 services:
   sshd:
     image: linuxserver/openssh-server:latest
-    container_name: sshkit-e2e-sshd
+    container_name: sshore-e2e-sshd
     environment:
       PUID: "1000"
       PGID: "1000"

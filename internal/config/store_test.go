@@ -14,7 +14,7 @@ import (
 )
 
 func TestLoadSaveRoundTrip(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sshkit.toml")
+	path := filepath.Join(t.TempDir(), "sshore.toml")
 	cfg := &AppConfig{
 		App: AppSettings{AutoReconnectDefault: true},
 		Tunnels: []Tunnel{{
@@ -60,7 +60,7 @@ func mixedWriterPrefixes(tunnels []Tunnel) bool {
 // rename 则让读者只可能看到完整的旧文件或完整的文件。读端在保存期间
 // 持续采样，写端 8×30 次保存（每条配置逐步变大，拉长写窗口）。
 func TestSaveConfigConcurrentSavesNeverCorrupt(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sshkit.toml")
+	path := filepath.Join(t.TempDir(), "sshore.toml")
 	stop := make(chan struct{})
 	var torn int32
 	var reader sync.WaitGroup
@@ -126,7 +126,7 @@ func TestSaveConfigConcurrentSavesNeverCorrupt(t *testing.T) {
 
 func TestSaveConfigAtomicNoTmpLeftAndContentMatches(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "sshkit.toml")
+	path := filepath.Join(dir, "sshore.toml")
 	cfg1 := &AppConfig{App: AppSettings{AutoReconnectDefault: true}, Tunnels: []Tunnel{{ID: "a", Host: "h", Mode: "local", ListenPort: 1}}}
 	if err := SaveConfig(path, cfg1); err != nil {
 		t.Fatalf("save: %v", err)
