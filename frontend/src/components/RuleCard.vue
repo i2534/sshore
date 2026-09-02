@@ -59,14 +59,15 @@ async function toggle() {
 
 <style scoped>
 .rule { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
-.dot { width: 10px; height: 10px; border-radius: 50%; }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .dot.on { background: var(--success); }
 .dot.off { background: var(--text-faint); }
 .dot.warn { background: #f0ad4e; }
 .dot.err { background: var(--danger); }
-.name { font-weight: 600; color: var(--text); }
-.meta { color: var(--text-dim); font-size: 12px; flex: 1; }
-.actions { display: flex; gap: 6px; }
+.name { font-weight: 600; color: var(--text); white-space: nowrap; }
+.meta { color: var(--text-dim); font-size: 12px; flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.actions { display: flex; gap: 6px; flex-shrink: 0; align-items: center; }
+.actions button { white-space: nowrap; }
 button.ghost { background: transparent; border-color: var(--border); color: var(--text-dim); }
 button.ghost:hover { background: var(--surface-hover); color: var(--text); }
 button.ghost.danger:hover { color: var(--danger); border-color: var(--danger); }

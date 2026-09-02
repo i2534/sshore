@@ -1,6 +1,7 @@
 <script setup>
-import { computed } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import { useLogStore } from '../stores/logs'
+import { fmtLogTime } from '../utils/time'
 
 const props = defineProps({
   // 可选:隧道规则列表(forward 视图传入)。有值时显示"按规则过滤"chips,
@@ -9,13 +10,49 @@ const props = defineProps({
 })
 
 const logStore = useLogStore()
+const linesEl = ref(null)
+// 用户是否停留在底部附近:是→新日志自动滚动;向上翻阅历史时不打扰。
+const stick = ref(true)
 
 const chips = computed(() =>
   props.tunnels.map(t => ({ id: t.id, label: t.name || t.host })).filter(c => c.label))
 
+// filterSource 命中的若是某条规则,输入框显示规则名而非 32 位 id。
+const displaySource = computed(() => {
+  const s = logStore.filterSource
+  if (!s) return ''
+  const t = props.tunnels.find(t => t.id === s)
+  return t ? (t.name || t.host) : s
+})
+
 function toggleChip(id) {
   logStore.filterSource = logStore.filterSource === id ? '' : id
 }
+
+function onScroll() {
+  const el = linesEl.value
+  if (!el) return
+  stick.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+}
+
+function scrollToBottom() {
+  const el = linesEl.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+// 日志数量变化(filtered)时自动滚到底部(仅当用户停留在底部)。
+watch(() => logStore.filtered.length, async () => {
+  if (!stick.value) return
+  await nextTick()
+  scrollToBottom()
+})
+
+// 切换过滤条件后强制回到底部。
+watch(() => [logStore.filterSource, logStore.filterLevel], async () => {
+  stick.value = true
+  await nextTick()
+  scrollToBottom()
+})
 </script>
 
 <template>
@@ -29,18 +66,22 @@ function toggleChip(id) {
       >{{ c.label }}</button>
     </div>
     <div class="logbar">
-      <input v-model="logStore.filterSource" placeholder="filter source_id" />
+      <input
+        :value="displaySource"
+        @input="logStore.filterSource = $event.target.value"
+        placeholder="filter source_id (规则名/主机)"
+      />
       <select v-model="logStore.filterLevel">
         <option value="">全部</option>
-        <option value="info">info</option>
-        <option value="warn">warn</option>
-        <option value="error">error</option>
+        <option value="info">INFO</option>
+        <option value="warn">WARN</option>
+        <option value="error">ERROR</option>
       </select>
       <button @click="logStore.clear()">清空</button>
     </div>
-    <div class="loglines">
+    <div ref="linesEl" class="loglines" @scroll="onScroll">
       <div v-for="(l, i) in logStore.filtered" :key="i" :class="'level-' + l.level">
-        {{ l.ts }} [{{ l.level }}] {{ l.message }}
+        {{ fmtLogTime(l.ts) }} [{{ l.level.toUpperCase() }}] {{ l.message }}
       </div>
     </div>
   </div>
