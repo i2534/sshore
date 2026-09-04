@@ -57,10 +57,13 @@ func TestAutoStartEnabledContinuesAfterFirstFailure(t *testing.T) {
 	defer ln.Close()
 	busyPort := ln.Addr().(*net.TCPAddr).Port
 
-	a.cfg = &config.AppConfig{Tunnels: []config.Tunnel{
-		{ID: "t1", Name: "bad", Host: "-evil", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 1, Enabled: true},
-		{ID: "t2", Name: "good", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: busyPort, TargetHost: "127.0.0.1", TargetPort: 80, Enabled: true},
-	}}
+	a.cfg = &config.AppConfig{
+		App: config.AppSettings{AutoReconnectDefault: true, AutoStartOnLaunch: true},
+		Tunnels: []config.Tunnel{
+			{ID: "t1", Name: "bad", Host: "-evil", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 1, Enabled: true},
+			{ID: "t2", Name: "good", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: busyPort, TargetHost: "127.0.0.1", TargetPort: 80, Enabled: true},
+		},
+	}
 
 	err = a.AutoStartEnabled()
 	if err == nil {
@@ -83,6 +86,93 @@ func TestAutoStartEnabledContinuesAfterFirstFailure(t *testing.T) {
 	}
 	if !appLevel {
 		t.Fatalf("expected app-level 自动启动 failure event for t2, got %+v", events)
+	}
+}
+
+// 设置里的 AutoStartOnLaunch=false 时，AutoStartEnabled 必须整体跳过：
+// 不启动任何隧道、不发任何事件、不产生错误。
+func TestAutoStartEnabledSkippedWhenDisabled(t *testing.T) {
+	a := NewApp()
+	var events []forward.Event
+	a.Init(func(e forward.Event) { events = append(events, e) })
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
+	a.cfg = &config.AppConfig{
+		App: config.AppSettings{AutoReconnectDefault: true, AutoStartOnLaunch: false},
+		Tunnels: []config.Tunnel{
+			{ID: "t1", Name: "prod", Host: "prod-db", Mode: "local", ListenBind: "127.0.0.1", ListenPort: 5432, TargetHost: "127.0.0.1", TargetPort: 5432, Enabled: true},
+		},
+	}
+	if err := a.AutoStartEnabled(); err != nil {
+		t.Fatalf("auto-start should be skipped without error, got %v", err)
+	}
+	if st := a.forward.State("t1"); st != forward.StateStopped {
+		t.Fatalf("t1 must not have been started when disabled, state=%q", st)
+	}
+	if len(events) != 0 {
+		t.Fatalf("no events expected when auto-start disabled, got %+v", events)
+	}
+}
+
+// GetAppInfo 必须返回非空的应用名与版本/仓库（默认值或构建注入值）。
+func TestGetAppInfo(t *testing.T) {
+	a := NewApp()
+	info := a.GetAppInfo()
+	if info.Name != "sshore" {
+		t.Fatalf("app name: %q", info.Name)
+	}
+	if info.Version == "" || info.Repo == "" {
+		t.Fatalf("version/repo should be non-empty: %+v", info)
+	}
+}
+
+// SyncWindowBackground 在 ctx 未设置（启动前/单元测试）时必须安全无操作，不 panic。
+func TestSyncWindowBackgroundNoCtx(t *testing.T) {
+	a := NewApp() // a.ctx == nil
+	a.SyncWindowBackground("light")
+	a.SyncWindowBackground("dark")
+}
+
+// cfg 为 nil 时 GetSettings 应返回安全默认（theme=system, fontScale=1, auto-start 开启）。
+func TestGetSettingsNilCfgReturnsDefaults(t *testing.T) {
+	a := NewApp()
+	s := a.GetSettings()
+	if s.Theme != "system" || s.FontScale != 1 || !s.AutoStartOnLaunch {
+		t.Fatalf("unexpected default settings: %+v", s)
+	}
+}
+
+// SetSettings 归一化并持久化：空 theme→system、非法 fontScale→1、其余字段原样落盘。
+func TestSetSettingsPersistsAndNormalizes(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
+	in := config.AppSettings{LatinFont: "inter", CJKFont: "yahei", AutoStartOnLaunch: false}
+	if err := a.SetSettings(in); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	got := a.GetSettings()
+	if got.Theme != "system" || got.FontScale != 1 || got.LatinFont != "inter" || got.CJKFont != "yahei" || got.AutoStartOnLaunch != false {
+		t.Fatalf("normalize/persist wrong: %+v", got)
+	}
+	loaded, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.App.Theme != "system" || loaded.App.FontScale != 1 || loaded.App.LatinFont != "inter" || loaded.App.CJKFont != "yahei" {
+		t.Fatalf("persisted settings wrong: %+v", loaded.App)
+	}
+}
+
+// 非法主题值必须回退到 system。
+func TestSetSettingsInvalidThemeFallsBackToSystem(t *testing.T) {
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
+	if err := a.SetSettings(config.AppSettings{Theme: "blue", FontScale: 1.15}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if got := a.GetSettings().Theme; got != "system" {
+		t.Fatalf("invalid theme should fall back to system, got %q", got)
 	}
 }
 

@@ -28,6 +28,19 @@ type App struct {
 	cfgLoadErr error
 }
 
+var (
+	// Version/Repo 由构建注入（-X main.Version=...），未注入时用默认值。
+	Version = "dev"
+	Repo    = "https://github.com/i2534/sshore"
+)
+
+// AppInfo 供前端「帮助」展示的应用元信息。
+type AppInfo struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Repo    string `json:"repo"`
+}
+
 func NewApp() *App {
 	return &App{}
 }
@@ -122,6 +135,48 @@ func (a *App) ListTunnels() []config.Tunnel {
 		return []config.Tunnel{}
 	}
 	return a.cfg.Tunnels
+}
+
+// GetAppInfo returns app metadata (name/version/repo) for the help panel.
+func (a *App) GetAppInfo() AppInfo {
+	return AppInfo{Name: "sshore", Version: Version, Repo: Repo}
+}
+
+// SyncWindowBackground aligns the native window background with the active theme
+// so the light theme doesn't leave a dark window edge. Best-effort: no-op if the
+// startup context is missing (e.g. before OnStartup runs).
+func (a *App) SyncWindowBackground(theme string) {
+	if a.ctx == nil {
+		return
+	}
+	if theme == "light" {
+		runtime.WindowSetBackgroundColour(a.ctx, 238, 242, 247, 255) // #eef2f7 (light --bg)
+	} else {
+		runtime.WindowSetBackgroundColour(a.ctx, 27, 38, 54, 255) // #1b2636 (dark --bg)
+	}
+}
+
+// GetSettings returns the persisted app settings (theme/font/auto-start),
+// normalized so callers never receive empty/invalid values.
+func (a *App) GetSettings() config.AppSettings {
+	if a.cfg == nil {
+		return config.DefaultAppConfig().App
+	}
+	return a.cfg.App
+}
+
+// SetSettings validates and persists app settings. Invalid theme falls back to
+// "system"; fontScale is clamped by AppSettings.Normalize().
+func (a *App) SetSettings(s config.AppSettings) error {
+	s.Normalize()
+	if s.Theme != "dark" && s.Theme != "light" {
+		s.Theme = "system"
+	}
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	a.cfg.App = s
+	return a.saveConfig()
 }
 
 // TunnelStates 返回各隧道运行态（id → state 字符串），供前端四态圆点渲染。
@@ -252,7 +307,11 @@ func (a *App) updateTunnel(u config.Tunnel) {
 
 // AutoStartEnabled starts all tunnels that were enabled at last run.
 // M10: 单个隧道失败不得中止循环——逐项收集失败、经事件管道上报，最后汇总返回。
+// 设置中的 AutoStartOnLaunch 关闭时整体跳过（用户选择"启动后不自动连接转发通道"）。
 func (a *App) AutoStartEnabled() error {
+	if a.cfg == nil || !a.cfg.App.AutoStartOnLaunch {
+		return nil
+	}
 	var errs []error
 	for _, t := range a.cfg.Tunnels {
 		if !t.Enabled {

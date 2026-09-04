@@ -43,7 +43,7 @@ function statusClass(status) {
 </template>
 
 <style scoped>
-.queue { border-top: 1px solid var(--border); max-height: 140px; overflow: auto; font-family: monospace; font-size: 12px; color: var(--text-dim); }
+.queue { border-top: 1px solid var(--border); max-height: 140px; overflow: auto; font-family: monospace; font-size: var(--fs-12); color: var(--text-dim); }
 .t { display: flex; gap: 10px; padding: 3px 8px; align-items: center; }
 .name { flex: 1; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .meta { color: var(--text-faint); white-space: nowrap; }

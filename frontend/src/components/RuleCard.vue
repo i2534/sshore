@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import { StartTunnel, StopTunnel } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
+import { modeLabel } from '../utils/forward'
 
 const props = defineProps({
   tunnel: { type: Object, required: true },
@@ -30,6 +31,7 @@ async function toggle() {
     // 并照常刷新列表以同步后端真实状态。
     logStore.add({
       source_id: 'rule',
+      source_type: 'tunnel',
       level: 'error',
       message: `${props.tunnel.name || props.tunnel.host}: ${String(e)}`,
       ts: new Date().toISOString(),
@@ -45,7 +47,7 @@ async function toggle() {
   <div class="rule">
     <span :class="['dot', dotCls]"></span>
     <span class="name">{{ tunnel.name || tunnel.host }}</span>
-    <span class="meta">{{ tunnel.mode }} {{ tunnel.listen_bind }}:{{ tunnel.listen_port }}<template v-if="props.state === 'reconnecting'"> · 重连中</template></span>
+    <span class="meta">{{ modeLabel(tunnel.mode) }} {{ tunnel.listen_bind }}:{{ tunnel.listen_port }}<template v-if="props.state === 'reconnecting'"> · 重连中</template></span>
     <div class="actions">
       <button class="ghost" @click="emit('edit', tunnel)">编辑</button>
       <button class="ghost danger" @click="emit('delete', tunnel)">删除</button>
@@ -62,10 +64,10 @@ async function toggle() {
 .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .dot.on { background: var(--success); }
 .dot.off { background: var(--text-faint); }
-.dot.warn { background: #f0ad4e; }
+.dot.warn { background: var(--warning); }
 .dot.err { background: var(--danger); }
 .name { font-weight: 600; color: var(--text); white-space: nowrap; }
-.meta { color: var(--text-dim); font-size: 12px; flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta { color: var(--text-dim); font-size: var(--fs-12); flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .actions { display: flex; gap: 6px; flex-shrink: 0; align-items: center; }
 .actions button { white-space: nowrap; }
 button.ghost { background: transparent; border-color: var(--border); color: var(--text-dim); }

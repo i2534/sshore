@@ -92,7 +92,7 @@ func TestSaveConfigConcurrentSavesNeverCorrupt(t *testing.T) {
 			cfg := &AppConfig{App: AppSettings{AutoReconnectDefault: true}}
 			for i := 0; i < 30; i++ {
 				cfg.Tunnels = append(cfg.Tunnels, Tunnel{
-					ID: fmt.Sprintf("g%d-%d", n, i),
+					ID:   fmt.Sprintf("g%d-%d", n, i),
 					Name: strings.Repeat(fmt.Sprintf("n%d-x", n), 40+i),
 					Mode: "local", Host: "prod-db",
 					ListenBind: "127.0.0.1", ListenPort: 5000 + n,
@@ -179,5 +179,77 @@ func TestLoadConfigMissingFileReturnsDefaults(t *testing.T) {
 	}
 	if len(got.Tunnels) != 0 {
 		t.Fatal("empty tunnels expected")
+	}
+}
+
+// AppSettings.Normalize 必须把空主题/非法字号兜底为可用值，并夹紧字号区间。
+func TestAppSettingsNormalizeDefaults(t *testing.T) {
+	s := AppSettings{}
+	s.Normalize()
+	if s.Theme != "system" || s.FontScale != 1 {
+		t.Fatalf("normalize defaults wrong: %+v", s)
+	}
+	high := AppSettings{FontScale: 3}
+	high.Normalize()
+	if high.FontScale != 2 {
+		t.Fatalf("fontScale upper clamp wrong: %+v", high)
+	}
+	low := AppSettings{FontScale: 0.2}
+	low.Normalize()
+	if low.FontScale != 0.5 {
+		t.Fatalf("fontScale lower clamp wrong: %+v", low)
+	}
+	neg := AppSettings{FontScale: -1}
+	neg.Normalize()
+	if neg.FontScale != 1 {
+		t.Fatalf("non-positive fontScale should reset to 1: %+v", neg)
+	}
+}
+
+// 出厂默认须包含界面设置：theme=system、fontScale=1、auto-start 开启。
+func TestDefaultAppConfigHasUISettings(t *testing.T) {
+	cfg := DefaultAppConfig()
+	if cfg.App.Theme != "system" || cfg.App.FontScale != 1 || !cfg.App.AutoStartOnLaunch {
+		t.Fatalf("default UI settings wrong: %+v", cfg.App)
+	}
+}
+
+// 旧配置（无 theme/font/latin/cjk/auto_start 键）反序列化后必须保留 UI 默认值，
+// 避免升级后应用以 0 字号/空主题启动。
+func TestLoadConfigLegacyMissingUIFieldsKeepsDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sshore.toml")
+	if err := os.WriteFile(path, []byte("[app]\nauto_reconnect_default = true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.App.Theme != "system" || cfg.App.FontScale != 1 || !cfg.App.AutoStartOnLaunch {
+		t.Fatalf("legacy config should keep UI defaults: %+v", cfg.App)
+	}
+}
+
+// 完整设置项往返：保存/加载后字段一致（含显式关闭 auto-start）。
+func TestLoadSaveSettingsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sshore.toml")
+	cfg := &AppConfig{App: AppSettings{
+		AutoReconnectDefault: true,
+		Theme:                "light",
+		FontScale:            1.15,
+		LatinFont:            "inter",
+		CJKFont:              "yahei",
+		AutoStartOnLaunch:    false,
+	}}
+	if err := SaveConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := got.App
+	if g.Theme != "light" || g.FontScale != 1.15 || g.LatinFont != "inter" || g.CJKFont != "yahei" || g.AutoStartOnLaunch != false {
+		t.Fatalf("settings round-trip broken: %+v", g)
 	}
 }

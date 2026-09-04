@@ -1,5 +1,27 @@
 export namespace config {
 	
+	export class AppSettings {
+	    auto_reconnect_default: boolean;
+	    theme: string;
+	    font_scale: number;
+	    latin_font?: string;
+	    cjk_font?: string;
+	    auto_start_on_launch: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new AppSettings(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.auto_reconnect_default = source["auto_reconnect_default"];
+	        this.theme = source["theme"];
+	        this.font_scale = source["font_scale"];
+	        this.latin_font = source["latin_font"];
+	        this.cjk_font = source["cjk_font"];
+	        this.auto_start_on_launch = source["auto_start_on_launch"];
+	    }
+	}
 	export class Host {
 	    alias: string;
 	    host_name: string;
@@ -22,7 +44,6 @@ export namespace config {
 	        this.proxy_jump = source["proxy_jump"];
 	    }
 	}
-
 	export class RecentSFTP {
 	    host: string;
 	    remote_dir: string;
@@ -41,7 +62,6 @@ export namespace config {
 	        this.ts = source["ts"];
 	    }
 	}
-
 	export class Tunnel {
 	    id: string;
 	    name: string;
@@ -76,6 +96,27 @@ export namespace config {
 	        this.proxy_jump = source["proxy_jump"];
 	        this.auto_reconnect = source["auto_reconnect"];
 	        this.enabled = source["enabled"];
+	    }
+	}
+
+}
+
+export namespace main {
+	
+	export class AppInfo {
+	    name: string;
+	    version: string;
+	    repo: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new AppInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.version = source["version"];
+	        this.repo = source["repo"];
 	    }
 	}
 

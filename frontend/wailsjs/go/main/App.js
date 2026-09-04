@@ -22,6 +22,14 @@ export function DeleteTunnel(arg1) {
   return window['go']['main']['App']['DeleteTunnel'](arg1);
 }
 
+export function GetAppInfo() {
+  return window['go']['main']['App']['GetAppInfo']();
+}
+
+export function GetSettings() {
+  return window['go']['main']['App']['GetSettings']();
+}
+
 export function HomeDir() {
   return window['go']['main']['App']['HomeDir']();
 }
@@ -72,6 +80,10 @@ export function PickLocalFile() {
 
 export function RenameLocal(arg1, arg2) {
   return window['go']['main']['App']['RenameLocal'](arg1, arg2);
+}
+
+export function SetSettings(arg1) {
+  return window['go']['main']['App']['SetSettings'](arg1);
 }
 
 export function SftpConnect(arg1) {
@@ -128,6 +140,10 @@ export function StatLocal(arg1) {
 
 export function StopTunnel(arg1) {
   return window['go']['main']['App']['StopTunnel'](arg1);
+}
+
+export function SyncWindowBackground(arg1) {
+  return window['go']['main']['App']['SyncWindowBackground'](arg1);
 }
 
 export function TunnelStates() {

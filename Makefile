@@ -18,8 +18,10 @@ OUTNAME  := sshore
 # Always strip symbols/DWARF (-s -w, via -ldflags) and file paths (-trimpath is
 # a go-build-level flag, passed to `wails build` as -trimpath, NOT inside
 # -ldflags — go build rejects it there): no runtime cost, small free saving.
-LDFLAGS    := -s -w
-TRIMPATH   := -trimpath
+# Version is injected from the latest git tag so the 帮助/About panel can show it.
+VERSION   := $(shell git describe --tags 2>/dev/null || echo dev)
+LDFLAGS   := -s -w -X main.Version=$(VERSION)
+TRIMPATH  := -trimpath
 # UPX-compress the final binaries (~63% smaller). Default on; set COMPRESS=0
 # to disable (e.g. to avoid antivirus false positives or for faster startup).
 COMPRESS ?= 1
