@@ -12,7 +12,29 @@ import (
 )
 
 type AppSettings struct {
-	AutoReconnectDefault bool `toml:"auto_reconnect_default" json:"auto_reconnect_default"`
+	AutoReconnectDefault bool    `toml:"auto_reconnect_default" json:"auto_reconnect_default"`
+	Theme                string  `toml:"theme" json:"theme"`                               // dark|light|system
+	FontScale            float64 `toml:"font_scale" json:"font_scale"`                     // 字号缩放系数
+	LatinFont            string  `toml:"latin_font,omitempty" json:"latin_font,omitempty"` // 英文字体（空=系统默认）
+	CJKFont              string  `toml:"cjk_font,omitempty" json:"cjk_font,omitempty"`     // 中文字体（空=系统默认）
+	AutoStartOnLaunch    bool    `toml:"auto_start_on_launch" json:"auto_start_on_launch"` // 启动后自动连接转发通道
+}
+
+// Normalize 兜底无效设置：主题缺省为跟随系统、字号系数非法时回退到 1，
+// 并把字号系数限制在安全区间，避免前端应用出 0/负字号导致文字不可见。
+func (s *AppSettings) Normalize() {
+	if s.Theme == "" {
+		s.Theme = "system"
+	}
+	if s.FontScale <= 0 {
+		s.FontScale = 1
+	}
+	if s.FontScale < 0.5 {
+		s.FontScale = 0.5
+	}
+	if s.FontScale > 2 {
+		s.FontScale = 2
+	}
 }
 
 type Tunnel struct {
@@ -44,11 +66,23 @@ type AppConfig struct {
 	RecentSFTP []RecentSFTP `toml:"recent_sftp" json:"recent_sftp"`
 }
 
+// normalize applies per-field defaults to the whole config (currently just App).
+func (c *AppConfig) normalize() { c.App.Normalize() }
+
 var tmpSeq int64
 
 // DefaultAppConfig returns a fresh config with safe defaults.
 func DefaultAppConfig() *AppConfig {
-	return &AppConfig{App: AppSettings{AutoReconnectDefault: true}}
+	c := &AppConfig{
+		App: AppSettings{
+			AutoReconnectDefault: true,
+			Theme:                "system",
+			FontScale:            1,
+			AutoStartOnLaunch:    true,
+		},
+	}
+	c.normalize()
+	return c
 }
 
 // LoadConfig reads the TOML config; returns safe defaults if the file doesn't exist.
@@ -62,6 +96,9 @@ func LoadConfig(path string) (*AppConfig, error) {
 	if _, err := toml.DecodeFile(path, cfg); err != nil {
 		return nil, fmt.Errorf("decode config %s: %w", path, err)
 	}
+	// 旧配置缺少新字段时，decode 只覆盖文件中出现的键，预先填充的默认值保留；
+	// 显式写入的空/非法值在此统一兜底，保证读到的设置总是可用的。
+	cfg.normalize()
 	return cfg, nil
 }
 

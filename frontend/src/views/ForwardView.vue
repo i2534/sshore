@@ -5,6 +5,7 @@ import RuleCard from '../components/RuleCard.vue'
 import LogPanel from '../components/LogPanel.vue'
 import AppDialog from '../components/AppDialog.vue'
 import { useLogStore } from '../stores/logs'
+import { modeDesc } from '../utils/forward'
 
 const tunnels = ref([])
 const hosts = ref([])
@@ -117,7 +118,7 @@ onUnmounted(() => {
 
 <template>
   <div class="fwd">
-    <div class="panel">
+    <div class="panel ui-panel">
       <div class="toolbar">
         <button @click="openCreate">+ 新建规则</button>
         <button @click="refresh">刷新</button>
@@ -126,13 +127,6 @@ onUnmounted(() => {
       <form v-if="showForm" class="form" @submit.prevent="submit">
         <div class="row">
           <label>名称 <input v-model="form.name" placeholder="e.g. prod-db" /></label>
-          <label>模式
-            <select v-model="form.mode">
-              <option value="local">local (-L)</option>
-              <option value="remote">remote (-R)</option>
-              <option value="dynamic">dynamic SOCKS (-D)</option>
-            </select>
-          </label>
           <label>主机
             <select v-model="form.host" required>
               <option value="" disabled>选择主机</option>
@@ -140,7 +134,15 @@ onUnmounted(() => {
               <option v-for="h in hosts" :key="h" :value="h">{{ h }}</option>
             </select>
           </label>
+          <label>模式
+            <select v-model="form.mode">
+              <option value="local">本地转发 local (-L)</option>
+              <option value="remote">远程转发 remote (-R)</option>
+              <option value="dynamic">动态 SOCKS dynamic (-D)</option>
+            </select>
+          </label>
         </div>
+        <p v-if="form.mode" class="mode-hint">{{ modeDesc(form.mode) }}</p>
         <div class="row">
           <label>监听地址 <input v-model="form.listen_bind" /></label>
           <label>监听端口 <input v-model.number="form.listen_port" type="number" /></label>
@@ -167,7 +169,7 @@ onUnmounted(() => {
         <button @click="doImport">导入</button>
       </div>
     </div>
-    <div class="panel"><LogPanel :tunnels="tunnels" :source-types="['tunnel', 'system']" /></div>
+    <div class="panel ui-panel"><LogPanel :tunnels="tunnels" :source-types="['tunnel', 'system']" /></div>
 
     <AppDialog
       :visible="dialog.visible"
@@ -182,13 +184,14 @@ onUnmounted(() => {
 
 <style scoped>
 .fwd { display: flex; height: 100%; gap: 12px; }
-.panel { flex: 1; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 12px; overflow: auto; }
+.panel { flex: 1; padding: 12px; overflow: auto; }
 .toolbar { display: flex; gap: 8px; margin-bottom: 12px; }
 .form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev); }
 .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
-.row label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-dim); }
+.row label { display: flex; flex-direction: column; gap: 4px; font-size: var(--fs-12); color: var(--text-dim); }
 .import { display: flex; gap: 6px; margin-top: 12px; }
 .import input { flex: 1; }
+.mode-hint { margin: -4px 0 10px; color: var(--text-faint); font-size: var(--fs-12); line-height: 1.4; }
 .empty { color: var(--text-faint); }
 .empty.err { color: var(--danger); }
 </style>

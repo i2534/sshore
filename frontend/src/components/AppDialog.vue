@@ -21,7 +21,7 @@ function confirm() {
 </script>
 
 <template>
-  <div v-if="visible" class="overlay" @click.self="emit('cancel')">
+  <div v-if="visible" class="ui-overlay" @click.self="emit('cancel')">
     <div class="dialog" role="dialog">
       <div class="dtitle">{{ title }}</div>
       <p class="dmsg">{{ message }}</p>
@@ -42,13 +42,12 @@ function confirm() {
 </template>
 
 <style scoped>
-.overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 2000; }
 .dialog { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; padding: 20px; width: 360px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
 .dtitle { font-weight: 600; color: var(--text); margin-bottom: 8px; }
-.dmsg { color: var(--text-dim); margin: 0 0 12px; font-size: 14px; }
+.dmsg { color: var(--text-dim); margin: 0 0 12px; font-size: var(--fs-14); }
 .dinput { width: 100%; box-sizing: border-box; padding: 8px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text); margin-bottom: 12px; }
 .dinput:focus { border-color: var(--accent); outline: none; }
 .dbtns { display: flex; gap: 8px; justify-content: flex-end; }
-.primary { background: var(--accent); border-color: var(--accent); }
+.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .primary:hover { background: var(--accent-hover); }
 </style>

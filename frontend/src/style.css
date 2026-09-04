@@ -15,6 +15,43 @@
   --warning: #eab308;
   --danger: #ef4444;
   --seed: #f59e0b;
+  /* UI 设置相关变量（由前端按用户设置覆盖） */
+  --ui-scale: 1;
+  --font-latin: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Helvetica Neue", Arial;
+  --font-cjk: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Microsoft JhengHei", "WenQuanYi Micro Hei";
+  /* 强调色/危险色底上的文字色，统一避免各处硬编码 #fff */
+  --on-accent: #fff;
+  --on-danger: #fff;
+  /* 字号层级（每个都随 --ui-scale 缩放，使“字号”设置全局生效） */
+  --fs-11: calc(11px * var(--ui-scale));
+  --fs-12: calc(12px * var(--ui-scale));
+  --fs-13: calc(13px * var(--ui-scale));
+  --fs-14: calc(14px * var(--ui-scale));
+  --fs-16: calc(16px * var(--ui-scale));
+  --fs-20: calc(20px * var(--ui-scale));
+  /* 让浏览器把表单控件（input/select/checkbox/滚动条）按深色配色绘制，
+     否则 Ubuntu/Wayland 深色主题下输入框仍会落到默认浅色底、刺眼 */
+  color-scheme: dark;
+}
+
+/* 浅色主题：根节点带 data-theme="light" 时覆盖上列深色变量 */
+:root[data-theme="light"] {
+  --bg: #eef2f7;
+  --bg-elev: #ffffff;
+  --surface: #f6f8fb;
+  --surface-hover: #e8edf4;
+  --border: #cbd5e1;
+  --border-strong: #94a3b8;
+  --text: #1e293b;
+  --text-dim: #475569;
+  --text-faint: #94a3b8;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --success: #16a34a;
+  --warning: #d97706;
+  --danger: #dc2626;
+  --seed: #d97706;
+  color-scheme: light;
 }
 
 html {
@@ -26,9 +63,8 @@ html {
 body {
   margin: 0;
   color: var(--text);
-  font-family: "Nunito", -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto",
-    "Oxygen", "Ubuntu", "Cantarell", "Fira Sans", "Droid Sans", "Helvetica Neue",
-    sans-serif;
+  font-family: var(--font-latin), var(--font-cjk), sans-serif;
+  font-size: var(--fs-16);
 }
 
 @font-face {
@@ -68,9 +104,27 @@ button.active {
   border-color: var(--accent);
 }
 
-input, select {
+input:not([type="checkbox"]):not([type="radio"]), select {
+  /* 去掉 WebKit 原生外观，强制用主题变量作底色，避免深浅主题下控件透出系统浅色 */
+  -webkit-appearance: none;
+  appearance: none;
   background: var(--bg-elev);
   border-color: var(--border);
+  color: var(--text);
+}
+
+/* checkbox/radio 保留原生形状，仅用 accent-color 着色，避免 appearance:none 吞掉勾选/圆点 */
+input[type="checkbox"], input[type="radio"] {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+/* select 用自定义下拉箭头代替被 appearance:none 隐藏的原生箭头 */
+select {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M0 0l5 6 5-6z' fill='%2364748b'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  padding-right: 24px;
 }
 
 input:focus, select:focus {
@@ -80,4 +134,22 @@ input:focus, select:focus {
 
 input::placeholder {
   color: var(--text-faint);
+}
+
+/* 通用面板容器：卡片底 / 边框 / 圆角，各面板组件复用，避免重复 */
+.ui-panel {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 8px;
+}
+
+/* 通用模态遮罩：AppDialog / SettingsDialog 复用 */
+.ui-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
 }

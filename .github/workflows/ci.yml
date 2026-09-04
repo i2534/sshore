@@ -55,6 +55,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Install webkit2gtk-4.1 + UPX build deps
         run: |
           sudo apt-get update
@@ -76,6 +78,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -83,8 +87,8 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: Install UPX
         run: choco install upx -y
-      - name: Build windows/amd64 (packaged, icon via .syso)
-        run: wails build -platform windows/amd64 -skipbindings -ldflags "-s -w" -trimpath -upx
+      - name: Build windows/amd64 (packaged, icon via .syso; version injected via Makefile)
+        run: make windows
       - name: Upload windows binary
         uses: actions/upload-artifact@v7
         with:

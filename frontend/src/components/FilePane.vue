@@ -57,7 +57,7 @@ function fmtSize(bytes) {
 </script>
 
 <template>
-  <div class="pane">
+  <div class="pane ui-panel">
     <div class="head">
       <span class="title">{{ title }}</span>
       <span class="curpath">{{ path }}</span>
@@ -94,20 +94,20 @@ function fmtSize(bytes) {
 </template>
 
 <style scoped>
-.pane { flex: 1; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
+.pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .head { padding: 6px 8px; background: var(--bg-elev); font-weight: 600; color: var(--text-dim); display: flex; justify-content: space-between; align-items: center; }
 .title { font-weight: 600; }
-.curpath { font-weight: 400; font-size: 11px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px; flex: 1; text-align: center; }
-.count { font-weight: 400; font-size: 11px; color: var(--text-faint); }
-.columns { display: flex; padding: 4px 8px; font-size: 11px; color: var(--text-faint); border-bottom: 1px solid var(--border); }
+.curpath { font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px; flex: 1; text-align: center; }
+.count { font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); }
+.columns { display: flex; padding: 4px 8px; font-size: var(--fs-11); color: var(--text-faint); border-bottom: 1px solid var(--border); }
 .sortable { cursor: pointer; user-select: none; }
 .sortable:hover { color: var(--text-dim); }
 .sortable.active { color: var(--accent); }
 .list-holder { flex: 1; display: flex; flex-direction: column; position: relative; min-height: 0; }
 .list { list-style: none; margin: 0; padding: 0; overflow: auto; flex: 1; }
 .list.busy { opacity: 0.4; pointer-events: none; }
-.loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-faint); font-size: 12px; pointer-events: none; }
-.list li { display: flex; align-items: center; padding: 4px 8px; cursor: pointer; font-family: monospace; font-size: 13px; color: var(--text); white-space: nowrap; }
+.loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-faint); font-size: var(--fs-12); pointer-events: none; }
+.list li { display: flex; align-items: center; padding: 4px 8px; cursor: pointer; font-family: monospace; font-size: var(--fs-13); color: var(--text); white-space: nowrap; }
 .list li:hover { background: var(--surface-hover); }
 .list li.sel { background: var(--surface-hover); color: var(--accent); }
 .list li.up { color: var(--text-dim); border-bottom: 1px solid var(--border); }

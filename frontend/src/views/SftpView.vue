@@ -83,7 +83,7 @@ async function loadRecents() {
   try { recents.value = (await ListRecentSFTP()) || [] } catch { recents.value = [] }
 }
 async function err(e) {
-  logStore.add({ source_id: 'sftp', level: 'error', message: String(e), ts: new Date().toISOString() })
+  logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'error', message: String(e), ts: new Date().toISOString() })
 }
 
 async function loadRemote() {
@@ -401,7 +401,7 @@ onUnmounted(() => {
         @select="remoteSel = $event" @open="openRemote" @context="showMenu('remote', $event)" />
     </div>
     <TransferQueue :transfers="transfers" :now="now" />
-    <div class="logpane"><LogPanel :source-types="['sftp', 'system']" /></div>
+    <div class="logpane ui-panel"><LogPanel :source-types="['sftp', 'system']" /></div>
 
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
       <template v-if="menu.pane === 'remote'">
@@ -435,7 +435,7 @@ onUnmounted(() => {
 .sftp { display: flex; flex-direction: column; height: 100%; gap: 8px; }
 .toolbar { display: flex; gap: 8px; align-items: center; }
 .panes { display: flex; gap: 8px; flex: 1; min-height: 0; }
-.logpane { height: 140px; flex-shrink: 0; border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 12px; overflow: auto; }
-.hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-dim); }
-.recent { max-width: 280px; font-size: 12px; color: var(--text-dim); margin-left: auto; }
+.logpane { height: 140px; flex-shrink: 0; padding: 12px; overflow: auto; }
+.hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: var(--fs-12); color: var(--text-dim); }
+.recent { max-width: 280px; font-size: var(--fs-12); color: var(--text-dim); margin-left: auto; }
 </style>
