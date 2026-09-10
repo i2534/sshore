@@ -774,3 +774,30 @@ func TestStopSyncRuleClearsEnabledWhenEngineNotRunning(t *testing.T) {
 		t.Fatal("StopSyncRule 后 a.cfg.Syncs 的 Enabled 必须为 false")
 	}
 }
+
+// I3（配套）：localStateOf 只允许把 fs.ErrNotExist 当成"本地不存在"；
+// 其它 stat 错误（此例为自指符号链接的 ELOOP）必须上抛，绝不能静默返回 Exists=false。
+func TestLocalStateOfSurfacesNonNotExistError(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "loop.txt")
+	if err := os.Symlink("loop.txt", link); err != nil {
+		t.Skipf("无法创建符号链接（环境不支持）: %v", err)
+	}
+	cfg := &config.AppConfig{Syncs: []config.SyncRule{{
+		ID: "r", Host: "h", Kind: "dir", RemotePath: "/r", LocalPath: dir,
+	}}}
+	if _, err := localStateOf(cfg, "r", "loop.txt"); err == nil {
+		t.Fatal("非 NotExist 的 stat 错误必须上抛，不能当成『本地不存在』")
+	}
+	st, err := localStateOf(cfg, "r", "missing.txt")
+	if err != nil || st.Exists {
+		t.Fatalf("真正不存在应返回 Exists=false 且无错误: st=%+v err=%v", st, err)
+	}
+}
+
+// 附加项 2：OnShutdown 可能在 Init 之前被调用（Wails 生命周期边界），
+// a.cfg / a.sync / a.forward / a.sftp 为 nil 时必须安全返回而不是 panic。
+func TestOnShutdownBeforeInitDoesNotPanic(t *testing.T) {
+	a := NewApp()
+	a.OnShutdown()
+}

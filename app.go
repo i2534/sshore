@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -592,14 +593,24 @@ func (a *App) ListRecentSFTP() []config.RecentSFTP {
 }
 
 func (a *App) OnShutdown() {
+	// OnShutdown 可能早于 Init 被调用（Wails 生命周期边界），此时 cfg 与三个
+	// 控制器都可能为 nil，必须逐项守卫而不是直接解引用。
 	// 1. 先停同步规则并关闭探测进程
-	for _, rule := range a.cfg.Syncs {
-		_ = a.sync.Stop(rule.ID)
+	if a.sync != nil && a.cfg != nil {
+		for _, rule := range a.cfg.Syncs {
+			_ = a.sync.Stop(rule.ID)
+		}
 	}
-	a.forward.OnShutdown()
+	if a.forward != nil {
+		a.forward.OnShutdown()
+	}
 	// 2. 最后才关 SFTP 的 ControlMaster（它会 RemoveAll 整个 socket 目录）
-	a.sftp.CloseAll()
-	_ = a.saveConfig()
+	if a.sftp != nil {
+		a.sftp.CloseAll()
+	}
+	if a.cfg != nil {
+		_ = a.saveConfig()
+	}
 }
 
 // 适配器只有一处定义：internal/sync/adapters.go 的 NewSftpAdapter（见 Task 10）。
@@ -756,7 +767,12 @@ func localStateOf(cfg *config.AppConfig, id, rel string) (sync.LocalState, error
 		}
 		st, err := os.Stat(target)
 		if err != nil {
-			return sync.LocalState{Exists: false}, nil
+			// 只有"确实不存在"才是 Exists=false；权限/符号链接环等错误必须
+			// 上抛，否则冲突裁决会把不可读的本地文件当成不存在。
+			if errors.Is(err, fs.ErrNotExist) {
+				return sync.LocalState{Exists: false}, nil
+			}
+			return sync.LocalState{}, err
 		}
 		return sync.LocalState{Exists: true, Size: st.Size(),
 			ModTime: sync.FormatModTime(st.ModTime())}, nil

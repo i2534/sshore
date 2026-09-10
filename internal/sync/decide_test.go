@@ -21,6 +21,7 @@ func TestDecideTable(t *testing.T) {
 		want   Action
 	}{
 		{"无基线+本地不存在 → GET", watch.KindCreate, nil, LocalState{}, false, ActionGet},
+		{"无远端元信息+本地存在 → 冲突", watch.KindCreate, nil, LocalState{Exists: true, Size: 5}, false, ActionConflict},
 		{"无基线+本地同大小 → 采纳", watch.KindCreate, &Entry{RemoteSize: rs}, LocalState{Exists: true, Size: rs}, false, ActionAdopt},
 		{"无基线+本地大小不同 → 冲突", watch.KindCreate, &Entry{RemoteSize: rs}, LocalState{Exists: true, Size: 99}, false, ActionConflict},
 		{"有基线+与基线一致 → GET", watch.KindWrite, full, LocalState{Exists: true, Size: ls, ModTime: lm}, false, ActionGet},
@@ -42,5 +43,16 @@ func TestDecideTable(t *testing.T) {
 				t.Fatal("每个决策都必须带可读原因，用于日志")
 			}
 		})
+	}
+}
+
+// I2: "远端元信息未知"与"远端不存在"不是一回事。本地已有同名文件时，
+// 未知元信息必须走冲突（交用户裁决），只有本地也不存在时才保守下载。
+func TestDecideUnknownRemoteMetaIsNotAbsent(t *testing.T) {
+	if got, reason := Decide(watch.KindWrite, nil, LocalState{Exists: true, Size: 3}, false); got != ActionConflict {
+		t.Fatalf("未知远端元信息 + 本地存在 ⇒ 冲突，得到 %v（%s）", got, reason)
+	}
+	if got, reason := Decide(watch.KindWrite, nil, LocalState{}, false); got != ActionGet {
+		t.Fatalf("未知远端元信息 + 本地不存在 ⇒ 下载，得到 %v（%s）", got, reason)
 	}
 }

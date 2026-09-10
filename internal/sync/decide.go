@@ -62,6 +62,9 @@ func (a Action) String() string {
 
 // Decide 实现决策表。它永远是纯函数：不做 IO、不改状态，便于逐行测试。
 //
+// 贯穿全表的原则是"未知不等于不存在"：远端元信息缺失时，本地已有的同名文件
+// 必须走冲突（交用户裁决）而不是直接覆盖。
+//
 // kind 必须是**文件级**事件：watch.KindCreate / watch.KindWrite / watch.KindDelete。
 // watch.KindDirAdded / KindDirGone / KindOverflow / KindRootGone 必须先由调用方
 // 展开成文件级事件再传入（每个文件一次调用）；把目录或溢出事件直接喂进来会落入
@@ -83,9 +86,14 @@ func Decide(kind watch.Kind, ent *Entry, local LocalState, mirrorDelete bool) (A
 		return ActionDelete, "远端已删除且本地未被改动，按镜像删除"
 	}
 
-	// ent 为 nil 表示远端元信息未知（ls 没补齐），保守地直接下载。
+	// ent 为 nil 表示远端元信息未知（ls 没补齐）。**"未知"不等于"远端不存在"**：
+	// 本地已有同名文件时直接下载会无冲突提示地覆盖它；只有本地也确实不存在
+	// （没有可丢的东西）时才保守下载。
 	if ent == nil {
-		return ActionGet, "无远端元信息，保守下载"
+		if local.Exists {
+			return ActionConflict, "远端元信息未知但本地已存在同名文件，不覆盖"
+		}
+		return ActionGet, "无远端元信息且本地不存在，保守下载"
 	}
 	if !ent.HasBaseline() {
 		if !local.Exists {

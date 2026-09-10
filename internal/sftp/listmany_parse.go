@@ -7,9 +7,10 @@ import "strings"
 // 分段依据是回显行前缀 "sftp> "（实测格式形如 `sftp> -ls -la "/x"`）。因此批处理中
 // **不能**用 '@' 前缀：它抑制回显，分段依据会丢失。
 //
-// 关键：失败的块必须判为"未知"并**缺席于返回值**。实测中 `sftp -b` 对失败目录只打印
-// `Can't ls: ... not found` 而退出码仍为 0，且 ParseLsLf 会把这种块解析成空列表——
-// 若照单全收，就会把"列不出来"误当成"目录是空的"，进而对整棵子树产出 delete 事件。
+// 关键：失败的块必须判为"未知"并**缺席于返回值**。实测（真实 OpenSSH）中 `sftp -b`
+// 把客户端错误原文写到 **stderr**（形如 `Can't ls: "<path>" not found`，退出码仍为 0），
+// 失败目录在 stdout 里**只剩一行回显、内容为空**。若把空块当成"目录是空的"，就会把
+// "列不出来"误当成空目录，进而对整棵子树产出 delete 事件。规则是：**空块 = 未知**。
 //
 // 归属按索引：第 i 个回显块对应 paths[i]。若块数少于请求数（批处理被截断/回显缺失），
 // 多出来的路径一律**缺席**（未知），绝不为它们返回空列表；调用方凭缺失的 key 判断完整性。
@@ -66,10 +67,12 @@ func splitBlocks(out string) []string {
 	return blocks
 }
 
-// blockFailed 判断一个输出块是否代表"该目录未知"。sftp 的客户端错误行不带前导空白。
+// blockFailed 判断一个输出块是否代表"该目录未知"。
 //
-// 只用**紧凑前缀**匹配：'not found' 之类的子串检查会误伤文件名里含该字样的正常目录。
-// `Can't ls: "..." not found` 本身已被 "Can't " 前缀覆盖。
+// 实测 OpenSSH 把客户端错误写到 stderr，stdout 的失败块只剩回显与空内容，因此判
+// "未知"的主路径是上面的**空块**检查；本函数只是防御性兜底（个别版本/包装可能把
+// 错误回显进 stdout）。只用**紧凑前缀**匹配：'not found' 之类的子串检查会误伤
+// 文件名里含该字样的正常目录；`Can't ls: "..." not found` 已被 "Can't " 前缀覆盖。
 func blockFailed(block string) bool {
 	for _, line := range strings.Split(block, "\n") {
 		l := strings.TrimSpace(strings.TrimRight(line, "\r"))
