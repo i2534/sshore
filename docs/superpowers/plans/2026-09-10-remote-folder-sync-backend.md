@@ -752,6 +752,92 @@ git commit -m "feat(sftp): 新增 ListMany 批量列举,用 '-' 前缀防整批�
 
 ---
 
+## Task 3b: 把 user 贯通到 sftp 的 ControlMaster socket
+
+**Files:** Modify `internal/sftp/ctrl.go`；Test `internal/sftp/ctrl_test.go`
+
+**为什么必须有这一步**：spec §4.4 要求 `controlPathFor(host)` 改为 `sshconn.ControlPath(host, user)`。不改的话，`EnsureMaster` 建的 socket 是 `cm-<host>+<user>.sock`，而 sftp 的 `List/Get/ListMany` 用的是 `cm-<host>.sock` —— **两者永不重合，"探测连接与文件传输共用一条 SSH 连接"这个设计前提直接落空**；同 host 异 user 时 sftp 还会复用错身份的旧 master。
+
+**公开方法签名一个不动**（`Disconnect(host)`/`Connected(host)` 的调用方是前端，不能动）：`Ctrl` 内部记住 host → user。
+
+- [ ] **Step 1: 写失败的测试**
+
+在 `internal/sftp/ctrl_test.go` 追加：
+
+~~~go
+// socket 路径必须随 user 变化：同 host 异 user 绝不能共用 master。
+func TestControlPathKeyedByUser(t *testing.T) {
+	c := NewCtrl(func(string, ...string) (osutil.Outcome, error) { return osutil.Outcome{}, nil }, nil)
+	a := c.controlPathFor("prod-01", "")
+	b := c.controlPathFor("prod-01", "alice")
+	if a == b {
+		t.Fatalf("同 host 异 user 必须得到不同 socket: %q", a)
+	}
+}
+
+// Disconnect/Connected 只拿到 host，必须用内部记住的 user 反查同一个 socket。
+func TestRememberedUserUsedByHostOnlyAPI(t *testing.T) {
+	c := NewCtrl(func(string, ...string) (osutil.Outcome, error) { return osutil.Outcome{}, nil }, nil)
+	c.rememberUser("prod-01", "alice")
+	if got, want := c.controlPathFor("prod-01", c.userFor("prod-01")), c.controlPathFor("prod-01", "alice"); got != want {
+		t.Fatalf("host-only API 未复用记住的 user: %q vs %q", got, want)
+	}
+}
+~~~
+
+- [ ] **Step 2: 运行测试确认失败** — Run: `go test ./internal/sftp/ -run 'ControlPathKeyed|RememberedUser' -v`；Expected: 编译失败（`controlPathFor` 参数个数不匹配）
+
+- [ ] **Step 3: 实现**
+
+在 `internal/sftp/ctrl.go` 中：
+
+~~~go
+type Ctrl struct {
+	runner     osutil.Runner
+	emit       forward.EmitFunc
+	controlDir string
+	active     map[string]bool   // hosts marked connected (Windows per-command mode)
+	users      map[string]string // host → 最近一次使用的 user（用于把 user 纳入 socket key）
+	mu         sync.Mutex
+}
+
+// controlPathFor 委托给 sshconn（socket 路径的唯一来源）；user 纳入 key，
+// 否则同 host 异 user 会共用 master，用错身份读写远端文件。
+func (c *Ctrl) controlPathFor(host, user string) string {
+	return sshconn.ControlPath(host, user)
+}
+
+func (c *Ctrl) rememberUser(host, user string) {
+	c.mu.Lock()
+	if c.users == nil {
+		c.users = map[string]string{}
+	}
+	c.users[host] = user
+	c.mu.Unlock()
+}
+
+func (c *Ctrl) userFor(host string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.users[host]
+}
+~~~
+
+调用点全部改掉（**方法签名一个不动**）：
+
+- `NewCtrl` 里初始化 `users: map[string]string{}`；删掉 `controlDir` 相关字段与 `CloseAll` 里的文件名反解逻辑；
+- `run(host, user, batch)`：开头 `c.rememberUser(host, user)`，socket 用 `c.controlPathFor(host, user)`；
+- `Connect(host, user)`：`c.rememberUser(host, user)`；
+- `Disconnect(host)` / `disconnectLocked(host)` / `Connected(host)`：用 `c.controlPathFor(host, c.userFor(host))`；
+- `CloseAll()`：**改为遍历 `c.users`**（`for host, user := range c.users { disconnectLocked(host, user) }`）——带 `+user` 的路径反解不出正确的 host，原来的文件名解析会失效。
+
+- [ ] **Step 4: 运行测试确认通过（含既有 sftp 回归）** — Run: `go test ./internal/sftp/ -race -count=1`；Expected: 全部 PASS
+
+- [ ] **Step 5: 提交** — `git add internal/sftp/ && git commit -m "refactor(sftp): ControlMaster socket 纳入 user 并委托 sshconn,修正同 host 异 user 复用错 master"`
+~~~
+
+---
+
 ## Task 4: config.SyncRule 与默认值归一化
 
 **Files:**
@@ -1505,6 +1591,21 @@ type InotifySource struct {
 	proc *osutil.Process
 	ch   chan Event
 	done chan struct{}
+
+	emitMu sync.Mutex // 串行化 emit 与 close(ch)
+	closed bool
+
+	sawEstablished bool  // 是否已收到 "Watches established."（区分启动期/运行期）
+	startErr       error // 启动期致命错误（远端路径不存在、watch 配额耗尽）
+	unmatched      int   // 无法解析的行数（spec §6.2 要求计数告警）
+}
+
+// Err 返回启动期的致命错误。引擎在探测断开后据此判定"进 error 不重连"，
+// 而不是把它当成一次可重连的抖动。
+func (s *InotifySource) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.startErr
 }
 
 func NewInotifySource(sp osutil.Streamer, o DetectOpts, log func(level, msg string)) *InotifySource {
@@ -1551,7 +1652,10 @@ func (s *InotifySource) Start(ctx context.Context) (<-chan Event, error) {
 	// channel 的唯一关闭点：进程结束（自然退出或 Close 杀掉）后关闭。
 	go func() {
 		proc.Wait()
+		s.emitMu.Lock()
+		s.closed = true
 		close(ch)
+		s.emitMu.Unlock()
 		close(done)
 	}()
 	return ch, nil
@@ -1571,6 +1675,14 @@ func (s *InotifySource) Close() error {
 }
 
 func (s *InotifySource) emit(ch chan Event, ev Event, done chan struct{}) {
+	// close(ch) 与 stdout/stderr 的 scanLines goroutine 是并发的：cmd.Wait()
+	// 返回后立刻 close(ch) 时，回调可能正在执行 ch <- ev —— 往已关闭的 channel
+	// 发送会 panic（select 挡不住）。所以用一个 closed 标志把"关闭"与"发送"串起来。
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	if s.closed {
+		return
+	}
 	select {
 	case ch <- ev:
 	case <-done:
@@ -1579,10 +1691,15 @@ func (s *InotifySource) emit(ch chan Event, ev Event, done chan struct{}) {
 
 func (s *InotifySource) handleStdout(ch chan Event) func(string) {
 	return func(line string) {
+		// **-tt 下远端 stderr 与 stdout 合并**（实测：Setting up watches... 就出现在
+		// stdout 里），所以 watch 故障文案必须在这里也识别一次——只挂在 OnStderr
+		// 上等于死路径，徽章会一直显示 inotify 而 watch 其实残缺。
+		if s.noteWatchProblem(ch, line) {
+			return
+		}
 		ev, ok := ParseInotifyLine(s.opts.RemotePath, line)
 		if !ok {
-			// 噪声行（Setting up watches... / OPEN / ACCESS / 目录的 CLOSE_NOWRITE,ISDIR）
-			// 静默丢弃；在这里告警会让每个噪声行都刷屏。
+			s.countUnmatched(line)
 			return
 		}
 		s.mu.Lock()
@@ -1592,24 +1709,62 @@ func (s *InotifySource) handleStdout(ch chan Event) func(string) {
 	}
 }
 
-// handleStderr 处理远端 stderr。实测：配额耗尽在启动时致命、新目录补挂失败在
-// 运行时只是降级——两者文案都以 Couldn't watch / Failed to watch 开头，必须
-// 按文案区分，并统一升级为 overflow（强制对账 + 禁止删除），绝不静默。
+// handleStderr 只是 stdout 路径的补充：-tt 下两者已经合并，识别逻辑集中在
+// noteWatchProblem，避免两处判断漂移。
 func (s *InotifySource) handleStderr(ch chan Event) func(string) {
-	return func(line string) {
-		l := strings.ToLower(line)
-		switch {
-		case strings.Contains(l, "failed to watch"), strings.Contains(l, "upper limit"):
-			s.log("error", "远端 inotify watch 配额耗尽："+line)
-			s.signalOverflow(ch)
-		case strings.Contains(l, "couldn't watch"):
-			if strings.Contains(l, "no such file") {
-				s.log("error", "远端路径不存在："+line)
-			} else {
-				s.log("warn", "有目录无法建立 watch，watch 集合不完整："+line)
-			}
-			s.signalOverflow(ch)
+	return func(line string) { s.noteWatchProblem(ch, line) }
+}
+
+// noteWatchProblem 识别 inotifywait 的故障/阶段文案；返回 true 表示该行已消费。
+//
+// 阶段区分（spec §6.2）："远端路径不存在"只可能发生在 "Watches established."
+// 之前 —— 那是配置错，规则要进 error 且**不重连**；运行期补挂失败（新目录）
+// 只降级为 overflow（强制对账 + 禁止删除）。
+func (s *InotifySource) noteWatchProblem(ch chan Event, line string) bool {
+	l := strings.ToLower(line)
+	switch {
+	case strings.Contains(l, "watches established"):
+		s.mu.Lock()
+		s.sawEstablished = true
+		s.mu.Unlock()
+		return true
+	case strings.Contains(l, "setting up watches"):
+		return true
+	case strings.Contains(l, "failed to watch"), strings.Contains(l, "upper limit"):
+		err := fmt.Errorf("远端 inotify watch 配额耗尽：%s", line)
+		s.mu.Lock()
+		s.startErr = err
+		s.mu.Unlock()
+		s.log("error", err.Error())
+		s.signalOverflow(ch)
+		return true
+	case strings.Contains(l, "couldn't watch"):
+		s.mu.Lock()
+		fatal := !s.sawEstablished && strings.Contains(l, "no such file")
+		if fatal {
+			s.startErr = fmt.Errorf("远端路径不存在：%s", line)
 		}
+		s.mu.Unlock()
+		if fatal {
+			s.log("error", "远端路径不存在："+line)
+		} else {
+			s.log("warn", "有目录无法建立 watch，watch 集合不完整："+line)
+		}
+		s.signalOverflow(ch)
+		return true
+	}
+	return false
+}
+
+// countUnmatched 计数无法解析的行，超阈值记一条带样本的 warn（spec §6.2）。
+// 只对噪声行静默会让真的格式故障（版本差异、CR 未裁）无从发现。
+func (s *InotifySource) countUnmatched(sample string) {
+	s.mu.Lock()
+	s.unmatched++
+	n := s.unmatched
+	s.mu.Unlock()
+	if n == 100 || n%1000 == 0 {
+		s.log("warn", fmt.Sprintf("有 %d 行 inotifywait 输出无法解析，样本: %s", n, sample))
 	}
 }
 
@@ -3581,6 +3736,7 @@ import (
 	"sshore/internal/config"
 	"sshore/internal/forward"
 	"sshore/internal/osutil"
+	"sshore/internal/sshconn"
 	"sshore/internal/watch"
 )
 
@@ -3661,6 +3817,19 @@ func NewCtrl(d Deps) *Ctrl {
 		d.Emit = func(forward.Event) {}
 	}
 	return &Ctrl{d: d, run: map[string]*ruleRuntime{}}
+}
+
+// retryDelay 是**单文件**下载失败的重试节奏（1s / 4s / 16s），与 §8.2 的
+// 连接退避是两套参数，不要合并。
+func retryDelay(attempt int) time.Duration {
+	switch attempt {
+	case 1:
+		return time.Second
+	case 2:
+		return 4 * time.Second
+	default:
+		return 16 * time.Second
+	}
 }
 
 // backoffDelay 与 forward 同一序列：1s 起、每次 ×2、30s 封顶。
@@ -3796,6 +3965,17 @@ func (c *Ctrl) loop(r *ruleRuntime) {
 			return
 		default:
 		}
+		// spec §4.3：规则启动时确保 ControlMaster 存在。sftp 的 run() 用的是
+		// ControlMaster=no（只复用不建立），不在这里建的话所有连接各自建连，
+		// "探测与传输共用一条连接"这个设计前提就不成立。
+		if c.d.Runner != nil {
+			mctx, mcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := sshconn.EnsureMaster(mctx, c.d.Runner, r.rule.Host, r.rule.User); err != nil {
+				// 降级而非失败：功能正确，只是每条命令各自建连。
+				c.emitThrottled(r, "master", "warn", "无法建立复用的 SSH 连接，将按命令独立连接："+err.Error())
+			}
+			mcancel()
+		}
 		info := watch.Detect(context.Background(), c.d.Runner, watch.DetectOpts{
 			Host: r.rule.Host, User: r.rule.User, RemotePath: r.rule.RemotePath,
 			ForcePoll: r.rule.ForcePoll, PollInterval: time.Duration(r.rule.PollIntervalS) * time.Second,
@@ -3840,6 +4020,17 @@ func (c *Ctrl) loop(r *ruleRuntime) {
 		_ = src.Close()
 		if dropped {
 			// 轮询连续失败达到阈值 ⇒ 配置/权限类问题，进 error 而不是无限重连。
+			// 启动期致命错误（远端路径不存在 / watch 配额耗尽）：配置错，进 error
+			// 且不重连——无限重试只会掩盖问题并刷屏。
+			if is, ok := src.(*watch.InotifySource); ok {
+				if e := is.Err(); e != nil {
+					r.mu.Lock()
+					r.status = "error"
+					r.mu.Unlock()
+					c.emit(r.rule.ID, "error", e.Error())
+					return
+				}
+			}
 			if ps, ok := src.(*watch.PollSource); ok && ps.Failures() >= 5 {
 				r.mu.Lock()
 				r.status = "error"
@@ -4058,14 +4249,22 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	r.stats.AlignTotal = len(snap.Entries)
 	r.mu.Unlock()
 	var dels []string
+	var changed []string
 	r.state.With(func(d *StateFile) {
 		for rel, meta := range snap.Entries {
 			ent := d.Entries[rel]
 			if ent == nil {
-				ent = &Entry{}
+				// 远端新增：登记远端字段（Local 字段留空 ⇒ HasLocal=false）
+				d.Entries[rel] = &Entry{RemoteSize: meta.Size, RemoteMTime: meta.ModTime}
+				changed = append(changed, rel)
+			} else if ent.RemoteSize != meta.Size || ent.RemoteMTime != meta.ModTime {
+				// **只在远端真的变了时才处理**。原来的写法无条件覆盖 Remote*
+				// 再对全部条目调 applyOne，而 Decide 的"有基线且本地未改"分支
+				// 恒返回 GET —— 结果是每次对账都重下整棵树，且 §7.8 要求的
+				// "本轮快照 vs entries.remote_*" diff 在覆盖后已无从比较。
+				ent.RemoteSize, ent.RemoteMTime = meta.Size, meta.ModTime
+				changed = append(changed, rel)
 			}
-			ent.RemoteSize, ent.RemoteMTime = meta.Size, meta.ModTime
-			d.Entries[rel] = ent
 			r.mu.Lock()
 			r.stats.AlignScanned++
 			r.mu.Unlock()
@@ -4093,8 +4292,9 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	r.stats.Pending = len(snap.Entries)
 	r.mu.Unlock()
 	_ = r.state.Flush()
-	for rel, meta := range snap.Entries {
-		c.applyOne(r, rel, watch.KindWrite, &Entry{RemoteSize: meta.Size, RemoteMTime: meta.ModTime})
+	// 只处理新增/变化的条目；remote_* 已在上面写进 entries，applyOne 从状态里读。
+	for _, rel := range changed {
+		c.applyOne(r, rel, watch.KindWrite, nil)
 	}
 	c.maybeDelete(r, len(snap.Entries))
 }
@@ -4154,11 +4354,30 @@ func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Ent
 			// 且**不更新基线**（原文件根本没有变化）。
 			target = local + ".remote-" + time.Now().Format("20060102-150405")
 		}
-		if err := TransferTo(c.d.Transfer, r.rule.Host, r.rule.User, remotePath, target, r.rule.ID, nil); err != nil {
-			c.emit(r.rule.ID, "error", "下载 "+rel+" 失败："+err.Error())
+		// 单文件失败退避重试 3 次（1s/4s/16s）；仍失败则标记并**继续处理其它文件**，
+		// 一个权限错误的文件不该让整条规则停摆。
+		var lastErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-r.cancel:
+					return
+				case <-c.d.After(retryDelay(attempt)):
+				}
+			}
+			if lastErr = TransferTo(c.d.Transfer, r.rule.Host, r.rule.User, remotePath, target, r.rule.ID, nil); lastErr == nil {
+				break
+			}
+		}
+		if lastErr != nil {
+			c.emit(r.rule.ID, "error", "下载 "+rel+" 失败（已重试 3 次）："+lastErr.Error())
 			r.mu.Lock()
 			r.stats.Failed++
 			r.mu.Unlock()
+			r.state.With(func(d *StateFile) {
+				d.Failed = append(d.Failed, FailedItem{RelPath: rel, Err: lastErr.Error(),
+					At: time.Now().Format(time.RFC3339)})
+			})
 			return
 		}
 		if saveAs {
@@ -4923,6 +5142,72 @@ false（不重连）处理，与 spec §5.2 的"缺键取全局 `App.AutoReconne
 以下 spec 内容**故意不在本计划范围**，由后续的前端计划承担：§9.2 界面、§9.3 实时性（`KeepAlive` / 不二次 `EventsOn`）、§9.4 日志隔离（`LogPanel` 的 `sourceTypes` 与 `sftp` 日志量修正）。Task 15 只负责把绑定与生成物落地。
 
 ---
+
+## Task 17: 关键集成测试（第三轮补）
+
+**Files:** Modify ¤internal/sync/ctrl_test.go¤
+
+**为什么单独列**：Task 8–14 的单测都是纯逻辑层（决策表、闸门、状态文件），而第三轮复审暴露的问题**全部在"接线"上**——逻辑对但没接上。这一层只能靠集成测试守住。
+
+- [ ] **Step 1: 写测试**
+
+在 ¤internal/sync/ctrl_test.go¤ 追加：
+
+~~~go
+// 端到端验证"镜像删除真的会删文件"。它能同时守住三件事：
+//   1) applyOne 的 ActionDelete 会登记进 pendingDel；
+//   2) drainQueue 处理完会真的调闸门（否则这里永远不会删）；
+//   3) 闸门在事件路径（CountKnown=false）放行单条删除。
+func TestEngineMirrorDeleteActuallyDeletes(t *testing.T) {
+	fs := newFakeRemote()
+	fs.set("/r", sftp.Item{Name: "a.txt", Size: 5, ModTime: "2026-09-10 10:00"})
+	xf := &fakeXfer{remote: map[string]string{"/r/a.txt": "hello"}}
+	c, rule, local := newTestCtrl(t, fs.list, xf)
+	rule.MirrorDelete = true
+	if err := c.Start(rule); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Stop(rule.ID)
+
+	target := filepath.Join(local, "a.txt")
+	waitFor(t, 5*time.Second, func() bool {
+		_, err := os.Stat(target)
+		return err == nil
+	}, "首轮对齐未把 a.txt 拉下来")
+
+	fs.set("/r") // 远端删除
+	waitFor(t, 6*time.Second, func() bool {
+		_, err := os.Stat(target)
+		return os.IsNotExist(err)
+	}, "mirror_delete 未删除本地文件（删除闸门没接上或未放行）")
+}
+
+func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal(msg)
+}
+~~~
+
+- [ ] **Step 2: 运行** — Run: ¤go test ./internal/sync/ -race -count=1 -run MirrorDelete -v¤；Expected: PASS
+
+- [ ] **Step 3: 提交** — ¤git add internal/sync/ && git commit -m "test(sync): 新增 mirror_delete 端到端测试,守住删除闸门接线"¤
+
+### 仍未写的测试（复审点名要求，后续补）
+
+以下测试**本轮没有写**，不要在实现时以为已经覆盖：
+
+1. ¤ConfirmDeletes¤ 的"挂起 → 远端恢复 → 确认 → 整批作废"（对应 §7.6 第 6 条）；
+2. ¤ResolveConflict¤ 与引擎并发时的无死锁断言（对应 §10.3）；
+3. ¤save_as¤ 写到 ¤<name>.remote-<ts>¤ 且**不覆盖本地**（对应 §7.7，数据安全级）；
+4. 单文件失败 3 次退避（1s/4s/16s）后标记 ¤failed¤ 且继续处理其它文件（对应 §8.4）；
+5. 背压：队列超过 ¤maxQueuePaths¤ 时退化为全量对账而不是阻塞（对应 §7.1）。
 
 ## Execution Handoff
 
