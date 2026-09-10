@@ -33,7 +33,7 @@
 6. 目录被 `mv` 进监控树时只发 `MOVED_TO,ISDIR`，**目录内已有文件零事件** → 必须触发子树对账扫描。
 7. `inotifywait` 退出码：`0`=收到事件、`1`=收到未请求事件或出错（**二义**）、`2`=`--timeout` 到期。
 8. `command -v inotifywait` 缺失时退出码是 **1**（不是 127）。
-9. `sftp -b` 多命令批处理：回显形如 `sftp> -ls -la "路径"`（含前导 `-`），可用 `sftp> ` 作**块边界**；`-` 前缀确实阻止整批中止（失败目录打印 `Can't ls: ... not found` 后继续执行）；**但 `sftp` 退出码仍是 0**，所以"某目录是否已知"必须在块内检测错误文案。
+9. `sftp -b` 多命令批处理：回显形如 `sftp> -ls -la "路径"`（含前导 `-`），可用 `sftp> ` 作**块边界**；`-` 前缀确实阻止整批中止；**`sftp` 退出码仍是 0**，所以不能靠退出码判断某目录是否被列出来。**⚠ 本条已更正**：OpenSSH sftp 的客户端错误文案（`Can't ls: "<path>" not found`，带 CRLF）走 **stderr** —— **stdout 里失败目录只剩一条回显、块内容为空**。因此主判据必须是「**空块 = 未知**」（可列目录的 `ls -la` 必出 `.` 与 `..`），块内文案判定只能作次级防御。（原先"sftp 错误文案在输出流里"的结论来自一个用了 `2>&1` 的探针，是错的。）
 10. `pkill -f '模式'` 会**匹配到远端 shell 自己的命令行**而自杀；必须用方括号技巧 `'[i]notifywait.*tag'`。
 
 ### 对本计划的范围界定
@@ -553,7 +553,7 @@ git commit -m "feat(sshconn): 新增 ControlMaster socket 唯一来源、可取�
 - Consumes: 现有 `c.run(host, user, batch)`、`quoteArg`、`ParseLsLf`、`Item`
 - Produces: `func (c *Ctrl) ListMany(host, user string, paths []string) (map[string][]Item, error)`
 
-**实测事实（决定本任务的全部设计）**：批处理回显是 `sftp> -ls -la "路径"`（含前导 `-`），可作块边界；`-` 前缀阻止整批中止；**失败目录只打印 `Can't ls: "..." not found` 而 `sftp` 退出码仍是 0** —— 所以必须靠块内错误文案判定"未知"，绝不能靠退出码。把"未知"当成"空目录"会让 diff 为整棵子树产出 delete 事件，进而删本地文件。
+**实测事实（决定本任务的全部设计）**：批处理回显是 `sftp> -ls -la "路径"`（含前导 `-`），可作块边界；`-` 前缀阻止整批中止；**`sftp` 退出码仍是 0**，不能靠它判断目录是否列出来了。**⚠ 更正**：OpenSSH 的错误文案（`Can't ls: "<path>" not found`，CRLF）走 **stderr**，**stdout 里失败目录只剩回显、块内容为空**。因此**主判据是「空块 = 未知」**，块内文案判定只是次级防御。把"未知"当成"空目录"会让 diff 为整棵子树产出 delete 事件，进而删本地文件。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -571,7 +571,8 @@ drwxr-xr-x    4 lan      lan          4096 Sep 10 20:46 ..
 -rw-r--r--    1 lan      lan             4 Sep 10 20:46 one.txt
 -rw-r--r--    1 lan      lan             4 Sep 10 20:46 two.txt
 sftp> -ls -la "/tmp/ldm/nope"
-Can't ls: "/tmp/ldm/nope" not found
+（真实客户端在此处**没有**列表内容 —— 错误文案走 stderr，见 listManyStderr）
+
 sftp> -ls -la "/tmp/ldm/empty"
 drwxr-xr-x    2 lan      lan          4096 Sep 10 20:46 .
 drwxr-xr-x    4 lan      lan          4096 Sep 10 20:46 ..
@@ -1052,7 +1053,7 @@ git commit -m "feat(config): 新增 SyncRule 与默认值归一化,避免手改�
   - `type Source interface { Start(ctx context.Context) (<-chan Event, error); Info() Info; Close() error }`
   - `func ParseInotifyLine(root, line string) (Event, bool)`
 
-**必须按实测写**：`%e` 是逗号分隔 token 列表；`*_SELF` 路径带尾斜杠；判定必须**先看 ISDIR 再看文件 token**（`CLOSE_NOWRITE,CLOSE,ISDIR` 同时含 `CLOSE`）。
+**必须按实测写**：`%e` 是逗号分隔 token 列表；`*_SELF` 的路径带尾斜杠且 token 里**没有 ISDIR**，必须**单独提前**归一到目录事件；其余判定**先看 ISDIR 再看文件 token**（`CLOSE_NOWRITE,CLOSE,ISDIR` 同时含 `CLOSE`，顺序反了会把目录事件误伤成噪声）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1247,15 +1248,21 @@ func ParseInotifyLine(root, line string) (Event, bool) {
 	}
 	// 必须先判 ISDIR：CLOSE_NOWRITE,CLOSE,ISDIR 同时含 CLOSE，
 	// 若先按文件 token 过滤会把目录事件误伤成噪声。
-	// *_SELF 的 token 里**没有 ISDIR**（实测 d/|DELETE_SELF），但路径带尾斜杠、
-	// 且只有被 watch 的目录才会收到自己的 SELF 事件 —— 一律按目录事件处理。
-	if toks["DELETE_SELF"] || toks["MOVE_SELF"] || toks["DELETE"] || toks["MOVED_FROM"] {
+	// *_SELF 的 token **不带 ISDIR**（实测 d/|DELETE_SELF），但路径带尾斜杠；
+	// 只有被 watch 的目录才会收到自己的 SELF 事件，故提前归一到目录事件。
+	// **注意只提前 SELF 两类**：DELETE / MOVED_FROM 不能放进来 —— 它们既可能是
+	// 文件删除（应归 delete）也可能是目录删除（带 ISDIR，应归 dir_gone）。
+	if !toks["ISDIR"] && (toks["DELETE_SELF"] || toks["MOVE_SELF"]) {
 		return Event{RelPath: rel, Kind: KindDirGone}, true
 	}
+	// 先判 ISDIR 再看文件 token：CLOSE_NOWRITE,CLOSE,ISDIR 同时含 CLOSE，
+	// 顺序反了会把目录事件误伤成噪声。
 	if toks["ISDIR"] {
 		switch {
 		case toks["CREATE"] || toks["MOVED_TO"]:
 			return Event{RelPath: rel, Kind: KindDirAdded}, true
+		case toks["DELETE"] || toks["MOVED_FROM"] || toks["DELETE_SELF"] || toks["MOVE_SELF"]:
+			return Event{RelPath: rel, Kind: KindDirGone}, true
 		default:
 			return Event{}, false // OPEN,ISDIR / ACCESS,ISDIR / CLOSE_NOWRITE,...,CLOSE,ISDIR
 		}
