@@ -184,6 +184,52 @@ func TestInotifySourceLateWatchErrorIsOnlyOverflow(t *testing.T) {
 	}
 }
 
+// Close 必须在有界时间内返回，即使 channel 已被事件灌满且消费方不再读取。
+//
+// 这是回归护栏：若 emit 在持有 emitMu 时阻塞在满 channel 的发送上，
+// osutil 的 proc.Wait() 会先等扫流 goroutine（正阻塞在回调里），
+// 关闭 goroutine 到不了 emitMu，done 永不关闭，Close 就永久挂起。
+// 现实的触发场景：引擎消费方正忙于传输大文件数秒，期间远端（构建、日志目录）
+// 产生超过容量的事件，此时停规则调用 Close 会挂死。
+func TestInotifySourceCloseReturnsOnBackpressure(t *testing.T) {
+	fs := &fakeStreamer{started: make(chan struct{})}
+	src := NewInotifySource(fs, DetectOpts{Host: "h", RemotePath: "/srv/conf"}, func(string, string) {})
+	ch, err := src.Start(context.Background())
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	<-fs.started
+
+	// 灌入超过 channel 容量的事件且**始终不读**：超出容量的回调阻塞在 emit。
+	const events = 400
+	go func() {
+		for i := 0; i < events; i++ {
+			fs.handlers.OnStdout("/srv/conf/a.txt|CLOSE_WRITE,CLOSE")
+		}
+	}()
+
+	// 等 channel 被填满，再给发送方一点时间真正阻塞在 emit（持 emitMu）。
+	deadline := time.Now().Add(3 * time.Second)
+	for len(ch) < cap(ch) {
+		if time.Now().After(deadline) {
+			t.Fatalf("channel 未能被填满（cap=%d）", cap(ch))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	closed := make(chan error, 1)
+	go func() { closed <- src.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("channel 满且消费方不读时 Close 必须仍有界返回（emit 背压不得挂死 Close）")
+	}
+}
+
 // Close 幂等，且必须关闭 channel，否则引擎的 range 永不退出（goroutine 泄漏）。
 func TestInotifySourceCloseClosesChannel(t *testing.T) {
 	fs := &fakeStreamer{started: make(chan struct{})}
