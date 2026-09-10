@@ -166,11 +166,13 @@ func Exec(ctx context.Context, host, user, cmd string) (osutil.Outcome, error)
    - **`cmd.Start()` 失败必须返回 `nil, err`**。现有实现失败时仍返回非 nil 的 `Process`，而它的 `done` channel 既无人写也无人关（`runner.go:73-76`）→ 任何 `Wait()` 调用**永久阻塞**。forward 现有调用方先查 err 所以没暴露，但 sync 若写 `defer p.Wait()` 就会挂死。
    - 旧 `Spawner.Start` 签名不动（改签名会破坏 `forward/ctrl_test.go` 的 fakeSpawner），内部委托给 `StartStream`；**上面两条改动必须由现有 `forward` 测试守住**（§10.1）。
 
-2. **`internal/sftp/ctrl.go`**：`controlPathFor(host)` → `sshconn.ControlPath(host, user)`；新增 `ListMany`（§6.4）。现有方法的语义一行不变。
+2. **`internal/sftp/ctrl.go`**：
+   - `controlPathFor(host)` → `sshconn.ControlPath(host, user)`。**公开方法签名一个不动**：`Ctrl` 内部维护 `users map[string]string`（host → 最近一次使用的 user），`run`/`Connect` 写入，`Disconnect`/`Connected`/`disconnectLocked`/`CloseAll` 读取（取不到时退化为空 user）。`CloseAll` 改为遍历这张 map，**不再反解 socket 文件名**（带 `+user` 的路径解不出正确的 host）。
+   - 新增批量只读方法 `ListMany`（§6.4）。现有方法的语义与签名不变。
 
 ### 4.5 依赖方向
 
-`sync → watch`（接口）、`sync → sftp`（传输/扫描适配器）、`sync → forward`（仅复用 `ValidateHost`）、`watch/sync → sshconn`、`sshconn → osutil`、`sync/watch/sftp → config`。**`config` 不 import 上述任何包**（无导入环）。
+`sync → watch`（接口与扫描器）、`sync → sftp`（**仅经 `adapters.go` 的 `NewSftpAdapter`**）、`sync → forward`（仅复用 `ValidateHost`）、`watch → sftp`（只依赖 `sftp.Item` 这个数据形状）、`watch/sync → sshconn`、`sshconn → osutil`、`sync/watch/sftp → config`。**`config` 不 import 上述任何包**（无导入环）。
 
 ## 5. 配置模型
 
@@ -693,8 +695,8 @@ func (a *App) ConfirmSyncRuleDeletes(id string, fingerprint string) error // §7
 **新增**
 
 - `internal/sshconn/`（`ControlPath` / `EnsureMaster` / `Exec`）+ `*_test.go`
-- `internal/watch/`（`source.go` 契约、`inotify.go`、`poll.go`）+ `*_test.go`
-- `internal/sync/`（`ctrl.go`、`engine.go`、`scan.go`、`state.go`、`paths.go`、`transfer.go`、`validate.go`）+ `*_test.go`
+- `internal/watch/`（`event.go` 契约、`inotify_parse.go`、`detect.go`、`inotify.go`、`scan.go`、`poll.go`）+ `*_test.go`
+- `internal/sync/`（`ctrl.go`、`decide.go`、`paths.go`、`state.go`、`transfer.go`、`adapters.go`、`delete_gate.go`、`conflict.go`、`validate.go`、`fs.go`）+ `*_test.go`
 - `frontend/src/views/SyncView.vue`、`frontend/src/components/SyncCard.vue`、`frontend/src/components/SyncConflictsDialog.vue`
 - 运行期目录 `<UserConfigDir>/sshore/state/`
 

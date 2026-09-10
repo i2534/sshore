@@ -763,7 +763,7 @@ git commit -m "feat(sftp): 新增 ListMany 批量列举,用 '-' 前缀防整批�
 
 **为什么必须有 Normalize**：`LoadConfig` 先构造默认值再 Decode，但 `[[syncs]]` 数组的元素是**解码时新建的零值结构体**，预置默认值不生效。缺键会被静默解释成零值（例如 `poll_interval_s = 0`、`excludes = nil`），而校验只在创建/编辑时跑，拦不住手改配置文件。
 
-**对 spec §5.2 的一处细化**：`auto_reconnect` 缺键按 **false（不重连）** 处理，不引用全局 `AutoReconnectDefault`——解码后的 `bool` 无法区分"缺键"与"显式 false"，强行套默认会制造一个不能关掉的开关。全局默认的落点是**前端新建表单的初始值**（与隧道同）。安全侧默认是不重连。
+**与 spec §5.2 一致**：`auto_reconnect` 缺键时取全局 `App.AutoReconnectDefault`（默认 true）。实现方式是把它做成 `*bool` + `Reconnect() bool` 访问器——解码后的裸 `bool` 分不清"缺键"与"显式 false"，套默认会制造一个关不掉的开关；用指针才能既满足 spec 又保留显式关闭的能力。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -875,7 +875,7 @@ type SyncRule struct {
 	MirrorDelete  bool     `toml:"mirror_delete" json:"mirror_delete"`
 	ForcePoll     bool     `toml:"force_poll" json:"force_poll"` // 反向字段：零值即"优先 inotify"
 	PollIntervalS int      `toml:"poll_interval_s" json:"poll_interval_s"`
-	AutoReconnect bool     `toml:"auto_reconnect" json:"auto_reconnect"`
+	AutoReconnect *bool    `toml:"auto_reconnect,omitempty" json:"auto_reconnect"`
 	Enabled       bool     `toml:"enabled" json:"enabled"`
 }
 
@@ -883,6 +883,13 @@ type SyncRule struct {
 // 不要放 *.part：那是我们本地临时文件的后缀，远端不会出现。
 func DefaultExcludes() []string {
 	return []string{".git/", "node_modules/", "*.swp", "*~", ".DS_Store"}
+}
+
+// Reconnect 返回"意外断开时是否自动重连"。缺键（nil）按 true 处理——真正的
+// 默认值由 AppConfig.normalize() 从全局 App.AutoReconnectDefault 灌入，
+// 这里只是防止绕过 LoadConfig 直接构造 SyncRule 时解引用 nil。
+func (r *SyncRule) Reconnect() bool {
+	return r.AutoReconnect == nil || *r.AutoReconnect
 }
 
 // Normalize 兜底零值。手改配置缺键时，零值不得静默改变行为
@@ -920,6 +927,12 @@ func (c *AppConfig) normalize() {
 	c.App.Normalize()
 	for i := range c.Syncs {
 		c.Syncs[i].Normalize()
+		// spec §5.2：auto_reconnect 缺键时取全局默认（默认 true）。
+		// 用例：手写配置只写 host/remote_path/local_path，不应被静默关闭重连。
+		if c.Syncs[i].AutoReconnect == nil {
+			v := c.App.AutoReconnectDefault
+			c.Syncs[i].AutoReconnect = &v
+		}
 	}
 }
 ~~~
@@ -3836,7 +3849,7 @@ func (c *Ctrl) loop(r *ruleRuntime) {
 			}
 			// 通道关闭 = 探测断开。启动失败不重连，运行中断开才重连。
 			r.mu.Lock()
-			noReconnect := !r.rule.AutoReconnect
+			noReconnect := !r.rule.Reconnect()
 			r.status = "reconnecting"
 			if noReconnect {
 				r.status = "error"
@@ -4873,11 +4886,12 @@ git commit -m "test(sync): 新增真实 sshd 的端到端同步验证,由 e2e �
 
 **执行前建议先改 spec §12 的这一行**，否则执行者对照 spec 会困惑。这需要你点头，我没有擅自改。
 
-**第二处偏离：`auto_reconnect` 缺键的语义。** spec §5.2 要求"缺键 → 取全局
-`App.AutoReconnectDefault`"，但 Task 4 按 **false（不重连）** 处理——因为解码后的
-`bool` 无法区分"缺键"与"显式 false"，强行套默认会制造一个关不掉的开关。
-安全侧默认是不重连。若你要严格对齐 spec，需要把字段改成 `*bool` 并在
-`LoadConfig` 里灌默认值，这会影响 `wailsjs` 的模型（前端会看到 null）。**请裁定。**
+**第二处偏离：已按 spec 对齐（不再偏离）。** 原稿把 `auto_reconnect` 缺键按
+false（不重连）处理，与 spec §5.2 的"缺键取全局 `App.AutoReconnectDefault`"相反。
+现已改为 `AutoReconnect *bool` + `Reconnect() bool` 访问器，由
+`AppConfig.normalize()` 在加载时灌入全局默认——既满足 spec，也避免"解码后的
+`bool` 分不清缺键与显式 false"这个根本问题。副作用：`wailsjs` 模型里该字段是
+`*bool`（加载后永不为 nil，前端实际只会看到 true/false）。
 
 ### 6. 第二轮自审（/review 阶段一）修掉的问题
 
