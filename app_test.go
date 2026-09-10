@@ -751,3 +751,26 @@ func newTestApp(t *testing.T) *App {
 	a.sync = sync.NewCtrl(sync.Deps{StateDir: t.TempDir()})
 	return a
 }
+
+// StopSyncRule 必须幂等：对 Enabled=true 但引擎未运行的规则调用后应返回 nil，
+// 并把持久化的 Enabled 置回 false。否则该规则无法关闭、下次启动仍会被自动拉起。
+func TestStopSyncRuleClearsEnabledWhenEngineNotRunning(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.Syncs = []config.SyncRule{{
+		ID: "rule-x", Host: "prod-01", Kind: "dir",
+		RemotePath: "/r", LocalPath: "/l", PollIntervalS: 5, Enabled: true,
+	}}
+	if err := a.StopSyncRule("rule-x"); err != nil {
+		t.Fatalf("未运行的规则 StopSyncRule 必须返回 nil，得到 %v", err)
+	}
+	got, ok := a.findSyncRule("rule-x")
+	if !ok {
+		t.Fatal("StopSyncRule 不应删除规则")
+	}
+	if got.Enabled {
+		t.Fatal("StopSyncRule 后持久化的 Enabled 必须为 false")
+	}
+	if a.cfg.Syncs[0].Enabled {
+		t.Fatal("StopSyncRule 后 a.cfg.Syncs 的 Enabled 必须为 false")
+	}
+}

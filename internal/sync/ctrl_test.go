@@ -409,3 +409,16 @@ func TestEngineConfirmDeletesRevalidatesFingerprint(t *testing.T) {
 		t.Fatalf("确认已过期时绝不能执行删除: %v", err)
 	}
 }
+
+// Stop 必须幂等：对未运行的规则调用 Stop 返回 nil，而不是错误。契约与
+// forward.Ctrl.Stop 对齐（进程不存在时 return nil），否则上层无法用它清 Enabled。
+func TestEngineStopIsIdempotentWhenNotRunning(t *testing.T) {
+	c, rule, _ := newTestCtrl(t, nil, nil)
+	if err := c.Stop(rule.ID); err != nil {
+		t.Fatalf("未运行的规则 Stop 必须返回 nil（幂等契约），得到 %v", err)
+	}
+	// 再调一次也必须 nil：重复 Stop 不得改变契约。
+	if err := c.Stop(rule.ID); err != nil {
+		t.Fatalf("重复 Stop 必须返回 nil，得到 %v", err)
+	}
+}
