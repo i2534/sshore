@@ -1053,7 +1053,7 @@ git commit -m "feat(config): 新增 SyncRule 与默认值归一化,避免手改�
   - `type Source interface { Start(ctx context.Context) (<-chan Event, error); Info() Info; Close() error }`
   - `func ParseInotifyLine(root, line string) (Event, bool)`
 
-**必须按实测写**：`%e` 是逗号分隔 token 列表；`*_SELF` 路径带尾斜杠；判定必须**先看 ISDIR 再看文件 token**（`CLOSE_NOWRITE,CLOSE,ISDIR` 同时含 `CLOSE`）。
+**必须按实测写**：`%e` 是逗号分隔 token 列表；`*_SELF` 的路径带尾斜杠且 token 里**没有 ISDIR**，必须**单独提前**归一到目录事件；其余判定**先看 ISDIR 再看文件 token**（`CLOSE_NOWRITE,CLOSE,ISDIR` 同时含 `CLOSE`，顺序反了会把目录事件误伤成噪声）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1248,15 +1248,21 @@ func ParseInotifyLine(root, line string) (Event, bool) {
 	}
 	// 必须先判 ISDIR：CLOSE_NOWRITE,CLOSE,ISDIR 同时含 CLOSE，
 	// 若先按文件 token 过滤会把目录事件误伤成噪声。
-	// *_SELF 的 token 里**没有 ISDIR**（实测 d/|DELETE_SELF），但路径带尾斜杠、
-	// 且只有被 watch 的目录才会收到自己的 SELF 事件 —— 一律按目录事件处理。
-	if toks["DELETE_SELF"] || toks["MOVE_SELF"] || toks["DELETE"] || toks["MOVED_FROM"] {
+	// *_SELF 的 token **不带 ISDIR**（实测 d/|DELETE_SELF），但路径带尾斜杠；
+	// 只有被 watch 的目录才会收到自己的 SELF 事件，故提前归一到目录事件。
+	// **注意只提前 SELF 两类**：DELETE / MOVED_FROM 不能放进来 —— 它们既可能是
+	// 文件删除（应归 delete）也可能是目录删除（带 ISDIR，应归 dir_gone）。
+	if !toks["ISDIR"] && (toks["DELETE_SELF"] || toks["MOVE_SELF"]) {
 		return Event{RelPath: rel, Kind: KindDirGone}, true
 	}
+	// 先判 ISDIR 再看文件 token：CLOSE_NOWRITE,CLOSE,ISDIR 同时含 CLOSE，
+	// 顺序反了会把目录事件误伤成噪声。
 	if toks["ISDIR"] {
 		switch {
 		case toks["CREATE"] || toks["MOVED_TO"]:
 			return Event{RelPath: rel, Kind: KindDirAdded}, true
+		case toks["DELETE"] || toks["MOVED_FROM"] || toks["DELETE_SELF"] || toks["MOVE_SELF"]:
+			return Event{RelPath: rel, Kind: KindDirGone}, true
 		default:
 			return Event{}, false // OPEN,ISDIR / ACCESS,ISDIR / CLOSE_NOWRITE,...,CLOSE,ISDIR
 		}
