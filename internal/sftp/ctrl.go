@@ -309,6 +309,39 @@ func (c *Ctrl) List(host, user, path string) ([]Item, error) {
 	return items, nil
 }
 
+// ListMany 在一个 sftp 批处理里列出多个远端目录，返回 path -> items。
+// 返回的 map 中缺失某个 key 表示"该目录未知"，绝不表示"空目录"——调用方必须凭
+// 缺失的 key 判断完整性，否则会把"列不出来"当成"目录为空"而误删本地文件。
+func (c *Ctrl) ListMany(host, user string, paths []string) (map[string][]Item, error) {
+	if len(paths) == 0 {
+		return map[string][]Item{}, nil
+	}
+	c.logEvent(host, "info", fmt.Sprintf("sftp ls many (%d dirs)", len(paths)))
+	var sb strings.Builder
+	for _, p := range paths {
+		q, err := quoteArg(p)
+		if err != nil {
+			c.logEvent(host, "error", "sftp ls many failed: "+err.Error())
+			return nil, fmt.Errorf("ListMany: %w", err)
+		}
+		// 前缀 '-' 抑制逐命令中止：man sftp 明确 ls 失败会中止整批，
+		// 任一个子目录不可读就会让后面所有目录永远列不出来。
+		sb.WriteString("-ls -la " + q + "\n")
+	}
+	out, err := c.run(host, user, []byte(sb.String()))
+	if err != nil {
+		c.logEvent(host, "error", "sftp ls many failed: "+commandErr(out))
+		return nil, fmt.Errorf("sftp ListMany %s: %w (%s)", host, err, commandErr(out))
+	}
+	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp ls many failed: "+commandErr(out))
+		return nil, fmt.Errorf("sftp ListMany failed: %s", commandErr(out))
+	}
+	res := parseListMany(out.Stdout, paths)
+	c.logEvent(host, "info", fmt.Sprintf("sftp ls many done (%d/%d dirs)", len(res), len(paths)))
+	return res, nil
+}
+
 // Home returns the remote user's home directory by running `pwd`. The output
 // is the sftp prompt line followed by the absolute home path, which we extract.
 func (c *Ctrl) Home(host, user string) (string, error) {
