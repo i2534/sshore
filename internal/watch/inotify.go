@@ -28,6 +28,12 @@ type InotifySource struct {
 	ch   chan Event
 	done chan struct{}
 
+	// quit 是"停"信号：Close 与 ctx 取消都通过 quitOnce 先关闭它，再杀进程。
+	// 它给被背压顶住的 emit 发送方一条退路——否则阻塞的发送方会一直占着
+	// emitMu，使关闭 goroutine 无法 close(ch)，Close 永久挂起。
+	quit     chan struct{}
+	quitOnce sync.Once
+
 	emitMu sync.Mutex // 串行化 emit 与 close(ch)
 	closed bool
 
@@ -48,7 +54,7 @@ func NewInotifySource(sp osutil.Streamer, o DetectOpts, log func(level, msg stri
 	if log == nil {
 		log = func(string, string) {}
 	}
-	return &InotifySource{sp: sp, opts: o, log: log}
+	return &InotifySource{sp: sp, opts: o, log: log, quit: make(chan struct{})}
 }
 
 func (s *InotifySource) Info() Info { return Info{Mode: "inotify"} }
@@ -73,16 +79,27 @@ func (s *InotifySource) Start(ctx context.Context) (<-chan Event, error) {
 	args = append(args, s.opts.Host, s.RemoteCommand())
 
 	ch := make(chan Event, 256)
+	done := make(chan struct{})
+	// ch/done 必须**先于** StartStream 发布：StartStream 会立刻启动扫流 goroutine，
+	// 若回调在该赋值窗口内触发，handleStdout 会读到 nil done（emit 的 select 在 nil
+	// channel 上该分支永久不可达），signalOverflow 也会因 done==nil 静默丢弃 overflow。
+	s.mu.Lock()
+	s.ch, s.done = ch, done
+	s.mu.Unlock()
+
 	proc, err := s.sp.StartStream("ssh", args, osutil.StreamHandlers{
 		OnStdout: s.handleStdout(ch),
 		OnStderr: s.handleStderr(ch),
 	})
 	if err != nil {
+		// Start 失败：回滚已发布的 ch/done，避免后续 Close 误以为有进程在跑。
+		s.mu.Lock()
+		s.ch, s.done = nil, nil
+		s.mu.Unlock()
 		return nil, err
 	}
 	s.mu.Lock()
-	s.proc, s.ch, s.done = proc, ch, make(chan struct{})
-	done := s.done
+	s.proc = proc
 	s.mu.Unlock()
 
 	// channel 的唯一关闭点：进程结束（自然退出或 Close 杀掉）后关闭。
@@ -102,6 +119,9 @@ func (s *InotifySource) Start(ctx context.Context) (<-chan Event, error) {
 	go func() {
 		select {
 		case <-ctx.Done():
+			// 必须先 requestQuit 再 Kill：先释放可能阻塞在 emit 的发送方，
+			// 进程退出慢时也不会让 Wait/Close 卡住。
+			s.requestQuit()
 			_ = proc.Kill()
 		case <-done:
 		}
@@ -110,11 +130,28 @@ func (s *InotifySource) Start(ctx context.Context) (<-chan Event, error) {
 	return ch, nil
 }
 
-// Close 幂等：杀掉探测进程并等待 channel 关闭。
+// requestQuit 关闭 quit，释放所有被背压顶住、阻塞在 emit 里的发送方。
+// 必须在 proc.Kill() **之前**调用：Kill 到进程真正退出之间可能很久，而 Close 的有界
+// 返回依赖阻塞的 emit 立即返回——发送方返回后 scanLines → streams.Wait → cmd.Wait
+// 依次推进，p.done 才有机会发出，proc.Wait() 与 close(ch) 才能到达。
+func (s *InotifySource) requestQuit() {
+	s.quitOnce.Do(func() {
+		// quit 由 NewInotifySource 创建后不再改写，读取无需加锁。nil 守卫只用于
+		// 兜底零值构造的 InotifySource，避免 close(nil) panic。
+		if s.quit == nil {
+			return
+		}
+		close(s.quit)
+	})
+}
+
+// Close 幂等：先释放阻塞的发送方，再杀掉探测进程并等待 channel 关闭。
 func (s *InotifySource) Close() error {
 	s.mu.Lock()
 	proc, done := s.proc, s.done
 	s.mu.Unlock()
+	// 即使 proc 尚未发布（Start 失败）也释放 quit，保证不会留下阻塞的发送方。
+	s.requestQuit()
 	if proc == nil {
 		return nil
 	}
@@ -135,6 +172,10 @@ func (s *InotifySource) emit(ch chan Event, ev Event, done chan struct{}) {
 	select {
 	case ch <- ev:
 	case <-done:
+	case <-s.quit:
+		// quit 仅由 Close/ctx 取消关闭。它让被背压顶住的发送方退出，
+		// 从而打破"emit 持 emitMu 阻塞 → 关闭 goroutine 拿不到锁"的死锁。
+		// close(ch) 仍在 emitMu 内进行，所以这里返回不会造成 send-on-closed panic。
 	}
 }
 
