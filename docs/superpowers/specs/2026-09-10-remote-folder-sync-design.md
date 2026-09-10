@@ -5,7 +5,7 @@
 - **关联**: `docs/superpowers/specs/2026-08-25-sshkit-design.md`、`2026-08-26-auto-reconnect-design.md`（状态机与退避沿用其模式）
 - **路径判定**: 架构级（新子系统：新探测层 + 新同步引擎 + 新配置模型 + 新前端模块）
 
-> **第 2 稿说明**：第 1 稿经"自审 + 两个独立 subagent 复审"后重写。改动集中在**数据安全**（首轮语义、删除闸门、临时文件、冲突队列）与**两条探测路径的元信息同源**两处。逐条修订记录见 §13。
+> **修订说明**：第 1 稿经"自审 + 两个独立 subagent 复审"后重写为第 2 稿（改动集中在**数据安全**与**两条探测路径的元信息同源**）；第 3 稿把 §6.1/§6.2 中原本靠文档推断的行为**全部改为实测结论**（inotify-tools 3.22.1.0 与 3.22.6.0 两台机器对照，逐条证据见 §6.2 与 §13）。逐条修订记录见 §13，**仍未证实的项集中在 §11.1**。
 
 ---
 
@@ -295,7 +295,7 @@ ssh -o BatchMode=yes -o ControlPath=<sock> <host> "command -v inotifywait"
 ```
 
 - `Exec` **必须带 context**（§4.3）：`osutil.Runner` 不可取消，用它做超时只会泄漏子进程与 goroutine。"降级"必须同时意味着"不留泄漏"。
-- `Info.Reason` 必须具体：`远端无 inotifywait (exit=127)` / `用户选择了强制轮询` / `探测超时` / `远端 watch 配额耗尽`（§6.2）。
+- `Info.Reason` 必须具体：`远端无 inotifywait（非 0 退出，实测为 1，不是 127）` / `用户选择了强制轮询` / `探测超时` / `远端路径不存在` / `远端 watch 配额耗尽`（§6.2）。
 - **日志记录粒度**：`Mode` 变化**必记**；`Mode` 不变而 `Reason` 变化时，按 §8.3 的 5 次汇总（避免在两种失败原因间抖动时刷屏）。
 - **静默降级是不允许的**：用户以为在实时同步而实际是 5s 轮询，是这个特性最危险的误信状态。
 
@@ -306,34 +306,57 @@ ssh -tt -o BatchMode=yes -o ControlPath=<sock> <host> \
     "exec inotifywait -m -r --format '%T|%w%f|%e' --timefmt '%s' <remote_root_escaped>"
 ```
 
-- `-tt` 给远端会话一个 pty，本地 ssh 退出/被 Kill 时远端进程收到 SIGHUP，**不留孤儿**。代价有二，都必须处理：
-  1. 远端 stderr 混入 stdout → 严格格式校验丢弃非事件行；
-  2. **pty 的 `OPOST|ONLCR` 会把换行翻译成 CR+LF** → **解析前必须 `strings.TrimRight(line, "\r\n")`**。否则最右段变成 `CLOSE_WRITE\r`，与任何事件名都不相等，**整条路径产出 0 个事件**，而告警还会把它误诊为"版本差异"。§10.1 的事件样本**必须包含带 CR 的行**。
-- 解析：裁掉行尾 CR/LF 后，**从右往左** split 两次 `|`（路径里可能含 `|`），最左段是秒级时间戳。
+> **本节的每条行为都已实测**（`inotifywait` 3.22.6.0 / kernel 6.12 / aarch64 与 3.22.1.0 / kernel 6.8 / x86_64 两台机器逐项一致，见 §11 W11）。下面的真实样本直接作为 §10.2 的表驱动输入——**不要凭直觉写解析器**。
+
+**`-tt` 是必需的，理由已实测**：
+
+- **不加 `-tt`**：杀掉本地 ssh 后，远端 `inotifywait` **会变成孤儿进程继续运行**（实测观察到存活进程）。
+- **加 `-tt`**：**SIGTERM 与 SIGKILL（模拟应用崩溃）都不留孤儿**。
+- 代价有二，都必须处理：
+  1. 远端 stderr 混入 stdout：`Setting up watches.  Beware: ...` 与 `Watches established.` 会出现在输出流里，必须按格式校验丢弃；
+  2. **pty 的 `OPOST|ONLCR` 把每个换行翻译成 CR+LF**（实测 `od -c` 为 `\r \n`）→ **解析前必须 `strings.TrimRight(line, "\r\n")`**。否则最右段变成 `CLOSE_WRITE\r`，与任何事件名都不相等，**整条路径产出 0 个事件**，而告警还会把它误诊为"版本差异"。
+**解析规则（按实测输出写）**：
+
+1. 先 `TrimRight(line, "\r\n")`；
+2. 从右往左 split 两次 `|`（路径可能含 `|`），最左段是秒级时间戳；
+3. **路径必须归一化尾斜杠**：`*_SELF` 事件的 `%w%f` 会以 `/` 结尾且 `%f` 为空（实测 `root/d1/`、`root/`）；
+4. **`%e` 是逗号分隔的 token 列表，不是单个事件名**。实测值为 `CLOSE_WRITE,CLOSE`、`CREATE,ISDIR`、`OPEN,ISDIR`、`ACCESS,ISDIR`、`CLOSE_NOWRITE,CLOSE,ISDIR`、`MOVED_TO,ISDIR`、`DELETE_SELF`、`MOVE_SELF` ……**必须先按 `,` 切分成 token 集合再做归约**。用整串相等去比对 `CLOSE_WRITE` 会**全部匹配失败**——每次保存都收不到 `write` 事件。
 - `remote_root` **必须做远端 shell 单引号转义**后拼接（§4.3 的 `Exec` 走同一条转义路径）。含空格 / 分号 / 单引号 / `$` 的路径会被远端 shell 解释。
 - 事件映射：
 
-  | inotifywait 事件 | 归一为 |
+  | token 集合特征 | 归一为 |
   |---|---|
-  | `CREATE`（文件） | `create` |
-  | `CLOSE_WRITE` / `MODIFY` | `write` |
-  | `DELETE` / `MOVED_FROM`（文件） | `delete` |
-  | `CREATE,ISDIR` / `MOVED_TO,ISDIR` | **`dir_added` → 触发该子树的对账扫描** |
-  | `DELETE,ISDIR` / `MOVED_FROM,ISDIR` | **`dir_gone` → 触发该子树对账** |
-  | 根目录自身 / `UNMOUNT` / `DELETE_SELF` / `IGNORED` | **`root_gone` → 进 reconnecting + 暂停删除** |
-  | `OPEN` / `ACCESS` / `ATTRIB` | 丢弃 |
+  | 含 `CREATE` / `MOVED_TO`，**不含** `ISDIR` | `create` |
+  | 含 `CLOSE_WRITE` 或 `MODIFY`，不含 `ISDIR` | `write` |
+  | 含 `DELETE` / `MOVED_FROM`，不含 `ISDIR` | `delete` |
+  | 含 `CREATE` / `MOVED_TO` 且**含** `ISDIR` | **`dir_added` → 触发该子树的对账扫描** |
+  | 含 `DELETE` / `MOVED_FROM` 且含 `ISDIR`；或路径等于根 | **`dir_gone` → 触发该子树对账**（根则为 `root_gone`） |
+  | 仅含 `OPEN` / `ACCESS` / `ATTRIB` / `CLOSE` / `CLOSE_NOWRITE` / `MOVE_SELF` | 丢弃 |
 
-  > **目录事件绝不可丢弃**：把一个目录 `mv` 进监控树（很常见的部署方式）时，内核只产生一条针对该目录的 `MOVED_TO`，**目录里已有的文件不产生任何事件**。丢弃就是整棵子树永久漏同步。
+  > **判定顺序很重要**：`CLOSE_NOWRITE,CLOSE,ISDIR` 里同时含 `CLOSE`。若先按 `CLOSE` 丢弃再判 `ISDIR`，就会误伤目录事件——**必须先判 `ISDIR`，再在文件分支里判有效 token**。
+
+- **噪声比例（实测）**：写一个文件产生 **5 行**（`CREATE`/`OPEN`/`MODIFY`/`CLOSE_WRITE,CLOSE`；追加写为 4 行）；每个目录还会产生 `OPEN,ISDIR`/`ACCESS,ISDIR`/`CLOSE_NOWRITE,CLOSE,ISDIR`。过滤表不精确会让事件量膨胀数倍。
+- **重复上报必须幂等容忍**：删除一个目录实测**同时**产生 `d1/|DELETE_SELF` 与 `d1|DELETE,ISDIR`；移出目录产生 `d2|MOVED_FROM,ISDIR` 与 `d2/|MOVE_SELF`。
+  但**移入目录的 `MOVE_SELF` 是竞态的**——为移入目录补挂 watch 的时机与事件赛跑，两台机器上表现不同（一台有、一台没有）。因此：**去重必须是幂等的，但绝不能反过来依赖重复一定出现**。
+
+  > **目录事件绝不可丢弃（已实测）**：把一个目录 `mv` 进监控树（很常见的部署方式）时，内核只产生针对该目录的一条 `MOVED_TO,ISDIR`，**目录里已有的文件不产生任何事件**——实测中移入目录内的 `preexisting.txt` 确实存在，但零事件。丢弃就是整棵子树永久漏同步。
 - **`inotifywait` 的 stderr 是一等信号**（不是噪声）：
 
-  | 输出 | 处置 |
-  |---|---|
-  | `Failed to watch ... upper limit on watches reached`（启动时 ENOSPC） | 直接 `error`，Reason = `远端 watch 配额耗尽` |
-  | `Couldn't watch new directory`（运行时） | 标记"watch 不完整" → 降级 poll 或至少**禁止一切删除**并记 warn |
-  | 内核队列溢出 | 产出 `KindOverflow` → 强制全量对账 + **本轮禁止删除** |
+  | 输出 | 阶段 | 处置 |
+  |---|---|---|
+  | `Couldn't watch <path>: No such file or directory`（实测 exit 1） | **启动** | 规则进入 `error`（配置错，不重连），Reason = `远端路径不存在` |
+  | `Failed to watch ... upper limit on watches reached` | 启动 | 直接 `error`，Reason = `远端 watch 配额耗尽` |
+  | `Couldn't watch new directory` | **运行** | 标记"watch 不完整" → 降级 poll 或至少**禁止一切删除**并记 warn |
+  | 内核队列溢出 | 运行 | 产出 `KindOverflow` → 强制全量对账 + **本轮禁止删除** |
+
+  > 注意 `Couldn't watch` 前缀在**启动**阶段是致命的、在**运行**阶段（新目录补挂）只是降级——必须按阶段区分，不能只匹配前缀。
 
 - 不匹配格式的行计数，超阈值记一条 warn，**warn 文案必须附原始行样本**（把"版本差异"和"真故障"区分开）。
+- **退出码语义**（`--help` 明文，实测一致）：`0` = 收到事件；`1` = 收到未请求的事件（通常是 `delete_self`/`unmount`）**或发生错误**；`2` = `--timeout` 到期无事件。
+  > **`1` 是二义的**：`root_gone` 与"启动失败"都返回 1。区分依据必须是**当前阶段（是否已收到过 `Watches established.`）+ stderr 文案**；只看退出码必然误判。
+- **根目录消失只能靠事件，不能靠进程退出（已实测）**：`rm -rf` 掉被监控的根目录后，只产生一条 `root/|DELETE_SELF`（尾斜杠、`%f` 为空），**`inotifywait` 进程继续运行**。因此 `root_gone` 的检测**不能挂在 `Process.Wait()` 上**，必须解析事件——否则这个场景会静默漏到底。
 - 进程退出（`Process.Wait()` 返回，且 `err == nil` 已检查）→ 状态机进 `reconnecting`，按 §8.2 退避重启。
+- **孤儿兜底**：正常路径靠 `-tt`（实测 SIGTERM/SIGKILL 都无残留）。若实现时仍发现残留，用启动前的远端清扫，**但必须避开 `pkill -f` 的自杀陷阱**——远端 shell 的命令行本身包含该模式，实测中 `pkill -f 'inotifywait.*<tag>'` **把自己的 shell 杀掉了**，导致后续清理根本没执行。正确写法是方括号技巧：`pkill -f '[i]notifywait.*<tag>'`。
 - **重连成功后强制对账**（见 §7.8）——inotify 断开期间的变更不产生任何事件。
 
 ### 6.3 poll 路径
@@ -604,9 +627,16 @@ func (a *App) ConfirmSyncRuleDeletes(id string, fingerprint string) error // §7
 
 ### 10.2 `internal/watch`
 
-- 事件解析表驱动：真实 `inotifywait` 输出样本，**必须包含带 `\r` 的行**（§6.2 的 pty ONLCR 缺陷只有这类样本能发现）、带空格 / 带 `|` 的文件名、`CREATE,ISDIR`、`MOVED_TO,ISDIR`、`UNMOUNT`、`DELETE_SELF`、噪声行、`Failed to watch` / `Couldn't watch new directory`。
+- 事件解析表驱动：输入**直接用 §6.2 实测抓到的真实输出**，最少覆盖：
+  - 带 `\r\n` 行尾的行（**只有这类样本能发现 pty ONLCR 缺陷**）与不带 CR 的行；
+  - `CLOSE_WRITE,CLOSE`（**token 列表**，验证不会被整串比较漏掉）、`CREATE,ISDIR`、`CLOSE_NOWRITE,CLOSE,ISDIR`（验证**先判 ISDIR 再判文件 token** 的顺序）；
+  - `d1/|DELETE_SELF` 与 `d1|DELETE,ISDIR` 成对出现 → **幂等去重后只产出一个 `dir_gone`**；
+  - `root/|DELETE_SELF`（尾斜杠、`%f` 为空）→ `root_gone`，且**断言它不依赖进程退出**；
+  - `Setting up watches.  Beware: ...` / `Watches established.` 噪声行；带空格 / 带 `|` 的文件名；
+  - `Couldn't watch <path>: No such file or directory`（启动）vs `Couldn't watch new directory`（运行）→ **分类必须不同**。
+  - **竞态容忍**：移入目录的 `MOVE_SELF` **有时有、有时没有**（实测两台机器不一致）→ 两种输入序列都必须得到相同的最终结论。
 - poll 快照 diff 表驱动；**不完整轮次（`Complete=false`）必须产出零事件**。
-- 降级判定：假 Runner 返回 exit 0 / 127 / 超时 → 期望 Mode 与 Reason；**超时必须真取消子进程**（用真实短命进程验证无泄漏）。
+- 降级判定：假 Runner 返回 exit 0 / **exit 1（实测值，不是 127）** / 超时 → 期望 Mode 与 Reason；**超时必须真取消子进程**（用真实短命进程验证无泄漏）。
 - **契约测试**：两条路径在同一份脚本化世界状态变化下，**文件级**结论（路径集合 + 增/改/删）等价；不断言逐事件相等。
 
 ### 10.3 `internal/sync`
@@ -632,7 +662,7 @@ func (a *App) ConfirmSyncRuleDeletes(id string, fingerprint string) error // §7
 
 - 绑定层沿用 `app_test.go` 的契约风格（空切片而非 nil、JSON 字段名）。
 - **E2E 的驱动方式必须写明**：`e2e/test_local.sh` 是纯 bash、直接调 `ssh/sftp` 二进制，**没有 CLI 入口能触达 `internal/sync`**。方案：脚本起好临时 sshd 后，调用一个**新增的 Go 测试**（`TestSyncE2E`，从环境变量接收端口/别名）来驱动引擎；脚本层只负责准备宿主机与断言 OpenSSH 行为。本机没有 `inotifywait` 时**跳过并打印原因，不静默通过**。
-- 注意 §11 W4：`inotifywait` 的运行时行为**本机无法验证**（未安装），E2E 若不能提供该依赖，则 inotify 路径的验证级别必须在文档里降级声明。
+- `inotifywait` 的运行时行为**已在两台真实机器上实测**（§11 W11），E2E 若目标环境没有该依赖，仍须**跳过并打印原因**，不得静默通过。
 
 ## 11. 已知弱点
 
@@ -641,13 +671,22 @@ func (a *App) ConfirmSyncRuleDeletes(id string, fingerprint string) error // §7
 | W1 | `inotifywait -r` 无 maxdepth，内核 watch 覆盖全部层级 | **不是"消耗配额"这么轻**：配额耗尽时启动即失败（`Failed to watch`）→ 按 §8.2 进无限重连风暴，每轮重建全部 watch；运行时补挂失败（`Couldn't watch new directory`）则**带残缺 watch 静默漏同步**，而徽章仍显示 inotify | 两类消息提升为一等信号（§6.2）；逃生舱 `force_poll = true`；代码注释必须写明 |
 | W2 | poll 的 mtime 精度 | 老文件（>6 个月）**只到天**；且 `parseModTime` 用 `time.Now().Year()` 猜年份 → **跨年瞬间一批文件集体产生虚假 `write`** → 全体重下一次 | 代价仅"多传一次"，可接受；**纪律：绝不用 mtime 相同判定"未变化"**（§6.4） |
 | W3 | inotify 断开期间的变更不产生事件 | 必须靠重连后的对账补齐；**且对账必须能发现删除**，否则 `mirror_delete` 下永久漏同步 | §7.8 已覆盖，**测试必须落地**（§10.3）。**不要以为这是唯一的正确性缺口**：目录 move-in（§6.2）是另一条常态缺口 |
-| W4 | `inotifywait` 的运行时行为（`-t` 与 `-m` 的交互、孤儿是否真被 `-tt` 的 SIGHUP 终结） | 影响孤儿兜底方案 | **本机未安装 `inotifywait`，我未实测**。设计要求：正常工作靠 `-tt`，兜底靠启动前带唯一标记的远端 `pkill -f`。任何 `-t` 用法须先实测 |
+| W4 | ~~`inotifywait` 运行时行为未实测~~ → **已实测，该项关闭** | `-tt` 在 SIGTERM 与 SIGKILL 下均无孤儿；**不加 `-tt` 必留孤儿**；`-m -t N` 空闲 N 秒后以 **exit 2** 退出 | 结论已并入 §6.2。`-t` **不作为**孤儿兜底（空闲目录会被反复重启 + 每次触发对账）；兜底用**方括号技巧**的 `pkill` |
 | W5 | `-tt` 使远端 stderr 混入 stdout，且换行被翻译成 CR+LF | 解析必须裁 CR（否则 0 事件），噪声行需严格校验 | §6.2 已覆盖；样本测试必须含 CR |
 | W6 | 大文件无断点续传 | 中断需整体重来 | 已接受（选传输方式 A 的固有代价）；出现几百 MB 级文件时需重新评估 |
 | W7 | 同步 + sftp 双来源日志量 = 每文件 3–4 条 | 1000 条环形缓冲约 300 个文件即刷满 | 决策 13 选择先都保留；**首要缓解手段：抑制 `sftp` 的 `get done` 行**，实现时若确认噪声过大应立即启用 |
 | W8 | 部分重叠的规则本地目标由 last-writer-wins 决定 | 结果不确定（但**不会损坏**，临时文件名含规则 id） | 不检测（检测成本高）；精确重复已在 §7.5 拒绝 |
 | W9 | 退避是确定性序列且无抖动 | 多规则与多隧道同时抖动会同步重试 | 未实测；仅作观察记录 |
 | W10 | 首轮"采纳"只比对 size，不校验内容 | 本地同 size 不同内容的文件不会被下载 | §7.3/§7.8 明确；用户可用 `take_remote` 或删除本地文件后重下 |
+| W11 | **（正面结论）** 关键行为在 inotify-tools **3.22.1.0 / 3.22.6.0**、kernel **6.8 / 6.12**、**x86_64 / aarch64** 上逐项一致 | —— | **不需要按版本分支**；§6.2 的解析规则可直接按实测实现 |
+
+### 11.1 仍未证实的（不要当成已验证）
+
+1. `Failed to watch ... upper limit on watches reached`（watch 配额耗尽）：需耗尽 `max_user_instances=128` / `max_user_watches=524288`，未做。
+2. 运行阶段新目录补挂失败的 `Couldn't watch new directory` 文案。
+3. 内核队列溢出（`IN_Q_OVERFLOW`）的实际输出形态（`KindOverflow` 的触发条件因此仍是推测）。
+4. 挂载点 `UNMOUNT` 事件。
+5. 非 Linux 远端、真实网络断连、以及 ControlMaster 与 `-tt` 的组合行为。
 
 ## 12. 影响面
 
@@ -682,4 +721,5 @@ func (a *App) ConfirmSyncRuleDeletes(id string, fingerprint string) error // §7
 | 自审 | `sshconn` 补 `EnsureMaster`/`Exec`（原稿未说明 master 由谁建立）；`ListMany` 计入影响面；`excludes` 默认值去掉 `*.part`；`entries` 明确兼任基线；`keep_local` 语义边界；`kind=file` 的 `mirror_delete` 无效；契约测试断言强度；`wailsjs` 生成物 |
 | 复审 A（后端） | **B1** 删除阈值对小集合恒不触发；**B2** pty CR 导致整条 inotify 路径 0 事件；**B3** `sftp -b` 遇 `ls` 失败中止整批 + 缺失 key 语义；**B4** 冲突文件被写入本地基线 → 绕过冲突保护；**M1** 对账发现不了删除；**M2** 目录 move-in 整棵子树漏同步；**M3** W1 被写轻；**M4** `Runner` 不可取消；**M5** 两条路径元信息不可比；**M6** 删除状态文件后果与决策 5 矛盾；**M7** poll 无"断开"信号源；**M8** `EnsureMaster` 判据不足；**M9** `ResolveConflict` 死锁与临时文件冲突；**M10** `Start` 三条未声明契约；**M11** ControlPath 不含 user + `CloseAll` 耦合；N1–N10 全部采纳 |
 | 复审 B（配置/前端） | `SyncRule.Normalize()`（缺键静默改变行为）；状态文件缺规则指纹；`AutoStartEnabled` 无落点；`List`/`Get`/`ListMany` 命名不一致；两个 `excludes` 默认值；`LogPanel` 的 `sourceTypes` 冲突与"可分别过滤"不成立；实时性（KeepAlive、不二次 `EventsOn`）；绑定缺签名；`SyncWindowBackground` 撞名；`RuleCard` 不可复用；`ListHostsDetailed` 零引用；校验落点会形成导入环；`NewTunnelID` 无前缀；e2e 无 CLI 驱动；§3 决策表漏记 5 条 |
-| 本次自行核实 | `man sftp` 的中止清单与 `-` 前缀 ✅；`parseModTime` 的 `time.Now().Year()` ✅；`Start` 失败仍返回半成品 `Process` ✅；`controlPathFor` 不含 user ✅；`CloseAll` 会 `RemoveAll` ✅。**`inotifywait` 本机未安装，W4 未实测** |
+| 代码事实核实 | `man sftp` 的中止清单与 `-` 前缀 ✅；`parseModTime` 的 `time.Now().Year()` ✅；`Start` 失败仍返回半成品 `Process` ✅；`controlPathFor` 不含 user ✅；`CloseAll` 会 `RemoveAll` ✅ |
+| **第 3 轮：两台真实机器实测** | 在 `pi`（inotify-tools 3.22.6.0 / kernel 6.12 / aarch64）与本机（3.22.1.0 / kernel 6.8 / x86_64）上用同一套探针逐项对照：**证实** `-tt` 的 CRLF、`-tt` 的孤儿回收（含 SIGKILL）、无 `-tt` 必留孤儿、目录 move-in 不补发子事件、`-m -t` 的 exit 2；**新发现并修正** `%e` 是逗号分隔 token 列表、`*_SELF` 路径带尾斜杠、根目录被删后进程不退出、`command -v` 缺失返回 1（非 127）、退出码 1 二义、`pkill -f` 自杀陷阱、移入目录的 `MOVE_SELF` 竞态。**仍未证实项见 §11.1** |
