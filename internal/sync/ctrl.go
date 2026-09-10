@@ -405,12 +405,11 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 				c.align(r)
 				continue
 			}
-			// 文件事件在入队前按规则过滤：被 exclude 命中或超出 max_depth 的
-			// 路径绝不能进入队列。否则它会被下载、被登记进基线，随后又被对账
-			// 当成"远端已删"而删掉本地文件。目录事件不在此过滤：align 已处理
-			// 整棵子树，丢掉目录事件会破坏子树对账。
-			if watch.MatchExclude(ev.RelPath, r.rule.Excludes) ||
-				(r.rule.MaxDepth >= 0 && strings.Count(ev.RelPath, "/") > r.rule.MaxDepth) {
+			// 文件事件在入队前按规则过滤：不在处理范围（被 exclude 命中或超出
+			// max_depth）的路径绝不能进入队列。否则它会被下载、被登记进基线，
+			// 随后又被对账当成"远端已删"而删掉本地文件。目录事件不在此过滤：
+			// align 已处理整棵子树，丢掉目录事件会破坏子树对账。
+			if !inScope(r.rule, ev.RelPath) {
 				r.mu.Unlock()
 				continue
 			}
@@ -501,6 +500,22 @@ func (c *Ctrl) drainQueue(r *ruleRuntime) {
 	if hasDels {
 		c.maybeDelete(r, -1) // -1：本轮远端条目数未知（事件路径）
 	}
+}
+
+// inScope 判定一个相对路径是否属于本规则的处理范围：未被 excludes 命中，
+// 且不超过 max_depth（MaxDepth<0 表示不限深）。
+//
+// 这是**唯一**的"路径要不要管"判定，consume 的事件入队过滤与 align 的删除候选
+// 过滤都必须调用它。两处一旦各写一份就会漂移，而漂移的代价是把被排除路径当成
+// "远端已删"并删掉本地文件（C2）。
+func inScope(rule config.SyncRule, rel string) bool {
+	if watch.MatchExclude(rel, rule.Excludes) {
+		return false
+	}
+	if rule.MaxDepth >= 0 && strings.Count(rel, "/") > rule.MaxDepth {
+		return false
+	}
+	return true
 }
 
 // remotePathFor 把规则内的相对路径映射成远端绝对路径。
@@ -598,6 +613,12 @@ func (c *Ctrl) align(r *ruleRuntime) {
 			r.mu.Unlock()
 		}
 		for rel, ent := range d.Entries {
+			// 不在处理范围的路径（被 exclude 命中 / 超出 max_depth）本轮快照
+			// 本就不会包含它，绝不能因此判成"远端已删"而登记删除。只有真正
+			// 在范围内、又缺席于快照的条目才是删除候选。
+			if !inScope(r.rule, rel) {
+				continue
+			}
 			if _, ok := snap.Entries[rel]; !ok && ent.HasLocal {
 				dels = append(dels, rel)
 			}
