@@ -2,9 +2,7 @@ package sftp
 
 import (
 	"fmt"
-	"net/url"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -13,6 +11,7 @@ import (
 
 	"sshore/internal/forward"
 	"sshore/internal/osutil"
+	"sshore/internal/sshconn"
 )
 
 // isWindows: Windows OpenSSH has no ControlMaster/-f support, so connection
@@ -20,27 +19,42 @@ import (
 var isWindows = runtime.GOOS == "windows"
 
 type Ctrl struct {
-	runner     osutil.Runner
-	emit       forward.EmitFunc
-	controlDir string
-	active     map[string]bool // hosts marked connected (Windows per-command mode)
-	mu         sync.Mutex
+	runner osutil.Runner
+	emit   forward.EmitFunc
+	active map[string]bool   // hosts marked connected (Windows per-command mode)
+	users  map[string]string // host → 最近一次使用的 user（用于把 user 纳入 socket key）
+	mu     sync.Mutex
 }
 
 func NewCtrl(r osutil.Runner, emit forward.EmitFunc) *Ctrl {
-	return &Ctrl{runner: r, emit: emit, controlDir: filepath.Join(os.TempDir(), "sshore-sftp-ctrl"), active: map[string]bool{}}
+	return &Ctrl{runner: r, emit: emit, active: map[string]bool{}, users: map[string]string{}}
 }
 
-// controlPathFor returns a per-host ControlMaster socket path (URL-encoded so
-// arbitrary host strings map to a safe filename). Reusing this socket lets
-// successive sftp commands share one SSH connection (ControlMaster=auto).
-func (c *Ctrl) controlPathFor(host string) string {
-	_ = os.MkdirAll(c.controlDir, 0700)
-	name := url.PathEscape(host)
-	return filepath.Join(c.controlDir, "cm-"+name+".sock")
+// controlPathFor 委托给 sshconn（socket 路径的唯一来源）；user 纳入 key，
+// 否则同 host 异 user 会共用 master，用错身份读写远端文件。
+func (c *Ctrl) controlPathFor(host, user string) string {
+	return sshconn.ControlPath(host, user)
+}
+
+func (c *Ctrl) rememberUser(host, user string) {
+	c.mu.Lock()
+	if c.users == nil {
+		c.users = map[string]string{}
+	}
+	c.users[host] = user
+	c.mu.Unlock()
+}
+
+// userFor 返回该 host 最近一次使用的 user；无记录时返回空串，即
+// ControlPath(host, "")，与旧版 cm-<host>.sock 完全一致。
+func (c *Ctrl) userFor(host string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.users[host]
 }
 
 func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
+	c.rememberUser(host, user)
 	dir, err := os.MkdirTemp("", "sshore-sftp")
 	if err != nil {
 		return osutil.Outcome{}, err
@@ -50,7 +64,7 @@ func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
 	if err != nil {
 		return osutil.Outcome{}, err
 	}
-	cp := c.controlPathFor(host)
+	cp := c.controlPathFor(host, user)
 	args := []string{
 		"-o", "BatchMode=yes",
 		"-o", "IdentitiesOnly=yes",
@@ -73,21 +87,15 @@ func (c *Ctrl) run(host, user string, batch []byte) (osutil.Outcome, error) {
 }
 
 // CloseAll closes any lingering ControlMaster connections and removes sockets.
+// socket 名形如 cm-<host>+<user>.sock，从文件名反解不出 host，因此改为遍历
+// 内存中的 host→user 映射；随后仍清掉整个 control 目录。
 func (c *Ctrl) CloseAll() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.controlDir == "" {
-		return
+	for host, user := range c.users {
+		_ = c.disconnectLocked(host, user)
 	}
-	entries, _ := os.ReadDir(c.controlDir)
-	for _, e := range entries {
-		name := strings.TrimPrefix(e.Name(), "cm-")
-		name = strings.TrimSuffix(name, ".sock")
-		if unescaped, err := url.PathUnescape(name); err == nil {
-			_ = c.disconnectLocked(unescaped)
-		}
-	}
-	_ = os.RemoveAll(c.controlDir)
+	_ = os.RemoveAll(sshconn.ControlDir())
 }
 
 // logEvent 记录一条 SFTP 操作日志(SourceType=sftp, SourceID=host),
@@ -130,7 +138,8 @@ func (c *Ctrl) Connect(host, user string) error {
 		return nil
 	}
 
-	cp := c.controlPathFor(host)
+	c.rememberUser(host, user)
+	cp := c.controlPathFor(host, user)
 	args := []string{"-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=10", "-o", "ControlMaster=yes", "-o", "ControlPersist=30", "-o", "ControlPath=" + cp, "-N", "-f"}
 	if user != "" {
 		args = append(args, "-o", "User="+user)
@@ -161,11 +170,13 @@ func (c *Ctrl) Disconnect(host string) error {
 		delete(c.active, host)
 		return nil
 	}
-	return c.disconnectLocked(host)
+	return c.disconnectLocked(host, c.users[host])
 }
 
-func (c *Ctrl) disconnectLocked(host string) error {
-	cp := c.controlPathFor(host)
+// disconnectLocked 需在持有 c.mu 时调用；user 由调用方传入（map 读在锁内完成），
+// 不能在此调用 userFor，否则会重复加锁。
+func (c *Ctrl) disconnectLocked(host, user string) error {
+	cp := c.controlPathFor(host, user)
 	out, err := c.runner("ssh", "-O", "exit", "-o", "ControlPath="+cp, "-o", "ConnectTimeout=10", host)
 	if err != nil {
 		return fmt.Errorf("sftp disconnect %s: %w (%s)", host, err, out.Stderr)
@@ -182,7 +193,7 @@ func (c *Ctrl) Connected(host string) bool {
 	if isWindows {
 		return c.active[host]
 	}
-	cp := c.controlPathFor(host)
+	cp := c.controlPathFor(host, c.users[host])
 	_, err := os.Stat(cp)
 	return err == nil
 }
