@@ -218,7 +218,10 @@ func (c *Ctrl) Stop(id string) error {
 	}
 	c.mu.Unlock()
 	if r == nil {
-		return fmt.Errorf("规则未在运行: %s", id)
+		// 幂等契约：规则未运行不算失败，返回 nil，与 forward.Ctrl.Stop 对齐
+		// （进程不存在时同样 return nil）。上层 StopSyncRule 依赖它来清 Enabled，
+		// 请不要改回错误——否则"引擎未运行但 Enabled=true"的规则将无法关闭。
+		return nil
 	}
 	r.mu.Lock()
 	if r.src != nil {
