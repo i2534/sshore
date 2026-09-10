@@ -59,3 +59,22 @@ func TestResolveUnknownConflictIsError(t *testing.T) {
 		t.Fatal("未知路径必须报错")
 	}
 }
+
+// 未知动作必须在改动状态之前就被拒绝：否则调用方拿到 error 的同时，
+// 队列里的冲突已被 splice 掉（落盘后从磁盘消失）。
+func TestResolveUnknownActionKeepsConflict(t *testing.T) {
+	d := &StateFile{}
+	UpsertConflict(d, Conflict{RelPath: "c.conf", RemoteSize: 7})
+	if _, err := ResolveConflict(d, "c.conf", ConflictAction("bogus"), LocalState{}, "t"); err == nil {
+		t.Fatal("未知冲突动作必须报错")
+	}
+	if len(d.Conflicts) != 1 {
+		t.Fatalf("未知动作不得移除冲突，得到 %d 条", len(d.Conflicts))
+	}
+	if d.Conflicts[0].RelPath != "c.conf" {
+		t.Fatalf("冲突应保持原样，得到 %#v", d.Conflicts[0])
+	}
+	if d.Entries != nil {
+		t.Fatalf("未知动作不得改动 d.Entries，得到 %#v", d.Entries)
+	}
+}
