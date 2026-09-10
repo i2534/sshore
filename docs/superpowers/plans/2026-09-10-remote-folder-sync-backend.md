@@ -1209,22 +1209,23 @@ import "strings"
 //  3. *_SELF 事件的路径带尾斜杠，必须归一化。
 func ParseInotifyLine(root, line string) (Event, bool) {
 	line = strings.TrimRight(line, "\r\n")
-	// 时间戳取第一个 "|" 之前，事件取最后一个 "|" 之后，中间的整段是路径
-	// ——这样路径里含 "|" 也不会切错（"从右往左两次"会切错）。
+	// 两种可能形状：生产格式 <epoch>|<path>|<events>，以及测试里用的退化形式
+	// <path>|<events>。**光看 | 的个数分不清**——路径本身可能含 "|"
+	//（"/srv/conf/we|ird.txt|CREATE" 是 2 段还是 3 段，取决于首段是不是 epoch）。
+	// 故用"首段是否全为数字"判别。**该判别耦合于远端命令的 --timefmt 为 epoch 秒**：
+	// 换成非数字时间格式，所有真实行都会通不过根前缀校验而被丢弃，表现为
+	// "探测无事件"而非报错。%w%f 实测恒为绝对路径（以 "/" 开头），
+	// 所以生产流量不会被误判成退化形式。
 	first := strings.Index(line, "|")
 	last := strings.LastIndex(line, "|")
-	if first < 0 {
+	if last < 0 {
 		return Event{}, false
 	}
 	var full, ev string
-	if first == last {
-		// 容错：只有 path|events（没有时间戳）。生产格式一定带时间戳，
-		// 但缺时间戳时 path|events 也是无歧义的，没必要为此丢掉事件。
-		full, ev = line[:first], line[first+1:]
-	} else {
-		// 生产格式：<epoch>|<path>|<events>。取第一个 | 与最后一个 |，
-		// 中间的整段是路径 —— 路径里含 | 也不会切错。
+	if first != last && allDigits(line[:first]) {
 		full, ev = line[first+1:last], line[last+1:]
+	} else {
+		full, ev = line[:last], line[last+1:]
 	}
 	full = strings.TrimSuffix(full, "/")
 	// 必须按**路径边界**判断，不能用裸 HasPrefix：root="/srv/conf" 时
