@@ -44,13 +44,27 @@ func ResolveConflict(d *StateFile, rel string, action ConflictAction, local Loca
 		return TransferOrDelete{}, fmt.Errorf("冲突不存在: %s", rel)
 	}
 	c := d.Conflicts[idx]
+
+	// 先在 switch 内只计算请求：非法动作在 default 提前返回，
+	// 此时尚未改动 d（否则冲突会被 splice 掉，落盘后从磁盘消失）。
+	var req TransferOrDelete
+	switch action {
+	case ConflictKeepLocal:
+		req = TransferOrDelete{RelPath: rel, Action: ActionSkip, Detail: "保留本地"}
+	case ConflictTakeRemote:
+		req = TransferOrDelete{RelPath: rel, Action: ActionGet, Detail: "用远端覆盖"}
+	case ConflictSaveAs:
+		req = TransferOrDelete{RelPath: rel, Action: ActionSaveAs, Detail: "另存远端副本"}
+	default:
+		return TransferOrDelete{}, fmt.Errorf("未知冲突动作: %s", action)
+	}
+
+	// 动作已合法，才开始改动 d。
 	d.Conflicts = append(d.Conflicts[:idx], d.Conflicts[idx+1:]...)
 	if d.Entries == nil {
 		d.Entries = map[string]*Entry{}
 	}
-
-	switch action {
-	case ConflictKeepLocal:
+	if action == ConflictKeepLocal {
 		e := d.Entries[rel]
 		if e == nil {
 			e = &Entry{}
@@ -63,12 +77,6 @@ func ResolveConflict(d *StateFile, rel string, action ConflictAction, local Loca
 		if !local.Exists {
 			delete(d.Entries, rel)
 		}
-		return TransferOrDelete{RelPath: rel, Action: ActionSkip, Detail: "保留本地"}, nil
-	case ConflictTakeRemote:
-		return TransferOrDelete{RelPath: rel, Action: ActionGet, Detail: "用远端覆盖"}, nil
-	case ConflictSaveAs:
-		return TransferOrDelete{RelPath: rel, Action: ActionSaveAs, Detail: "另存远端副本"}, nil
-	default:
-		return TransferOrDelete{}, fmt.Errorf("未知冲突动作: %s", action)
 	}
+	return req, nil
 }
