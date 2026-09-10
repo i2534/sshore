@@ -7,6 +7,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMPD="$(mktemp -d)"
 PORT=22901
 SOCK="$TMPD/sshd.sock"
+# HOME 下面会指向临时目录；先把真实的 Go 缓存路径固定下来，否则 go 会把模块/编译缓存
+# 写进 $TMPD（只读的模块缓存还会让 cleanup 的 rm -rf 刷 Permission denied）。
+REAL_GOPATH="$(go env GOPATH)"
+REAL_GOMODCACHE="$(go env GOMODCACHE)"
+REAL_GOCACHE="$(go env GOCACHE)"
 export HOME="$TMPD/home"
 mkdir -p "$HOME/.ssh"
 
@@ -52,7 +57,7 @@ CFG
 chmod 600 "$HOME/.ssh/config"
 
 for i in $(seq 1 20); do
-  if ssh -F "$HOME/.ssh/config" -o BatchMode=yes -o ConnectTimeout=2 e2e-test 'echo READY' 2>/dev/null | grep -q READY; then break; fi
+  if ssh -F "$HOME/.ssh/config" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=2 e2e-test 'echo READY' 2>/dev/null | grep -q READY; then break; fi
   sleep 0.3
 done
 
@@ -64,7 +69,7 @@ echo "$G_OUT" | grep -q "hostname 127.0.0.1" && echo "PASS: ssh -G resolves host
 
 echo "== TEST 2: -N -L forward authorizes and binds =="
 # verbose diagnostic to a log first
-ssh -v -N -o BatchMode=yes -o StrictHostKeyChecking=no \
+ssh -v -N -o BatchMode=yes -o StrictHostKeyChecking=no -o IdentitiesOnly=yes \
   -F "$HOME/.ssh/config" \
   -o "UserKnownHostsFile /dev/null" \
   -o "ExitOnForwardFailure=yes" \
@@ -99,7 +104,7 @@ mkdir -p "$TMPD/home/remote_dir"
 echo "hello" > "$TMPD/home/remote_dir/a.txt"
 BATCH="$TMPD/sftp.bat"
 printf "ls -l %s\n" "$TMPD/home/remote_dir" > "$BATCH"
-sftp_out="$(sftp -o BatchMode=yes -o StrictHostKeyChecking=no -F "$HOME/.ssh/config" \
+sftp_out="$(sftp -o BatchMode=yes -o StrictHostKeyChecking=no -o IdentitiesOnly=yes -F "$HOME/.ssh/config" \
   -o "UserKnownHostsFile /dev/null" -b "$BATCH" e2e-test 2>&1 || true)"
 echo "--- sftp output ---"
 echo "$sftp_out"
@@ -109,7 +114,7 @@ echo "== sync e2e (Go side) =="
 REMOTE_DIR="$TMPD/remote-conf"
 mkdir -p "$REMOTE_DIR"
 echo "v1" > "$REMOTE_DIR/app.conf"
-# 注意：ssh 别名通过 -F 注入，避免污染用户 ~/.ssh/config
+# 注意：别名只写进 $TMPD 下的临时配置，绝不碰真实 ~/.ssh/config。
 cat > "$HOME/.ssh/config" <<EOF
 Host sshore-e2e
   HostName 127.0.0.1
@@ -120,7 +125,23 @@ Host sshore-e2e
   UserKnownHostsFile /dev/null
 EOF
 chmod 600 "$HOME/.ssh/config"
-if SSHORE_E2E_HOST=sshore-e2e SSHORE_E2E_REMOTE="$REMOTE_DIR" \
+# OpenSSH 的默认用户配置取自 passwd 家目录，而不是 $HOME：即使把 HOME 指向临时目录，
+# go 测试里的 ssh/sftp 仍会去读真实 ~/.ssh/config，找不到 sshore-e2e。这里生成只作用于
+# 本次 go test 的 ssh/sftp 垫片，用 -F 指向临时配置（垫片在 $TMPD 内，PATH 仅本命令前置）。
+SHIM="$TMPD/shim"
+mkdir -p "$SHIM"
+cat > "$SHIM/ssh" <<SHIMSH
+#!/usr/bin/env bash
+exec /usr/bin/ssh -F "$HOME/.ssh/config" -o IdentitiesOnly=yes "\$@"
+SHIMSH
+cat > "$SHIM/sftp" <<SHIMSF
+#!/usr/bin/env bash
+exec /usr/bin/sftp -F "$HOME/.ssh/config" -o IdentitiesOnly=yes "\$@"
+SHIMSF
+chmod +x "$SHIM/ssh" "$SHIM/sftp"
+if PATH="$SHIM:$PATH" \
+   GOPATH="$REAL_GOPATH" GOMODCACHE="$REAL_GOMODCACHE" GOCACHE="$REAL_GOCACHE" \
+   SSHORE_E2E_HOST=sshore-e2e SSHORE_E2E_REMOTE="$REMOTE_DIR" \
    HOME="$HOME" go test ./internal/sync/ -run TestSyncE2E -count=1 -v; then
   echo "sync e2e OK"
 else
