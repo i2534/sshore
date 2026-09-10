@@ -98,7 +98,7 @@
 ~~~go
 // StartStream 必须把 stdout 与 stderr 分别逐行回调；空行丢弃、行首尾空白裁掉。
 func TestStartStreamRoutesBothStreams(t *testing.T) {
-	sp := NewSpawner()
+	sp := NewStreamer()
 	var out, errs []string
 	p, err := sp.StartStream("sh", []string{"-c", "echo o1; echo o2; echo e1 >&2; echo '  e2  ' >&2"}, StreamHandlers{
 		OnStdout: func(l string) { out = append(out, l) },
@@ -120,7 +120,7 @@ func TestStartStreamRoutesBothStreams(t *testing.T) {
 
 // 回调为 nil 表示不接该管道。若接了没人读的管道，子进程写满 64KB 缓冲后会永久阻塞。
 func TestStartStreamNilHandlerDoesNotBlock(t *testing.T) {
-	sp := NewSpawner()
+	sp := NewStreamer()
 	p, err := sp.StartStream("sh", []string{"-c", "yes | head -c 1048576"}, StreamHandlers{})
 	if err != nil {
 		t.Fatalf("StartStream failed: %v", err)
@@ -140,7 +140,7 @@ func TestStartStreamNilHandlerDoesNotBlock(t *testing.T) {
 
 // cmd.Start() 失败必须返回 (nil, err)：半成品 Process 的 done channel 永不关闭。
 func TestStartFailureReturnsNilProcess(t *testing.T) {
-	sp := NewSpawner()
+	sp := NewStreamer()
 	p, err := sp.StartStream("sshore-no-such-binary-xyz", nil, StreamHandlers{})
 	if err == nil {
 		t.Fatal("want error for missing binary")
@@ -199,9 +199,15 @@ type StreamHandlers struct {
 
 // Streamer 启动长驻子进程并消费其 stdout/stderr。forward 用 Spawner（只关心
 // stderr），watch 用 Streamer（inotifywait 的事件流在 stdout）。
+//
+// 注意：NewSpawner() 返回的是只有 Start 的 Spawner 接口，**不能**用来调
+// StartStream。需要流式能力的地方一律用 NewStreamer()（同一个 realSpawner 实现）。
 type Streamer interface {
 	StartStream(name string, args []string, h StreamHandlers) (*Process, error)
 }
+
+// NewStreamer 返回同时具备流式能力的启动器。
+func NewStreamer() Streamer { return realSpawner{} }
 
 // Start 保持既有签名与语义（仅 stderr 回调），内部委托给 StartStream。
 func (realSpawner) Start(name string, args []string, onLine func(string)) (*Process, error) {
@@ -266,7 +272,17 @@ func NewCtxRunner() CtxRunner {
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 		err := cmd.Run()
-		return Outcome{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: execResult(err)}, err
+		out := Outcome{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: execResult(err)}
+		// 契约：**非 0 退出不算 err**，只看 ExitCode（探测 command -v 返回 1 是
+		// 正常结果，不是失败）。只有取消/超时与启动类失败才返回 err。
+		if ctx.Err() != nil {
+			return out, ctx.Err()
+		}
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return out, nil
+		}
+		return out, err
 	}
 }
 ~~~
@@ -957,6 +973,9 @@ func TestParseInotifyLineScenarios(t *testing.T) {
 		want Event
 		ok   bool
 	}{
+		// 生产格式（带 %T 时间戳）：远程命令用的是 '%T|%w%f|%e'，必须覆盖
+		{"生产格式-创建", "1789033487|/srv/conf/a.txt|CREATE", Event{"a.txt", KindCreate}, true},
+		{"生产格式-含CRLF", "1789033487|/srv/conf/a.txt|CLOSE_WRITE,CLOSE\r", Event{"a.txt", KindWrite}, true},
 		{"创建文件", "/srv/conf/a.txt|CREATE", Event{"a.txt", KindCreate}, true},
 		{"写入文件", "/srv/conf/a.txt|CLOSE_WRITE,CLOSE", Event{"a.txt", KindWrite}, true},
 		{"仅 MODIFY", "/srv/conf/a.txt|MODIFY", Event{"a.txt", KindWrite}, true},
@@ -1089,19 +1108,25 @@ import "strings"
 //  2. %e 是 token **列表**，必须按逗号切分——整串比较会全部匹配失败；
 //  3. *_SELF 事件的路径带尾斜杠，必须归一化。
 func ParseInotifyLine(root, line string) (Event, bool) {
-	line = strings.TrimRight(line, "
-")
-	i := strings.LastIndex(line, "|")
-	if i < 0 {
+	line = strings.TrimRight(line, "\r\n")
+	// 时间戳取第一个 "|" 之前，事件取最后一个 "|" 之后，中间的整段是路径
+	// ——这样路径里含 "|" 也不会切错（"从右往左两次"会切错）。
+	first := strings.Index(line, "|")
+	last := strings.LastIndex(line, "|")
+	if first < 0 {
 		return Event{}, false
 	}
-	ev := line[i+1:]
-	rest := line[:i]
-	j := strings.LastIndex(rest, "|")
-	if j < 0 {
-		return Event{}, false
+	var full, ev string
+	if first == last {
+		// 容错：只有 path|events（没有时间戳）。生产格式一定带时间戳，
+		// 但缺时间戳时 path|events 也是无歧义的，没必要为此丢掉事件。
+		full, ev = line[:first], line[first+1:]
+	} else {
+		// 生产格式：<epoch>|<path>|<events>。取第一个 | 与最后一个 |，
+		// 中间的整段是路径 —— 路径里含 | 也不会切错。
+		full, ev = line[first+1:last], line[last+1:]
 	}
-	full := strings.TrimSuffix(rest[j+1:], "/")
+	full = strings.TrimSuffix(full, "/")
 	// 必须按**路径边界**判断，不能用裸 HasPrefix：root="/srv/conf" 时
 	// "/srv/conf-backup/x" 也会通过前缀检查，把邻居目录的事件混进来。
 	base := strings.TrimSuffix(root, "/")
@@ -1123,14 +1148,17 @@ func ParseInotifyLine(root, line string) (Event, bool) {
 	}
 	// 必须先判 ISDIR：CLOSE_NOWRITE,CLOSE,ISDIR 同时含 CLOSE，
 	// 若先按文件 token 过滤会把目录事件误伤成噪声。
+	// *_SELF 的 token 里**没有 ISDIR**（实测 d/|DELETE_SELF），但路径带尾斜杠、
+	// 且只有被 watch 的目录才会收到自己的 SELF 事件 —— 一律按目录事件处理。
+	if toks["DELETE_SELF"] || toks["MOVE_SELF"] || toks["DELETE"] || toks["MOVED_FROM"] {
+		return Event{RelPath: rel, Kind: KindDirGone}, true
+	}
 	if toks["ISDIR"] {
 		switch {
 		case toks["CREATE"] || toks["MOVED_TO"]:
 			return Event{RelPath: rel, Kind: KindDirAdded}, true
-		case toks["DELETE"] || toks["MOVED_FROM"] || toks["DELETE_SELF"] || toks["MOVE_SELF"]:
-			return Event{RelPath: rel, Kind: KindDirGone}, true
 		default:
-			return Event{}, false // OPEN,ISDIR / ACCESS,ISDIR / CLOSE_NOWRITE,...,ISDIR
+			return Event{}, false // OPEN,ISDIR / ACCESS,ISDIR / CLOSE_NOWRITE,...,CLOSE,ISDIR
 		}
 	}
 	switch {
@@ -2338,6 +2366,9 @@ const (
 	ActionAdopt
 	ActionConflict
 	ActionDelete
+	// ActionSaveAs：远端版本另存为 <name>.remote-<ts>，**本地原文件保留**。
+	// 必须与 ActionGet 分开：否则"另存为"会直接覆盖本地文件（数据丢失）。
+	ActionSaveAs
 )
 
 func (a Action) String() string {
@@ -2350,6 +2381,8 @@ func (a Action) String() string {
 		return "conflict"
 	case ActionDelete:
 		return "delete"
+	case ActionSaveAs:
+		return "save_as"
 	default:
 		return "skip"
 	}
@@ -2562,6 +2595,18 @@ func (a Fingerprint) equal(b Fingerprint) bool {
 	return true
 }
 
+// Conflict 是一条待用户裁决的冲突。定义在这里（而不是 Task 12）是因为状态文件
+// 就要序列化它——否则 Task 9/10/11 结束时 go test ./... 会 undefined: Conflict。
+// Task 12 只在其上补三个动作。
+type Conflict struct {
+	RelPath     string `json:"rel_path"`
+	RemoteSize  int64  `json:"remote_size"`
+	RemoteMTime string `json:"remote_mtime"`
+	LocalSize   int64  `json:"local_size"`
+	LocalMTime  string `json:"local_mtime"`
+	DetectedAt  string `json:"detected_at"`
+}
+
 const stateVersion = 1
 
 type FailedItem struct {
@@ -2630,16 +2675,19 @@ func (s *StateStore) With(fn func(*StateFile)) {
 
 // Flush 原子落盘（临时文件 + rename），权限 0600、目录 0700，并对内容 fsync。
 func (s *StateStore) Flush() error {
-	s.mu.Lock()
-	data := s.data
-	s.mu.Unlock()
-	if data == nil {
-		return nil
-	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
 		return err
 	}
-	body, err := json.MarshalIndent(data, "", "  ")
+	// **必须在锁内 marshal**：序列化会遍历整张 Entries map，而引擎 goroutine
+	// 可能正在 With 里写它 —— 锁外 marshal 会并发读写 map（-race 报错、运行时
+	// 可能直接 fatal）。
+	s.mu.Lock()
+	if s.data == nil {
+		s.mu.Unlock()
+		return nil
+	}
+	body, err := json.MarshalIndent(s.data, "", "  ")
+	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -2811,6 +2859,8 @@ Expected: 编译失败，`undefined: TransferTo`
 package sync
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -2841,7 +2891,14 @@ func TransferTo(tr Transferer, host, user, remotePath, target, ruleID string, ra
 		return err
 	}
 	if randSuffix == nil {
-		randSuffix = func() string { return fmt.Sprintf("%d", os.Getpid()) }
+		// 默认必须是**每次调用都不同**的随机串：进程 pid 在整个应用生命周期内
+		// 恒定，同一规则的两次传输（引擎一次、UI 触发一次）会写同一个临时文件。
+		// randSuffix 参数只用于测试注入确定性后缀。
+		randSuffix = func() string {
+			var b [8]byte
+			_, _ = rand.Read(b[:])
+			return hex.EncodeToString(b[:])
+		}
 	}
 	tmp := target + PartSuffix(ruleID) + randSuffix()
 	if err := tr.Get(host, user, remotePath, tmp); err != nil {
@@ -2884,11 +2941,18 @@ func CleanupParts(localRoot, ruleID string) (int, error) {
 ~~~go
 package sync
 
-import "sshore/internal/sftp"
+import (
+	"sshore/internal/sftp"
+	"sshore/internal/watch"
+)
 
 // NewSftpAdapter 让 sync 通过 sftp.Ctrl 完成传输与列举，同时保持
 // internal/sync 不依赖 sftp 的内部实现。
-func NewSftpAdapter(c *sftp.Ctrl) (Transferer, ListManyFunc) {
+//
+// 返回类型必须是 watch.ListManyFunc（它定义在 watch 包），不能在这里另起一个
+// 同名命名类型——Deps.ListMany 的字段类型是 watch.ListManyFunc，命名类型不同
+// 会赋值失败。
+func NewSftpAdapter(c *sftp.Ctrl) (Transferer, watch.ListManyFunc) {
 	return sftpTransfer{c: c}, sftpListMany{c: c}
 }
 
@@ -2988,6 +3052,7 @@ package sync
 type DeleteGateInput struct {
 	MirrorDelete bool
 	Complete     bool // 本轮扫描是否完整（有目录未知则为 false）
+	CountKnown   bool // PrevCount/CurCount 是否是真实统计（事件路径上未知）
 	RootGone     bool // 收到根目录 DELETE_SELF/UNMOUNT/IGNORED
 	Overflow     bool // 内核队列溢出或 watch 集合不完整
 	FirstRound   bool // 规则启动/重连/模式切换后的第一轮
@@ -3015,12 +3080,13 @@ func EvaluateDeleteGate(in DeleteGateInput) GateResult {
 		return deny("本轮扫描不完整（有目录未知或 watch 不完整），禁止删除")
 	case in.FirstRound:
 		return deny("启动/重连后的第一轮不执行删除")
-	case in.CurCount == 0 && in.PrevCount > 0:
+	case in.CountKnown && in.CurCount == 0 && in.PrevCount > 0:
 		return deny("远端本轮为空而上一轮非空，疑似挂载点掉线，禁止删除")
 	}
 	n := in.PendingCount
 	// 阈值对**小集合**同样生效：不要写成 n > max(10, prev*10%)。
-	if n >= 1 && (n >= 10 || n*2 >= in.PrevCount) {
+	// 事件路径上 CountKnown=false，此时只按绝对数量 10 兜底（没有可用的分母）。
+	if n >= 1 && (n >= 10 || (in.CountKnown && n*2 >= in.PrevCount)) {
 		return GateResult{Allowed: false, NeedsConfirm: true,
 			Reason: "待删数量达到阈值，已挂起等待确认"}
 	}
@@ -3116,15 +3182,7 @@ package sync
 
 import "fmt"
 
-// Conflict 是一条待用户裁决的冲突。持久化在状态文件里。
-type Conflict struct {
-	RelPath     string `json:"rel_path"`
-	RemoteSize  int64  `json:"remote_size"`
-	RemoteMTime string `json:"remote_mtime"`
-	LocalSize   int64  `json:"local_size"`
-	LocalMTime  string `json:"local_mtime"`
-	DetectedAt  string `json:"detected_at"`
-}
+// Conflict 的类型定义在 Task 9 的 state.go（状态文件要序列化它），本任务只加动作。
 
 type ConflictAction string
 
@@ -3189,7 +3247,7 @@ func ResolveConflict(d *StateFile, rel string, action ConflictAction, local Loca
 	case ConflictTakeRemote:
 		return TransferOrDelete{RelPath: rel, Action: ActionGet, Detail: "用远端覆盖"}, nil
 	case ConflictSaveAs:
-		return TransferOrDelete{RelPath: rel, Action: ActionGet, Detail: "另存远端副本"}, nil
+		return TransferOrDelete{RelPath: rel, Action: ActionSaveAs, Detail: "另存远端副本"}, nil
 	default:
 		return TransferOrDelete{}, fmt.Errorf("未知冲突动作: %s", action)
 	}
@@ -3502,6 +3560,7 @@ package sync
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"path"
 	"sync"
 	"time"
@@ -3543,6 +3602,10 @@ type SyncRuleStat struct {
 	CurrentFile   string
 	SourceMissing bool
 	DeletePending int
+	// DeleteFingerprint 是待确认删除的"轮次 + 路径集合指纹"，UI 必须原样回传
+	// 给 ConfirmSyncRuleDeletes —— 否则确认闭环断裂（无法解除挂起状态）。
+	DeleteFingerprint string
+	DeletePaths       []string
 }
 
 type ruleRuntime struct {
@@ -3561,6 +3624,7 @@ type ruleRuntime struct {
 	logCount   map[string]int
 	firstRound bool // 启动/重连/模式切换后的第一轮：禁止删除
 	blockDels  bool // 收到 root_gone / overflow：暂停删除直到对账确认
+	stableAt   time.Time // 最近一次进入 connected 的时刻（防抖基准）
 }
 
 type Ctrl struct {
@@ -3734,6 +3798,7 @@ func (c *Ctrl) loop(r *ruleRuntime) {
 		r.mu.Lock()
 		r.src = src
 		r.status = "connected"
+		r.stableAt = time.Now()
 		r.stats.Mode = info.Mode
 		r.stats.Reason = info.Reason
 		r.stats.PollIntervalS = r.rule.PollIntervalS
@@ -3782,6 +3847,14 @@ func (c *Ctrl) loop(r *ruleRuntime) {
 				c.emit(r.rule.ID, "error", "监控连接断开，且未开启自动重连")
 				return
 			}
+			// 连续稳定在线满 60s 就清零计数（对齐 forward 的 stableThreshold 语义），
+			// 否则多次独立抖动会让退避永久停在 30s。
+			r.mu.Lock()
+			stable := time.Since(r.stableAt) >= 60*time.Second
+			r.mu.Unlock()
+			if stable {
+				attempt = 0
+			}
 			attempt++
 			delay := c.d.BackoffFn(attempt)
 			c.emit(r.rule.ID, "warn", fmt.Sprintf("监控连接断开，%s 后进行第 %d 次重连", delay, attempt))
@@ -3802,8 +3875,13 @@ func (c *Ctrl) newSource(r *ruleRuntime, info watch.Info) (watch.Source, error) 
 		ForcePoll: r.rule.ForcePoll, PollInterval: time.Duration(r.rule.PollIntervalS) * time.Second,
 	}
 	logf := func(level, msg string) { c.emit(r.rule.ID, level, msg) }
-	if info.Mode == "inotify" && c.d.Spawner != nil {
+	// kind=file 强制轮询：inotify 下根路径就是那个文件，%w%f 的 rel 恒为空串，
+	// CLOSE_WRITE/MODIFY 会被当作根目录噪声丢弃 —— 写事件永远拿不到。
+	if info.Mode == "inotify" && c.d.Spawner != nil && r.rule.Kind != "file" {
 		return watch.NewInotifySource(c.d.Spawner, opts, logf), nil
+	}
+	if info.Mode == "inotify" && r.rule.Kind == "file" {
+		c.emit(r.rule.ID, "warn", "单文件规则使用轮询探测（inotify 无法提供该文件的写事件）")
 	}
 	if c.d.ListMany == nil {
 		return nil, fmt.Errorf("缺少 ListMany 依赖")
@@ -3857,6 +3935,13 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 				timer.Reset(300 * time.Millisecond)
 				dirty = true
 			}
+		case <-r.wake:
+			// UI 裁决 take_remote/save_as 后唤醒：走同一条去抖路径，不另开传输
+			// （传输只能在规则 goroutine 内串行发生）。
+			if !dirty {
+				timer.Reset(300 * time.Millisecond)
+				dirty = true
+			}
 		case <-timer.C:
 			dirty = false
 			c.drainQueue(r)
@@ -3873,7 +3958,11 @@ func (c *Ctrl) drainQueue(r *ruleRuntime) {
 	if len(batch) == 0 {
 		return
 	}
-	metas := c.fetchMeta(r, batch)
+	metas, metaErr := c.fetchMeta(r, batch)
+	if metaErr != nil {
+		c.emit(r.rule.ID, "warn", "远端元信息补齐失败，本批跳过："+metaErr.Error())
+		return
+	}
 	for rel, kind := range batch {
 		r.mu.Lock()
 		r.stats.CurrentFile = rel
@@ -3884,12 +3973,19 @@ func (c *Ctrl) drainQueue(r *ruleRuntime) {
 		r.mu.Unlock()
 	}
 	_ = r.state.Flush()
+	// 事件路径的删除也必须过闸门 —— 只登记不执行等于 mirror_delete 失效。
+	r.mu.Lock()
+	hasDels := len(r.pendingDel) > 0
+	r.mu.Unlock()
+	if hasDels {
+		c.maybeDelete(r, -1) // -1：本轮远端条目数未知（事件路径）
+	}
 }
 
-func (c *Ctrl) fetchMeta(r *ruleRuntime, batch map[string]watch.Kind) map[string]*Entry {
+func (c *Ctrl) fetchMeta(r *ruleRuntime, batch map[string]watch.Kind) (map[string]*Entry, error) {
 	out := map[string]*Entry{}
 	if c.d.ListMany == nil {
-		return out
+		return out, nil
 	}
 	// 注意：不做批量路径拼接的猜测——逐个文件 ls 由 ListMany 承担，
 	// 它内部仍是一个 sftp 批处理（约定见 Task 3）。
@@ -3899,8 +3995,7 @@ func (c *Ctrl) fetchMeta(r *ruleRuntime, batch map[string]watch.Kind) map[string
 	}
 	res, err := c.d.ListMany(r.rule.Host, r.rule.User, paths)
 	if err != nil {
-		c.emit(r.rule.ID, "warn", "远端元信息补齐失败："+err.Error())
-		return out
+		return out, err
 	}
 	for rel := range batch {
 		items, ok := res[path.Join(r.rule.RemotePath, rel)]
@@ -3909,7 +4004,7 @@ func (c *Ctrl) fetchMeta(r *ruleRuntime, batch map[string]watch.Kind) map[string
 		}
 		out[rel] = &Entry{RemoteSize: items[0].Size, RemoteMTime: items[0].ModTime}
 	}
-	return out
+	return out, nil
 }
 
 // align 做一次全量对账：扫描远端，与 entries 的 remote_* 比对（含删除）。
@@ -3970,10 +4065,18 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	})
 	r.mu.Lock()
 	r.pendingDel = dels
-	r.delFP = fmt.Sprintf("round-%d", time.Now().UnixNano())
+	// 指纹 = 轮次号 + 路径集合摘要：路径集合一变，指纹就变，确认即失效。
+	h := fnv.New64a()
+	for _, rel := range dels {
+		_, _ = h.Write([]byte(rel))
+		_, _ = h.Write([]byte{0})
+	}
+	r.delFP = fmt.Sprintf("%d-%x", time.Now().UnixNano(), h.Sum64())
+	r.stats.DeletePaths = append([]string{}, dels...)
 	r.logCount = map[string]int{} // 每轮对账后重置节流计数
 	r.blockDels = false           // 完整对账成功 ⇒ 解除删除暂停（firstRound 已由闸门消费）
 	r.stats.DeletePending = len(dels)
+	r.stats.DeleteFingerprint = r.delFP
 	r.stats.Pending = len(snap.Entries)
 	r.mu.Unlock()
 	_ = r.state.Flush()
@@ -4029,13 +4132,25 @@ func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Ent
 	})
 	action, reason := Decide(kind, ent, st, r.rule.MirrorDelete)
 	switch action {
-	case ActionGet:
+	case ActionGet, ActionSaveAs:
 		remotePath := path.Join(r.rule.RemotePath, rel)
-		if err := TransferTo(c.d.Transfer, r.rule.Host, r.rule.User, remotePath, local, r.rule.ID, nil); err != nil {
+		target := local
+		saveAs := action == ActionSaveAs
+		if saveAs {
+			// 另存为：远端版本写到 <name>.remote-<ts>，**本地原文件保留**，
+			// 且**不更新基线**（原文件根本没有变化）。
+			target = local + ".remote-" + time.Now().Format("20060102-150405")
+		}
+		if err := TransferTo(c.d.Transfer, r.rule.Host, r.rule.User, remotePath, target, r.rule.ID, nil); err != nil {
 			c.emit(r.rule.ID, "error", "下载 "+rel+" 失败："+err.Error())
 			r.mu.Lock()
 			r.stats.Failed++
 			r.mu.Unlock()
+			return
+		}
+		if saveAs {
+			r.state.With(func(d *StateFile) { removeConflict(d, rel) })
+			c.emit(r.rule.ID, "info", "远端副本已另存为 "+path.Base(target))
 			return
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
@@ -4100,7 +4215,7 @@ func (c *Ctrl) maybeDelete(r *ruleRuntime, curCount int) {
 	res := EvaluateDeleteGate(DeleteGateInput{
 		MirrorDelete: r.rule.MirrorDelete, Complete: true,
 		FirstRound: first, RootGone: blocked, Overflow: blocked,
-		PrevCount: curCount + pending, CurCount: curCount, PendingCount: pending,
+		CountKnown: curCount >= 0, PrevCount: curCount + pending, CurCount: curCount, PendingCount: pending,
 	})
 	if !res.Allowed {
 		if res.NeedsConfirm {
@@ -4149,7 +4264,7 @@ func (c *Ctrl) ResolveConflict(id, rel string, action ConflictAction, local Loca
 		return err
 	}
 	_ = r.state.Flush()
-	if req.Action == ActionGet {
+	if req.Action == ActionGet || req.Action == ActionSaveAs {
 		r.mu.Lock()
 		r.queue[rel] = watch.KindWrite
 		r.mu.Unlock()
@@ -4177,7 +4292,7 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 		return fmt.Errorf("确认已过期：删除清单已变化，请重新查看")
 	}
 	r.mu.Unlock()
-	metas := c.fetchMeta(r, func() map[string]watch.Kind {
+	metas, err := c.fetchMeta(r, func() map[string]watch.Kind {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		m := map[string]watch.Kind{}
@@ -4186,6 +4301,10 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 		}
 		return m
 	}())
+	if err != nil {
+		// 无法确认远端状态时**绝不删**：一次瞬时 sftp 故障就会删掉远端其实仍在的文件。
+		return fmt.Errorf("无法确认远端状态，已取消本批删除: %w", err)
+	}
 	for rel := range metas {
 		if metas[rel] != nil {
 			c.emit(r.rule.ID, "warn", "远端文件已恢复，取消整批删除："+rel)
@@ -4327,7 +4446,7 @@ func newTestApp(t *testing.T) *App {
 ~~~go
 	transfer, lister := sync.NewSftpAdapter(a.sftp)
 	a.sync = sync.NewCtrl(sync.Deps{
-		Spawner:  osutil.NewSpawner(),
+		Spawner:  osutil.NewStreamer(),
 		Runner:   osutil.NewCtxRunner(),
 		Transfer: transfer,
 		ListMany: lister,
@@ -4545,7 +4664,9 @@ func (a *App) OnShutdown() {
 Run: `go vet ./... && go test . -race -count=1`
 Expected: PASS
 
-Run: `cd frontend && npx wails generate module && git status --short`
+Run: `wails generate module && git status --short`（**在仓库根目录执行**：wails 是 Go 版 CLI，
+需要读根目录的 wails.json；`npx` 解析的是 npm 包，调不到它。若不在 PATH：
+`$(go env GOPATH)/bin/wails generate module`）
 Expected: `frontend/wailsjs/go/main/App.d.ts`、`App.js`、`models.ts` 三个文件出现改动（Makefile 全部构建带 `-skipbindings`，这一步**不会自动发生**）。
 
 - [ ] **Step 5: 提交**
@@ -4746,11 +4867,17 @@ git commit -m "test(sync): 新增真实 sshd 的端到端同步验证,由 e2e �
 
 **发现并修掉 1 处真 bug**：`Decide` 的"无基线"分支原本调用 `ent.remoteSizeOr(...)`，而该分支的 `ent` 正是 `nil` ——远端大小根本取不到。已改为明确语义：**引擎必须先补齐远端元信息**，因此该分支 `ent` 非 nil 且 `HasLocal=false`；`ent == nil` 表示"远端元信息未知"，保守地直接下载。测试用例同步改为传入 `&Entry{RemoteSize: rs}`。
 
-### 4. 需要确认的一处 spec 偏离
+### 4. 需要确认的两处 spec 偏离
 
 `Global Constraints` 里登记的**扫描器位置修正**：spec §12 把 `scan.go` 放在 `internal/sync`，但它被 `watch` 的 poll 路径使用，而 §4.5 规定 `sync → watch` 单向——放 sync 会造成 `watch → sync` 反向依赖（导入环）。本计划放在 `internal/watch/scan.go`。
 
 **执行前建议先改 spec §12 的这一行**，否则执行者对照 spec 会困惑。这需要你点头，我没有擅自改。
+
+**第二处偏离：`auto_reconnect` 缺键的语义。** spec §5.2 要求"缺键 → 取全局
+`App.AutoReconnectDefault`"，但 Task 4 按 **false（不重连）** 处理——因为解码后的
+`bool` 无法区分"缺键"与"显式 false"，强行套默认会制造一个关不掉的开关。
+安全侧默认是不重连。若你要严格对齐 spec，需要把字段改成 `*bool` 并在
+`LoadConfig` 里灌默认值，这会影响 `wailsjs` 的模型（前端会看到 null）。**请裁定。**
 
 ### 6. 第二轮自审（/review 阶段一）修掉的问题
 
