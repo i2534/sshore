@@ -14,6 +14,8 @@ func TestParseInotifyLineScenarios(t *testing.T) {
 		// 生产格式（带 %T 时间戳）：远程命令用的是 '%T|%w%f|%e'，必须覆盖
 		{"生产格式-创建", "1789033487|/srv/conf/a.txt|CREATE", Event{"a.txt", KindCreate}, true},
 		{"生产格式-含CRLF", "1789033487|/srv/conf/a.txt|CLOSE_WRITE,CLOSE\r", Event{"a.txt", KindWrite}, true},
+		// 生产形状 + 路径含 | ：判别式的回归护栏（%T 纯数字 → 取首个 | 与最后一个 | 之间）。
+		{"生产格式-路径含|", "1789033487|/srv/conf/we|ird.txt|CREATE", Event{"we|ird.txt", KindCreate}, true},
 		{"创建文件", "/srv/conf/a.txt|CREATE", Event{"a.txt", KindCreate}, true},
 		{"写入文件", "/srv/conf/a.txt|CLOSE_WRITE,CLOSE", Event{"a.txt", KindWrite}, true},
 		{"仅 MODIFY", "/srv/conf/a.txt|MODIFY", Event{"a.txt", KindWrite}, true},
@@ -65,7 +67,9 @@ func TestParseInotifyLineToleratesCRLF(t *testing.T) {
 	}
 }
 
-// 路径中可能含 '|'，所以必须从右往左切分两次。
+// 路径中可能含 '|'：事件恒取最后一个 '|' 之后；路径取（首个 '|' 之后、最后一个 '|' 之前），
+// 无时间戳的 path|events 形状则取（行首、最后一个 '|' 之前）。首个 '|' 之前的段是否为纯数字
+// epoch（%T/--timefmt '%s'）用于区分这两种形状。
 func TestParseInotifyLineHandlesPipeInPath(t *testing.T) {
 	got, ok := ParseInotifyLine(root, "/srv/conf/we|ird.txt|CREATE")
 	if !ok || got.RelPath != "we|ird.txt" {

@@ -23,6 +23,11 @@ func ParseInotifyLine(root, line string) (Event, bool) {
 		return Event{}, false
 	}
 	var full, ev string
+	// 判别式与远端命令的 --timefmt 强耦合：这里假定 %T 是 epoch 秒（纯数字）。
+	// Task 6 组装远程命令时必须保持 --timefmt '%s'。若换成非数字格式（如 '%F %T'），
+	// 每条真实输出的首个 '|' 之前都不再是纯数字，会被误判成无时间戳形状，导致整段路径
+	// 过不了 root 前缀校验而被**静默丢弃** —— 表现是 "watch 一直没事件" 而不是报错，极难定位。
+	// 此处只作说明，刻意不做运行时校验（非数字时间格式在解析层无从证伪）。
 	if first == last || !allDigits(line[:first]) {
 		// 无时间戳：<path>|<events>。注意不能取 line[first+1:last]——
 		// 那样会把首个 "|" 之前的路径前缀（如 "/srv/conf/we"）整段丢掉。
