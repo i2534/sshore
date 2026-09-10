@@ -44,3 +44,33 @@ func TestDeleteGateAllowsSmallDelete(t *testing.T) {
 		t.Fatalf("1/100 应直接放行，得到 %+v", got)
 	}
 }
+
+// 事件路径上没有分母：CountKnown 留 false，PrevCount 是零值。
+// 相对阈值不得在此触发，否则 n*2 >= 0 对任意 n>=1 都成立，
+// 每次删除都会被要求确认，mirror_delete 形同虚设。
+func TestDeleteGateEventPathHasNoRelativeThreshold(t *testing.T) {
+	got := EvaluateDeleteGate(DeleteGateInput{MirrorDelete: true, Complete: true, PendingCount: 3})
+	if !got.Allowed || got.NeedsConfirm {
+		t.Fatalf("事件路径无分母时不应按相对阈值挂起，得到 %+v", got)
+	}
+}
+
+// 事件路径仍受绝对数量 10 兜底（没有分母可用）。
+func TestDeleteGateEventPathAbsoluteFallback(t *testing.T) {
+	got := EvaluateDeleteGate(DeleteGateInput{MirrorDelete: true, Complete: true, PendingCount: 10})
+	if got.Allowed || !got.NeedsConfirm {
+		t.Fatalf("事件路径待删 10 个应挂起确认，得到 %+v", got)
+	}
+}
+
+// 空远端硬拒绝（delete_gate.go 的 in.CountKnown && CurCount==0 && PrevCount>0）
+// 必须带 CountKnown 前置条件。原因：事件路径上引擎不掌握 CurCount，会把 CurCount
+// 留在零值，而 PrevCount 来自 state 可能 > 0；若去掉该前置条件，这条硬拒绝会在
+// 每次事件路径判定时触发，从而永久阻断 inotify 路径上的所有删除。此测试固定该
+// 契约，禁止后人"修复"掉这个前置条件。
+func TestDeleteGateEmptyRemoteHardDenyRequiresKnownCounts(t *testing.T) {
+	got := EvaluateDeleteGate(DeleteGateInput{MirrorDelete: true, Complete: true, PrevCount: 5, CurCount: 0, PendingCount: 0})
+	if !got.Allowed {
+		t.Fatalf("调用方未声明计数真实时，空远端硬拒绝不得触发，得到 %+v", got)
+	}
+}
