@@ -278,6 +278,81 @@ func TestEventPathUnknownMetaKeepsExistingLocalAsConflict(t *testing.T) {
 	}
 }
 
+// C2（完成）：对账的删除候选循环也必须跳过"不在处理范围"的路径。被 exclude 覆盖
+// 的路径只是退出处理范围，不是"远端已删"——用户后来才加 exclude 时，绝不能因此
+// 删掉已镜像的本地文件。同时保留语义：真正在范围内消失的路径仍会被删除。
+func TestReconcileDoesNotDeleteNewlyExcludedPath(t *testing.T) {
+	local := t.TempDir()
+	rule := dirRule(local)
+	rule.MirrorDelete = true
+
+	// 12 条 keep 基线，使本轮删除数低于闸门阈值（否则只会挂起等待确认）。
+	keep := make([]sftp.Item, 0, 12)
+	for i := 0; i < 12; i++ {
+		keep = append(keep, sftp.Item{Name: fmt.Sprintf("keep%02d.txt", i), Size: 3, ModTime: "2026-09-10 10:00"})
+	}
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{"/r": keep}}
+	xf := &fakeXfer{remote: map[string]string{}}
+	c, r := newEventCtrl(t, rule, lm.list, xf)
+
+	writeBaselineFile := func(rel string) (LocalState, string) {
+		t.Helper()
+		target := filepath.Join(local, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, []byte("abc"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		st, err := osStat(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st, target
+	}
+
+	excludedSt, excludedTarget := writeBaselineFile("node_modules/x.js") // 默认 exclude 覆盖
+	goneSt, goneTarget := writeBaselineFile("gone.txt")                  // 在范围内、远端真的消失
+
+	r.state.With(func(d *StateFile) {
+		for i := 0; i < 12; i++ {
+			d.Entries[fmt.Sprintf("keep%02d.txt", i)] = &Entry{
+				RemoteSize: 3, RemoteMTime: "2026-09-10 10:00",
+				LocalSize: 3, LocalMTime: "2026-09-10 10:00", HasLocal: true,
+			}
+		}
+		d.Entries["node_modules/x.js"] = &Entry{
+			RemoteSize: excludedSt.Size, RemoteMTime: "2026-09-10 10:00",
+			LocalSize: excludedSt.Size, LocalMTime: excludedSt.ModTime, HasLocal: true,
+		}
+		d.Entries["gone.txt"] = &Entry{
+			RemoteSize: goneSt.Size, RemoteMTime: "2026-09-10 10:00",
+			LocalSize: goneSt.Size, LocalMTime: goneSt.ModTime, HasLocal: true,
+		}
+	})
+
+	c.align(r)
+
+	if _, err := os.Stat(excludedTarget); err != nil {
+		t.Fatalf("新加入 exclude 的已镜像路径被对账删除: %v", err)
+	}
+	present := false
+	r.state.With(func(d *StateFile) { present = d.Entries["node_modules/x.js"] != nil })
+	if !present {
+		t.Fatal("被排除路径的基线条目必须保留，不能被当成远端已删而清除")
+	}
+
+	// 语义护栏：在范围内且远端确实消失的路径，必须照常删除。
+	if _, err := os.Stat(goneTarget); !os.IsNotExist(err) {
+		t.Fatalf("在范围内真正消失的路径必须被镜像删除，stat err=%v", err)
+	}
+	gonePresent := false
+	r.state.With(func(d *StateFile) { gonePresent = d.Entries["gone.txt"] != nil })
+	if gonePresent {
+		t.Fatal("真正被删除的路径，其条目必须一并清除")
+	}
+}
+
 // I3: 本地 stat 返回"非不存在"的错误（此例为自指符号链接的 ELOOP）时，
 // 必须跳过该路径，绝不能当成"本地不存在"而 re-download 覆盖本地文件。
 func TestEventPathSkipsOnNonNotExistStatError(t *testing.T) {
