@@ -61,6 +61,11 @@ func (a Action) String() string {
 }
 
 // Decide 实现决策表。它永远是纯函数：不做 IO、不改状态，便于逐行测试。
+//
+// kind 必须是**文件级**事件：watch.KindCreate / watch.KindWrite / watch.KindDelete。
+// watch.KindDirAdded / KindDirGone / KindOverflow / KindRootGone 必须先由调用方
+// 展开成文件级事件再传入（每个文件一次调用）；把目录或溢出事件直接喂进来会落入
+// "远端内容变更"分支，语义不成立。
 func Decide(kind watch.Kind, ent *Entry, local LocalState, mirrorDelete bool) (Action, string) {
 	if kind == watch.KindDelete {
 		if !ent.HasBaseline() {

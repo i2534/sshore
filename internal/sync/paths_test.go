@@ -10,7 +10,7 @@ import (
 func TestSafeRelPathRejectsTraversal(t *testing.T) {
 	bad := []string{
 		"", ".", "..", "../etc/passwd", "a/../../b", "/abs/path",
-		"a/b/../../..", "C:\\Windows\\x", "a\nb", "a\x00b",
+		"a/b/../../..", "C:\\Windows\\x", "a\nb", "a\x00b", "a\r", "\tfile", "a ", " a", "a\u00a0",
 	}
 	for _, rel := range bad {
 		if got, ok := SafeRelPath(rel); ok {
