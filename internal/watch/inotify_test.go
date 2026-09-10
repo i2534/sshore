@@ -254,3 +254,57 @@ func TestInotifySourceCloseClosesChannel(t *testing.T) {
 		t.Fatal("Close 未关闭 channel")
 	}
 }
+
+// I4: "Watches established." 之前的任何 watch 失败都是配置类错误，必须致命。
+// 尤其是 Permission denied：它不会自愈，降级为 warn+overflow 会让规则永远
+// 显示 connected 却什么都不同步（本特性 §6.2 明确要避免的静默失败）。
+func TestInotifySourcePreEstablishedPermissionWatchFailureIsFatal(t *testing.T) {
+	fs := &fakeStreamer{started: make(chan struct{})}
+	src := NewInotifySource(fs, DetectOpts{Host: "h", RemotePath: "/srv/conf"}, func(string, string) {})
+	ch, err := src.Start(context.Background())
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer src.Close()
+	<-fs.started
+
+	fs.handlers.OnStdout("Couldn't watch /srv/conf: Permission denied")
+	if src.Err() == nil {
+		t.Fatal("Watches established 之前的权限失败必须是致命错误，否则规则假装 connected 却什么都不同步")
+	}
+	select {
+	case got := <-ch:
+		if got.Kind != KindOverflow {
+			t.Fatalf("want overflow, got %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("必须产出 overflow 强制对账")
+	}
+}
+
+// I4 镜像：同一条权限文案出现在 "Watches established." 之后属于运行期补挂失败，
+// 必须保持非致命（只 overflow），以免把可恢复的运行期问题升级成启动错误。
+func TestInotifySourceLatePermissionWatchFailureIsOnlyOverflow(t *testing.T) {
+	fs := &fakeStreamer{started: make(chan struct{})}
+	src := NewInotifySource(fs, DetectOpts{Host: "h", RemotePath: "/srv/conf"}, func(string, string) {})
+	ch, err := src.Start(context.Background())
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer src.Close()
+	<-fs.started
+
+	fs.handlers.OnStdout("Watches established.")
+	fs.handlers.OnStdout("Couldn't watch /srv/conf/new: Permission denied")
+	if src.Err() != nil {
+		t.Fatalf("运行期补挂失败不应是致命错误: %v", src.Err())
+	}
+	select {
+	case got := <-ch:
+		if got.Kind != KindOverflow {
+			t.Fatalf("want overflow, got %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("必须产出 overflow 强制对账")
+	}
+}

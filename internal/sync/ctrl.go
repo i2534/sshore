@@ -2,9 +2,12 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io/fs"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -402,6 +405,15 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 				c.align(r)
 				continue
 			}
+			// 文件事件在入队前按规则过滤：被 exclude 命中或超出 max_depth 的
+			// 路径绝不能进入队列。否则它会被下载、被登记进基线，随后又被对账
+			// 当成"远端已删"而删掉本地文件。目录事件不在此过滤：align 已处理
+			// 整棵子树，丢掉目录事件会破坏子树对账。
+			if watch.MatchExclude(ev.RelPath, r.rule.Excludes) ||
+				(r.rule.MaxDepth >= 0 && strings.Count(ev.RelPath, "/") > r.rule.MaxDepth) {
+				r.mu.Unlock()
+				continue
+			}
 			r.queue[ev.RelPath] = ev.Kind
 			overflowed := len(r.queue) > maxQueuePaths
 			if overflowed {
@@ -491,6 +503,17 @@ func (c *Ctrl) drainQueue(r *ruleRuntime) {
 	}
 }
 
+// remotePathFor 把规则内的相对路径映射成远端绝对路径。
+//
+// kind=file 时 RemotePath 本身就是那个文件（事件/对齐传入的 rel 只是它的
+// basename），不能再 Join——否则会向服务器请求 /srv/conf/a.conf/a.conf。
+func remotePathFor(rule config.SyncRule, rel string) string {
+	if rule.Kind == "file" {
+		return rule.RemotePath
+	}
+	return path.Join(rule.RemotePath, rel)
+}
+
 func (c *Ctrl) fetchMeta(r *ruleRuntime, batch map[string]watch.Kind) (map[string]*Entry, error) {
 	out := map[string]*Entry{}
 	if c.d.ListMany == nil {
@@ -500,14 +523,14 @@ func (c *Ctrl) fetchMeta(r *ruleRuntime, batch map[string]watch.Kind) (map[strin
 	// 它内部仍是一个 sftp 批处理（约定见 Task 3）。
 	paths := make([]string, 0, len(batch))
 	for rel := range batch {
-		paths = append(paths, path.Join(r.rule.RemotePath, rel))
+		paths = append(paths, remotePathFor(r.rule, rel))
 	}
 	res, err := c.d.ListMany(r.rule.Host, r.rule.User, paths)
 	if err != nil {
 		return out, err
 	}
 	for rel := range batch {
-		items, ok := res[path.Join(r.rule.RemotePath, rel)]
+		items, ok := res[remotePathFor(r.rule, rel)]
 		if !ok || len(items) == 0 {
 			continue // 未知：Decide 会保守下载
 		}
@@ -591,7 +614,9 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	r.delFP = fmt.Sprintf("%d-%x", time.Now().UnixNano(), h.Sum64())
 	r.stats.DeletePaths = append([]string{}, dels...)
 	r.logCount = map[string]int{} // 每轮对账后重置节流计数
-	r.blockDels = false           // 完整对账成功 ⇒ 解除删除暂停（firstRound 已由闸门消费）
+	// 完整扫描成功即视为已完成对账，主动解除删除暂停。因此 RootGone/Overflow
+	// 两个闸门臂只在事件路径（blockDels 仍可能为真、且没有全量扫描背书）上生效。
+	r.blockDels = false
 	r.stats.DeletePending = len(dels)
 	r.stats.DeleteFingerprint = r.delFP
 	r.stats.Pending = len(snap.Entries)
@@ -648,7 +673,13 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 		c.emit(r.rule.ID, "error", "拒绝非法路径："+rel)
 		return
 	}
-	st, _ := osStat(local)
+	st, statErr := osStat(local)
+	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+		// "读不到本地状态" ≠ "本地不存在"：不能落进 Decide 的 re-download 分支
+		// 去覆盖一个只是暂时不可读（权限、符号链接环等）的本地文件。本轮跳过。
+		c.emitThrottled(r, "stat:"+rel, "warn", "读取本地文件状态失败，本轮跳过 "+rel+"："+statErr.Error())
+		return
+	}
 	var ent *Entry
 	r.state.With(func(d *StateFile) {
 		if e, ok := d.Entries[rel]; ok {
@@ -670,7 +701,7 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 	}
 	switch action {
 	case ActionGet, ActionSaveAs:
-		remotePath := path.Join(r.rule.RemotePath, rel)
+		remotePath := remotePathFor(r.rule, rel)
 		target := local
 		saveAs := action == ActionSaveAs
 		if saveAs {
@@ -723,6 +754,11 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 				d.Entries[rel] = e
 			}
 			e.LocalSize, e.LocalMTime, e.HasLocal, e.WrittenAt = after.Size, after.ModTime, true, now
+			if ent != nil {
+				// 同批刚取回的远端元信息必须一并登记：只写 Local*/HasLocal 会让
+				// 下一次对账看到 Remote*=0 而判成"远端变化"，再下载一次。
+				e.RemoteSize, e.RemoteMTime = ent.RemoteSize, ent.RemoteMTime
+			}
 			removeConflict(d, rel)
 		})
 		r.mu.Lock()
@@ -740,8 +776,14 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 		})
 		c.emit(r.rule.ID, "info", rel+" 本地已存在且大小一致，未下载（未校验内容）")
 	case ActionConflict:
+		// ent 可能为 nil（"远端元信息未知但本地已存在"，见 Decide）；此时远端
+		// 字段保持零值，绝不能解引用。
+		remoteSize, remoteMTime := int64(0), ""
+		if ent != nil {
+			remoteSize, remoteMTime = ent.RemoteSize, ent.RemoteMTime
+		}
 		r.state.With(func(d *StateFile) {
-			UpsertConflict(d, Conflict{RelPath: rel, RemoteSize: ent.RemoteSize, RemoteMTime: ent.RemoteMTime,
+			UpsertConflict(d, Conflict{RelPath: rel, RemoteSize: remoteSize, RemoteMTime: remoteMTime,
 				LocalSize: st.Size, LocalMTime: st.ModTime, DetectedAt: time.Now().Format(time.RFC3339)})
 		})
 		r.mu.Lock()

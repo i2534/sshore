@@ -13,11 +13,13 @@ import (
 // InotifySource 用一条常驻的远端 inotifywait 进程提供近实时事件。
 //
 // 【已知弱点 W1，必须保留这段注释】
-// inotifywait -r 没有 maxdepth：内核 watch 会覆盖全部层级，规则里的 max_depth
-// 只在**解析事件时**过滤，并不能减少内核 watch 配额的开销。大目录（例如下面挂着
-// node_modules）可能耗尽配额，后果是启动即失败（Failed to watch）或带残缺 watch
-// 静默漏同步。需要真正限量扫描时，请在规则里关闭 inotify（force_poll = true）
-// 改用轮询路径。
+// inotifywait -r 没有 maxdepth：内核 watch 会覆盖全部层级，并不能减少内核 watch
+// 配额的开销。大目录（例如下面挂着 node_modules）可能耗尽配额，后果是启动即失败
+// （Failed to watch）或带残缺 watch 静默漏同步。需要真正限量扫描时，请在规则里
+// 关闭 inotify（force_poll = true）改用轮询路径。
+//
+// 注意：max_depth / excludes 的过滤发生在上层引擎的事件队列边界（sync.consume），
+// 本包既不在解析事件时过滤，也不减少内核 watch 数。
 type InotifySource struct {
 	sp   osutil.Streamer
 	opts DetectOpts
@@ -230,13 +232,24 @@ func (s *InotifySource) noteWatchProblem(ch chan Event, line string) bool {
 		return true
 	case strings.Contains(l, "couldn't watch"):
 		s.mu.Lock()
-		fatal := !s.sawEstablished && strings.Contains(l, "no such file")
+		// "Watches established." 之前的任何 watch 失败都是配置类错误
+		// （No such file 之外还有 Permission denied 等），不会自愈。必须
+		// 致命，否则规则会一直显示 connected 却什么都不同步。
+		fatal := !s.sawEstablished
 		if fatal {
-			s.startErr = fmt.Errorf("远端路径不存在：%s", line)
+			if strings.Contains(l, "no such file") {
+				s.startErr = fmt.Errorf("远端路径不存在：%s", line)
+			} else {
+				s.startErr = fmt.Errorf("远端路径无法建立 watch：%s", line)
+			}
 		}
 		s.mu.Unlock()
 		if fatal {
-			s.log("error", "远端路径不存在："+line)
+			if strings.Contains(l, "no such file") {
+				s.log("error", "远端路径不存在："+line)
+			} else {
+				s.log("error", "远端路径无法建立 watch："+line)
+			}
 		} else {
 			s.log("warn", "有目录无法建立 watch，watch 集合不完整："+line)
 		}
