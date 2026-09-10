@@ -4,6 +4,7 @@ package sshconn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -36,8 +37,15 @@ func ControlPath(host, user string) string {
 // 文件会一直 stat 成功，此后所有连接静默退化成各自建连。
 func EnsureMaster(ctx context.Context, r osutil.CtxRunner, host, user string) error {
 	cp := ControlPath(host, user)
-	if out, err := r(ctx, "ssh", "-O", "check", "-o", "ControlPath="+cp, host); err == nil && out.ExitCode == 0 {
+	if masterAlive(ctx, r, cp, host) {
 		return nil
+	}
+	// 判活失败可能只是 master 崩溃留下的陈旧 socket 文件（kill -9 后文件仍在）。
+	// ssh -o ControlMaster=yes 遇到已存在的 socket 会打印 "ControlSocket ...
+	// already exists, disabling multiplexing" 并以 rc=0 退出——既不建 master
+	// 也不报错，因此必须先删掉残留文件，否则会静默失败。
+	if err := os.Remove(cp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("清理残留 ControlMaster socket 失败: %w", err)
 	}
 	args := []string{
 		"-o", "BatchMode=yes",
@@ -59,7 +67,19 @@ func EnsureMaster(ctx context.Context, r osutil.CtxRunner, host, user string) er
 	if out.ExitCode != 0 {
 		return fmt.Errorf("建立 ControlMaster 失败: %s", strings.TrimSpace(out.Stderr))
 	}
+	// rc=0 不是 master 真的起来的证据（残留 socket 场景下正是 rc=0 却没建成），
+	// 必须再用 ssh -O check 复核，否则会把静默退化当成功返回。
+	if !masterAlive(ctx, r, cp, host) {
+		return fmt.Errorf("建立 ControlMaster 失败: 重建后 ssh -O check 仍报告不可用")
+	}
 	return nil
+}
+
+// masterAlive 用 ssh -O check 的退出码判断 ControlMaster 是否存活。不能用
+// os.Stat：kill -9 残留的 socket 文件会一直 stat 成功。
+func masterAlive(ctx context.Context, r osutil.CtxRunner, cp, host string) bool {
+	out, err := r(ctx, "ssh", "-O", "check", "-o", "ControlPath="+cp, host)
+	return err == nil && out.ExitCode == 0
 }
 
 // Exec 执行一次性远端命令（降级探测等）。remoteCmd 原样交给远端 shell；

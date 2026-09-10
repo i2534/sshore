@@ -2,6 +2,8 @@ package sshconn
 
 import (
 	"context"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -43,6 +45,7 @@ func TestEnsureMasterReusesLiveMaster(t *testing.T) {
 }
 
 // 陈旧 socket（文件在但 master 已死）⇒ -O check 非 0 ⇒ 必须真正重建 master。
+// 重建命令 rc=0 之后再用 -O check 复核一次，因此共 3 次调用。
 func TestEnsureMasterRebuildsStaleSocket(t *testing.T) {
 	var calls [][]string
 	fake := func(ctx context.Context, name string, args ...string) (osutil.Outcome, error) {
@@ -55,14 +58,84 @@ func TestEnsureMasterRebuildsStaleSocket(t *testing.T) {
 	if err := EnsureMaster(context.Background(), fake, "h1", ""); err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if len(calls) != 2 {
-		t.Fatalf("应 check 失败后再建一次，实际 %d 次", len(calls))
+	if len(calls) != 3 {
+		t.Fatalf("应 check 失败 → 重建 → 复核，实际 %d 次", len(calls))
 	}
 	built := strings.Join(calls[1], " ")
 	for _, want := range []string{"ControlMaster=yes", "-N", "-f", "BatchMode=yes"} {
 		if !strings.Contains(built, want) {
 			t.Fatalf("建 master 参数缺少 %q: %s", want, built)
 		}
+	}
+	if joined := strings.Join(calls[2], " "); !strings.Contains(joined, "-O check") {
+		t.Fatalf("重建后必须用 ssh -O check 复核，实际: %s", joined)
+	}
+}
+
+// 崩溃 master（kill -9）会留下 socket 文件；ssh -o ControlMaster=yes 遇到已存在
+// 的 socket 会打印 "already exists, disabling multiplexing" 并以 rc=0 退出——既不
+// 建 master 也不报错。所以重建前必须先删掉残留文件，否则会静默失败。
+func TestEnsureMasterRemovesStaleSocketBeforeRebuild(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+
+	host, user := "h-stale", "u-stale"
+	cp := ControlPath(host, user)
+	if err := os.WriteFile(cp, []byte("stale"), 0600); err != nil {
+		t.Fatalf("预置陈旧 socket 文件失败: %v", err)
+	}
+
+	var calls [][]string
+	removedBeforeRebuild := false
+	fake := func(ctx context.Context, name string, args ...string) (osutil.Outcome, error) {
+		calls = append(calls, append([]string{name}, args...))
+		switch len(calls) {
+		case 1:
+			return osutil.Outcome{ExitCode: 255, Stderr: "Control socket connect: refused"}, nil
+		case 2:
+			if _, err := os.Stat(cp); errors.Is(err, os.ErrNotExist) {
+				removedBeforeRebuild = true
+			}
+			return osutil.Outcome{ExitCode: 0}, nil
+		default:
+			return osutil.Outcome{ExitCode: 0}, nil
+		}
+	}
+	if err := EnsureMaster(context.Background(), fake, host, user); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if !removedBeforeRebuild {
+		t.Fatalf("重建前必须删除残留 socket 文件: %s", cp)
+	}
+	if len(calls) != 3 {
+		t.Fatalf("应为 check(失败) → 重建 → 复核，共 3 次调用，实际 %d 次: %v", len(calls), calls)
+	}
+}
+
+// 重建命令 rc=0 并不代表 master 真的起来了：重建后复核仍非 0 必须返回错误，
+// 绝不能报告成功让调用方以为有 master 可用（否则静默退化为各自建连）。
+func TestEnsureMasterFailsWhenRebuildLeavesNoLiveMaster(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+
+	host := "h-dead"
+	var calls [][]string
+	fake := func(ctx context.Context, name string, args ...string) (osutil.Outcome, error) {
+		calls = append(calls, append([]string{name}, args...))
+		switch len(calls) {
+		case 2:
+			return osutil.Outcome{ExitCode: 0}, nil
+		default:
+			return osutil.Outcome{ExitCode: 255, Stderr: "Control socket connect: refused"}, nil
+		}
+	}
+	if err := EnsureMaster(context.Background(), fake, host, ""); err == nil {
+		t.Fatalf("重建后 master 仍未存活，必须返回错误而不是成功")
+	}
+	if len(calls) != 3 {
+		t.Fatalf("应为 check(失败) → 重建 → 复核，共 3 次调用，实际 %d 次", len(calls))
 	}
 }
 
