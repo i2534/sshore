@@ -422,3 +422,43 @@ func TestEngineStopIsIdempotentWhenNotRunning(t *testing.T) {
 		t.Fatalf("重复 Stop 必须返回 nil，得到 %v", err)
 	}
 }
+
+// 端到端验证"镜像删除真的会删文件"。它能同时守住三件事：
+//  1. applyOne 的 ActionDelete 会登记进 pendingDel；
+//  2. drainQueue 处理完会真的调闸门（否则这里永远不会删）；
+//  3. 闸门在事件路径（CountKnown=false）放行单条删除。
+func TestEngineMirrorDeleteActuallyDeletes(t *testing.T) {
+	fs := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	fs.set("/r", sftp.Item{Name: "a.txt", Size: 5, ModTime: "2026-09-10 10:00"})
+	xf := &fakeXfer{remote: map[string]string{"/r/a.txt": "hello"}}
+	c, rule, local := newTestCtrl(t, fs.list, xf)
+	rule.MirrorDelete = true
+	if err := c.Start(rule); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Stop(rule.ID)
+
+	target := filepath.Join(local, "a.txt")
+	waitFor(t, 5*time.Second, func() bool {
+		_, err := os.Stat(target)
+		return err == nil
+	}, "首轮对齐未把 a.txt 拉下来")
+
+	fs.set("/r") // 远端删除
+	waitFor(t, 6*time.Second, func() bool {
+		_, err := os.Stat(target)
+		return os.IsNotExist(err)
+	}, "mirror_delete 未删除本地文件（删除闸门没接上或未放行）")
+}
+
+func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal(msg)
+}
