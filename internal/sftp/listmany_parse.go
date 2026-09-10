@@ -21,6 +21,13 @@ func parseListMany(out string, paths []string) map[string][]Item {
 			// 没有对应回显块的路径：未知，缺席于返回值。
 			break
 		}
+		// 安全不变量:去掉回显后内容为空/全空白 ⇒ 列表根本没发生 ⇒ 未知。
+		// 实测 OpenSSH sftp 把 "Can't ls" 写到 stderr,失败目录在 stdout 里只剩一行回显;
+		// 成功的 ls -la 至少输出 "." 与 "..",所以空块绝不可能是空目录。若把它当场空目录,
+		// diff 会把该目录下已知的全部文件判为删除,配合 mirror-delete 会删掉本地文件。
+		if strings.TrimSpace(blocks[i]) == "" {
+			continue
+		}
 		if blockFailed(blocks[i]) {
 			continue
 		}
@@ -76,4 +83,27 @@ func blockFailed(block string) bool {
 		}
 	}
 	return false
+}
+
+// stderrListFailure 在 stderr 中按已请求路径反查客户端错误原文,找不到返回 "".
+//
+// 实测 OpenSSH sftp 把 `ls` 的客户端错误写到 **stderr**(形如
+// `Can't ls: "<path>" not found`,行尾带 CR),stdout 里失败目录只剩回显行。
+// 这里用请求路径反查而不是解析任意引号路径:stderr 打印的是 sftp 解析后的真实路径,
+// 与请求值逐字相同,可避免路径含引号/反斜杠时的转义歧义。
+func stderrListFailure(stderr, path string) string {
+	if stderr == "" || path == "" {
+		return ""
+	}
+	for _, line := range strings.Split(stderr, "\n") {
+		l := strings.TrimSpace(strings.TrimRight(line, "\r"))
+		if l == "" {
+			continue
+		}
+		if strings.Contains(l, "Can't ls: \""+path+"\"") ||
+			strings.Contains(l, "Couldn't ls: \""+path+"\"") {
+			return l
+		}
+	}
+	return ""
 }

@@ -338,6 +338,15 @@ func (c *Ctrl) ListMany(host, user string, paths []string) (map[string][]Item, e
 		return nil, fmt.Errorf("sftp ListMany failed: %s", commandErr(out))
 	}
 	res := parseListMany(out.Stdout, paths)
+	// stderr 是客户端错误行的真实来源(实测 OpenSSH sftp)。stdout 里失败目录只剩回显行,
+	// 空块不变量已把它判为未知;这里再按请求路径反查 stderr:既兜底,
+	// 又把"为什么列不出来"的远端原文写进日志。
+	for _, p := range paths {
+		if msg := stderrListFailure(out.Stderr, p); msg != "" {
+			delete(res, p)
+			c.logEvent(host, "error", "sftp ls "+p+" failed: "+msg)
+		}
+	}
 	c.logEvent(host, "info", fmt.Sprintf("sftp ls many done (%d/%d dirs)", len(res), len(paths)))
 	return res, nil
 }
