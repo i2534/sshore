@@ -16,6 +16,7 @@ import (
 	"sshore/internal/forward"
 	"sshore/internal/osutil"
 	"sshore/internal/sftp"
+	"sshore/internal/sync"
 )
 
 // appWithFakeSFTP 返回一个 sftp 控制器由假 runner 支撑的 App：
@@ -708,4 +709,45 @@ func TestUpdateTunnelRejectsEmptyTargetHost(t *testing.T) {
 	if got := a.cfg.Tunnels[0].TargetHost; got != "127.0.0.1" {
 		t.Fatalf("rejected update must not mutate stored rule, got %q", got)
 	}
+}
+
+// 绑定契约：空切片而非 nil；创建时校验会拒绝坏规则。
+func TestSyncRuleBindingsContract(t *testing.T) {
+	a := newTestApp(t)
+	if got := a.ListSyncRules(); got == nil {
+		t.Fatal("ListSyncRules 必须返回空切片而不是 nil")
+	}
+	if got := a.SyncRuleConflicts("nope"); got == nil {
+		t.Fatal("SyncRuleConflicts 必须返回空切片而不是 nil")
+	}
+	if got := a.SyncRuleStates(); got == nil {
+		t.Fatal("SyncRuleStates 必须返回空 map 而不是 nil")
+	}
+	if _, err := a.CreateSyncRule(config.SyncRule{Host: "-bad", Kind: "dir", RemotePath: "/r", LocalPath: "/l"}); err == nil {
+		t.Fatal("坏规则必须被拒绝")
+	}
+}
+
+// 精确重复的规则必须被拒绝（对齐 CheckRemoteConflict 的做法）。
+func TestCreateSyncRuleRejectsExactDuplicate(t *testing.T) {
+	a := newTestApp(t)
+	r := config.SyncRule{Host: "prod-01", Kind: "dir", RemotePath: "/r", LocalPath: "/l", PollIntervalS: 5}
+	created, err := a.CreateSyncRule(r)
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if created.ID == "" {
+		t.Fatal("创建时必须生成 ID")
+	}
+	if _, err := a.CreateSyncRule(r); err == nil {
+		t.Fatal("同 host/remote/local/kind 的重复规则必须被拒绝")
+	}
+}
+
+// newTestApp 构造隔离的 App：配置与状态都落在临时目录。
+func newTestApp(t *testing.T) *App {
+	t.Helper()
+	a := &App{cfg: config.DefaultAppConfig(), cfgPath: filepath.Join(t.TempDir(), "sshore.toml")}
+	a.sync = sync.NewCtrl(sync.Deps{StateDir: t.TempDir()})
+	return a
 }
