@@ -64,6 +64,7 @@ type ruleRuntime struct {
 	queue      map[string]watch.Kind
 	wake       chan struct{}
 	pendingDel []string
+	resolved   map[string]Action // UI 裁决、待 loop 执行的下载动作（不重跑 Decide）
 	delFP      string
 	logCount   map[string]int
 	firstRound bool      // 启动/重连/模式切换后的第一轮：禁止删除
@@ -402,6 +403,7 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 			overflowed := len(r.queue) > maxQueuePaths
 			if overflowed {
 				r.queue = map[string]watch.Kind{}
+				r.resolved = map[string]Action{}
 			}
 			r.mu.Unlock()
 			if overflowed {
@@ -432,23 +434,49 @@ func (c *Ctrl) drainQueue(r *ruleRuntime) {
 	r.mu.Lock()
 	batch := r.queue
 	r.queue = map[string]watch.Kind{}
+	// 取出与本批对应的用户裁决，并从 map 中摘除（每批只消费一次）。
+	resolved := map[string]Action{}
+	pending := map[string]watch.Kind{}
+	for rel, kind := range batch {
+		if act, ok := r.resolved[rel]; ok {
+			resolved[rel] = act
+			delete(r.resolved, rel)
+		} else {
+			pending[rel] = kind
+		}
+	}
 	r.mu.Unlock()
 	if len(batch) == 0 {
 		return
 	}
-	metas, metaErr := c.fetchMeta(r, batch)
-	if metaErr != nil {
-		c.emit(r.rule.ID, "warn", "远端元信息补齐失败，本批跳过："+metaErr.Error())
-		return
-	}
-	for rel, kind := range batch {
+	// UI 裁决不依赖远端元信息，先执行：即使随后补齐元信息失败也不会丢用户的决定。
+	for rel, act := range resolved {
 		r.mu.Lock()
 		r.stats.CurrentFile = rel
 		r.mu.Unlock()
-		c.applyOne(r, rel, kind, metas[rel])
+		c.applyResolved(r, rel, act)
 		r.mu.Lock()
 		r.stats.CurrentFile = ""
 		r.mu.Unlock()
+	}
+	if len(resolved) > 0 {
+		_ = r.state.Flush()
+	}
+	if len(pending) > 0 {
+		metas, metaErr := c.fetchMeta(r, pending)
+		if metaErr != nil {
+			c.emit(r.rule.ID, "warn", "远端元信息补齐失败，本批跳过："+metaErr.Error())
+			return
+		}
+		for rel, kind := range pending {
+			r.mu.Lock()
+			r.stats.CurrentFile = rel
+			r.mu.Unlock()
+			c.applyOne(r, rel, kind, metas[rel])
+			r.mu.Lock()
+			r.stats.CurrentFile = ""
+			r.mu.Unlock()
+		}
 	}
 	_ = r.state.Flush()
 	// 事件路径的删除也必须过闸门 —— 只登记不执行等于 mirror_delete 失效。
@@ -599,6 +627,19 @@ func (c *Ctrl) alignFile(r *ruleRuntime) {
 
 // applyOne 走决策表并执行动作。全程在规则 goroutine 内 ⇒ 传输天然串行。
 func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Entry) {
+	c.applyAction(r, rel, kind, remote, ActionSkip, false)
+}
+
+// applyResolved 执行用户在冲突卡片上裁决的动作，**不重跑 Decide**：
+// Decide 是纯决策表、没有"用户意图"输入，对同一个冲突状态只会再次返回 Conflict，
+// 会让 take_remote / save_as 永远无法落地。
+func (c *Ctrl) applyResolved(r *ruleRuntime, rel string, action Action) {
+	c.applyAction(r, rel, watch.KindWrite, nil, action, true)
+}
+
+// applyAction 是 applyOne / applyResolved 的共同实现：hasForced 为真时直接执行
+// forced（用户裁决），否则才走 Decide。
+func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *Entry, forced Action, hasForced bool) {
 	local, err := LocalTarget(r.rule.LocalPath, rel)
 	if err != nil {
 		c.emit(r.rule.ID, "error", "拒绝非法路径："+rel)
@@ -617,7 +658,13 @@ func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Ent
 		}
 		_ = d
 	})
-	action, reason := Decide(kind, ent, st, r.rule.MirrorDelete)
+	var action Action
+	var reason string
+	if hasForced {
+		action, reason = forced, "用户裁决"
+	} else {
+		action, reason = Decide(kind, ent, st, r.rule.MirrorDelete)
+	}
 	switch action {
 	case ActionGet, ActionSaveAs:
 		remotePath := path.Join(r.rule.RemotePath, rel)
@@ -709,12 +756,12 @@ func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Ent
 	}
 }
 
-// maybeDelete 在删除闸门放行时才删本地文件。
+// maybeDelete 在删除闸门放行时才删本地文件。批次在 r.mu 下取好快照后交给
+// executeDeletes —— 后者不再回读 r.pendingDel，避免并发对账换掉清单。
 func (c *Ctrl) maybeDelete(r *ruleRuntime, curCount int) {
 	r.mu.Lock()
-	pending := len(r.pendingDel)
-	r.mu.Unlock()
-	r.mu.Lock()
+	batch := append([]string{}, r.pendingDel...)
+	pending := len(batch)
 	first, blocked := r.firstRound, r.blockDels
 	r.firstRound = false // 第一轮只放行一次
 	r.mu.Unlock()
@@ -731,22 +778,47 @@ func (c *Ctrl) maybeDelete(r *ruleRuntime, curCount int) {
 		}
 		return
 	}
-	c.executeDeletes(r)
+	// 闸门放行：清空清单与确认指纹（批次已快照），再执行这一批。
+	r.mu.Lock()
+	r.pendingDel = nil
+	r.delFP = ""
+	r.stats.DeletePending = 0
+	r.stats.DeleteFingerprint = ""
+	r.mu.Unlock()
+	c.executeDeletes(r, batch)
 }
 
-func (c *Ctrl) executeDeletes(r *ruleRuntime) {
-	r.mu.Lock()
-	pending := r.pendingDel
-	r.pendingDel = nil
-	r.stats.DeletePending = 0
-	r.mu.Unlock()
-	for _, rel := range pending {
+// executeDeletes 是两条删除路径（对账/事件、用户确认）的**唯一**收口点。
+// batch 必须由调用方在 r.mu 下快照，本方法不回读 r.pendingDel：并发 align 换掉
+// 清单时回读会删掉用户从未确认的那一批。每个文件删除前都要重新比对本地与基线，
+// 本地被改过的一律保留（与事件路径 Decide 的语义对齐）。
+func (c *Ctrl) executeDeletes(r *ruleRuntime, batch []string) {
+	for _, rel := range batch {
 		local, err := LocalTarget(r.rule.LocalPath, rel)
 		if err != nil {
 			continue
 		}
+		// 本地状态必须在锁外读取：StateStore.With 的回调里禁止任何 IO。
+		st, statErr := osStat(local)
+		if statErr != nil || !st.Exists {
+			// 本地也已不存在 ⇒ 对齐 Decide 的 both-gone Skip，条目保留不动。
+			continue
+		}
+		keep := false
+		r.state.With(func(d *StateFile) {
+			e := d.Entries[rel]
+			if e != nil && e.HasLocal && (st.Size != e.LocalSize || st.ModTime != e.LocalMTime) {
+				keep = true
+			}
+		})
+		if keep {
+			c.emit(r.rule.ID, "warn", "本地文件已被修改，保留不删："+rel)
+			continue
+		}
 		if err := osRemove(local); err != nil {
+			// 删除失败绝不能顺手删条目：否则该文件成为永久孤儿，再也不会被对账到。
 			c.emit(r.rule.ID, "warn", "删除本地文件失败："+rel+" "+err.Error())
+			continue
 		}
 		r.state.With(func(d *StateFile) { delete(d.Entries, rel) })
 	}
@@ -771,7 +843,13 @@ func (c *Ctrl) ResolveConflict(id, rel string, action ConflictAction, local Loca
 	}
 	_ = r.state.Flush()
 	if req.Action == ActionGet || req.Action == ActionSaveAs {
+		// 记下用户裁决：loop 在 drainQueue 里直接执行它，而不是让 Decide 重判
+		//（Decide 对同一冲突状态只会再次返回 Conflict，take_remote/save_as 永不落地）。
 		r.mu.Lock()
+		if r.resolved == nil {
+			r.resolved = map[string]Action{}
+		}
+		r.resolved[rel] = req.Action
 		r.queue[rel] = watch.KindWrite
 		r.mu.Unlock()
 		select {
@@ -797,12 +875,11 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 		r.mu.Unlock()
 		return fmt.Errorf("确认已过期：删除清单已变化，请重新查看")
 	}
+	batch := append([]string{}, r.pendingDel...)
 	r.mu.Unlock()
 	metas, err := c.fetchMeta(r, func() map[string]watch.Kind {
-		r.mu.Lock()
-		defer r.mu.Unlock()
 		m := map[string]watch.Kind{}
-		for _, rel := range r.pendingDel {
+		for _, rel := range batch {
 			m[rel] = watch.KindDelete
 		}
 		return m
@@ -817,7 +894,20 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 			return nil
 		}
 	}
-	c.executeDeletes(r)
+	// fetchMeta 是锁外网络往返，期间并发 align 可能换掉清单。删除前**重新**校验
+	// 指纹并取最后一份快照，保证删掉的正是用户确认过的那一批。
+	r.mu.Lock()
+	if r.delFP != fingerprint {
+		r.mu.Unlock()
+		return fmt.Errorf("确认已过期：删除清单已变化，请重新查看")
+	}
+	final := append([]string{}, r.pendingDel...)
+	r.pendingDel = nil
+	r.delFP = ""
+	r.stats.DeletePending = 0
+	r.stats.DeleteFingerprint = ""
+	r.mu.Unlock()
+	c.executeDeletes(r, final)
 	return nil
 }
 
