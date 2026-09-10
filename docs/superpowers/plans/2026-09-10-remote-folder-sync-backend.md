@@ -61,6 +61,7 @@
 | `internal/sync/conflict.go` | 冲突队列与三个动作（入队，不自己传输） |
 | `internal/sync/validate.go` | `ValidateSyncRule` |
 | `internal/sync/ctrl.go` | 编排：每规则一个 goroutine、状态机、退避、首轮对齐、对账、日志、绑定查询 |
+| `internal/sync/adapters.go` | `NewSftpAdapter(*sftp.Ctrl)`：**适配器的唯一定义处**，main 包与 E2E 测试共用 |
 
 **修改**
 
@@ -981,6 +982,8 @@ func TestParseInotifyLineScenarios(t *testing.T) {
 		{"文件噪声2", "/srv/conf/a.txt|ACCESS", Event{}, false},
 		{"属性噪声", "/srv/conf/a.txt|ATTRIB", Event{}, false},
 		{"非本规则路径", "/srv/other/a.txt|CREATE", Event{}, false},
+		{"兄弟目录（前缀相同）", "/srv/conf-backup/a.txt|CREATE", Event{}, false},
+		{"根路径自身带尾斜杠", "/srv/conf/|CREATE,ISDIR", Event{}, false},
 		{"格式不符", "Watches established.", Event{}, false},
 		{"空行", "", Event{}, false},
 	}
@@ -1099,10 +1102,13 @@ func ParseInotifyLine(root, line string) (Event, bool) {
 		return Event{}, false
 	}
 	full := strings.TrimSuffix(rest[j+1:], "/")
-	if !strings.HasPrefix(full, root) {
+	// 必须按**路径边界**判断，不能用裸 HasPrefix：root="/srv/conf" 时
+	// "/srv/conf-backup/x" 也会通过前缀检查，把邻居目录的事件混进来。
+	base := strings.TrimSuffix(root, "/")
+	if full != base && !strings.HasPrefix(full, base+"/") {
 		return Event{}, false
 	}
-	rel := strings.TrimPrefix(strings.TrimPrefix(full, root), "/")
+	rel := strings.TrimPrefix(strings.TrimPrefix(full, base), "/")
 
 	toks := map[string]bool{}
 	for _, tk := range strings.Split(ev, ",") {
@@ -2019,8 +2025,17 @@ func (p *PollSource) Start(ctx context.Context) (<-chan Event, error) {
 	return ch, nil
 }
 
-// Close 幂等。channel 由 Start 里的 goroutine 在 ctx 取消后关闭。
-func (p *PollSource) Close() error { return nil }
+// Close 幂等：关闭 stop 让轮询 goroutine 退出，channel 由该 goroutine 关闭。
+// 必须这样做——引擎传进来的是 context.Background()，ctx 永远不会取消。
+func (p *PollSource) Close() error {
+	p.mu.Lock()
+	stop := p.stop
+	p.mu.Unlock()
+	if stop != nil {
+		p.stopOnce.Do(func() { close(stop) })
+	}
+	return nil
+}
 
 // round 执行一轮扫描与比对。失败或不完整 ⇒ 零事件 + 失败计数。
 func (p *PollSource) round(ch chan Event) {
@@ -2069,9 +2084,15 @@ func (p *PollSource) round(ch chan Event) {
 	}
 }
 
-// emit 阻塞投递直到消费端取走或 ctx 取消（消费者只做去重入队，不会长阻塞）。
+// emit 投递事件；Close/ctx 取消时立即返回，绝不把轮询 goroutine 永久挂在发送上。
 func (p *PollSource) emit(ch chan Event, ev Event) {
-	ch <- ev
+	p.mu.Lock()
+	stop := p.stop
+	p.mu.Unlock()
+	select {
+	case ch <- ev:
+	case <-stop:
+	}
 }
 
 var _ Source = (*PollSource)(nil)
@@ -2667,7 +2688,7 @@ git commit -m "feat(sync): 新增状态文件存储,按 fingerprint 失效并原
 ## Task 10: 原子传输与临时文件清理
 
 **Files:**
-- Create: `internal/sync/transfer.go`
+- Create: `internal/sync/transfer.go`、`internal/sync/adapters.go`
 - Test: `internal/sync/transfer_test.go`
 
 **Interfaces:**
@@ -2854,6 +2875,33 @@ func CleanupParts(localRoot, ruleID string) (int, error) {
 		return nil
 	})
 	return n, err
+}
+~~~
+
+同时创建 `internal/sync/adapters.go`（**适配器的唯一定义处**，main 包与 E2E 测试都只用它，
+不要在 app.go 里再写一份，否则 Task 15/16 会各持一份实现）：
+
+~~~go
+package sync
+
+import "sshore/internal/sftp"
+
+// NewSftpAdapter 让 sync 通过 sftp.Ctrl 完成传输与列举，同时保持
+// internal/sync 不依赖 sftp 的内部实现。
+func NewSftpAdapter(c *sftp.Ctrl) (Transferer, ListManyFunc) {
+	return sftpTransfer{c: c}, sftpListMany{c: c}
+}
+
+type sftpTransfer struct{ c *sftp.Ctrl }
+
+func (t sftpTransfer) Get(host, user, remote, local string) error {
+	return t.c.Get(host, user, remote, local)
+}
+
+type sftpListMany struct{ c *sftp.Ctrl }
+
+func (t sftpListMany) ListMany(host, user string, paths []string) (map[string][]sftp.Item, error) {
+	return t.c.ListMany(host, user, paths)
 }
 ~~~
 
@@ -3464,6 +3512,11 @@ import (
 	"sshore/internal/watch"
 )
 
+// 【锁顺序不变式，违反即 ABBA 死锁】
+//   - 允许的嵌套只有一种：state.mu → r.mu（align 里在 state.With 回调内加 r.mu）；
+//   - **绝不允许先持 r.mu 再进 state.With / state.Flush**；
+//   - 传输与任何 IO 都必须在锁外做（ResolveConflict 只入队就是这个原因）。
+//
 // Deps 是引擎的全部外部依赖，便于测试注入。
 type Deps struct {
 	Spawner   osutil.Streamer
@@ -3506,6 +3559,8 @@ type ruleRuntime struct {
 	pendingDel []string
 	delFP      string
 	logCount   map[string]int
+	firstRound bool // 启动/重连/模式切换后的第一轮：禁止删除
+	blockDels  bool // 收到 root_gone / overflow：暂停删除直到对账确认
 }
 
 type Ctrl struct {
@@ -3690,6 +3745,9 @@ func (c *Ctrl) loop(r *ruleRuntime) {
 		}
 
 		// 首轮全量对齐（含重连后的对账：以 entries 的 remote_* 为基线）。
+		r.mu.Lock()
+		r.firstRound = true
+		r.mu.Unlock()
 		c.align(r)
 
 		ch, err := src.Start(context.Background())
@@ -3771,8 +3829,9 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 			}
 			r.mu.Lock()
 			if ev.Kind == watch.KindOverflow || ev.Kind == watch.KindRootGone {
-				// 强制对账：把整棵远端树重新比一遍。
+				// 强制对账：把整棵远端树重新比一遍，并暂停删除直到确认。
 				r.stats.SourceMissing = ev.Kind == watch.KindRootGone
+				r.blockDels = true
 				r.mu.Unlock()
 				c.align(r)
 				continue
@@ -3913,6 +3972,7 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	r.pendingDel = dels
 	r.delFP = fmt.Sprintf("round-%d", time.Now().UnixNano())
 	r.logCount = map[string]int{} // 每轮对账后重置节流计数
+	r.blockDels = false           // 完整对账成功 ⇒ 解除删除暂停（firstRound 已由闸门消费）
 	r.stats.DeletePending = len(dels)
 	r.stats.Pending = len(snap.Entries)
 	r.mu.Unlock()
@@ -3979,7 +4039,12 @@ func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Ent
 			return
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
-		after, _ := osStat(local)
+		after, statErr := osStat(local)
+		if statErr != nil {
+			// 不能把零值当成"基线"写进去：那会让下一次比对恒不等，刷出假冲突。
+			c.emit(r.rule.ID, "warn", "下载后无法读取本地状态，本条暂不登记基线："+rel)
+			return
+		}
 		r.state.With(func(d *StateFile) {
 			e := d.Entries[rel]
 			if e == nil {
@@ -4013,7 +4078,13 @@ func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Ent
 		r.mu.Unlock()
 		c.emit(r.rule.ID, "warn", rel+" 本地已修改，未覆盖")
 	case ActionDelete:
-		c.emit(r.rule.ID, "info", "删除本地 "+rel+"（"+reason+"）")
+		// 绝不在 applyOne 里直接删：删除必须统一过六重闸门。这里只登记，
+		// 由 maybeDelete 在闸门放行后才真正执行。
+		r.mu.Lock()
+		r.pendingDel = append(r.pendingDel, rel)
+		r.stats.DeletePending = len(r.pendingDel)
+		r.mu.Unlock()
+		c.emit(r.rule.ID, "info", "待删除本地 "+rel+"（"+reason+"）")
 	}
 }
 
@@ -4022,8 +4093,13 @@ func (c *Ctrl) maybeDelete(r *ruleRuntime, curCount int) {
 	r.mu.Lock()
 	pending := len(r.pendingDel)
 	r.mu.Unlock()
+	r.mu.Lock()
+	first, blocked := r.firstRound, r.blockDels
+	r.firstRound = false // 第一轮只放行一次
+	r.mu.Unlock()
 	res := EvaluateDeleteGate(DeleteGateInput{
 		MirrorDelete: r.rule.MirrorDelete, Complete: true,
+		FirstRound: first, RootGone: blocked, Overflow: blocked,
 		PrevCount: curCount + pending, CurCount: curCount, PendingCount: pending,
 	})
 	if !res.Allowed {
@@ -4135,14 +4211,24 @@ func removeConflict(d *StateFile, rel string) {
 ~~~go
 package sync
 
-import "os"
+import (
+	"os"
+	"time"
+)
+
+// FormatModTime 是本地文件时间的**唯一**序列化格式。
+// 引擎记录 local_mtime 与 UI 读取 LocalState 都必须用它：两处格式不一致会让
+// "未被改动"被误判成"被改动"，进而刷出假冲突。
+func FormatModTime(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+}
 
 func osStat(p string) (LocalState, error) {
 	st, err := os.Stat(p)
 	if err != nil {
 		return LocalState{}, err
 	}
-	return LocalState{Exists: true, Size: st.Size(), ModTime: st.ModTime().UTC().Format("2006-01-02T15:04:05.000000000Z07:00")}, nil
+	return LocalState{Exists: true, Size: st.Size(), ModTime: FormatModTime(st.ModTime())}, nil
 }
 
 func osRemove(p string) error { return os.Remove(p) }
@@ -4220,7 +4306,17 @@ func TestCreateSyncRuleRejectsExactDuplicate(t *testing.T) {
 }
 ~~~
 
-（`newTestApp` 沿用该文件里已有的测试构造方式：设置 `a.cfgPath` 到 t.TempDir()，并初始化 `a.cfg = config.DefaultAppConfig()`。）
+测试文件底部补一个隔离的构造器（该文件现有的测试都是手工拼 `&App{...}`，这里统一成一个，避免碰用户真实配置）：
+
+~~~go
+// newTestApp 构造隔离的 App：配置与状态都落在临时目录。
+func newTestApp(t *testing.T) *App {
+	t.Helper()
+	a := &App{cfg: config.DefaultAppConfig(), cfgPath: filepath.Join(t.TempDir(), "sshore.toml")}
+	a.sync = sync.NewCtrl(sync.Deps{StateDir: t.TempDir()})
+	return a
+}
+~~~
 
 - [ ] **Step 2: 运行测试确认失败** — Run: `go test . -run SyncRule -v`；Expected: `a.ListSyncRules undefined`
 
@@ -4229,31 +4325,22 @@ func TestCreateSyncRuleRejectsExactDuplicate(t *testing.T) {
 在 `app.go` 的 `App` 结构体加字段 `sync *sync.Ctrl`，在 `Init` 里接线：
 
 ~~~go
+	transfer, lister := sync.NewSftpAdapter(a.sftp)
 	a.sync = sync.NewCtrl(sync.Deps{
-		Spawner:   osutil.NewSpawner(),
-		Runner:    osutil.NewCtxRunner(),
-		Transfer:  sftpTransfer{a.sftp},
-		ListMany:  sftpListMany{a.sftp},
-		Emit:      emit,
-		StateDir:  stateDir(),
+		Spawner:  osutil.NewSpawner(),
+		Runner:   osutil.NewCtxRunner(),
+		Transfer: transfer,
+		ListMany: lister,
+		Emit:     emit,
+		StateDir: stateDir(),
 	})
 ~~~
 
 并新增两个适配器（放在 `app.go` 底部）：
 
 ~~~go
-// sftpTransfer 让 sync 通过 sftp.Ctrl 完成传输，同时保持 sync 包不 import sftp。
-type sftpTransfer struct{ c *sftp.Ctrl }
-
-func (t sftpTransfer) Get(host, user, remote, local string) error {
-	return t.c.Get(host, user, remote, local)
-}
-
-type sftpListMany struct{ c *sftp.Ctrl }
-
-func (t sftpListMany) ListMany(host, user string, paths []string) (map[string][]sftp.Item, error) {
-	return t.c.ListMany(host, user, paths)
-}
+// 适配器只有一处定义：internal/sync/adapters.go 的 NewSftpAdapter（见 Task 10）。
+// 这里不要重复定义，否则 Task 16 的 E2E 测试还要再写一份。
 
 // stateDir 与 DefaultConfigPath 同源：<UserConfigDir>/sshore/state。
 func stateDir() string {
@@ -4413,7 +4500,7 @@ func localStateOf(cfg *config.AppConfig, id, rel string) (sync.LocalState, error
 			return sync.LocalState{Exists: false}, nil
 		}
 		return sync.LocalState{Exists: true, Size: st.Size(),
-			ModTime: st.ModTime().UTC().Format(time.RFC3339Nano)}, nil
+			ModTime: sync.FormatModTime(st.ModTime())}, nil
 	}
 	return sync.LocalState{}, errors.New("sync rule not found")
 }
@@ -4515,6 +4602,7 @@ func TestSyncE2E(t *testing.T) {
 	}
 
 	ctrl := sftp.NewCtrl(osutil.NewRunner(), nil)
+	transfer, lister := NewSftpAdapter(ctrl)
 	local := t.TempDir()
 	rule := config.SyncRule{
 		ID: "e2e", Host: host, Kind: "dir", RemotePath: remote,
@@ -4528,8 +4616,8 @@ func TestSyncE2E(t *testing.T) {
 	}
 
 	c := NewCtrl(Deps{
-		Runner: runner, Transfer: sftpTransfer{c: ctrl},
-		ListMany: sftpListMany{c: ctrl}, StateDir: t.TempDir(),
+		Runner: runner, Transfer: transfer,
+		ListMany: lister, StateDir: t.TempDir(),
 	})
 	if err := c.Start(rule); err != nil {
 		t.Fatalf("start: %v", err)
@@ -4663,6 +4751,31 @@ git commit -m "test(sync): 新增真实 sshd 的端到端同步验证,由 e2e �
 `Global Constraints` 里登记的**扫描器位置修正**：spec §12 把 `scan.go` 放在 `internal/sync`，但它被 `watch` 的 poll 路径使用，而 §4.5 规定 `sync → watch` 单向——放 sync 会造成 `watch → sync` 反向依赖（导入环）。本计划放在 `internal/watch/scan.go`。
 
 **执行前建议先改 spec §12 的这一行**，否则执行者对照 spec 会困惑。这需要你点头，我没有擅自改。
+
+### 6. 第二轮自审（/review 阶段一）修掉的问题
+
+把计划里的 Go 代码当作"要真的编译并跑起来"逐行推演，找到 12 处，全部已修：
+
+**会导致功能失效或编译不过的（blocker）**
+
+1. **【ParseInotifyLine 的路径前缀判断不按边界】**（Task 5）：裸用 strings.HasPrefix(full, root) 会让 root=/srv/conf 时把兄弟目录 /srv/conf-backup/x 的事件也收进来。已改为按路径边界判断，并加了两个测试用例。
+2. **【删除事件永远不会真的删文件】**（Task 14）：applyOne 的 ActionDelete 分支只写了一行日志，既不过闸门也不删除 —— 也就是 mirror_delete 在 inotify 删除路径上完全失效。已改为登记进 pendingDel，由闸门放行后统一执行。
+3. **【六重删除闸门里有三条永远不会触发】**（Task 14）：调用点把 FirstRound / RootGone / Overflow 留空，maybeDelete 只传了 Complete: true 和一个常量。已补 firstRound 与 blockDels 两个运行时字段，在 loop 与 consume 里置位、在闸门消费后清除。
+4. **【PollSource 的 goroutine 永远停不下来】**（Task 7、14）：Close() 原本直接 return nil，而引擎传进去的是 context.Background()（永不取消）—— 规则停止后轮询 goroutine 会一直活着。已改为 Close 关闭 stop（stopOnce 保证幂等）。
+
+**会导致假冲突的（major）**
+
+5. **【本地时间格式两处不一致】**（Task 14 与 15）：引擎的 osStat 用固定纳秒格式，而 localStateOf 用 time.RFC3339Nano（纳秒为 0 时会省略小数部分）—— 用户在界面裁决 keep_local 后写入的记录与引擎下次读到的值不等，会刷出假冲突。已抽出唯一的 FormatModTime 供两处共用。
+6. **【下载后 stat 失败会把零值当作基线写入】**（Task 14）：原本 after, _ := osStat(local)，失败时得到 HasLocal=true 且大小时间为零的记录，下一次比对恒不等。已加防护：stat 失败则本条不登记基线并记 warn。
+7. **【适配器定义重复】**（Task 15 与 16）：两处各定义了一份 sftpTransfer。已收敛到 internal/sync/adapters.go 的 NewSftpAdapter，main 包与 E2E 测试共用，并把它登记进文件结构与 Task 10。
+
+**其余（minor）**
+
+8. Task 14 锁顺序未写明（align 里是 state.mu 到 r.mu 的嵌套）→ 已在 Deps 前写明不变式：绝不允许先持 r.mu 再进 state.With / state.Flush。
+9. Task 7 的 PollSource.emit 是无退出路径的阻塞发送 → 已加 select on stop。
+10. Task 15 的测试引用了不存在的 newTestApp → 已给出真实构造器代码。
+11. 文件结构表缺 internal/sync/adapters.go → 已补。
+12. Task 6 的 s.done 在 StartStream 返回后才赋值，理论上存在极窄的 nil 窗口 → 未改（影响可忽略），但实现时不要在 handleStdout 里假设 done 非 nil。
 
 ### 5. 未覆盖到计划的 spec 内容
 
