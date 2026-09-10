@@ -105,4 +105,27 @@ echo "--- sftp output ---"
 echo "$sftp_out"
 echo "$sftp_out" | grep -q "a.txt" && echo "PASS: sftp ls lists file" || { echo "FAIL: sftp ls"; exit 1; }
 
+echo "== sync e2e (Go side) =="
+REMOTE_DIR="$TMPD/remote-conf"
+mkdir -p "$REMOTE_DIR"
+echo "v1" > "$REMOTE_DIR/app.conf"
+# 注意：ssh 别名通过 -F 注入，避免污染用户 ~/.ssh/config
+cat > "$HOME/.ssh/config" <<EOF
+Host sshore-e2e
+  HostName 127.0.0.1
+  Port $PORT
+  User $(id -un)
+  IdentityFile $TMPD/client_key
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+EOF
+chmod 600 "$HOME/.ssh/config"
+if SSHORE_E2E_HOST=sshore-e2e SSHORE_E2E_REMOTE="$REMOTE_DIR" \
+   HOME="$HOME" go test ./internal/sync/ -run TestSyncE2E -count=1 -v; then
+  echo "sync e2e OK"
+else
+  echo "sync e2e FAILED" >&2
+  exit 1
+fi
+
 echo "== ALL E2E TESTS PASSED =="
