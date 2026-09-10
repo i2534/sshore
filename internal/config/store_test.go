@@ -253,3 +253,83 @@ func TestLoadSaveSettingsRoundTrip(t *testing.T) {
 		t.Fatalf("settings round-trip broken: %+v", g)
 	}
 }
+
+// 手写配置缺键时，零值不得静默改变行为。
+func TestSyncRuleNormalizeFillsDefaults(t *testing.T) {
+	var r SyncRule
+	r.Normalize()
+	if r.Kind != "dir" {
+		t.Fatalf("kind 缺省应为 dir，得到 %q", r.Kind)
+	}
+	if r.PollIntervalS != 5 {
+		t.Fatalf("poll_interval_s 缺省应为 5，得到 %d", r.PollIntervalS)
+	}
+	if len(r.Excludes) != 5 || r.Excludes[0] != ".git/" {
+		t.Fatalf("excludes 缺省应为 DefaultExcludes()，得到 %#v", r.Excludes)
+	}
+	if r.ForcePoll {
+		t.Fatal("force_poll 零值必须是 false（即优先 inotify），否则与文档相反")
+	}
+}
+
+// 显式清空 excludes 要保留为空，不能被"补回默认值"。
+func TestSyncRuleNormalizeKeepsExplicitEmptyExcludes(t *testing.T) {
+	r := SyncRule{Excludes: []string{}}
+	r.Normalize()
+	if len(r.Excludes) != 0 {
+		t.Fatalf("显式空 excludes 必须保留，得到 %#v", r.Excludes)
+	}
+}
+
+func TestSyncRuleNormalizeClampsNumbers(t *testing.T) {
+	r := SyncRule{PollIntervalS: 99999, MaxDepth: -7}
+	r.Normalize()
+	if r.PollIntervalS != 3600 {
+		t.Fatalf("poll_interval_s 上限 3600，得到 %d", r.PollIntervalS)
+	}
+	if r.MaxDepth != -1 {
+		t.Fatalf("max_depth < -1 应归一为 -1，得到 %d", r.MaxDepth)
+	}
+}
+
+// TOML 往返：Syncs 数组必须能被读写，且缺键元素自动获得默认值。
+func TestConfigSyncsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sshore.toml")
+	cfg := DefaultAppConfig()
+	cfg.Syncs = []SyncRule{{
+		ID: "abc123", Name: "cfg", Host: "prod-01", Kind: "dir",
+		RemotePath: "/srv/conf", LocalPath: "/tmp/conf", MaxDepth: 2,
+		MirrorDelete: true, Enabled: true,
+	}}
+	if err := SaveConfig(path, cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(got.Syncs) != 1 {
+		t.Fatalf("want 1 sync rule, got %d", len(got.Syncs))
+	}
+	r := got.Syncs[0]
+	if r.ID != "abc123" || !r.MirrorDelete || !r.Enabled {
+		t.Fatalf("round-trip 丢字段: %#v", r)
+	}
+	if r.PollIntervalS != 5 || r.Kind != "dir" {
+		t.Fatalf("round-trip 未套用默认值: %#v", r)
+	}
+}
+
+func TestNewSyncIDIsStableFormat(t *testing.T) {
+	a, b := NewSyncID(), NewSyncID()
+	if a == b {
+		t.Fatal("id 必须随机")
+	}
+	if len(a) != 32 {
+		t.Fatalf("与 NewTunnelID 同构应为 32 位 hex，得到 %d: %q", len(a), a)
+	}
+	if strings.Contains(a, "-") {
+		t.Fatalf("id 不带前缀/连字符，得到 %q", a)
+	}
+}
