@@ -1,22 +1,27 @@
 <script setup>
 import { computed } from 'vue'
-import { conflictActionLabel } from '../utils/sync'
+// FIX 5：动作字符串与批量上限都来自被测的 utils/sync.js（跨语言契约），组件不再硬编码。
+import { conflictActionLabel, CONFLICT_ACTIONS, BATCH_LIMIT, batchResolvable } from '../utils/sync'
 
 const props = defineProps({
   visible: Boolean,
   conflicts: { type: Array, default: () => [] },
   ruleName: { type: String, default: '' },
+  // FIX 1a：裁决失败时的错误文案。对话框是全屏遮罩，左侧面板的 opError 用户看不见，
+  // 因此必须把失败原因渲染在对话框内部。空串即不渲染。
+  errorText: { type: String, default: '' },
+  // FIX 1d：批量在途标记，禁用批量按钮，避免重复触发。
+  busy: { type: Boolean, default: false },
 })
 const emit = defineEmits(['close', 'resolve', 'resolveAll'])
 
-const ACTIONS = ['keep_local', 'take_remote', 'save_as']
+const ACTIONS = CONFLICT_ACTIONS
 
 // S10：批量按钮会给**每个**冲突各发一次 IPC（N 条 = N 次 ResolveSyncConflict 往返），
-// 大队列会把 UI 卡住且毫无提示。超过这个上限就禁用批量，要求分批或逐条处理。
+// 大队列会把 UI 卡住且毫无提示。超过 BATCH_LIMIT 就禁用批量，要求分批或逐条处理。
 // 50 的取法：一次批量 IPC 串行往返约几十毫秒量级，50 条仍在可接受范围，
-// 再大就明显卡顿；宁可让用户分批，也不静默卡死。
-const BATCH_LIMIT = 50
-const batchDisabled = computed(() => !props.conflicts.length || props.conflicts.length > BATCH_LIMIT)
+// 再大就明显卡顿；宁可让用户分批，也不静默卡死。（上限定义已移至 utils/sync.js。）
+const batchDisabled = computed(() => !batchResolvable(props.conflicts.length, props.busy))
 
 function fmtSize(n) {
   const v = Number(n)
@@ -43,6 +48,9 @@ function fmtSize(n) {
           超过 {{ BATCH_LIMIT }} 条已禁用批量，请逐条裁决或分批处理
         </span>
       </div>
+
+      <!-- FIX 1a：错误必须在遮罩层内可见，否则失败的裁决对用户毫无反馈。 -->
+      <p v-if="errorText" class="derr" role="alert">{{ errorText }}</p>
 
       <div class="rows">
         <div v-for="c in conflicts" :key="c.rel_path" class="row">
@@ -74,6 +82,7 @@ function fmtSize(n) {
 .dmsg { color: var(--text-dim); margin: 0 0 12px; font-size: var(--fs-13); line-height: 1.5; }
 .bulk { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; color: var(--text-dim); font-size: var(--fs-12); }
 .over { color: var(--warning); }
+.derr { color: var(--danger); font-size: var(--fs-13); margin: 0 0 10px; word-break: break-all; }
 .rows { display: flex; flex-direction: column; gap: 8px; }
 .row { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
 .rel { color: var(--text); word-break: break-all; margin-bottom: 4px; }

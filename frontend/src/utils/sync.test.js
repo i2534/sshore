@@ -4,6 +4,8 @@ import {
   probeBadge, countsOf, alignText, currentFileName, statsOf, deleteSummary, retryable,
   conflictActionLabel, parseExcludes, formatExcludes, ruleLabel,
   newSyncRuleForm, syncRuleToForm, formToSyncRule, validateSyncRuleForm, shouldRefresh,
+  CONFLICT_KEEP_LOCAL, CONFLICT_TAKE_REMOTE, CONFLICT_SAVE_AS, CONFLICT_ACTIONS, BATCH_LIMIT,
+  dialogErrorText, batchResolvable, shouldSubscribe,
 } from './sync'
 
 // 注意：SyncRuleStat 在 Go 侧没有 json tag，故运行时键是 PascalCase。
@@ -12,7 +14,7 @@ const stat = {
   Pending: 4, Done: 10, Failed: 2, Conflicts: 1,
   AlignScanned: 3, AlignTotal: 120, CurrentFile: 'a/b.txt',
   SourceMissing: true, DeletePending: 2, DeleteFingerprint: 'fp-1',
-  DeletePaths: ['x.txt', 'y.txt'],
+  DeletePaths: ['x.txt', 'y.txt'], DeleteNeedsConfirm: true,
 }
 
 describe('sync 展示辅助', () => {
@@ -77,8 +79,11 @@ describe('sync 展示辅助', () => {
     expect(statsOf(undefined, 'r1')).toEqual({})
   })
 
-  it('待确认删除摘要：有挂起才有指纹', () => {
+  it('待确认删除摘要：挂起 + 指纹 + 闸门可确认三者齐全才显示', () => {
     expect(deleteSummary(stat)).toEqual({ count: 2, fingerprint: 'fp-1', paths: ['x.txt', 'y.txt'] })
+    // FIX 2c：只有阈值臂挂起（DeleteNeedsConfirm=true）才可确认，硬拒绝臂必须为 null。
+    expect(deleteSummary({ ...stat, DeleteNeedsConfirm: false })).toBe(null)
+    expect(deleteSummary({ ...stat, DeleteNeedsConfirm: undefined })).toBe(null)
     expect(deleteSummary({ DeletePending: 0 })).toBe(null)
     expect(deleteSummary(undefined)).toBe(null)
   })
@@ -167,5 +172,50 @@ describe('排除项与表单', () => {
     expect(shouldRefresh('sync', ['sync', 'system'])).toBe(true)
     expect(shouldRefresh('system', ['sync', 'system'])).toBe(true)
     expect(shouldRefresh('sftp', ['sync', 'system'])).toBe(false)
+  })
+
+  it('FIX 4：规则缺 excludes（null/undefined）时不得清空默认排除项（M1 防线）', () => {
+    // 后端 Normalize 只在 Excludes==nil 时填默认值；UI 提交空数组会让 .git/、node_modules/
+    // 被同步，因此缺省时必须回退到与表单预置一致的默认排除项。
+    expect(syncRuleToForm({ id: 'x' }).excludesText).toBe(DEFAULT_EXCLUDES.join('\n'))
+    expect(syncRuleToForm({ id: 'x', excludes: null }).excludesText).toBe(DEFAULT_EXCLUDES.join('\n'))
+    // 显式空数组仍尊重用户选择（与后端 Excludes!=nil 的语义一致），不得被默认值覆盖。
+    expect(syncRuleToForm({ id: 'x', excludes: [] }).excludesText).toBe('')
+    expect(syncRuleToForm({ id: 'x', excludes: ['.git/'] }).excludesText).toBe('.git/')
+  })
+})
+
+describe('冲突对话框跨语言契约与交互守卫', () => {
+  it('FIX 5：三个引擎动作字符串与 internal/sync/conflict.go 逐字一致', () => {
+    expect(CONFLICT_KEEP_LOCAL).toBe('keep_local')
+    expect(CONFLICT_TAKE_REMOTE).toBe('take_remote')
+    expect(CONFLICT_SAVE_AS).toBe('save_as')
+    expect(CONFLICT_ACTIONS).toEqual(['keep_local', 'take_remote', 'save_as'])
+    expect(BATCH_LIMIT).toBe(50)
+  })
+
+  it('FIX 1a：对话框错误文案归一，空值不渲染', () => {
+    expect(dialogErrorText(null)).toBe('')
+    expect(dialogErrorText(undefined)).toBe('')
+    expect(dialogErrorText('')).toBe('')
+    expect(dialogErrorText('  boom  ')).toBe('boom')
+    expect(dialogErrorText(new Error('boom'))).toContain('boom')
+  })
+
+  it('FIX 1d：批量按钮决策——无冲突/超上限/执行中一律禁用', () => {
+    expect(batchResolvable(3, false)).toBe(true)
+    expect(batchResolvable(50, false)).toBe(true)
+    expect(batchResolvable(0, false)).toBe(false)
+    expect(batchResolvable(51, false)).toBe(false)
+    // busy 守卫：批量在途时不得再次触发。
+    expect(batchResolvable(3, true)).toBe(false)
+    expect(batchResolvable(0, true)).toBe(false)
+  })
+
+  it('FIX 3：激活竞态守卫——只有激活且未订阅时才注册', () => {
+    expect(shouldSubscribe(true, false)).toBe(true)
+    expect(shouldSubscribe(true, true)).toBe(false)
+    expect(shouldSubscribe(false, false)).toBe(false)
+    expect(shouldSubscribe(false, true)).toBe(false)
   })
 })
