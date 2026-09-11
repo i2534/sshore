@@ -55,10 +55,15 @@ type FailedItem struct {
 	Err     string `json:"err"`
 	At      string `json:"at"`
 	// Action 记录失败时引擎正在执行的动作（ActionGet / ActionSaveAs）。
-	// 手动重试必须原样重放用户的 save_as 裁决，而不是重跑 Decide 再推导一次
-	// —— 对同一冲突状态 Decide 只会再判一次 Conflict，用户点过的「另存远端版本」
-	// 会变成一张冲突卡片（M2c）。
+	// 手动重试必须原样重放用户的裁决，而不是重跑 Decide 再推导一次
+	// —— 对同一冲突状态 Decide 只会再判一次 Conflict，用户点过的
+	// 「用远端覆盖」/「另存远端版本」会变成一张冲突卡片（M2c）。
 	Action Action `json:"action,omitempty"`
+	// Forced 标记该动作来自用户在冲突卡片上的裁决、而非 Decide 推导。
+	// 单看 Action 区分不了二者：用户强制 take_remote 与 Decide 判定的普通
+	// 下载都是 ActionGet。重试时必须靠 Forced 决定是否写入 r.resolved 走
+	// 引擎已有的强制动作通道，否则会用一个新冲突卡片顶掉用户的决定。
+	Forced bool `json:"forced,omitempty"`
 }
 
 type StateFile struct {
