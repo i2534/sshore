@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, beforeAll, vi } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 import {
   useSettingsStore,
@@ -9,6 +9,25 @@ import {
   latinStack,
   cjkStack,
 } from './settings'
+
+// 把 Wails 绑定挡在测试之外：store 的 load()/save() 会直接调用
+// GetSettings/SetSettings/SyncWindowBackground，真跑到它们会去摸 window.go。
+// vi.hoisted 让假后端在 vi.mock 工厂之前就绪（仓库此前没有 mock 绑定的先例）。
+const backend = vi.hoisted(() => ({
+  settings: {},
+  saved: [],
+}))
+vi.mock('../../wailsjs/go/main/App', () => ({
+  GetSettings: async () => backend.settings,
+  SetSettings: async (payload) => { backend.saved.push(payload) },
+  SyncWindowBackground: async () => {},
+}))
+
+// load() 经 apply()/ensureSystemListener() 触碰 DOM；node 环境补最小 stub。
+beforeAll(() => {
+  globalThis.window = { matchMedia: () => null }
+  globalThis.document = { documentElement: { setAttribute() {}, style: { setProperty() {} } } }
+})
 
 describe('settings option tables', () => {
   it('每个选项都有 value/label/stack 三元组', () => {
@@ -52,5 +71,53 @@ describe('settings store defaults', () => {
     expect(s.autoStartOnLaunch).toBe(true)
     expect(s.autoReconnectDefault).toBe(true)
     expect(s.loaded).toBe(false)
+  })
+})
+
+describe('settings store auto_reconnect_default 往返', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    backend.settings = {}
+    backend.saved.length = 0
+  })
+
+  it('save() 必须回传 auto_reconnect_default（漏掉该字段即失败）', async () => {
+    const s = useSettingsStore()
+    s.autoReconnectDefault = true
+    await s.save()
+    expect(backend.saved).toHaveLength(1)
+    expect(backend.saved[0]).toHaveProperty('auto_reconnect_default')
+    expect(backend.saved[0].auto_reconnect_default).toBe(true)
+  })
+
+  it('load() 把后端的 true 读进 autoReconnectDefault', async () => {
+    backend.settings = { auto_reconnect_default: true }
+    const s = useSettingsStore()
+    await s.load()
+    expect(s.autoReconnectDefault).toBe(true)
+  })
+
+  it('load() 不得把后端的显式 false 强转为 true', async () => {
+    backend.settings = { auto_reconnect_default: false }
+    const s = useSettingsStore()
+    await s.load()
+    expect(s.autoReconnectDefault).toBe(false)
+  })
+
+  it('load() 缺字段（undefined）时按 true 兜底，与 !== false 语义一致', async () => {
+    backend.settings = {}
+    const s = useSettingsStore()
+    await s.load()
+    expect(s.autoReconnectDefault).toBe(true)
+  })
+
+  it('改值后 save() 原样保持：false→false、true→true', async () => {
+    const s = useSettingsStore()
+    s.autoReconnectDefault = false
+    await s.save()
+    expect(backend.saved[backend.saved.length - 1].auto_reconnect_default).toBe(false)
+    s.autoReconnectDefault = true
+    await s.save()
+    expect(backend.saved[backend.saved.length - 1].auto_reconnect_default).toBe(true)
   })
 })
