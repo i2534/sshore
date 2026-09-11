@@ -1586,11 +1586,13 @@ import (
 // InotifySource 用一条常驻的远端 inotifywait 进程提供近实时事件。
 //
 // 【已知弱点 W1，必须保留这段注释】
-// inotifywait -r 没有 maxdepth：内核 watch 会覆盖全部层级，规则里的 max_depth
-// 只在**解析事件时**过滤，并不能减少内核 watch 配额的开销。大目录（例如下面挂着
-// node_modules）可能耗尽配额，后果是启动即失败（Failed to watch）或带残缺 watch
-// 静默漏同步。需要真正限量扫描时，请在规则里关闭 inotify（force_poll = true）
-// 改用轮询路径。
+// inotifywait -r 没有 maxdepth：内核 watch 会覆盖全部层级，并不能减少内核 watch
+// 配额的开销。大目录（例如下面挂着 node_modules）可能耗尽配额，后果是启动即失败
+// （Failed to watch）或带残缺 watch 静默漏同步。需要真正限量扫描时，请在规则里
+// 关闭 inotify（force_poll = true）改用轮询路径。
+//
+// 注意：max_depth / excludes 的过滤发生在上层引擎的事件队列边界（sync.consume），
+// 本包既不在解析事件时过滤，也不减少内核 watch 数。
 type InotifySource struct {
 	sp   osutil.Streamer
 	opts DetectOpts
@@ -3038,7 +3040,6 @@ package sync
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -3130,7 +3131,7 @@ import (
 // 同名命名类型——Deps.ListMany 的字段类型是 watch.ListManyFunc，命名类型不同
 // 会赋值失败。
 func NewSftpAdapter(c *sftp.Ctrl) (Transferer, watch.ListManyFunc) {
-	return sftpTransfer{c: c}, sftpListMany{c: c}
+	return sftpTransfer{c: c}, sftpListMany{c: c}.ListMany
 }
 
 type sftpTransfer struct{ c *sftp.Ctrl }
@@ -3186,7 +3187,7 @@ func TestDeleteGateBlocksAllUnsafeCases(t *testing.T) {
 		{"根目录消失", DeleteGateInput{MirrorDelete: true, Complete: true, RootGone: true}, false},
 		{"内核队列溢出", DeleteGateInput{MirrorDelete: true, Complete: true, Overflow: true}, false},
 		{"重连/启动后的第一轮", DeleteGateInput{MirrorDelete: true, Complete: true, FirstRound: true}, false},
-		{"远端看起来空了", DeleteGateInput{MirrorDelete: true, Complete: true, PrevCount: 5, CurCount: 0}, false},
+		{"远端看起来空了", DeleteGateInput{MirrorDelete: true, Complete: true, CountKnown: true, PrevCount: 5, CurCount: 0}, false},
 		{"正常小批量", base, true},
 	}
 	for _, c := range cases {
@@ -3200,7 +3201,7 @@ func TestDeleteGateBlocksAllUnsafeCases(t *testing.T) {
 
 // 小集合也必须被阈值保护：5 个条目删 3 个就要挂起等确认。
 func TestDeleteGateThresholdCoversSmallSets(t *testing.T) {
-	got := EvaluateDeleteGate(DeleteGateInput{MirrorDelete: true, Complete: true, PrevCount: 5, CurCount: 5, PendingCount: 3})
+	got := EvaluateDeleteGate(DeleteGateInput{MirrorDelete: true, Complete: true, CountKnown: true, PrevCount: 5, CurCount: 5, PendingCount: 3})
 	if got.Allowed {
 		t.Fatal("删 5 个里的 3 个必须先确认")
 	}
@@ -3280,7 +3281,7 @@ func EvaluateDeleteGate(in DeleteGateInput) GateResult {
 
 **Files:** Create `internal/sync/conflict.go`；Test `internal/sync/conflict_test.go`
 
-**Interfaces:** Produces `Conflict`、`ConflictAction` 与三个常量、`func UpsertConflict(d *StateFile, c Conflict)`、`func ResolveConflict(d *StateFile, rel string, action ConflictAction, now string) (TransferOrDelete, error)`
+**Interfaces:** Produces `Conflict`、`ConflictAction` 与三个常量、`func UpsertConflict(d *StateFile, c Conflict)`、`func ResolveConflict(d *StateFile, rel string, action ConflictAction, local LocalState, now string) (TransferOrDelete, error)`
 
 **关键**：`ResolveConflict` **只入队并返回请求，绝不自己传输**。若绑定线程持状态锁去下载，而引擎 goroutine 持"串行传输"锁等状态锁，就是 ABBA 死锁。
 
@@ -3401,13 +3402,27 @@ func ResolveConflict(d *StateFile, rel string, action ConflictAction, local Loca
 		return TransferOrDelete{}, fmt.Errorf("冲突不存在: %s", rel)
 	}
 	c := d.Conflicts[idx]
+
+	// 先在 switch 内只计算请求：非法动作在 default 提前返回，
+	// 此时尚未改动 d（否则冲突会被 splice 掉，落盘后从磁盘消失）。
+	var req TransferOrDelete
+	switch action {
+	case ConflictKeepLocal:
+		req = TransferOrDelete{RelPath: rel, Action: ActionSkip, Detail: "保留本地"}
+	case ConflictTakeRemote:
+		req = TransferOrDelete{RelPath: rel, Action: ActionGet, Detail: "用远端覆盖"}
+	case ConflictSaveAs:
+		req = TransferOrDelete{RelPath: rel, Action: ActionSaveAs, Detail: "另存远端副本"}
+	default:
+		return TransferOrDelete{}, fmt.Errorf("未知冲突动作: %s", action)
+	}
+
+	// 动作已合法，才开始改动 d。
 	d.Conflicts = append(d.Conflicts[:idx], d.Conflicts[idx+1:]...)
 	if d.Entries == nil {
 		d.Entries = map[string]*Entry{}
 	}
-
-	switch action {
-	case ConflictKeepLocal:
+	if action == ConflictKeepLocal {
 		e := d.Entries[rel]
 		if e == nil {
 			e = &Entry{}
@@ -3420,14 +3435,8 @@ func ResolveConflict(d *StateFile, rel string, action ConflictAction, local Loca
 		if !local.Exists {
 			delete(d.Entries, rel)
 		}
-		return TransferOrDelete{RelPath: rel, Action: ActionSkip, Detail: "保留本地"}, nil
-	case ConflictTakeRemote:
-		return TransferOrDelete{RelPath: rel, Action: ActionGet, Detail: "用远端覆盖"}, nil
-	case ConflictSaveAs:
-		return TransferOrDelete{RelPath: rel, Action: ActionSaveAs, Detail: "另存远端副本"}, nil
-	default:
-		return TransferOrDelete{}, fmt.Errorf("未知冲突动作: %s", action)
 	}
+	return req, nil
 }
 ~~~
 
@@ -3561,7 +3570,7 @@ func ValidateSyncRule(r config.SyncRule) error {
 
 ## Task 14: 同步引擎（编排、状态机、首轮对齐、退避重连）
 
-**Files:** Create `internal/sync/ctrl.go`；Test `internal/sync/ctrl_test.go`
+**Files:** Create `internal/sync/ctrl.go`、`internal/sync/fs.go`；Test `internal/sync/ctrl_test.go`
 
 **Interfaces:**
 - Consumes: 前面全部任务
@@ -3581,7 +3590,6 @@ func ValidateSyncRule(r config.SyncRule) error {
 package sync
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"sync"
@@ -3739,6 +3747,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -4054,7 +4063,6 @@ func (c *Ctrl) loop(r *ruleRuntime) {
 			if noReconnect {
 				r.status = "error"
 			}
-			r.stats = r.stats
 			r.mu.Unlock()
 			if noReconnect {
 				c.emit(r.rule.ID, "error", "监控连接断开，且未开启自动重连")
@@ -4133,6 +4141,14 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 				c.align(r)
 				continue
 			}
+			// 文件事件在入队前按规则过滤：不在处理范围（被 exclude 命中或超出
+			// max_depth）的路径绝不能进入队列。否则它会被下载、被登记进基线，
+			// 随后又被对账当成"远端已删"而删掉本地文件。目录事件不在此过滤：
+			// align 已处理整棵子树，丢掉目录事件会破坏子树对账。
+			if !inScope(r.rule, ev.RelPath) {
+				r.mu.Unlock()
+				continue
+			}
 			r.queue[ev.RelPath] = ev.Kind
 			overflowed := len(r.queue) > maxQueuePaths
 			if overflowed {
@@ -4195,6 +4211,33 @@ func (c *Ctrl) drainQueue(r *ruleRuntime) {
 	}
 }
 
+// inScope 判定一个相对路径是否属于本规则的处理范围：未被 excludes 命中，
+// 且不超过 max_depth（MaxDepth<0 表示不限深）。
+//
+// 这是**唯一**的"路径要不要管"判定，consume 的事件入队过滤与 align 的删除候选
+// 过滤都必须调用它。两处一旦各写一份就会漂移，而漂移的代价是把被排除路径当成
+// "远端已删"并删掉本地文件（C2）。
+func inScope(rule config.SyncRule, rel string) bool {
+	if watch.MatchExclude(rel, rule.Excludes) {
+		return false
+	}
+	if rule.MaxDepth >= 0 && strings.Count(rel, "/") > rule.MaxDepth {
+		return false
+	}
+	return true
+}
+
+// remotePathFor 把规则内的相对路径映射成远端绝对路径。
+//
+// kind=file 时 RemotePath 本身就是那个文件（事件/对齐传入的 rel 只是它的
+// basename），不能再 Join——否则会向服务器请求 /srv/conf/a.conf/a.conf。
+func remotePathFor(rule config.SyncRule, rel string) string {
+	if rule.Kind == "file" {
+		return rule.RemotePath
+	}
+	return path.Join(rule.RemotePath, rel)
+}
+
 func (c *Ctrl) fetchMeta(r *ruleRuntime, batch map[string]watch.Kind) (map[string]*Entry, error) {
 	out := map[string]*Entry{}
 	if c.d.ListMany == nil {
@@ -4204,14 +4247,14 @@ func (c *Ctrl) fetchMeta(r *ruleRuntime, batch map[string]watch.Kind) (map[strin
 	// 它内部仍是一个 sftp 批处理（约定见 Task 3）。
 	paths := make([]string, 0, len(batch))
 	for rel := range batch {
-		paths = append(paths, path.Join(r.rule.RemotePath, rel))
+		paths = append(paths, remotePathFor(r.rule, rel))
 	}
 	res, err := c.d.ListMany(r.rule.Host, r.rule.User, paths)
 	if err != nil {
 		return out, err
 	}
 	for rel := range batch {
-		items, ok := res[path.Join(r.rule.RemotePath, rel)]
+		items, ok := res[remotePathFor(r.rule, rel)]
 		if !ok || len(items) == 0 {
 			continue // 未知：Decide 会保守下载
 		}
@@ -4249,7 +4292,7 @@ func (c *Ctrl) align(r *ruleRuntime) {
 		c.alignFile(r)
 		return
 	}
-	snap, err := watch.ScanTree(c.d.ListMany, r.rule.Host, r.rule.User, r.rule.RemotePath, r.rule.MaxDepth, r.rule.Excludes)
+	snap, err := watch.ScanTree(context.Background(), c.d.ListMany, r.rule.Host, r.rule.User, r.rule.RemotePath, r.rule.MaxDepth, r.rule.Excludes)
 	if err != nil || !snap.Complete {
 		c.emit(r.rule.ID, "warn", "对账扫描未完成，跳过本轮")
 		return
@@ -4279,6 +4322,12 @@ func (c *Ctrl) align(r *ruleRuntime) {
 			r.mu.Unlock()
 		}
 		for rel, ent := range d.Entries {
+			// 不在处理范围的路径（被 exclude 命中 / 超出 max_depth）本轮快照
+			// 本就不会包含它，绝不能因此判成"远端已删"而登记删除。只有真正
+			// 在范围内、又缺席于快照的条目才是删除候选。
+			if !inScope(r.rule, rel) {
+				continue
+			}
 			if _, ok := snap.Entries[rel]; !ok && ent.HasLocal {
 				dels = append(dels, rel)
 			}
@@ -4355,7 +4404,7 @@ func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Ent
 	action, reason := Decide(kind, ent, st, r.rule.MirrorDelete)
 	switch action {
 	case ActionGet, ActionSaveAs:
-		remotePath := path.Join(r.rule.RemotePath, rel)
+		remotePath := remotePathFor(r.rule, rel)
 		target := local
 		saveAs := action == ActionSaveAs
 		if saveAs {
@@ -4407,7 +4456,7 @@ func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Ent
 				e = &Entry{}
 				d.Entries[rel] = e
 			}
-			e.LocalSize, e.LocalModTime, e.HasLocal, e.WrittenAt = after.Size, after.ModTime, true, now
+			e.LocalSize, e.LocalMTime, e.HasLocal, e.WrittenAt = after.Size, after.ModTime, true, now
 			removeConflict(d, rel)
 		})
 		r.mu.Lock()
@@ -4421,7 +4470,7 @@ func (c *Ctrl) applyOne(r *ruleRuntime, rel string, kind watch.Kind, remote *Ent
 				e = &Entry{}
 				d.Entries[rel] = e
 			}
-			e.LocalSize, e.LocalModTime, e.HasLocal, e.Adopted = st.Size, st.ModTime, st.Exists, true
+			e.LocalSize, e.LocalMTime, e.HasLocal, e.Adopted = st.Size, st.ModTime, st.Exists, true
 		})
 		c.emit(r.rule.ID, "info", rel+" 本地已存在且大小一致，未下载（未校验内容）")
 	case ActionConflict:
@@ -4937,7 +4986,6 @@ import (
 	"context"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -5154,13 +5202,13 @@ false（不重连）处理，与 spec §5.2 的"缺键取全局 `App.AutoReconne
 
 ## Task 17: 关键集成测试（第三轮补）
 
-**Files:** Modify ¤internal/sync/ctrl_test.go¤
+**Files:** Modify `internal/sync/ctrl_test.go`
 
 **为什么单独列**：Task 8–14 的单测都是纯逻辑层（决策表、闸门、状态文件），而第三轮复审暴露的问题**全部在"接线"上**——逻辑对但没接上。这一层只能靠集成测试守住。
 
 - [ ] **Step 1: 写测试**
 
-在 ¤internal/sync/ctrl_test.go¤ 追加：
+在 `internal/sync/ctrl_test.go` 追加：
 
 ~~~go
 // 端到端验证"镜像删除真的会删文件"。它能同时守住三件事：
@@ -5168,7 +5216,7 @@ false（不重连）处理，与 spec §5.2 的"缺键取全局 `App.AutoReconne
 //   2) drainQueue 处理完会真的调闸门（否则这里永远不会删）；
 //   3) 闸门在事件路径（CountKnown=false）放行单条删除。
 func TestEngineMirrorDeleteActuallyDeletes(t *testing.T) {
-	fs := newFakeRemote()
+	fs := &scriptedListMany{tree: map[string][]sftp.Item{}}
 	fs.set("/r", sftp.Item{Name: "a.txt", Size: 5, ModTime: "2026-09-10 10:00"})
 	xf := &fakeXfer{remote: map[string]string{"/r/a.txt": "hello"}}
 	c, rule, local := newTestCtrl(t, fs.list, xf)
@@ -5204,19 +5252,19 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 }
 ~~~
 
-- [ ] **Step 2: 运行** — Run: ¤go test ./internal/sync/ -race -count=1 -run MirrorDelete -v¤；Expected: PASS
+- [ ] **Step 2: 运行** — Run: `go test ./internal/sync/ -race -count=1 -run MirrorDelete -v`；Expected: PASS
 
-- [ ] **Step 3: 提交** — ¤git add internal/sync/ && git commit -m "test(sync): 新增 mirror_delete 端到端测试,守住删除闸门接线"¤
+- [ ] **Step 3: 提交** — `git add internal/sync/ && git commit -m "test(sync): 新增 mirror_delete 端到端测试,守住删除闸门接线"`
 
 ### 仍未写的测试（复审点名要求，后续补）
 
 以下测试**本轮没有写**，不要在实现时以为已经覆盖：
 
-1. ¤ConfirmDeletes¤ 的"挂起 → 远端恢复 → 确认 → 整批作废"（对应 §7.6 第 6 条）；
-2. ¤ResolveConflict¤ 与引擎并发时的无死锁断言（对应 §10.3）；
-3. ¤save_as¤ 写到 ¤<name>.remote-<ts>¤ 且**不覆盖本地**（对应 §7.7，数据安全级）；
-4. 单文件失败 3 次退避（1s/4s/16s）后标记 ¤failed¤ 且继续处理其它文件（对应 §8.4）；
-5. 背压：队列超过 ¤maxQueuePaths¤ 时退化为全量对账而不是阻塞（对应 §7.1）。
+1. `ConfirmDeletes` 的"挂起 → 远端恢复 → 确认 → 整批作废"（对应 §7.6 第 6 条）；
+2. `ResolveConflict` 与引擎并发时的无死锁断言（对应 §10.3）；
+3. `save_as` 写到 `<name>.remote-<ts>` 且**不覆盖本地**（对应 §7.7，数据安全级）；
+4. 单文件失败 3 次退避（1s/4s/16s）后标记 `failed` 且继续处理其它文件（对应 §8.4）；
+5. 背压：队列超过 `maxQueuePaths` 时退化为全量对账而不是阻塞（对应 §7.1）。
 
 ## Execution Handoff
 
