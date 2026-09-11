@@ -1824,6 +1824,7 @@ git commit -m "feat(watch): 新增降级判定与 inotify 探测源,watch 异常
 package watch
 
 import (
+	"context"
 	"testing"
 
 	"sshore/internal/sftp"
@@ -1850,7 +1851,7 @@ func TestScanTreeRespectsMaxDepth(t *testing.T) {
 		"/r/d1":    {file("b.txt"), dir("d2")},
 		"/r/d1/d2": {file("c.txt")},
 	}
-	one, err := ScanTree(fakeList(tree), "h", "", "/r", 1, nil)
+	one, err := ScanTree(context.Background(), fakeList(tree), "h", "", "/r", 1, nil)
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -1874,7 +1875,7 @@ func TestScanTreeMarksIncompleteOnUnknownDir(t *testing.T) {
 		"/r":    {dir("d1"), dir("locked")},
 		"/r/d1": {file("a.txt")},
 	}
-	snap, err := ScanTree(fakeList(tree), "h", "", "/r", -1, nil)
+	snap, err := ScanTree(context.Background(), fakeList(tree), "h", "", "/r", -1, nil)
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
@@ -2044,6 +2045,7 @@ Expected: 编译失败，`undefined: ScanTree` / `undefined: NewPollSource`
 package watch
 
 import (
+	"context"
 	"path"
 	"strings"
 
@@ -2094,7 +2096,7 @@ func MatchExclude(rel string, excludes []string) bool {
 
 // ScanTree 从 root 开始 BFS 列举，深度受 maxDepth 限制（0=仅本层，-1=无限）。
 // 任一目录未知（ListMany 返回的 map 缺 key）都会把 Complete 置为 false。
-func ScanTree(list ListManyFunc, host, user, root string, maxDepth int, excludes []string) (Snapshot, error) {
+func ScanTree(ctx context.Context, list ListManyFunc, host, user, root string, maxDepth int, excludes []string) (Snapshot, error) {
 	snap := Snapshot{Entries: map[string]Meta{}, Complete: true}
 	type node struct {
 		dir   string
@@ -2214,7 +2216,7 @@ func (p *PollSource) Start(ctx context.Context) (<-chan Event, error) {
 	p.mu.Unlock()
 
 	// 首轮立即跑：既建立基线，也让"远端路径不存在"在启动阶段就暴露。
-	p.round(ch)
+	p.round(ctx, ch)
 
 	go func() {
 		defer close(ch)
@@ -2226,7 +2228,7 @@ func (p *PollSource) Start(ctx context.Context) (<-chan Event, error) {
 				return
 			case <-p.after(p.interval):
 			}
-			p.round(ch)
+			p.round(ctx, ch)
 		}
 	}()
 	return ch, nil
@@ -2245,8 +2247,8 @@ func (p *PollSource) Close() error {
 }
 
 // round 执行一轮扫描与比对。失败或不完整 ⇒ 零事件 + 失败计数。
-func (p *PollSource) round(ch chan Event) {
-	snap, err := ScanTree(p.list, p.opts.Host, p.opts.User, p.opts.RemotePath, p.maxDepth, p.excludes)
+func (p *PollSource) round(ctx context.Context, ch chan Event) {
+	snap, err := ScanTree(ctx, p.list, p.opts.Host, p.opts.User, p.opts.RemotePath, p.maxDepth, p.excludes)
 	if err != nil || !snap.Complete {
 		p.mu.Lock()
 		p.failures++
