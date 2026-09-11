@@ -801,3 +801,11 @@ func TestOnShutdownBeforeInitDoesNotPanic(t *testing.T) {
 	a := NewApp()
 	a.OnShutdown()
 }
+
+// RetrySyncRuleFailures 对未运行的规则必须返回错误（绑定契约）。
+func TestRetrySyncRuleFailuresRejectsNonRunningRule(t *testing.T) {
+	a := newTestApp(t)
+	if err := a.RetrySyncRuleFailures("nope"); err == nil {
+		t.Fatal("未运行的规则必须返回错误")
+	}
+}
