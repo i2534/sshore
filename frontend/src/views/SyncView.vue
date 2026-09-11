@@ -15,6 +15,7 @@ import {
   newSyncRuleForm, syncRuleToForm, formToSyncRule, validateSyncRuleForm,
   statsOf, ruleLabel,
   canMirrorDelete, mirrorDeleteHint, shouldRefresh,
+  dialogErrorText, shouldSubscribe,
 } from '../utils/sync'
 
 // 只有同步与系统日志进这个视图：sftp 传输日志的 source_id 是 host 而不是规则 id，
@@ -48,6 +49,10 @@ const form = ref(newSyncRuleForm())
 const conflictsVisible = ref(false)
 const conflictsFor = ref({ id: '', name: '' })
 const conflicts = ref([])
+// FIX 1：裁决失败的原因必须显示在对话框内部（左侧 opError 被遮罩挡住），
+// 且批量在途时要防重复触发。
+const conflictsError = ref('')
+const resolveBusy = ref(false)
 
 async function refresh() {
   try {
@@ -117,6 +122,7 @@ function toggleLog(rule) {
 
 async function openConflicts(rule) {
   opError.value = ''
+  conflictsError.value = '' // FIX 1b：打开对话框时清空上一次的错误
   try {
     conflictsFor.value = { id: rule.id, name: ruleLabel(rule) } // S6：与卡片同一回退顺序
     conflicts.value = (await SyncRuleConflicts(rule.id)) || []
@@ -124,22 +130,43 @@ async function openConflicts(rule) {
   } catch (e) { opError.value = String(e) }
 }
 
+// FIX 1c：无论裁决成功还是抛错（例如并发对账已把该路径解掉），末尾都要重取冲突列表，
+// 否则对话框会一直展示已解决的陈旧行，用户再点只会继续失败。
+async function refetchConflicts() {
+  try {
+    conflicts.value = (await SyncRuleConflicts(conflictsFor.value.id)) || []
+  } catch (e) {
+    conflictsError.value = dialogErrorText(e)
+  }
+}
+
 async function resolveOne({ rel, action }) {
+  conflictsError.value = '' // FIX 1b：每个裁决动作开始前清空错误
   try {
     await ResolveSyncConflict(conflictsFor.value.id, rel, action)
-    conflicts.value = (await SyncRuleConflicts(conflictsFor.value.id)) || []
     await refresh()
-  } catch (e) { opError.value = String(e) }
+  } catch (e) {
+    conflictsError.value = dialogErrorText(e)
+  } finally {
+    await refetchConflicts()
+  }
 }
 
 async function resolveAll(action) {
+  if (resolveBusy.value) return // FIX 1d：批量在途时拒绝再次触发
+  resolveBusy.value = true
+  conflictsError.value = ''
   try {
     for (const c of conflicts.value.slice()) {
       await ResolveSyncConflict(conflictsFor.value.id, c.rel_path, action)
     }
-    conflicts.value = (await SyncRuleConflicts(conflictsFor.value.id)) || []
     await refresh()
-  } catch (e) { opError.value = String(e) }
+  } catch (e) {
+    conflictsError.value = dialogErrorText(e)
+  } finally {
+    await refetchConflicts()
+    resolveBusy.value = false
+  }
 }
 
 async function confirmDeletes({ rule, fingerprint, count }) {
@@ -156,8 +183,12 @@ async function confirmDeletes({ rule, fingerprint, count }) {
 // 后防抖刷新 —— 不二次 EventsOn、不轮询（spec §9.3）。
 let unsubLogs = null
 let refreshTimer = null
+// FIX 3：loadHosts()/refresh() 的 await 期间视图可能被 KeepAlive 切走。active 由
+// onActivated/onDeactivated 维护，subscribe() 只在激活且未订阅时注册，避免在已隐藏
+// 的实例上挂订阅与 300ms 定时器（切走本身会 unsubscribe，只有 unmount 中途才会永久泄漏）。
+let active = false
 function subscribe() {
-  if (unsubLogs) return
+  if (!shouldSubscribe(active, !!unsubLogs)) return
   unsubLogs = logStore.$subscribe((mutation, state) => {
     const logs = state.logs
     const last = logs[logs.length - 1]
@@ -176,12 +207,13 @@ function unsubscribe() {
 // App.vue 用 <KeepAlive>：切走不会触发 onUnmounted，所以必须用
 // onActivated/onDeactivated 管理订阅与定时器（先例 SftpView.vue）。
 onActivated(async () => {
+  active = true
   if (!hosts.value.length) await loadHosts()
   await refresh()
-  subscribe()
+  subscribe() // 若 await 期间已 onDeactivated，这里会因 active=false 而跳过
 })
-onDeactivated(unsubscribe)
-onUnmounted(unsubscribe)
+onDeactivated(() => { active = false; unsubscribe() })
+onUnmounted(() => { active = false; unsubscribe() })
 </script>
 
 <template>
@@ -265,7 +297,8 @@ onUnmounted(unsubscribe)
     </div>
 
     <SyncConflictsDialog :visible="conflictsVisible" :conflicts="conflicts"
-      :rule-name="conflictsFor.name" @close="conflictsVisible = false"
+      :rule-name="conflictsFor.name" :error-text="conflictsError" :busy="resolveBusy"
+      @close="conflictsVisible = false"
       @resolve="resolveOne" @resolveAll="resolveAll" />
 
     <AppDialog :visible="dialog.visible" mode="confirm" :title="dialog.title" :message="dialog.message"

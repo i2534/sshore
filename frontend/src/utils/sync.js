@@ -108,10 +108,13 @@ export function ruleLabel(rule) {
 }
 
 // 待确认删除：只有真挂起时才有指纹，UI 必须把指纹原样回传给确认绑定。
+// FIX 2c：还必须要求闸门确实以「数量阈值」臂挂起（DeleteNeedsConfirm=true）。
+// 硬拒绝臂（镜像关闭/根消失/扫描不完整/溢出/首轮/远端疑似清空）即使留下指纹，
+// 也不得展示可点的「确认删除」——否则 UI 会提供一个后端拒绝的确认入口。
 export function deleteSummary(stats) {
   const s = stats || {}
   const count = intOf(s.DeletePending)
-  if (count <= 0 || !s.DeleteFingerprint) return null
+  if (count <= 0 || !s.DeleteFingerprint || s.DeleteNeedsConfirm !== true) return null
   return {
     count,
     fingerprint: s.DeleteFingerprint,
@@ -123,10 +126,37 @@ export function retryable(stats) {
   return intOf((stats || {}).Failed) > 0
 }
 
+// FIX 5：三个动作字符串是**跨语言契约**，必须与 internal/sync/conflict.go:10-12 的
+// ConflictKeepLocal/ConflictTakeRemote/ConflictSaveAs 逐字一致。放在被测模块里，
+// 组件不再各自硬编码，拼错会在 vitest 而不是运行时暴露。
+export const CONFLICT_KEEP_LOCAL = 'keep_local'
+export const CONFLICT_TAKE_REMOTE = 'take_remote'
+export const CONFLICT_SAVE_AS = 'save_as'
+export const CONFLICT_ACTIONS = [CONFLICT_KEEP_LOCAL, CONFLICT_TAKE_REMOTE, CONFLICT_SAVE_AS]
+// BATCH_LIMIT 是纯前端约束（后端没有这个上限），从组件搬进被测层。
+export const BATCH_LIMIT = 50
+
+// FIX 1a：对话框内的错误文案。空值归一为空串（不渲染），其余转成可读字符串。
+export function dialogErrorText(err) {
+  if (err == null) return ''
+  return String(err).trim()
+}
+
+// FIX 1d：批量按钮可用性 —— 有冲突、不超上限、且当前没有批量在途（busy 守卫）。
+export function batchResolvable(conflictCount, busy) {
+  const n = intOf(conflictCount)
+  return !busy && n > 0 && n <= BATCH_LIMIT
+}
+
+// FIX 3：激活竞态守卫 —— 只有视图处于激活态且尚未注册订阅时才注册。
+export function shouldSubscribe(active, alreadySubscribed) {
+  return !!active && !alreadySubscribed
+}
+
 export function conflictActionLabel(action) {
-  if (action === 'keep_local') return '保留本地'
-  if (action === 'take_remote') return '用远端覆盖'
-  if (action === 'save_as') return '另存远端版本'
+  if (action === CONFLICT_KEEP_LOCAL) return '保留本地'
+  if (action === CONFLICT_TAKE_REMOTE) return '用远端覆盖'
+  if (action === CONFLICT_SAVE_AS) return '另存远端版本'
   return action
 }
 
@@ -182,7 +212,10 @@ export function syncRuleToForm(rule) {
   f.remote_path = rule.remote_path || ''
   f.local_path = rule.local_path || ''
   f.max_depth = Number.isFinite(Number(rule.max_depth)) ? Number(rule.max_depth) : 0
-  f.excludesText = formatExcludes(rule.excludes)
+  // FIX 4：excludes 缺失（null/undefined）时必须回退到表单预置的默认排除项。
+  // 若照旧写成空串，提交空数组后后端只在 Excludes==nil 时填默认值，空 slice 获胜，
+  // .git/、node_modules/ 会被同步（M1 防线）。显式空数组仍尊重用户选择。
+  f.excludesText = Array.isArray(rule.excludes) ? formatExcludes(rule.excludes) : f.excludesText
   f.mirror_delete = !!rule.mirror_delete
   f.force_poll = !!rule.force_poll
   f.poll_interval_s = Number(rule.poll_interval_s) > 0 ? Number(rule.poll_interval_s) : 5
