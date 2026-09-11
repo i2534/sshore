@@ -55,6 +55,8 @@ export function RenameLocal(arg1:string,arg2:string):Promise<void>;
 
 export function ResolveSyncConflict(arg1:string,arg2:string,arg3:string):Promise<void>;
 
+export function RetrySyncRuleFailures(arg1:string):Promise<void>;
+
 export function SetSettings(arg1:config.AppSettings):Promise<void>;
 
 export function SftpConnect(arg1:string):Promise<void>;

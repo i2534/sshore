@@ -462,3 +462,87 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 	}
 	t.Fatal(msg)
 }
+
+// M2：RetryFailed 重新入队失败项、清空失败计数与清单，并重放用户当初的 save_as 裁决。
+// 用 newManualCtrl/attachRuntime 手动登记运行时（不启动 goroutine），因此不需要
+// 300ms 去抖容差，也不是时序相关的。
+func TestRetryFailedRequeuesClearsAndReplaysSaveAs(t *testing.T) {
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	xf := &fakeXfer{remote: map[string]string{}}
+	c, rule, _ := newManualCtrl(t, lm.list, xf)
+	r := attachRuntime(t, c, rule)
+
+	r.state.With(func(d *StateFile) {
+		d.Failed = []FailedItem{
+			{RelPath: "a.txt", Err: "boom", At: "2026-09-10T10:00:00Z", Action: ActionGet},
+			{RelPath: "b/c.txt", Err: "boom", At: "2026-09-10T10:00:01Z", Action: ActionGet},
+			{RelPath: "secret.key", Err: "boom", At: "2026-09-10T10:00:02Z", Action: ActionSaveAs},
+		}
+	})
+	r.mu.Lock()
+	// 故意让计数大于失败条数：模拟「摘除 d.Failed 之后、更新 stats 之前引擎又记了新失败」。
+	// 重试只应减去实际重排的 3 条（FIX 5），不能硬清零。
+	r.stats.Failed = 5
+	r.mu.Unlock()
+
+	n, err := c.RetryFailed(rule.ID)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("应重试 3 条，得到 %d", n)
+	}
+	r.mu.Lock()
+	gotA, gotB, gotC := r.queue["a.txt"], r.queue["b/c.txt"], r.queue["secret.key"]
+	resolved := r.resolved["secret.key"]
+	failedStat := r.stats.Failed
+	r.mu.Unlock()
+	if gotA != watch.KindWrite || gotB != watch.KindWrite || gotC != watch.KindWrite {
+		t.Fatalf("三条都应入队为 KindWrite，得到 %v %v %v", gotA, gotB, gotC)
+	}
+	if resolved != ActionSaveAs {
+		t.Fatalf("save_as 失败项必须重放为 resolved=ActionSaveAs，得到 %v", resolved)
+	}
+	if failedStat != 2 {
+		t.Fatalf("应按实际重排条数扣减（5-3=2）而不是清零，得到 %d", failedStat)
+	}
+	r.state.With(func(d *StateFile) {
+		if len(d.Failed) != 0 {
+			t.Fatalf("重试后失败清单必须清空，得到 %#v", d.Failed)
+		}
+	})
+}
+
+func TestRetryFailedErrorsWhenNotRunning(t *testing.T) {
+	c := NewCtrl(Deps{StateDir: t.TempDir()})
+	if _, err := c.RetryFailed("nope"); err == nil {
+		t.Fatal("规则未运行必须报错")
+	}
+}
+
+// M3：冲突计数必须反映**当前仍挂起**的冲突数（spec §9.2 要求 >0 才显示按钮），
+// 而不是只增不减的累加器 —— 否则最后一条裁决完，「冲突」按钮永远不消失。
+func TestConflictStatReflectsPendingNotTotal(t *testing.T) {
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	xf := &fakeXfer{remote: map[string]string{}}
+	c, rule, local := newManualCtrl(t, lm.list, xf)
+	r := attachRuntime(t, c, rule)
+
+	if err := os.WriteFile(filepath.Join(local, "a.txt"), []byte("much longer local content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r.state.With(func(d *StateFile) {
+		d.Entries["a.txt"] = &Entry{RemoteSize: 3, RemoteMTime: "2026-09-10 10:00"}
+	})
+	c.applyOne(r, "a.txt", watch.KindWrite, &Entry{RemoteSize: 3, RemoteMTime: "2026-09-10 10:00"})
+	if got := c.Stats()[rule.ID].Conflicts; got != 1 {
+		t.Fatalf("产生一条冲突后计数应为 1，得到 %d", got)
+	}
+	// 裁决 keep_local：冲突出队，计数必须归零。
+	if err := c.ResolveConflict(rule.ID, "a.txt", ConflictKeepLocal, LocalState{Exists: true, Size: 24, ModTime: "local-t"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got := c.Stats()[rule.ID].Conflicts; got != 0 {
+		t.Fatalf("裁决后计数必须归零，得到 %d", got)
+	}
+}

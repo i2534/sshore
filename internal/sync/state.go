@@ -54,6 +54,11 @@ type FailedItem struct {
 	RelPath string `json:"rel_path"`
 	Err     string `json:"err"`
 	At      string `json:"at"`
+	// Action 记录失败时引擎正在执行的动作（ActionGet / ActionSaveAs）。
+	// 手动重试必须原样重放用户的 save_as 裁决，而不是重跑 Decide 再推导一次
+	// —— 对同一冲突状态 Decide 只会再判一次 Conflict，用户点过的「另存远端版本」
+	// 会变成一张冲突卡片（M2c）。
+	Action Action `json:"action,omitempty"`
 }
 
 type StateFile struct {

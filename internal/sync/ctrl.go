@@ -752,7 +752,7 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 			r.mu.Unlock()
 			r.state.With(func(d *StateFile) {
 				d.Failed = append(d.Failed, FailedItem{RelPath: rel, Err: lastErr.Error(),
-					At: time.Now().Format(time.RFC3339)})
+					At: time.Now().Format(time.RFC3339), Action: action})
 			})
 			return
 		}
@@ -806,10 +806,12 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 		r.state.With(func(d *StateFile) {
 			UpsertConflict(d, Conflict{RelPath: rel, RemoteSize: remoteSize, RemoteMTime: remoteMTime,
 				LocalSize: st.Size, LocalMTime: st.ModTime, DetectedAt: time.Now().Format(time.RFC3339)})
+			// M3：计数 = 当前仍挂起的冲突数，不是只增不减的累加器。
+			r.mu.Lock()
+			r.stats.Conflicts = len(d.Conflicts)
+			r.mu.Unlock()
 		})
-		r.mu.Lock()
-		r.stats.Conflicts++
-		r.mu.Unlock()
+		// 原来的 r.stats.Conflicts++ 删除
 		c.emit(r.rule.ID, "warn", rel+" 本地已修改，未覆盖")
 	case ActionDelete:
 		// 绝不在 applyOne 里直接删：删除必须统一过六重闸门。这里只登记，
@@ -903,6 +905,12 @@ func (c *Ctrl) ResolveConflict(id, rel string, action ConflictAction, local Loca
 	var err error
 	r.state.With(func(d *StateFile) {
 		req, err = ResolveConflict(d, rel, action, local, time.Now().Format(time.RFC3339))
+		if err == nil {
+			// 裁决即移除一条冲突：计数必须同步下降，卡片上的「冲突」按钮才会消失。
+			r.mu.Lock()
+			r.stats.Conflicts = len(d.Conflicts)
+			r.mu.Unlock()
+		}
 	})
 	if err != nil {
 		return err
@@ -975,6 +983,67 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 	r.mu.Unlock()
 	c.executeDeletes(r, final)
 	return nil
+}
+
+// RetryFailed 把状态文件里记录的失败项重新入队并唤醒 loop goroutine。
+// 与 ResolveConflict 同一约束：**只入队与唤醒，绝不自己传输** —— UI 线程持状态锁
+// 去下载会与引擎的串行传输形成 ABBA 死锁。
+func (c *Ctrl) RetryFailed(id string) (int, error) {
+	c.mu.Lock()
+	r := c.run[id]
+	c.mu.Unlock()
+	if r == nil {
+		return 0, fmt.Errorf("规则未在运行: %s", id)
+	}
+	type retryItem struct {
+		rel    string
+		saveAs bool
+	}
+	var items []retryItem
+	r.state.With(func(d *StateFile) {
+		if len(d.Failed) == 0 {
+			return
+		}
+		items = make([]retryItem, 0, len(d.Failed))
+		for _, f := range d.Failed {
+			if f.RelPath != "" {
+				items = append(items, retryItem{rel: f.RelPath, saveAs: f.Action == ActionSaveAs})
+			}
+		}
+		d.Failed = nil
+	})
+	r.mu.Lock()
+	for _, it := range items {
+		r.queue[it.rel] = watch.KindWrite
+		if it.saveAs {
+			// 重放用户当初的 save_as 裁决；直接重跑 Decide 会把「另存远端版本」变成冲突卡片。
+			if r.resolved == nil {
+				r.resolved = map[string]Action{}
+			}
+			r.resolved[it.rel] = ActionSaveAs
+		}
+	}
+	// 只减去本次真正重排的条数，**不能直接清零**：r.state.With 摘除 d.Failed 之后、
+	// 这里更新 stats 之前，引擎 goroutine 可能又记下一个新失败（r.stats.Failed++ 并
+	// append 到 d.Failed）。硬清零会把这个新失败的计数抹掉、又不会重新入队，卡片于是
+	// 显示「失败 0」而失败清单里仍有条目（-race 看不到这种逻辑竞态）。
+	if r.stats.Failed > len(items) {
+		r.stats.Failed -= len(items)
+	} else {
+		r.stats.Failed = 0
+	}
+	r.mu.Unlock()
+	// FIX 4：即使 items 为空（Failed 里全是空 RelPath 被过滤掉），也必须 Flush，
+	// 否则刚清空的 d.Failed 不落盘，重启后又冒出来。
+	_ = r.state.Flush()
+	if len(items) == 0 {
+		return 0, nil
+	}
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+	return len(items), nil
 }
 
 func removeConflict(d *StateFile, rel string) {
