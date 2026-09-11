@@ -62,6 +62,44 @@ export namespace config {
 	        this.ts = source["ts"];
 	    }
 	}
+	export class SyncRule {
+	    id: string;
+	    name: string;
+	    host: string;
+	    user?: string;
+	    kind: string;
+	    remote_path: string;
+	    local_path: string;
+	    max_depth: number;
+	    excludes: string[];
+	    mirror_delete: boolean;
+	    force_poll: boolean;
+	    poll_interval_s: number;
+	    auto_reconnect?: boolean;
+	    enabled: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new SyncRule(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.host = source["host"];
+	        this.user = source["user"];
+	        this.kind = source["kind"];
+	        this.remote_path = source["remote_path"];
+	        this.local_path = source["local_path"];
+	        this.max_depth = source["max_depth"];
+	        this.excludes = source["excludes"];
+	        this.mirror_delete = source["mirror_delete"];
+	        this.force_poll = source["force_poll"];
+	        this.poll_interval_s = source["poll_interval_s"];
+	        this.auto_reconnect = source["auto_reconnect"];
+	        this.enabled = source["enabled"];
+	    }
+	}
 	export class Tunnel {
 	    id: string;
 	    name: string;
@@ -142,6 +180,33 @@ export namespace sftp {
 	        this.isDir = source["isDir"];
 	        this.mode = source["mode"];
 	        this.modTime = source["modTime"];
+	    }
+	}
+
+}
+
+export namespace sync {
+	
+	export class Conflict {
+	    rel_path: string;
+	    remote_size: number;
+	    remote_mtime: string;
+	    local_size: number;
+	    local_mtime: string;
+	    detected_at: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Conflict(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.rel_path = source["rel_path"];
+	        this.remote_size = source["remote_size"];
+	        this.remote_mtime = source["remote_mtime"];
+	        this.local_size = source["local_size"];
+	        this.local_mtime = source["local_mtime"];
+	        this.detected_at = source["detected_at"];
 	    }
 	}
 

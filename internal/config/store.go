@@ -60,14 +60,84 @@ type RecentSFTP struct {
 	TS        string `toml:"ts" json:"ts"`
 }
 
+// SyncRule 是一条"监控远端路径并同步到本地"的规则。
+type SyncRule struct {
+	ID            string   `toml:"id" json:"id"`
+	Name          string   `toml:"name" json:"name"`
+	Host          string   `toml:"host" json:"host"`
+	User          string   `toml:"user,omitempty" json:"user,omitempty"`
+	Kind          string   `toml:"kind" json:"kind"` // dir | file
+	RemotePath    string   `toml:"remote_path" json:"remote_path"`
+	LocalPath     string   `toml:"local_path" json:"local_path"` // 恒为目录
+	MaxDepth      int      `toml:"max_depth" json:"max_depth"`   // 0=仅本层 N=递归N层 -1=无限
+	Excludes      []string `toml:"excludes" json:"excludes"`
+	MirrorDelete  bool     `toml:"mirror_delete" json:"mirror_delete"`
+	ForcePoll     bool     `toml:"force_poll" json:"force_poll"` // 反向字段：零值即"优先 inotify"
+	PollIntervalS int      `toml:"poll_interval_s" json:"poll_interval_s"`
+	AutoReconnect *bool    `toml:"auto_reconnect,omitempty" json:"auto_reconnect"`
+	Enabled       bool     `toml:"enabled" json:"enabled"`
+}
+
+// DefaultExcludes 是远端路径的默认忽略集合（过滤的是**远端**路径）。
+// 不要放 *.part：那是我们本地临时文件的后缀，远端不会出现。
+func DefaultExcludes() []string {
+	return []string{".git/", "node_modules/", "*.swp", "*~", ".DS_Store"}
+}
+
+// Reconnect 返回"意外断开时是否自动重连"。缺键（nil）按 true 处理——真正的
+// 默认值由 AppConfig.normalize() 从全局 App.AutoReconnectDefault 灌入，
+// 这里只是防止绕过 LoadConfig 直接构造 SyncRule 时解引用 nil。
+func (r *SyncRule) Reconnect() bool {
+	return r.AutoReconnect == nil || *r.AutoReconnect
+}
+
+// Normalize 兜底零值。手改配置缺键时，零值不得静默改变行为
+// （例如 poll_interval_s=0 或 excludes=nil）。
+func (r *SyncRule) Normalize() {
+	if r.Kind != "file" {
+		r.Kind = "dir"
+	}
+	if r.MaxDepth < -1 {
+		r.MaxDepth = -1
+	}
+	if r.PollIntervalS < 1 {
+		r.PollIntervalS = 5
+	}
+	if r.PollIntervalS > 3600 {
+		r.PollIntervalS = 3600
+	}
+	if r.Excludes == nil {
+		r.Excludes = DefaultExcludes()
+	}
+}
+
+// NewSyncID 与 NewTunnelID 同构：32 位纯十六进制、无前缀。
+func NewSyncID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 type AppConfig struct {
 	App        AppSettings  `toml:"app" json:"app"`
 	Tunnels    []Tunnel     `toml:"tunnels" json:"tunnels"`
 	RecentSFTP []RecentSFTP `toml:"recent_sftp" json:"recent_sftp"`
+	Syncs      []SyncRule   `toml:"syncs" json:"syncs"`
 }
 
 // normalize applies per-field defaults to the whole config (currently just App).
-func (c *AppConfig) normalize() { c.App.Normalize() }
+func (c *AppConfig) normalize() {
+	c.App.Normalize()
+	for i := range c.Syncs {
+		c.Syncs[i].Normalize()
+		// spec §5.2：auto_reconnect 缺键时取全局默认（默认 true）。
+		// 用例：手写配置只写 host/remote_path/local_path，不应被静默关闭重连。
+		if c.Syncs[i].AutoReconnect == nil {
+			v := c.App.AutoReconnectDefault
+			c.Syncs[i].AutoReconnect = &v
+		}
+	}
+}
 
 var tmpSeq int64
 

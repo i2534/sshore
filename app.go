@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"sshore/internal/importer"
 	"sshore/internal/osutil"
 	"sshore/internal/sftp"
+	"sshore/internal/sync"
 )
 
 type App struct {
@@ -23,6 +25,7 @@ type App struct {
 	sftp    *sftp.Ctrl
 	cfg     *config.AppConfig
 	cfgPath string
+	sync    *sync.Ctrl
 	// H2: startup 早于 Init 注入 emit，加载错误先记录于此，Init 时补发事件
 	emit       func(forward.Event)
 	cfgLoadErr error
@@ -83,6 +86,15 @@ func (a *App) Init(emit func(forward.Event)) {
 	a.emit = emit
 	a.forward = forward.NewCtrl(osutil.NewSpawner(), emit, nil)
 	a.sftp = sftp.NewCtrl(osutil.NewRunner(), emit)
+	transfer, lister := sync.NewSftpAdapter(a.sftp)
+	a.sync = sync.NewCtrl(sync.Deps{
+		Spawner:  osutil.NewStreamer(),
+		Runner:   osutil.NewCtxRunner(),
+		Transfer: transfer,
+		ListMany: lister,
+		Emit:     emit,
+		StateDir: stateDir(),
+	})
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
 	}
@@ -331,6 +343,19 @@ func (a *App) AutoStartEnabled() error {
 			errs = append(errs, errors.New(msg))
 		}
 	}
+	for _, rule := range a.cfg.Syncs {
+		if !rule.Enabled {
+			continue
+		}
+		if err := a.sync.Start(rule); err != nil {
+			msg := fmt.Sprintf("自动启动同步规则 %s 失败: %v", rule.ID, err)
+			if a.emit != nil {
+				a.emit(forward.Event{SourceType: "sync", SourceID: rule.ID,
+					TS: time.Now().Format(time.RFC3339), Level: "error", Message: msg})
+			}
+			errs = append(errs, errors.New(msg))
+		}
+	}
 	return errors.Join(errs...)
 }
 
@@ -568,7 +593,189 @@ func (a *App) ListRecentSFTP() []config.RecentSFTP {
 }
 
 func (a *App) OnShutdown() {
-	a.forward.OnShutdown()
-	a.sftp.CloseAll()
-	_ = a.saveConfig()
+	// OnShutdown 可能早于 Init 被调用（Wails 生命周期边界），此时 cfg 与三个
+	// 控制器都可能为 nil，必须逐项守卫而不是直接解引用。
+	// 1. 先停同步规则并关闭探测进程
+	if a.sync != nil && a.cfg != nil {
+		for _, rule := range a.cfg.Syncs {
+			_ = a.sync.Stop(rule.ID)
+		}
+	}
+	if a.forward != nil {
+		a.forward.OnShutdown()
+	}
+	// 2. 最后才关 SFTP 的 ControlMaster（它会 RemoveAll 整个 socket 目录）
+	if a.sftp != nil {
+		a.sftp.CloseAll()
+	}
+	if a.cfg != nil {
+		_ = a.saveConfig()
+	}
+}
+
+// 适配器只有一处定义：internal/sync/adapters.go 的 NewSftpAdapter（见 Task 10）。
+// 这里不要重复定义，否则 Task 16 的 E2E 测试还要再写一份。
+
+// stateDir 与 DefaultConfigPath 同源：<UserConfigDir>/sshore/state。
+func stateDir() string {
+	p, err := config.DefaultConfigPath()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "sshore-state")
+	}
+	return filepath.Join(filepath.Dir(p), "state")
+}
+
+func (a *App) ListSyncRules() []config.SyncRule {
+	if a.cfg == nil || a.cfg.Syncs == nil {
+		return []config.SyncRule{}
+	}
+	return a.cfg.Syncs
+}
+
+func (a *App) CreateSyncRule(r config.SyncRule) (config.SyncRule, error) {
+	if err := sync.ValidateSyncRule(r); err != nil {
+		return r, err
+	}
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	for _, e := range a.cfg.Syncs {
+		if e.Host == r.Host && e.RemotePath == r.RemotePath &&
+			e.LocalPath == r.LocalPath && e.Kind == r.Kind {
+			return r, errors.New("已存在完全相同的同步规则")
+		}
+	}
+	if r.ID == "" {
+		r.ID = config.NewSyncID()
+	}
+	r.Normalize()
+	a.cfg.Syncs = append(a.cfg.Syncs, r)
+	return r, a.saveConfig()
+}
+
+func (a *App) UpdateSyncRule(r config.SyncRule) error {
+	if err := sync.ValidateSyncRule(r); err != nil {
+		return err
+	}
+	idx := -1
+	for i, e := range a.cfg.Syncs {
+		if e.ID == r.ID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return errors.New("sync rule not found")
+	}
+	// 运行中的规则先停再存（不做热更新：远端根路径可能整个换掉）。
+	_ = a.sync.Stop(r.ID)
+	r.Enabled = false
+	a.cfg.Syncs[idx] = r
+	return a.saveConfig()
+}
+
+func (a *App) DeleteSyncRule(id string) error {
+	idx := -1
+	for i, e := range a.cfg.Syncs {
+		if e.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return errors.New("sync rule not found")
+	}
+	rule := a.cfg.Syncs[idx]
+	_ = a.sync.Stop(id)
+	// 删除规则时一并清理状态文件与本地残留临时文件。
+	_ = os.Remove(filepath.Join(stateDir(), "sync-"+id+".json"))
+	_, _ = sync.CleanupParts(rule.LocalPath, id)
+	a.cfg.Syncs = append(a.cfg.Syncs[:idx], a.cfg.Syncs[idx+1:]...)
+	return a.saveConfig()
+}
+
+func (a *App) StartSyncRule(id string) error {
+	rule, ok := a.findSyncRule(id)
+	if !ok {
+		return errors.New("sync rule not found")
+	}
+	if err := a.sync.Start(rule); err != nil {
+		return err
+	}
+	rule.Enabled = true
+	a.updateSyncRule(rule)
+	return a.saveConfig()
+}
+
+func (a *App) StopSyncRule(id string) error {
+	if err := a.sync.Stop(id); err != nil {
+		return err
+	}
+	if rule, ok := a.findSyncRule(id); ok {
+		rule.Enabled = false
+		a.updateSyncRule(rule)
+		return a.saveConfig()
+	}
+	return nil
+}
+
+func (a *App) SyncRuleStates() map[string]string           { return a.sync.States() }
+func (a *App) SyncRuleStats() map[string]sync.SyncRuleStat { return a.sync.Stats() }
+func (a *App) SyncRuleConflicts(id string) []sync.Conflict { return a.sync.Conflicts(id) }
+
+func (a *App) ResolveSyncConflict(id, relPath, action string) error {
+	local, err := localStateOf(a.cfg, id, relPath)
+	if err != nil {
+		return err
+	}
+	return a.sync.ResolveConflict(id, relPath, sync.ConflictAction(action), local)
+}
+
+func (a *App) ConfirmSyncRuleDeletes(id, fingerprint string) error {
+	return a.sync.ConfirmDeletes(id, fingerprint)
+}
+
+func (a *App) findSyncRule(id string) (config.SyncRule, bool) {
+	if a.cfg == nil {
+		return config.SyncRule{}, false
+	}
+	for _, e := range a.cfg.Syncs {
+		if e.ID == id {
+			return e, true
+		}
+	}
+	return config.SyncRule{}, false
+}
+
+func (a *App) updateSyncRule(u config.SyncRule) {
+	for i := range a.cfg.Syncs {
+		if a.cfg.Syncs[i].ID == u.ID {
+			a.cfg.Syncs[i] = u
+		}
+	}
+}
+
+// localStateOf 读取本地文件现状，供冲突裁决使用（只读，不做传输）。
+func localStateOf(cfg *config.AppConfig, id, rel string) (sync.LocalState, error) {
+	for _, e := range cfg.Syncs {
+		if e.ID != id {
+			continue
+		}
+		target, err := sync.LocalTarget(e.LocalPath, rel)
+		if err != nil {
+			return sync.LocalState{}, err
+		}
+		st, err := os.Stat(target)
+		if err != nil {
+			// 只有"确实不存在"才是 Exists=false；权限/符号链接环等错误必须
+			// 上抛，否则冲突裁决会把不可读的本地文件当成不存在。
+			if errors.Is(err, fs.ErrNotExist) {
+				return sync.LocalState{Exists: false}, nil
+			}
+			return sync.LocalState{}, err
+		}
+		return sync.LocalState{Exists: true, Size: st.Size(),
+			ModTime: sync.FormatModTime(st.ModTime())}, nil
+	}
+	return sync.LocalState{}, errors.New("sync rule not found")
 }
