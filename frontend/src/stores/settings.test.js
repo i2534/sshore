@@ -50,6 +50,7 @@ describe('settings store defaults', () => {
     expect(s.latinFont).toBe('')
     expect(s.cjkFont).toBe('')
     expect(s.autoStartOnLaunch).toBe(true)
+    expect(s.autoReconnectDefault).toBe(true)
     expect(s.loaded).toBe(false)
   })
 })
