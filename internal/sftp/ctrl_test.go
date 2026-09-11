@@ -9,6 +9,7 @@ import (
 
 	"sshore/internal/forward"
 	"sshore/internal/osutil"
+	"sshore/internal/sshconn"
 )
 
 // fakeRunner records every (name, args) invocation so tests can assert on the
@@ -331,5 +332,73 @@ func TestPutLogsCarrySize(t *testing.T) {
 	last := events[len(events)-1]
 	if !strings.Contains(last.Message, "(2.0 KB)") {
 		t.Fatalf("done should carry size, got %q", last.Message)
+	}
+}
+
+// socket 路径必须随 user 变化：同 host 异 user 绝不能共用 master。
+func TestControlPathKeyedByUser(t *testing.T) {
+	c := NewCtrl(func(string, ...string) (osutil.Outcome, error) { return osutil.Outcome{}, nil }, nil)
+	a := c.controlPathFor("prod-01", "")
+	b := c.controlPathFor("prod-01", "alice")
+	if a == b {
+		t.Fatalf("同 host 异 user 必须得到不同 socket: %q", a)
+	}
+}
+
+// Disconnect/Connected 只拿到 host，必须用内部记住的 user 反查同一个 socket。
+func TestRememberedUserUsedByHostOnlyAPI(t *testing.T) {
+	c := NewCtrl(func(string, ...string) (osutil.Outcome, error) { return osutil.Outcome{}, nil }, nil)
+	c.rememberUser("prod-01", "alice")
+	if got, want := c.controlPathFor("prod-01", c.userFor("prod-01")), c.controlPathFor("prod-01", "alice"); got != want {
+		t.Fatalf("host-only API 未复用记住的 user: %q vs %q", got, want)
+	}
+}
+
+// socket 路径必须与 sshconn 的唯一来源逐字一致：两包各算一遍必然漂移，
+// 一旦漂移 sftp 就永远复用不到 sshconn 建的 master。
+func TestControlPathMatchesSSHConn(t *testing.T) {
+	c := NewCtrl(nil, nil)
+	cases := []struct{ host, user string }{
+		{"prod-01", ""},
+		{"prod-01", "alice"},
+		{"host with space", "u/ser+plus"},
+	}
+	for _, tc := range cases {
+		if got, want := c.controlPathFor(tc.host, tc.user), sshconn.ControlPath(tc.host, tc.user); got != want {
+			t.Fatalf("controlPathFor(%q,%q)=%q, sshconn.ControlPath=%q", tc.host, tc.user, got, want)
+		}
+	}
+}
+
+// Connected/Disconnect 只拿到 host：必须用记住的 user 命中同一个 socket；
+// 未知 host 回退空 user（与旧版 cm-<host>.sock 路径一致）。
+func TestHostOnlyAPIsUseRememberedUserSocket(t *testing.T) {
+	if isWindows {
+		t.Skip("ControlMaster socket path is unix-only")
+	}
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	host, user := "prod-01", "alice"
+	if err := os.WriteFile(sshconn.ControlPath(host, user), nil, 0600); err != nil {
+		t.Fatalf("预置 socket 失败: %v", err)
+	}
+	if c.Connected(host) {
+		t.Fatal("未记住 user 前不应命中 alice 的 socket")
+	}
+	c.rememberUser(host, user)
+	if !c.Connected(host) {
+		t.Fatal("记住 user 后应命中同一 socket")
+	}
+	if err := c.Disconnect(host); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	want := "ControlPath=" + sshconn.ControlPath(host, user)
+	if len(fr.calls) == 0 || !hasArg(fr.calls[0].args, want) {
+		t.Fatalf("Disconnect 未作用在记住的 user socket 上: %v", fr.calls)
+	}
+	if c.Connected("never-seen") {
+		t.Fatal("未知 host 的回退路径不应存在")
 	}
 }

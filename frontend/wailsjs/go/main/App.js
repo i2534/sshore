@@ -6,6 +6,14 @@ export function AutoStartEnabled() {
   return window['go']['main']['App']['AutoStartEnabled']();
 }
 
+export function ConfirmSyncRuleDeletes(arg1, arg2) {
+  return window['go']['main']['App']['ConfirmSyncRuleDeletes'](arg1, arg2);
+}
+
+export function CreateSyncRule(arg1) {
+  return window['go']['main']['App']['CreateSyncRule'](arg1);
+}
+
 export function CreateTunnel(arg1) {
   return window['go']['main']['App']['CreateTunnel'](arg1);
 }
@@ -16,6 +24,10 @@ export function Cwd() {
 
 export function DeleteLocal(arg1) {
   return window['go']['main']['App']['DeleteLocal'](arg1);
+}
+
+export function DeleteSyncRule(arg1) {
+  return window['go']['main']['App']['DeleteSyncRule'](arg1);
 }
 
 export function DeleteTunnel(arg1) {
@@ -58,6 +70,10 @@ export function ListRecentSFTP() {
   return window['go']['main']['App']['ListRecentSFTP']();
 }
 
+export function ListSyncRules() {
+  return window['go']['main']['App']['ListSyncRules']();
+}
+
 export function ListTunnels() {
   return window['go']['main']['App']['ListTunnels']();
 }
@@ -80,6 +96,10 @@ export function PickLocalFile() {
 
 export function RenameLocal(arg1, arg2) {
   return window['go']['main']['App']['RenameLocal'](arg1, arg2);
+}
+
+export function ResolveSyncConflict(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ResolveSyncConflict'](arg1, arg2, arg3);
 }
 
 export function SetSettings(arg1) {
@@ -130,6 +150,10 @@ export function SftpRename(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['SftpRename'](arg1, arg2, arg3, arg4);
 }
 
+export function StartSyncRule(arg1) {
+  return window['go']['main']['App']['StartSyncRule'](arg1);
+}
+
 export function StartTunnel(arg1) {
   return window['go']['main']['App']['StartTunnel'](arg1);
 }
@@ -138,8 +162,24 @@ export function StatLocal(arg1) {
   return window['go']['main']['App']['StatLocal'](arg1);
 }
 
+export function StopSyncRule(arg1) {
+  return window['go']['main']['App']['StopSyncRule'](arg1);
+}
+
 export function StopTunnel(arg1) {
   return window['go']['main']['App']['StopTunnel'](arg1);
+}
+
+export function SyncRuleConflicts(arg1) {
+  return window['go']['main']['App']['SyncRuleConflicts'](arg1);
+}
+
+export function SyncRuleStates() {
+  return window['go']['main']['App']['SyncRuleStates']();
+}
+
+export function SyncRuleStats() {
+  return window['go']['main']['App']['SyncRuleStats']();
 }
 
 export function SyncWindowBackground(arg1) {
@@ -148,6 +188,10 @@ export function SyncWindowBackground(arg1) {
 
 export function TunnelStates() {
   return window['go']['main']['App']['TunnelStates']();
+}
+
+export function UpdateSyncRule(arg1) {
+  return window['go']['main']['App']['UpdateSyncRule'](arg1);
 }
 
 export function UpdateTunnel(arg1) {

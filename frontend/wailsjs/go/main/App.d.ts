@@ -3,14 +3,21 @@
 import {config} from '../models';
 import {main} from '../models';
 import {sftp} from '../models';
+import {sync} from '../models';
 
 export function AutoStartEnabled():Promise<void>;
+
+export function ConfirmSyncRuleDeletes(arg1:string,arg2:string):Promise<void>;
+
+export function CreateSyncRule(arg1:config.SyncRule):Promise<config.SyncRule>;
 
 export function CreateTunnel(arg1:config.Tunnel):Promise<void>;
 
 export function Cwd():Promise<string>;
 
 export function DeleteLocal(arg1:string):Promise<void>;
+
+export function DeleteSyncRule(arg1:string):Promise<void>;
 
 export function DeleteTunnel(arg1:string):Promise<void>;
 
@@ -32,6 +39,8 @@ export function ListLocal(arg1:string):Promise<Array<sftp.Item>>;
 
 export function ListRecentSFTP():Promise<Array<config.RecentSFTP>>;
 
+export function ListSyncRules():Promise<Array<config.SyncRule>>;
+
 export function ListTunnels():Promise<Array<config.Tunnel>>;
 
 export function MkdirLocal(arg1:string):Promise<void>;
@@ -43,6 +52,8 @@ export function PickLocalDir():Promise<string>;
 export function PickLocalFile():Promise<string>;
 
 export function RenameLocal(arg1:string,arg2:string):Promise<void>;
+
+export function ResolveSyncConflict(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function SetSettings(arg1:config.AppSettings):Promise<void>;
 
@@ -68,14 +79,26 @@ export function SftpRemove(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function SftpRename(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
+export function StartSyncRule(arg1:string):Promise<void>;
+
 export function StartTunnel(arg1:string):Promise<void>;
 
 export function StatLocal(arg1:string):Promise<number>;
 
+export function StopSyncRule(arg1:string):Promise<void>;
+
 export function StopTunnel(arg1:string):Promise<void>;
+
+export function SyncRuleConflicts(arg1:string):Promise<Array<sync.Conflict>>;
+
+export function SyncRuleStates():Promise<Record<string, string>>;
+
+export function SyncRuleStats():Promise<Record<string, sync.SyncRuleStat>>;
 
 export function SyncWindowBackground(arg1:string):Promise<void>;
 
 export function TunnelStates():Promise<Record<string, string>>;
+
+export function UpdateSyncRule(arg1:config.SyncRule):Promise<void>;
 
 export function UpdateTunnel(arg1:config.Tunnel):Promise<void>;
