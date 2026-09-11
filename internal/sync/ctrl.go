@@ -583,6 +583,37 @@ func (c *Ctrl) emitThrottled(r *ruleRuntime, key, level, msg string) {
 	}
 }
 
+// refreshDeleteFingerprint 从**当前** r.pendingDel 重新计算删除指纹与统计。
+// **必须在持有 r.mu 时调用**。
+//
+// 非空集合的指纹格式与旧 align 内联实现**完全一致**（轮次时间戳 + 路径集合 FNV），
+// 因此 ConfirmDeletes 的等值校验无需改动。**空集合是有意的例外**：旧实现即使
+// pendingDel 为空也会写一个非空指纹（DeletePaths 为空 slice），本 helper 改为
+// delFP="" / DeleteFingerprint="" / DeletePaths=nil ——「当前没有任何挂起删除」
+// 本就不该被表示成一个可被确认的指纹。
+//
+// 统一收口的原因：事件路径（applyOne 的 ActionDelete）也会往 pendingDel 追加，
+// 若只有 align 写指纹，事件路径挂起的删除永远无法确认；且 pendingDel 变大后
+// 旧指纹不刷新，用户会确认一批与 UI 所示不符的删除。
+func (r *ruleRuntime) refreshDeleteFingerprint() {
+	if len(r.pendingDel) == 0 {
+		r.delFP = ""
+		r.stats.DeletePending = 0
+		r.stats.DeleteFingerprint = ""
+		r.stats.DeletePaths = nil
+		return
+	}
+	h := fnv.New64a()
+	for _, rel := range r.pendingDel {
+		_, _ = h.Write([]byte(rel))
+		_, _ = h.Write([]byte{0})
+	}
+	r.delFP = fmt.Sprintf("%d-%x", time.Now().UnixNano(), h.Sum64())
+	r.stats.DeletePending = len(r.pendingDel)
+	r.stats.DeleteFingerprint = r.delFP
+	r.stats.DeletePaths = append([]string{}, r.pendingDel...)
+}
+
 func (c *Ctrl) align(r *ruleRuntime) {
 	if c.d.ListMany == nil {
 		return
@@ -634,20 +665,11 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	})
 	r.mu.Lock()
 	r.pendingDel = dels
-	// 指纹 = 轮次号 + 路径集合摘要：路径集合一变，指纹就变，确认即失效。
-	h := fnv.New64a()
-	for _, rel := range dels {
-		_, _ = h.Write([]byte(rel))
-		_, _ = h.Write([]byte{0})
-	}
-	r.delFP = fmt.Sprintf("%d-%x", time.Now().UnixNano(), h.Sum64())
-	r.stats.DeletePaths = append([]string{}, dels...)
+	r.refreshDeleteFingerprint()
 	r.logCount = map[string]int{} // 每轮对账后重置节流计数
 	// 完整扫描成功即视为已完成对账，主动解除删除暂停。因此 RootGone/Overflow
 	// 两个闸门臂只在事件路径（blockDels 仍可能为真、且没有全量扫描背书）上生效。
 	r.blockDels = false
-	r.stats.DeletePending = len(dels)
-	r.stats.DeleteFingerprint = r.delFP
 	r.stats.Pending = len(snap.Entries)
 	r.mu.Unlock()
 	_ = r.state.Flush()
@@ -826,7 +848,7 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 		// 由 maybeDelete 在闸门放行后才真正执行。
 		r.mu.Lock()
 		r.pendingDel = append(r.pendingDel, rel)
-		r.stats.DeletePending = len(r.pendingDel)
+		r.refreshDeleteFingerprint()
 		r.mu.Unlock()
 		c.emit(r.rule.ID, "info", "待删除本地 "+rel+"（"+reason+"）")
 	}
@@ -857,9 +879,7 @@ func (c *Ctrl) maybeDelete(r *ruleRuntime, curCount int) {
 	// 闸门放行：清空清单与确认指纹（批次已快照），再执行这一批。
 	r.mu.Lock()
 	r.pendingDel = nil
-	r.delFP = ""
-	r.stats.DeletePending = 0
-	r.stats.DeleteFingerprint = ""
+	r.refreshDeleteFingerprint()
 	r.mu.Unlock()
 	c.executeDeletes(r, batch)
 }
@@ -983,9 +1003,7 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 	}
 	final := append([]string{}, r.pendingDel...)
 	r.pendingDel = nil
-	r.delFP = ""
-	r.stats.DeletePending = 0
-	r.stats.DeleteFingerprint = ""
+	r.refreshDeleteFingerprint()
 	r.mu.Unlock()
 	c.executeDeletes(r, final)
 	return nil

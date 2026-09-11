@@ -640,3 +640,108 @@ func TestStartSeedsFailedAndConflictStatsFromStateFile(t *testing.T) {
 		t.Fatalf("启动后 Conflicts 必须由状态文件播种为 1，得到 %d", got.Conflicts)
 	}
 }
+
+// M5（性质 1）：事件路径挂起的删除也必须带非空指纹，否则「确认删除」永远确认不了。
+func TestEventPathDeleteSuspensionHasFingerprint(t *testing.T) {
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	xf := &fakeXfer{remote: map[string]string{}}
+	c, rule, local := newManualCtrl(t, lm.list, xf)
+	rule.MirrorDelete = true
+	r := attachRuntime(t, c, rule)
+
+	target := filepath.Join(local, "gone.txt")
+	if err := os.WriteFile(target, []byte("abc"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.state.With(func(d *StateFile) {
+		d.Entries["gone.txt"] = &Entry{
+			RemoteSize: st.Size(), RemoteMTime: "2026-09-10 10:00",
+			LocalSize: st.Size(), LocalMTime: FormatModTime(st.ModTime()), HasLocal: true,
+		}
+	})
+	// 事件路径：只说「远端删了」，remote 元信息未知。
+	c.applyOne(r, "gone.txt", watch.KindDelete, nil)
+
+	got := c.Stats()[rule.ID]
+	if got.DeletePending != 1 {
+		t.Fatalf("事件路径挂起删除数应为 1，得到 %d", got.DeletePending)
+	}
+	if got.DeleteFingerprint == "" {
+		t.Fatal("事件路径挂起的删除必须带非空指纹")
+	}
+}
+
+// M5（性质 2）：pendingDel 变化后，先前发出的指纹必须失效。
+func TestDeleteFingerprintInvalidatedWhenPendingGrows(t *testing.T) {
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	xf := &fakeXfer{remote: map[string]string{}}
+	c, rule, local := newManualCtrl(t, lm.list, xf)
+	rule.MirrorDelete = true
+	r := attachRuntime(t, c, rule)
+
+	seedDeletable := func(rel string) {
+		target := filepath.Join(local, rel)
+		if err := os.WriteFile(target, []byte("abc"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		st, err := os.Stat(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.state.With(func(d *StateFile) {
+			d.Entries[rel] = &Entry{RemoteSize: st.Size(), RemoteMTime: "t",
+				LocalSize: st.Size(), LocalMTime: FormatModTime(st.ModTime()), HasLocal: true}
+		})
+	}
+	seedDeletable("a.txt")
+	c.applyOne(r, "a.txt", watch.KindDelete, nil)
+	r.mu.Lock()
+	first := r.stats.DeleteFingerprint
+	r.mu.Unlock()
+	if first == "" {
+		t.Fatal("首轮指纹不应为空")
+	}
+
+	seedDeletable("b.txt")
+	c.applyOne(r, "b.txt", watch.KindDelete, nil)
+	r.mu.Lock()
+	second := r.stats.DeleteFingerprint
+	r.mu.Unlock()
+	if second == first {
+		t.Fatal("pendingDel 变化后指纹必须失效")
+	}
+	// 旧指纹必须被 ConfirmDeletes 拒绝（不会误删新增的那一批）。
+	if err := c.ConfirmDeletes(rule.ID, first); err == nil {
+		t.Fatal("使用过期指纹确认必须被拒绝")
+	}
+}
+
+// M5（FIX 3）：pendingDel 清空后必须把指纹一并清掉 —— 空集合不该有可确认的指纹。
+func TestDeleteFingerprintClearedWhenPendingEmpty(t *testing.T) {
+	c, rule, _ := newManualCtrl(t, nil, nil)
+	r := attachRuntime(t, c, rule)
+
+	r.mu.Lock()
+	r.pendingDel = []string{"a.txt"}
+	r.refreshDeleteFingerprint()
+	r.mu.Unlock()
+	if got := c.Stats()[rule.ID].DeleteFingerprint; got == "" {
+		t.Fatal("非空挂起集必须有指纹")
+	}
+
+	r.mu.Lock()
+	r.pendingDel = nil
+	r.refreshDeleteFingerprint()
+	r.mu.Unlock()
+	got := c.Stats()[rule.ID]
+	if got.DeleteFingerprint != "" {
+		t.Fatalf("清空后 DeleteFingerprint 必须为空串，得到 %q", got.DeleteFingerprint)
+	}
+	if got.DeletePaths != nil {
+		t.Fatalf("清空后 DeletePaths 必须为 nil，得到 %#v", got.DeletePaths)
+	}
+}
