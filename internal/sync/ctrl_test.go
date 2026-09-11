@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -400,6 +401,9 @@ func TestEngineConfirmDeletesRevalidatesFingerprint(t *testing.T) {
 	r.mu.Lock()
 	r.pendingDel = []string{"gone.txt"}
 	r.delFP = "fp-1"
+	// FIX 2b 适配：诚实地模拟"闸门确实以阈值臂挂起过本批"。否则新增的纵深防御
+	// （DeleteNeedsConfirm=false 一律拒绝）会提前拦截，本用例就测不到指纹重校验了。
+	r.stats.DeleteNeedsConfirm = true
 	r.mu.Unlock()
 
 	if err := c.ConfirmDeletes(rule.ID, "fp-1"); err == nil {
@@ -700,6 +704,8 @@ func TestDeleteFingerprintInvalidatedWhenPendingGrows(t *testing.T) {
 	seedDeletable("a.txt")
 	c.applyOne(r, "a.txt", watch.KindDelete, nil)
 	r.mu.Lock()
+	// FIX 2b 适配：模拟闸门以阈值臂挂起本批；否则新增的纵深防御会先拒绝，测不到指纹失效。
+	r.stats.DeleteNeedsConfirm = true
 	first := r.stats.DeleteFingerprint
 	r.mu.Unlock()
 	if first == "" {
@@ -709,6 +715,7 @@ func TestDeleteFingerprintInvalidatedWhenPendingGrows(t *testing.T) {
 	seedDeletable("b.txt")
 	c.applyOne(r, "b.txt", watch.KindDelete, nil)
 	r.mu.Lock()
+	r.stats.DeleteNeedsConfirm = true // 追加后需重新过闸门才可确认
 	second := r.stats.DeleteFingerprint
 	r.mu.Unlock()
 	if second == first {
@@ -743,5 +750,169 @@ func TestDeleteFingerprintClearedWhenPendingEmpty(t *testing.T) {
 	}
 	if got.DeletePaths != nil {
 		t.Fatalf("清空后 DeletePaths 必须为 nil，得到 %#v", got.DeletePaths)
+	}
+}
+
+// FIX 2（后端）：删除闸门结果必须区分"数量阈值挂起（可确认）"与"硬拒绝（不可确认）"。
+// 只有 NeedsConfirm 臂写 DeleteNeedsConfirm=true；任何硬拒绝都必须把它清回 false。
+func TestMaybeDeleteRecordsNeedsConfirmOnlyForThreshold(t *testing.T) {
+	seed := func(t *testing.T, r *ruleRuntime, n int) {
+		t.Helper()
+		local := r.rule.LocalPath
+		rels := make([]string, 0, n)
+		r.state.With(func(d *StateFile) {
+			for i := 0; i < n; i++ {
+				rel := fmt.Sprintf("d%02d.txt", i)
+				if err := os.WriteFile(filepath.Join(local, rel), []byte("abc"), 0644); err != nil {
+					t.Fatal(err)
+				}
+				st, err := osStat(filepath.Join(local, rel))
+				if err != nil {
+					t.Fatal(err)
+				}
+				d.Entries[rel] = &Entry{RemoteSize: st.Size, RemoteMTime: "t",
+					LocalSize: st.Size, LocalMTime: st.ModTime, HasLocal: true}
+				rels = append(rels, rel)
+			}
+		})
+		r.mu.Lock()
+		r.pendingDel = append([]string{}, rels...)
+		r.refreshDeleteFingerprint()
+		r.mu.Unlock()
+	}
+
+	t.Run("阈值臂：挂起并标记可确认", func(t *testing.T) {
+		lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+		c, rule, _ := newManualCtrl(t, lm.list, &fakeXfer{remote: map[string]string{}})
+		r := attachRuntime(t, c, rule)
+		seed(t, r, 10)
+		r.mu.Lock()
+		r.firstRound = false
+		r.blockDels = false
+		r.mu.Unlock()
+		// curCount=100：CountKnown=true 且 CurCount!=0（不触发"远端疑似清空"硬拒绝），
+		// 10*2 < PrevCount(110)，因此只可能命中绝对阈值 n>=10 的 NeedsConfirm 臂。
+		c.maybeDelete(r, 100)
+		got := c.Stats()[rule.ID]
+		if !got.DeleteNeedsConfirm {
+			t.Fatalf("阈值臂挂起必须标记 DeleteNeedsConfirm=true，得到 %+v", got)
+		}
+		if got.DeletePending != 10 || got.DeleteFingerprint == "" {
+			t.Fatalf("阈值臂必须保留挂起清单与指纹，得到 %+v", got)
+		}
+	})
+
+	t.Run("硬拒绝臂：清回不可确认", func(t *testing.T) {
+		cases := map[string]func(r *ruleRuntime){
+			"镜像删除未开启": func(r *ruleRuntime) { r.rule.MirrorDelete = false },
+			"根目录消失":   func(r *ruleRuntime) { r.blockDels = true },
+			"第一轮":     func(r *ruleRuntime) { r.firstRound = true },
+		}
+		for name, prep := range cases {
+			t.Run(name, func(t *testing.T) {
+				lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+				c, rule, _ := newManualCtrl(t, lm.list, &fakeXfer{remote: map[string]string{}})
+				r := attachRuntime(t, c, rule)
+				seed(t, r, 10)
+				r.mu.Lock()
+				r.firstRound = false
+				r.blockDels = false
+				prep(r)
+				// 假装上一轮闸门曾以阈值挂起：硬拒绝必须主动把它清回 false。
+				r.stats.DeleteNeedsConfirm = true
+				r.mu.Unlock()
+				c.maybeDelete(r, 100)
+				if got := c.Stats()[rule.ID]; got.DeleteNeedsConfirm {
+					t.Fatalf("硬拒绝臂 %q 绝不能标记可确认，得到 %+v", name, got)
+				}
+			})
+		}
+	})
+
+	t.Run("远端疑似清空：硬拒绝", func(t *testing.T) {
+		lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+		c, rule, _ := newManualCtrl(t, lm.list, &fakeXfer{remote: map[string]string{}})
+		r := attachRuntime(t, c, rule)
+		seed(t, r, 1)
+		r.mu.Lock()
+		r.firstRound = false
+		r.blockDels = false
+		r.stats.DeleteNeedsConfirm = true
+		r.mu.Unlock()
+		// curCount=0 且 PrevCount=1>0 ⇒ "远端本轮为空而上一轮非空"硬拒绝。
+		c.maybeDelete(r, 0)
+		if got := c.Stats()[rule.ID]; got.DeleteNeedsConfirm {
+			t.Fatalf("远端疑似清空臂绝不能标记可确认，得到 %+v", got)
+		}
+	})
+}
+
+// FIX 2b（纵深防御）：闸门未以阈值臂挂起（DeleteNeedsConfirm=false）时，即使指纹
+// 看似匹配，ConfirmDeletes 也必须拒绝，绝不能凭一个硬拒绝过的批次执行删除。
+func TestConfirmDeletesRefusesWhenGateDidNotSuspend(t *testing.T) {
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	c, rule, local := newManualCtrl(t, lm.list, &fakeXfer{remote: map[string]string{}})
+	r := attachRuntime(t, c, rule)
+
+	target := filepath.Join(local, "gone.txt")
+	if err := os.WriteFile(target, []byte("doomed"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := osStat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 基线取当前 stat ⇒ 若被错误放行，"本地已改"护栏不会救它，会真的被删。
+	r.state.With(func(d *StateFile) {
+		d.Entries["gone.txt"] = &Entry{RemoteSize: st.Size, RemoteMTime: "t",
+			LocalSize: st.Size, LocalMTime: st.ModTime, HasLocal: true}
+	})
+	r.mu.Lock()
+	r.pendingDel = []string{"gone.txt"}
+	r.refreshDeleteFingerprint() // 会重置 DeleteNeedsConfirm=false（模拟硬拒绝臂）
+	fp := r.delFP
+	r.mu.Unlock()
+
+	if err := c.ConfirmDeletes(rule.ID, fp); err == nil {
+		t.Fatal("闸门未以阈值臂挂起时 ConfirmDeletes 必须拒绝")
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("被拒绝的确认绝不能执行删除: %v", err)
+	}
+}
+
+// FIX 2b 正向护栏：真的由阈值臂挂起的批次仍可正常确认并执行，且执行后清回不可确认。
+func TestConfirmDeletesStillWorksWhenGateSuspended(t *testing.T) {
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	c, rule, local := newManualCtrl(t, lm.list, &fakeXfer{remote: map[string]string{}})
+	r := attachRuntime(t, c, rule)
+
+	target := filepath.Join(local, "gone.txt")
+	if err := os.WriteFile(target, []byte("doomed"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := osStat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.state.With(func(d *StateFile) {
+		d.Entries["gone.txt"] = &Entry{RemoteSize: st.Size, RemoteMTime: "t",
+			LocalSize: st.Size, LocalMTime: st.ModTime, HasLocal: true}
+	})
+	r.mu.Lock()
+	r.pendingDel = []string{"gone.txt"}
+	r.refreshDeleteFingerprint()
+	r.stats.DeleteNeedsConfirm = true // 模拟 maybeDelete 的阈值臂结论
+	fp := r.delFP
+	r.mu.Unlock()
+
+	if err := c.ConfirmDeletes(rule.ID, fp); err != nil {
+		t.Fatalf("阈值臂挂起的批次必须可确认: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("确认后文件应被删除，stat err=%v", err)
+	}
+	if got := c.Stats()[rule.ID]; got.DeleteNeedsConfirm {
+		t.Fatalf("执行后必须清回 DeleteNeedsConfirm=false，得到 %+v", got)
 	}
 }
