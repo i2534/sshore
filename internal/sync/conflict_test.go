@@ -78,3 +78,27 @@ func TestResolveUnknownActionKeepsConflict(t *testing.T) {
 		t.Fatalf("未知动作不得改动 d.Entries，得到 %#v", d.Entries)
 	}
 }
+
+// I2 后续耐久性：ent==nil 的冲突（RemoteSize=0/RemoteMTime=""）下选择 keep_local
+// 时，绝不能把零值当成远端基线写进 entry——否则下一轮对账必判"远端变化"并按
+// "远端赢"回下载，覆盖用户刚刚选择保留的文件。未知元信息时干脆不登记任何基线。
+func TestResolveKeepLocalWithoutRemoteMetaLeavesNoBaseline(t *testing.T) {
+	d := &StateFile{Entries: map[string]*Entry{
+		"a.conf": {LocalSize: 5, LocalMTime: "local-t", HasLocal: true},
+	}}
+	UpsertConflict(d, Conflict{RelPath: "a.conf", LocalSize: 5, LocalMTime: "local-t"}) // 未知远端元信息
+	local := LocalState{Exists: true, Size: 5, ModTime: "local-t"}
+	req, err := ResolveConflict(d, "a.conf", ConflictKeepLocal, local, "2026-09-10T12:00:00Z")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if req.Action != ActionSkip || req.RelPath != "a.conf" {
+		t.Fatalf("keep_local 仍必须返回 skip 请求: %#v", req)
+	}
+	if e := d.Entries["a.conf"]; e != nil {
+		t.Fatalf("未知远端元信息时不得写入零值基线，得到 %#v", e)
+	}
+	if len(d.Conflicts) != 0 {
+		t.Fatal("解决后冲突条目必须移除")
+	}
+}
