@@ -53,6 +53,11 @@ type SyncRuleStat struct {
 	// 给 ConfirmSyncRuleDeletes —— 否则确认闭环断裂（无法解除挂起状态）。
 	DeleteFingerprint string
 	DeletePaths       []string
+	// DeleteNeedsConfirm 表示最近一次删除闸门的结果是「数量阈值挂起、等待用户确认」。
+	// 只有这一条臂允许前端展示「确认删除」；其余硬拒绝臂（镜像关闭/根消失/扫描不完整/
+	// 溢出/首轮/远端疑似清空）绝不提供确认入口。SyncRuleStat 无 json tag，运行时键
+	// 即 PascalCase 字段名，前端按 DeleteNeedsConfirm 读取。
+	DeleteNeedsConfirm bool
 }
 
 type ruleRuntime struct {
@@ -596,6 +601,9 @@ func (c *Ctrl) emitThrottled(r *ruleRuntime, key, level, msg string) {
 // 若只有 align 写指纹，事件路径挂起的删除永远无法确认；且 pendingDel 变大后
 // 旧指纹不刷新，用户会确认一批与 UI 所示不符的删除。
 func (r *ruleRuntime) refreshDeleteFingerprint() {
+	// 任何一次清单/指纹重算都作废"可确认"状态：集合一变，先前闸门的 NeedsConfirm
+	// 结论就不再适用于新集合，必须由 maybeDelete 重新过闸门后才可再次确认（FIX 2）。
+	r.stats.DeleteNeedsConfirm = false
 	if len(r.pendingDel) == 0 {
 		r.delFP = ""
 		r.stats.DeletePending = 0
@@ -869,6 +877,11 @@ func (c *Ctrl) maybeDelete(r *ruleRuntime, curCount int) {
 		CountKnown: curCount >= 0, PrevCount: curCount + pending, CurCount: curCount, PendingCount: pending,
 	})
 	if !res.Allowed {
+		r.mu.Lock()
+		// 只有"数量阈值挂起"才是用户可确认的批次；其余硬拒绝臂显式清回 false，
+		// 否则上一轮遗留的 true 会让卡片错误地提供确认入口（FIX 2a）。
+		r.stats.DeleteNeedsConfirm = res.NeedsConfirm
+		r.mu.Unlock()
 		if res.NeedsConfirm {
 			c.emit(r.rule.ID, "warn", fmt.Sprintf("本轮待删 %d 个文件，已挂起等待确认", pending))
 		} else if pending > 0 {
@@ -877,6 +890,7 @@ func (c *Ctrl) maybeDelete(r *ruleRuntime, curCount int) {
 		return
 	}
 	// 闸门放行：清空清单与确认指纹（批次已快照），再执行这一批。
+	// refreshDeleteFingerprint 会把 DeleteNeedsConfirm 清回 false。
 	r.mu.Lock()
 	r.pendingDel = nil
 	r.refreshDeleteFingerprint()
@@ -971,6 +985,13 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 		return fmt.Errorf("规则未在运行: %s", id)
 	}
 	r.mu.Lock()
+	// FIX 2b 纵深防御：只有闸门以"数量阈值"臂挂起的批次才允许确认。硬拒绝臂
+	// （镜像关闭/根消失/扫描不完整/溢出/首轮/远端疑似清空）绝不提供确认入口；
+	// 没有该标记时即使指纹碰巧匹配也必须拒绝。
+	if !r.stats.DeleteNeedsConfirm {
+		r.mu.Unlock()
+		return fmt.Errorf("没有等待确认的删除批次：删除闸门未以数量阈值挂起本批")
+	}
 	if r.delFP != fingerprint {
 		r.mu.Unlock()
 		return fmt.Errorf("确认已过期：删除清单已变化，请重新查看")
@@ -995,8 +1016,12 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 		}
 	}
 	// fetchMeta 是锁外网络往返，期间并发 align 可能换掉清单。删除前**重新**校验
-	// 指纹并取最后一份快照，保证删掉的正是用户确认过的那一批。
+	// 指纹与可确认标记并取最后一份快照，保证删掉的正是用户确认过的那一批。
 	r.mu.Lock()
+	if !r.stats.DeleteNeedsConfirm {
+		r.mu.Unlock()
+		return fmt.Errorf("没有等待确认的删除批次：删除闸门未以数量阈值挂起本批")
+	}
 	if r.delFP != fingerprint {
 		r.mu.Unlock()
 		return fmt.Errorf("确认已过期：删除清单已变化，请重新查看")
