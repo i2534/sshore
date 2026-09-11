@@ -1812,7 +1812,7 @@ git commit -m "feat(watch): 新增降级判定与 inotify 探测源,watch 异常
 
 **Interfaces:**
 - Consumes: `sftp.ListMany`（Task 3）、`Event/Kind/Source`（Task 5）
-- Produces: `Meta`、`Snapshot`、`ListManyFunc`、`MatchExclude(rel, excludes)`、`ScanTree(list, host, user, root, maxDepth, excludes)`、`NewPollSource(list, opts, maxDepth, excludes, after, log)`
+- Produces: `Meta`、`Snapshot`、`ListManyFunc`、`MatchExclude(rel, excludes)`、`ScanTree(ctx, list, host, user, root, maxDepth, excludes)`、`NewPollSource(list, opts, maxDepth, excludes, after, log)`
 
 **两条硬规则**：`Complete=false`（任一目录未知）**绝不产生任何 delete**；第一轮只建立基线、不产事件。
 
