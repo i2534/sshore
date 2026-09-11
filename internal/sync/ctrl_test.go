@@ -916,3 +916,73 @@ func TestConfirmDeletesStillWorksWhenGateSuspended(t *testing.T) {
 		t.Fatalf("执行后必须清回 DeleteNeedsConfirm=false，得到 %+v", got)
 	}
 }
+
+// FIX 2 residual（a）：远端根消失/队列溢出时，consume 立即把"可确认"标记作废。
+// 本测试故意让 ListMany 为 nil，使随后的 align 直接返回（不重算清单、不清标记），
+// 从而隔离出 consume 分支自身的清标记行为。
+func TestConsumeUntrustedRootClearsDeleteConfirm(t *testing.T) {
+	c, rule, _ := newManualCtrl(t, nil, &fakeXfer{remote: map[string]string{}})
+	r := attachRuntime(t, c, rule)
+
+	r.mu.Lock()
+	r.pendingDel = []string{"gone.txt"}
+	r.refreshDeleteFingerprint()
+	r.stats.DeleteNeedsConfirm = true // 模拟 maybeDelete 阈值臂留下的可确认状态
+	fp := r.delFP
+	r.mu.Unlock()
+	if !c.Stats()[rule.ID].DeleteNeedsConfirm {
+		t.Fatal("前置：应处于可确认状态")
+	}
+
+	// 直接把 RootGone 事件送进 consume：分支内应清标记；align 因 ListMany==nil 直接返回。
+	ch := make(chan watch.Event, 1)
+	ch <- watch.Event{Kind: watch.KindRootGone}
+	close(ch)
+	if dropped := c.consume(r, ch); !dropped {
+		t.Fatal("通道关闭时 consume 应返回 true（断开/需要重连）")
+	}
+
+	if got := c.Stats()[rule.ID]; got.DeleteNeedsConfirm {
+		t.Fatalf("根目录消失后必须作废可确认标记，得到 %+v", got)
+	}
+	if err := c.ConfirmDeletes(rule.ID, fp); err == nil {
+		t.Fatal("根目录消失后即使指纹未变，ConfirmDeletes 也必须拒绝")
+	}
+}
+
+// FIX 2 residual（b）：对账扫描出错/不完整时 align 提前返回，必须同时作废"可确认"标记。
+// 否则陈旧标记 + 陈旧指纹会让 ConfirmDeletes 在 fetchMeta 全部"未知"的情况下照删整批。
+func TestAlignIncompleteScanClearsDeleteConfirm(t *testing.T) {
+	// 空 tree：ScanTree 对根路径返回"未知"（map 缺 key）-> snap.Complete=false。
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	c, rule, local := newManualCtrl(t, lm.list, &fakeXfer{remote: map[string]string{}})
+	r := attachRuntime(t, c, rule)
+
+	target := filepath.Join(local, "gone.txt")
+	if err := os.WriteFile(target, []byte("doomed"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	r.pendingDel = []string{"gone.txt"}
+	r.refreshDeleteFingerprint()
+	r.stats.DeleteNeedsConfirm = true // 模拟 maybeDelete 阈值臂留下的可确认状态
+	fp := r.delFP
+	r.mu.Unlock()
+
+	c.align(r) // 扫描不完整 -> 提前返回
+
+	got := c.Stats()[rule.ID]
+	if got.DeleteNeedsConfirm {
+		t.Fatalf("扫描不完整后必须作废可确认标记，得到 %+v", got)
+	}
+	// 按设计：pendingDel/指纹不动，交给下一轮完整对账重算并重跑闸门。
+	if got.DeleteFingerprint != fp || got.DeletePending != 1 {
+		t.Fatalf("不得改动挂起清单/指纹，得到 %+v（期望 fp=%q pending=1）", got, fp)
+	}
+	if err := c.ConfirmDeletes(rule.ID, fp); err == nil {
+		t.Fatal("扫描不完整后即使指纹未变，ConfirmDeletes 也必须拒绝")
+	}
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("被拒绝的确认绝不能删本地文件: %v", err)
+	}
+}

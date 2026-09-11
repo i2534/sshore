@@ -408,6 +408,9 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 				// 强制对账：把整棵远端树重新比一遍，并暂停删除直到确认。
 				r.stats.SourceMissing = ev.Kind == watch.KindRootGone
 				r.blockDels = true
+				// 远端视图已不可信，残留的"可确认"必须立即作废（FIX 2 residual）：
+				// 若随后的 align 也失败/不完整，闸门将无法再被评估，绝不能留下可点的确认。
+				r.invalidateDeleteConfirm()
 				r.mu.Unlock()
 				c.align(r)
 				continue
@@ -622,6 +625,17 @@ func (r *ruleRuntime) refreshDeleteFingerprint() {
 	r.stats.DeletePaths = append([]string{}, r.pendingDel...)
 }
 
+// invalidateDeleteConfirm 作废"可确认"状态。远端视图一旦不可信（根目录消失/队列溢出/
+// 扫描不完整），删除闸门在下一轮完整对账前无法被重新评估；此时若残留
+// DeleteNeedsConfirm=true，UI 会继续提供确认入口，而 fetchMeta 把不可列的路径当作
+// "远端已删"直接跳过（metas 为空、取消循环零次迭代），用户的单次确认就会清掉整批
+// 本地文件——正是闸门要防的场景。
+// pendingDel 本身不动：下一轮**完整** align 会重算它并重跑闸门，那才是判定能否确认的
+// 正确时机。**必须在持有 r.mu 时调用**；本 helper 内不得再取 state.mu。
+func (r *ruleRuntime) invalidateDeleteConfirm() {
+	r.stats.DeleteNeedsConfirm = false
+}
+
 func (c *Ctrl) align(r *ruleRuntime) {
 	if c.d.ListMany == nil {
 		return
@@ -632,6 +646,11 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	}
 	snap, err := watch.ScanTree(context.Background(), c.d.ListMany, r.rule.Host, r.rule.User, r.rule.RemotePath, r.rule.MaxDepth, r.rule.Excludes)
 	if err != nil || !snap.Complete {
+		// 本轮不重算清单、也不跑闸门；旧的可确认标记必须作废，否则它会带着陈旧的
+		// 指纹存活，让 ConfirmDeletes 绕过一个无法再被评估的闸门（FIX 2 residual）。
+		r.mu.Lock()
+		r.invalidateDeleteConfirm()
+		r.mu.Unlock()
 		c.emit(r.rule.ID, "warn", "对账扫描未完成，跳过本轮")
 		return
 	}
