@@ -378,3 +378,121 @@ func TestEventPathSkipsOnNonNotExistStatError(t *testing.T) {
 		t.Fatalf("不可读的本地文件不得被 rename 覆盖，mode=%v err=%v", fi.Mode(), err)
 	}
 }
+
+// I2 后续耐久性（引擎级、决定性）：未知远端元信息导致的冲突选择 keep_local 后，
+// 下一轮对账绝不能把用户保留的本地文件回下载覆盖。同时验证尺寸不同时会带着
+// **真实**远端元信息再冲突一次，第二次裁决后收敛。
+func TestKeepLocalUnknownMetaDoesNotRedownload(t *testing.T) {
+	local := t.TempDir()
+	rule := dirRule(local)
+	rule.MirrorDelete = true                                // 若被误判成删除候选，这里也会立刻暴露
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}} // 首轮：远端元信息未知
+	xf := &fakeXfer{remote: map[string]string{"/r/a.txt": "REMOTE"}}
+	localFile := filepath.Join(local, "a.txt")
+	if err := os.WriteFile(localFile, []byte("local content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c, r := newEventCtrl(t, rule, lm.list, xf)
+
+	// 1) 未知元信息 + 本地已存在 ⇒ 冲突（远端字段为零值）
+	driveEvent(t, c, r, watch.Event{RelPath: "a.txt", Kind: watch.KindWrite})
+	cs := c.Conflicts(rule.ID)
+	if len(cs) != 1 {
+		t.Fatalf("应先产生一个冲突，得到 %+v", cs)
+	}
+	if cs[0].RemoteSize != 0 || cs[0].RemoteMTime != "" {
+		t.Fatalf("本测试的前提是未知远端元信息（零值），得到 %+v", cs[0])
+	}
+
+	// 2) 用户选择保留本地
+	st, err := osStat(localFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ResolveConflict(rule.ID, "a.txt", ConflictKeepLocal, st); err != nil {
+		t.Fatalf("resolve keep_local: %v", err)
+	}
+
+	// 3) 远端其实仍在（真实元信息 Size=6），驱动下一轮对账
+	lm.set("/r", sftp.Item{Name: "a.txt", Size: 6, ModTime: "2026-09-10 10:00"})
+	c.align(r)
+
+	b, err := os.ReadFile(localFile)
+	if err != nil || string(b) != "local content" {
+		t.Fatalf("keep_local 后本地文件被回下载覆盖，err=%v content=%q", err, string(b))
+	}
+	if xf.calls != 0 {
+		t.Fatalf("keep_local 后不得发生任何回下载，calls=%d", xf.calls)
+	}
+
+	// 4) 尺寸不同 ⇒ 带着真实元信息再冲突一次；再次 keep_local 后收敛
+	cs = c.Conflicts(rule.ID)
+	if len(cs) != 1 || cs[0].RemoteSize != 6 || cs[0].RemoteMTime != "2026-09-10 10:00" {
+		t.Fatalf("尺寸不同应带着真实远端元信息再次冲突，得到 %+v", cs)
+	}
+	if err := c.ResolveConflict(rule.ID, "a.txt", ConflictKeepLocal, st); err != nil {
+		t.Fatalf("resolve keep_local(2): %v", err)
+	}
+	c.align(r)
+	if got := c.Conflicts(rule.ID); len(got) != 0 {
+		t.Fatalf("第二次 keep_local 后必须收敛，仍有冲突 %+v", got)
+	}
+	if xf.calls != 0 {
+		t.Fatalf("全程不得发生回下载，calls=%d", xf.calls)
+	}
+	if b, _ := os.ReadFile(localFile); string(b) != "local content" {
+		t.Fatalf("第二次裁决后本地文件也不得被覆盖，content=%q", string(b))
+	}
+}
+
+// 正常路径护栏：冲突携带**真实**远端元信息时，keep_local 仍必须登记 remote_*
+// 作为基线，且下一轮对账保持安静（不重冲突、不下载）。该路径行为不得改变。
+func TestKeepLocalWithRealRemoteMetadataStaysQuiet(t *testing.T) {
+	local := t.TempDir()
+	rule := dirRule(local)
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{
+		"/r/a.txt": {{Name: "a.txt", Size: 6, ModTime: "2026-09-10 10:00"}},
+	}}
+	xf := &fakeXfer{remote: map[string]string{"/r/a.txt": "REMOTE"}}
+	localFile := filepath.Join(local, "a.txt")
+	if err := os.WriteFile(localFile, []byte("local content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c, r := newEventCtrl(t, rule, lm.list, xf)
+
+	driveEvent(t, c, r, watch.Event{RelPath: "a.txt", Kind: watch.KindWrite})
+	cs := c.Conflicts(rule.ID)
+	if len(cs) != 1 || cs[0].RemoteSize != 6 || cs[0].RemoteMTime != "2026-09-10 10:00" {
+		t.Fatalf("应产生携带真实元信息的冲突，得到 %+v", cs)
+	}
+	st, err := osStat(localFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ResolveConflict(rule.ID, "a.txt", ConflictKeepLocal, st); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	var got Entry
+	found := false
+	r.state.With(func(d *StateFile) {
+		if x := d.Entries["a.txt"]; x != nil {
+			got = *x
+			found = true
+		}
+	})
+	if !found || got.RemoteSize != 6 || got.RemoteMTime != "2026-09-10 10:00" || !got.HasLocal {
+		t.Fatalf("真实远端元信息必须被登记为基线，得到 %#v", got)
+	}
+
+	c.align(r)
+	if cs := c.Conflicts(rule.ID); len(cs) != 0 {
+		t.Fatalf("基线正确时不得重新冲突，得到 %+v", cs)
+	}
+	if xf.calls != 0 {
+		t.Fatalf("基线正确时不得回下载，calls=%d", xf.calls)
+	}
+	if b, _ := os.ReadFile(localFile); string(b) != "local content" {
+		t.Fatalf("本地文件不得被覆盖，content=%q", string(b))
+	}
+}

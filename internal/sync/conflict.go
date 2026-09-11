@@ -65,17 +65,29 @@ func ResolveConflict(d *StateFile, rel string, action ConflictAction, local Loca
 		d.Entries = map[string]*Entry{}
 	}
 	if action == ConflictKeepLocal {
-		e := d.Entries[rel]
-		if e == nil {
-			e = &Entry{}
-			d.Entries[rel] = e
-		}
-		// remote_* 保持本次冲突时观测到的远端值，绝不用本地值覆盖。
-		e.RemoteSize, e.RemoteMTime = c.RemoteSize, c.RemoteMTime
-		// local_* 对齐当前磁盘状态，否则下次同步会反复告警同一个文件。
-		e.LocalSize, e.LocalMTime, e.HasLocal = local.Size, local.ModTime, local.Exists
-		if !local.Exists {
+		if c.RemoteSize == 0 && c.RemoteMTime == "" {
+			// 冲突没有携带任何远端元信息（I2 让 ent==nil 的冲突可达）。零值不是
+			// 真实基线：若照常写进 entry，下一轮对账会判"远端变化"并按"远端赢"
+			// 回下载，覆盖用户刚选择保留的文件。此时干脆不登记任何基线——
+			// 下一轮 align 会用真实 meta 重建条目（HasLocal=false）：
+			//   - 本地大小与远端相同 ⇒ Adopt（只登记，不下载）；
+			//   - 大小不同 ⇒ 带着真实元信息再次冲突，第二次裁决即可收敛。
+			// 两条路都不会覆盖本地文件。而在不确知远端时保留本地本身也是最安全
+			// 的选择，所以这里不做"拒绝 keep_local"，只拒绝写入假基线。
 			delete(d.Entries, rel)
+		} else {
+			e := d.Entries[rel]
+			if e == nil {
+				e = &Entry{}
+				d.Entries[rel] = e
+			}
+			// remote_* 保持本次冲突时观测到的远端值，绝不用本地值覆盖。
+			e.RemoteSize, e.RemoteMTime = c.RemoteSize, c.RemoteMTime
+			// local_* 对齐当前磁盘状态，否则下次同步会反复告警同一个文件。
+			e.LocalSize, e.LocalMTime, e.HasLocal = local.Size, local.ModTime, local.Exists
+			if !local.Exists {
+				delete(d.Entries, rel)
+			}
 		}
 	}
 	return req, nil
