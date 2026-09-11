@@ -463,7 +463,9 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 	t.Fatal(msg)
 }
 
-// M2：RetryFailed 重新入队失败项、清空失败计数与清单，并重放用户当初的 save_as 裁决。
+// M2：RetryFailed 重新入队失败项、清空失败计数与清单，并按 Forced 标记重放用户当初
+// 的裁决（强制 take_remote→ActionGet、强制 save_as→ActionSaveAs）。刻意混入一条
+// Forced=false 的普通下载，证明不会把 Decide 推导的动作误当成用户裁决。
 // 用 newManualCtrl/attachRuntime 手动登记运行时（不启动 goroutine），因此不需要
 // 300ms 去抖容差，也不是时序相关的。
 func TestRetryFailedRequeuesClearsAndReplaysSaveAs(t *testing.T) {
@@ -475,8 +477,8 @@ func TestRetryFailedRequeuesClearsAndReplaysSaveAs(t *testing.T) {
 	r.state.With(func(d *StateFile) {
 		d.Failed = []FailedItem{
 			{RelPath: "a.txt", Err: "boom", At: "2026-09-10T10:00:00Z", Action: ActionGet},
-			{RelPath: "b/c.txt", Err: "boom", At: "2026-09-10T10:00:01Z", Action: ActionGet},
-			{RelPath: "secret.key", Err: "boom", At: "2026-09-10T10:00:02Z", Action: ActionSaveAs},
+			{RelPath: "b/c.txt", Err: "boom", At: "2026-09-10T10:00:01Z", Action: ActionGet, Forced: true},
+			{RelPath: "secret.key", Err: "boom", At: "2026-09-10T10:00:02Z", Action: ActionSaveAs, Forced: true},
 		}
 	})
 	r.mu.Lock()
@@ -494,14 +496,22 @@ func TestRetryFailedRequeuesClearsAndReplaysSaveAs(t *testing.T) {
 	}
 	r.mu.Lock()
 	gotA, gotB, gotC := r.queue["a.txt"], r.queue["b/c.txt"], r.queue["secret.key"]
-	resolved := r.resolved["secret.key"]
+	forcedGet := r.resolved["b/c.txt"]
+	forcedSaveAs := r.resolved["secret.key"]
+	_, ordinaryDownloadWasForced := r.resolved["a.txt"]
 	failedStat := r.stats.Failed
 	r.mu.Unlock()
 	if gotA != watch.KindWrite || gotB != watch.KindWrite || gotC != watch.KindWrite {
 		t.Fatalf("三条都应入队为 KindWrite，得到 %v %v %v", gotA, gotB, gotC)
 	}
-	if resolved != ActionSaveAs {
-		t.Fatalf("save_as 失败项必须重放为 resolved=ActionSaveAs，得到 %v", resolved)
+	if forcedGet != ActionGet {
+		t.Fatalf("强制 take_remote（Forced 的 ActionGet）必须重放为 resolved=ActionGet，得到 %v", forcedGet)
+	}
+	if forcedSaveAs != ActionSaveAs {
+		t.Fatalf("save_as 失败项必须重放为 resolved=ActionSaveAs，得到 %v", forcedSaveAs)
+	}
+	if ordinaryDownloadWasForced {
+		t.Fatal("Forced=false 的普通下载不得写入 resolved（会被误当成用户裁决）")
 	}
 	if failedStat != 2 {
 		t.Fatalf("应按实际重排条数扣减（5-3=2）而不是清零，得到 %d", failedStat)
@@ -544,5 +554,89 @@ func TestConflictStatReflectsPendingNotTotal(t *testing.T) {
 	}
 	if got := c.Stats()[rule.ID].Conflicts; got != 0 {
 		t.Fatalf("裁决后计数必须归零，得到 %d", got)
+	}
+}
+
+// M3 配套：成功执行强制 take_remote（ActionGet）会 removeConflict，计数必须同步归零。
+// 这是第三个冲突移除点（另两处是 ResolveConflict 与 save_as）；漏刷新会让「冲突」
+// 按钮在背后已无冲突时仍然显示。
+func TestConflictStatZeroAfterSuccessfulForcedGet(t *testing.T) {
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	xf := &fakeXfer{remote: map[string]string{"/r/a.txt": "rem"}}
+	c, rule, local := newManualCtrl(t, lm.list, xf)
+	r := attachRuntime(t, c, rule)
+
+	if err := os.WriteFile(filepath.Join(local, "a.txt"), []byte("much longer local content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r.state.With(func(d *StateFile) {
+		d.Entries["a.txt"] = &Entry{RemoteSize: 3, RemoteMTime: "2026-09-10 10:00"}
+	})
+	c.applyOne(r, "a.txt", watch.KindWrite, &Entry{RemoteSize: 3, RemoteMTime: "2026-09-10 10:00"})
+	if got := c.Stats()[rule.ID].Conflicts; got != 1 {
+		t.Fatalf("前置：应产生 1 条挂起冲突，得到 %d", got)
+	}
+	// 走强制通道执行 take_remote：下载成功后 removeConflict，计数必须同步下降。
+	c.applyResolved(r, "a.txt", ActionGet)
+	if got := c.Stats()[rule.ID].Conflicts; got != 0 {
+		t.Fatalf("成功 take_remote 后冲突计数必须归零，得到 %d", got)
+	}
+	r.state.With(func(d *StateFile) {
+		if len(d.Conflicts) != 0 {
+			t.Fatalf("成功 take_remote 后状态文件里不应再有冲突，得到 %#v", d.Conflicts)
+		}
+	})
+}
+
+// M3 配套：成功 save_as 同样会 removeConflict，计数必须同步归零。
+func TestConflictStatZeroAfterSuccessfulForcedSaveAs(t *testing.T) {
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	xf := &fakeXfer{remote: map[string]string{"/r/a.txt": "rem"}}
+	c, rule, local := newManualCtrl(t, lm.list, xf)
+	r := attachRuntime(t, c, rule)
+
+	if err := os.WriteFile(filepath.Join(local, "a.txt"), []byte("much longer local content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r.state.With(func(d *StateFile) {
+		d.Entries["a.txt"] = &Entry{RemoteSize: 3, RemoteMTime: "2026-09-10 10:00"}
+	})
+	c.applyOne(r, "a.txt", watch.KindWrite, &Entry{RemoteSize: 3, RemoteMTime: "2026-09-10 10:00"})
+	if got := c.Stats()[rule.ID].Conflicts; got != 1 {
+		t.Fatalf("前置：应产生 1 条挂起冲突，得到 %d", got)
+	}
+	c.applyResolved(r, "a.txt", ActionSaveAs)
+	if got := c.Stats()[rule.ID].Conflicts; got != 0 {
+		t.Fatalf("成功 save_as 后冲突计数必须归零，得到 %d", got)
+	}
+}
+
+// 重启后统计必须从状态文件播种：失败清单还在盘上，Failed 就不能是 0，否则重试按钮
+// 被隐藏、用户无从触发 RetryFailed；冲突计数同理。
+func TestStartSeedsFailedAndConflictStatsFromStateFile(t *testing.T) {
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{}}
+	xf := &fakeXfer{remote: map[string]string{}}
+	c, rule, _ := newTestCtrl(t, lm.list, xf)
+
+	st := NewStateStore(filepath.Join(c.d.StateDir, "sync-"+rule.ID+".json"), c.fingerprintOf(rule))
+	st.With(func(d *StateFile) {
+		d.Failed = []FailedItem{{RelPath: "a.txt", Err: "boom", At: "2026-09-10T10:00:00Z", Action: ActionGet}}
+		d.Conflicts = []Conflict{{RelPath: "b.txt"}}
+	})
+	if err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.Start(rule); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Stop(rule.ID)
+
+	got := c.Stats()[rule.ID]
+	if got.Failed != 1 {
+		t.Fatalf("启动后 Failed 必须由状态文件播种为 1，得到 %d", got.Failed)
+	}
+	if got.Conflicts != 1 {
+		t.Fatalf("启动后 Conflicts 必须由状态文件播种为 1，得到 %d", got.Conflicts)
 	}
 }

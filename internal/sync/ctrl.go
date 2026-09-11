@@ -204,6 +204,14 @@ func (c *Ctrl) Start(rule config.SyncRule) error {
 		rule: rule, state: st, status: "connecting",
 		cancel: make(chan struct{}), queue: map[string]watch.Kind{}, wake: make(chan struct{}, 1),
 	}
+	// 重启后卡片必须能看到持久化的失败/冲突：统计从状态文件播种，而不是从零开始。
+	// 否则失败清单还躺在盘上、Failed 却显示 0，重试按钮被隐藏，用户无从触发。
+	st.With(func(d *StateFile) {
+		r.refreshConflicts(d)
+		r.mu.Lock()
+		r.stats.Failed = len(d.Failed)
+		r.mu.Unlock()
+	})
 	c.mu.Lock()
 	c.run[rule.ID] = r
 	c.mu.Unlock()
@@ -752,12 +760,15 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 			r.mu.Unlock()
 			r.state.With(func(d *StateFile) {
 				d.Failed = append(d.Failed, FailedItem{RelPath: rel, Err: lastErr.Error(),
-					At: time.Now().Format(time.RFC3339), Action: action})
+					At: time.Now().Format(time.RFC3339), Action: action, Forced: hasForced})
 			})
 			return
 		}
 		if saveAs {
-			r.state.With(func(d *StateFile) { removeConflict(d, rel) })
+			r.state.With(func(d *StateFile) {
+				removeConflict(d, rel)
+				r.refreshConflicts(d)
+			})
 			c.emit(r.rule.ID, "info", "远端副本已另存为 "+path.Base(target))
 			return
 		}
@@ -781,6 +792,7 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 				e.RemoteSize, e.RemoteMTime = ent.RemoteSize, ent.RemoteMTime
 			}
 			removeConflict(d, rel)
+			r.refreshConflicts(d)
 		})
 		r.mu.Lock()
 		r.stats.Done++
@@ -806,12 +818,8 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 		r.state.With(func(d *StateFile) {
 			UpsertConflict(d, Conflict{RelPath: rel, RemoteSize: remoteSize, RemoteMTime: remoteMTime,
 				LocalSize: st.Size, LocalMTime: st.ModTime, DetectedAt: time.Now().Format(time.RFC3339)})
-			// M3：计数 = 当前仍挂起的冲突数，不是只增不减的累加器。
-			r.mu.Lock()
-			r.stats.Conflicts = len(d.Conflicts)
-			r.mu.Unlock()
+			r.refreshConflicts(d)
 		})
-		// 原来的 r.stats.Conflicts++ 删除
 		c.emit(r.rule.ID, "warn", rel+" 本地已修改，未覆盖")
 	case ActionDelete:
 		// 绝不在 applyOne 里直接删：删除必须统一过六重闸门。这里只登记，
@@ -907,9 +915,7 @@ func (c *Ctrl) ResolveConflict(id, rel string, action ConflictAction, local Loca
 		req, err = ResolveConflict(d, rel, action, local, time.Now().Format(time.RFC3339))
 		if err == nil {
 			// 裁决即移除一条冲突：计数必须同步下降，卡片上的「冲突」按钮才会消失。
-			r.mu.Lock()
-			r.stats.Conflicts = len(d.Conflicts)
-			r.mu.Unlock()
+			r.refreshConflicts(d)
 		}
 	})
 	if err != nil {
@@ -997,7 +1003,8 @@ func (c *Ctrl) RetryFailed(id string) (int, error) {
 	}
 	type retryItem struct {
 		rel    string
-		saveAs bool
+		action Action
+		forced bool
 	}
 	var items []retryItem
 	r.state.With(func(d *StateFile) {
@@ -1007,7 +1014,7 @@ func (c *Ctrl) RetryFailed(id string) (int, error) {
 		items = make([]retryItem, 0, len(d.Failed))
 		for _, f := range d.Failed {
 			if f.RelPath != "" {
-				items = append(items, retryItem{rel: f.RelPath, saveAs: f.Action == ActionSaveAs})
+				items = append(items, retryItem{rel: f.RelPath, action: f.Action, forced: f.Forced})
 			}
 		}
 		d.Failed = nil
@@ -1015,12 +1022,16 @@ func (c *Ctrl) RetryFailed(id string) (int, error) {
 	r.mu.Lock()
 	for _, it := range items {
 		r.queue[it.rel] = watch.KindWrite
-		if it.saveAs {
-			// 重放用户当初的 save_as 裁决；直接重跑 Decide 会把「另存远端版本」变成冲突卡片。
+		if it.forced {
+			// 重放用户当初的裁决（take_remote→ActionGet、save_as→ActionSaveAs），走引擎
+			// 已有的强制动作通道。绝不能重跑 Decide：对同一冲突状态它只会再判一次
+			// Conflict，用户点过的「用远端覆盖」会被一张全新的冲突卡片顶掉。
+			// 判据必须是 Forced 而不是 Action —— Decide 推导的普通下载同样是 ActionGet，
+			// 按 Action 特判会把普通下载误当成用户裁决。
 			if r.resolved == nil {
 				r.resolved = map[string]Action{}
 			}
-			r.resolved[it.rel] = ActionSaveAs
+			r.resolved[it.rel] = it.action
 		}
 	}
 	// 只减去本次真正重排的条数，**不能直接清零**：r.state.With 摘除 d.Failed 之后、
@@ -1044,6 +1055,16 @@ func (c *Ctrl) RetryFailed(id string) (int, error) {
 	default:
 	}
 	return len(items), nil
+}
+
+// refreshConflicts 让 r.stats.Conflicts 等于状态文件里**当前仍挂起**的冲突数。
+// 必须在 r.state.With 的回调内调用（此时已持 state.mu）：内部只加 r.mu，维持
+// state.mu → r.mu 的锁顺序。所有改动 d.Conflicts 的分支都要经它刷新，否则计数会
+// 与清单漂移 —— 按钮该消失时不消失，或显示一个背后没有任何冲突的计数。
+func (r *ruleRuntime) refreshConflicts(d *StateFile) {
+	r.mu.Lock()
+	r.stats.Conflicts = len(d.Conflicts)
+	r.mu.Unlock()
 }
 
 func removeConflict(d *StateFile, rel string) {
