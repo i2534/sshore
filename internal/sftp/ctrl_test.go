@@ -3,6 +3,7 @@ package sftp
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -64,7 +65,8 @@ func TestBuildBatchAndWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0600 {
+	// Windows 无 chmod 语义（权限由 ACL 决定），跳过权限断言。
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatalf("temp file should be 0600, got %o", info.Mode().Perm())
 	}
 	data, _ := os.ReadFile(p)

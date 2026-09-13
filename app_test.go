@@ -337,6 +337,9 @@ func TestListHostsDetailedEnrichesViaSSH_G(t *testing.T) {
 	if err != nil {
 		t.Skip("ssh binary not available")
 	}
+	if runtime.GOOS == "windows" {
+		t.Skip("该用例依赖 POSIX shell shim 与 HOME 重定向；Windows 的 FindSSHConfigPath 走 USERPROFILE，shim 也无法执行")
+	}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	cfgPath := filepath.Join(home, ".ssh", "config")
@@ -384,6 +387,10 @@ func TestListHostsDetailedEnrichesViaSSH_G(t *testing.T) {
 func TestDeleteLocalRejectsHomeDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	if runtime.GOOS == "windows" {
+		// Windows 的 os.UserHomeDir 读 USERPROFILE，只改 HOME 不生效。
+		t.Setenv("USERPROFILE", home)
+	}
 	a := NewApp()
 	a.Init(func(forward.Event) {})
 
@@ -404,8 +411,12 @@ func TestDeleteLocalRejectsHomeDir(t *testing.T) {
 func TestCheckDeletablePath(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", home)
+	}
 
-	for _, p := range []string{"/", "C:\\", "C:/", "c:\\"} {
+	// 文件系统根按平台取：Windows 是 "\\"，Unix 是 "/"。
+	for _, p := range []string{string(filepath.Separator), "C:\\", "C:/", "c:\\"} {
 		err := checkDeletablePath(p)
 		if err == nil {
 			t.Fatalf("%q should be rejected", p)
@@ -540,7 +551,7 @@ func TestSftpGetRecordsRecent(t *testing.T) {
 		t.Fatalf("want 1 recent entry, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
 	}
 	e := cfg.RecentSFTP[0]
-	if e.Host != "prod-db" || e.RemoteDir != "/var/log" || e.LocalDir != "/tmp/dl" {
+	if wantR, wantL := filepath.Dir("/var/log/app.log"), filepath.Dir("/tmp/dl/app.log"); e.Host != "prod-db" || e.RemoteDir != wantR || e.LocalDir != wantL {
 		t.Fatalf("wrong entry: %+v", e)
 	}
 	if _, perr := time.Parse(time.RFC3339, e.TS); perr != nil || e.TS == "" {
@@ -562,7 +573,7 @@ func TestSftpPutRecordsRecent(t *testing.T) {
 		t.Fatalf("want 1 recent entry, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
 	}
 	e := cfg.RecentSFTP[0]
-	if e.Host != "prod-db" || e.RemoteDir != "/var/log" || e.LocalDir != "/tmp/dl" {
+	if wantR, wantL := filepath.Dir("/var/log/app.log"), filepath.Dir("/tmp/dl/app.log"); e.Host != "prod-db" || e.RemoteDir != wantR || e.LocalDir != wantL {
 		t.Fatalf("wrong entry: %+v", e)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -185,11 +186,26 @@ func SaveConfig(path string, cfg *AppConfig) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := renameWithRetry(tmp, path); err != nil {
 		_ = os.Remove(tmp) // rename 失败也不遗留临时文件
 		return err
 	}
 	return nil
+}
+
+// renameWithRetry 在 Windows 上有必要：目标文件若正被其他句柄打开（杀毒/索引器/
+// 并发读者），MoveFileEx 会返回共享冲突（Access is denied）。这类冲突通常是瞬时的，
+// 短暂重试即可成功；超过次数仍失败才如实返回错误。Unix 上 rename 极少瞬时失败，
+// 重试无副作用。
+func renameWithRetry(oldpath, newpath string) error {
+	var err error
+	for i := 0; i < 20; i++ {
+		if err = os.Rename(oldpath, newpath); err == nil {
+			return nil
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return err
 }
 
 // writeConfigFile encodes cfg as TOML into a fresh file at path with mode 0600.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,25 +65,31 @@ func TestSaveConfigConcurrentSavesNeverCorrupt(t *testing.T) {
 	stop := make(chan struct{})
 	var torn int32
 	var reader sync.WaitGroup
-	reader.Add(1)
-	go func() {
-		defer reader.Done()
-		for {
-			select {
-			case <-stop:
-				return
-			default:
+	// Windows 用强制文件锁：替换目标文件时若正被读句柄打开会返回共享冲突，
+	// 「持续并发读 + 并发替换」在该平台不受支持。热读只在 Unix 上跑；
+	// Windows 仍保留 8 路并发写与收尾后的完整性校验。
+	hotReader := runtime.GOOS != "windows"
+	if hotReader {
+		reader.Add(1)
+		go func() {
+			defer reader.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := os.Stat(path); err != nil {
+					continue // 首个保存尚未落盘
+				}
+				cfg, err := LoadConfig(path)
+				if err != nil || len(cfg.Tunnels) == 0 || mixedWriterPrefixes(cfg.Tunnels) {
+					atomic.StoreInt32(&torn, 1)
+					return
+				}
 			}
-			if _, err := os.Stat(path); err != nil {
-				continue // 首个保存尚未落盘
-			}
-			cfg, err := LoadConfig(path)
-			if err != nil || len(cfg.Tunnels) == 0 || mixedWriterPrefixes(cfg.Tunnels) {
-				atomic.StoreInt32(&torn, 1)
-				return
-			}
-		}
-	}()
+		}()
+	}
 
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
@@ -106,8 +113,10 @@ func TestSaveConfigConcurrentSavesNeverCorrupt(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
-	close(stop)
-	reader.Wait()
+	if hotReader {
+		close(stop)
+		reader.Wait()
+	}
 
 	if atomic.LoadInt32(&torn) != 0 {
 		t.Fatal("reader observed an empty, undecodable or mixed config mid-save")
