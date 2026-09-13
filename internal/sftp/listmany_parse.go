@@ -9,12 +9,17 @@ import "strings"
 //
 // 关键：失败的块必须判为"未知"并**缺席于返回值**。实测（真实 OpenSSH）中 `sftp -b`
 // 把客户端错误原文写到 **stderr**（形如 `Can't ls: "<path>" not found`，退出码仍为 0），
-// 失败目录在 stdout 里**只剩一行回显、内容为空**。若把空块当成"目录是空的"，就会把
-// "列不出来"误当成空目录，进而对整棵子树产出 delete 事件。规则是：**空块 = 未知**。
+// 失败目录在 stdout 里**只剩一行回显、内容为空**。若把这种空块当成"目录是空的"，就会把
+// "列不出来"误当成空目录，进而对整棵子树产出 delete 事件。
+//
+// 但"空块"并不总是失败：Linux OpenSSH 成功列目录时至少输出 "." 与 ".."，
+// **Windows OpenSSH 不输出** "." / ".."（实测），所以 Windows 上"存在但为空"的目录
+// 在 stdout 里同样是空块。二者只能靠 stderr 区分：该路径有失败原文 ⇒ 未知；
+// 没有 ⇒ 空目录。为此调用方必须把 stderr 一并传进来（见 ListMany）。
 //
 // 归属按索引：第 i 个回显块对应 paths[i]。若块数少于请求数（批处理被截断/回显缺失），
 // 多出来的路径一律**缺席**（未知），绝不为它们返回空列表；调用方凭缺失的 key 判断完整性。
-func parseListMany(out string, paths []string) map[string][]Item {
+func parseListMany(out, stderr string, paths []string) map[string][]Item {
 	res := make(map[string][]Item, len(paths))
 	blocks := splitBlocks(out)
 	for i, p := range paths {
@@ -22,11 +27,14 @@ func parseListMany(out string, paths []string) map[string][]Item {
 			// 没有对应回显块的路径：未知，缺席于返回值。
 			break
 		}
-		// 安全不变量:去掉回显后内容为空/全空白 ⇒ 列表根本没发生 ⇒ 未知。
-		// 实测 OpenSSH sftp 把 "Can't ls" 写到 stderr,失败目录在 stdout 里只剩一行回显;
-		// 成功的 ls -la 至少输出 "." 与 "..",所以空块绝不可能是空目录。若把它当场空目录,
-		// diff 会把该目录下已知的全部文件判为删除,配合 mirror-delete 会删掉本地文件。
+		// 空块：(a) 列不出来（未知）还是 (b) 目录确实为空？
+		// 该路径在 stderr 里有失败原文 ⇒ (a)；没有 ⇒ (b) 空目录。
+		// Windows OpenSSH 成功列表不含 "." / ".."，空目录的块就是空的。
 		if strings.TrimSpace(blocks[i]) == "" {
+			if stderrListFailure(stderr, p) != "" {
+				continue
+			}
+			res[p] = []Item{}
 			continue
 		}
 		if blockFailed(blocks[i]) {
