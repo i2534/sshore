@@ -348,7 +348,9 @@ func (c *Ctrl) ListMany(host, user string, paths []string) (map[string][]Item, e
 		c.logEvent(host, "error", "sftp ls many failed: "+commandErr(out))
 		return nil, fmt.Errorf("sftp ListMany failed: %s", commandErr(out))
 	}
-	res := parseListMany(out.Stdout, paths)
+	// stderr 一并传入：Windows OpenSSH 的成功列表不含 "." / ".."，
+	// 空块只有靠该路径的 stderr 失败原文才能与"空目录"区分开。
+	res := parseListMany(out.Stdout, out.Stderr, paths)
 	// stderr 是客户端错误行的真实来源(实测 OpenSSH sftp)。stdout 里失败目录只剩回显行,
 	// 空块不变量已把它判为未知;这里再按请求路径反查 stderr:既兜底,
 	// 又把"为什么列不出来"的远端原文写进日志。
