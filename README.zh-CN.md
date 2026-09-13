@@ -73,7 +73,7 @@ wails dev
   端口预检、错误分类
 - `internal/sftp` — 每次操作一个 `sftp -b` 进程，`ls -la` 输出解析
 - `internal/importer` — 将 `ssh -L/-R/-D` 命令行分词为规则（注入安全）
-- `frontend/src` — Vue 3 UI（左侧导航模块切换：转发 / SFTP / 同步）+ Pinia 日志存储
+- `frontend/src` — Vue 3 UI（左侧导航模块切换：转发 / SFTP / 文件同步）+ Pinia 日志存储
 
 ## 测试
 

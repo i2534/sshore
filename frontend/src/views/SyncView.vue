@@ -107,7 +107,7 @@ async function pickLocalDir() {
 }
 
 async function remove(rule) {
-  const ok = await openConfirm('确认删除', '删除同步规则「' + ruleLabel(rule) + '」？这会同时清理它的状态文件与本地临时残留。')
+  const ok = await openConfirm('确认删除', '删除文件同步规则「' + ruleLabel(rule) + '」？这会同时清理它的状态文件与本地临时残留。')
   if (!ok) return
   opError.value = ''
   try {
@@ -287,7 +287,7 @@ onUnmounted(() => { active = false; unsubscribe() })
 
       <p v-if="loadError" class="empty err">加载失败: {{ loadError }}</p>
       <p v-if="opError" class="empty err">{{ opError }}</p>
-      <p v-else-if="!rules.length" class="empty">暂无同步规则，点「+ 新建规则」</p>
+      <p v-else-if="!rules.length" class="empty">暂无文件同步规则，点「+ 新建规则」</p>
     </div>
 
     <div class="panel ui-panel">
