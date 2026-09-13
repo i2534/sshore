@@ -74,6 +74,7 @@ export const useSettingsStore = defineStore('settings', {
     latinFont: '',
     cjkFont: '',
     autoStartOnLaunch: true,
+    autoReconnectDefault: true,
     loaded: false,
   }),
   actions: {
@@ -85,6 +86,7 @@ export const useSettingsStore = defineStore('settings', {
       this.latinFont = s.latin_font || ''
       this.cjkFont = s.cjk_font || ''
       this.autoStartOnLaunch = s.auto_start_on_launch !== false
+      this.autoReconnectDefault = s.auto_reconnect_default !== false
       this.loaded = true
       this.apply()
       this.ensureSystemListener()
@@ -96,6 +98,7 @@ export const useSettingsStore = defineStore('settings', {
         latin_font: this.latinFont,
         cjk_font: this.cjkFont,
         auto_start_on_launch: this.autoStartOnLaunch,
+        auto_reconnect_default: this.autoReconnectDefault,
       })
     },
     // 把当前状态写到根节点（data-theme / --ui-scale / --font-latin / --font-cjk）

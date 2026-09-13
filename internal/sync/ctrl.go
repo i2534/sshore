@@ -53,6 +53,11 @@ type SyncRuleStat struct {
 	// 给 ConfirmSyncRuleDeletes —— 否则确认闭环断裂（无法解除挂起状态）。
 	DeleteFingerprint string
 	DeletePaths       []string
+	// DeleteNeedsConfirm 表示最近一次删除闸门的结果是「数量阈值挂起、等待用户确认」。
+	// 只有这一条臂允许前端展示「确认删除」；其余硬拒绝臂（镜像关闭/根消失/扫描不完整/
+	// 溢出/首轮/远端疑似清空）绝不提供确认入口。SyncRuleStat 无 json tag，运行时键
+	// 即 PascalCase 字段名，前端按 DeleteNeedsConfirm 读取。
+	DeleteNeedsConfirm bool
 }
 
 type ruleRuntime struct {
@@ -204,6 +209,14 @@ func (c *Ctrl) Start(rule config.SyncRule) error {
 		rule: rule, state: st, status: "connecting",
 		cancel: make(chan struct{}), queue: map[string]watch.Kind{}, wake: make(chan struct{}, 1),
 	}
+	// 重启后卡片必须能看到持久化的失败/冲突：统计从状态文件播种，而不是从零开始。
+	// 否则失败清单还躺在盘上、Failed 却显示 0，重试按钮被隐藏，用户无从触发。
+	st.With(func(d *StateFile) {
+		r.refreshConflicts(d)
+		r.mu.Lock()
+		r.stats.Failed = len(d.Failed)
+		r.mu.Unlock()
+	})
 	c.mu.Lock()
 	c.run[rule.ID] = r
 	c.mu.Unlock()
@@ -270,16 +283,26 @@ func (c *Ctrl) loop(r *ruleRuntime) {
 			c.emit(r.rule.ID, "error", "无法启动探测："+err.Error())
 			return
 		}
+		// kind=file 恒定走轮询（newSource 里 inotify 分支显式排除单文件），
+		// 所以即使远端装了 inotifywait，也必须如实报告 poll —— 否则卡片徽章
+		// 会谎报“实时”，而实际是每 N 秒轮询。
+		effMode, effReason := info.Mode, info.Reason
+		if r.rule.Kind == "file" {
+			effMode = "poll"
+			if effReason == "" {
+				effReason = "单文件规则使用轮询探测"
+			}
+		}
 		r.mu.Lock()
 		r.src = src
 		r.status = "connected"
 		r.stableAt = time.Now()
-		r.stats.Mode = info.Mode
-		r.stats.Reason = info.Reason
+		r.stats.Mode = effMode
+		r.stats.Reason = effReason
 		r.stats.PollIntervalS = r.rule.PollIntervalS
 		r.mu.Unlock()
-		if info.Mode == "poll" {
-			c.emit(r.rule.ID, "warn", "已降级为轮询："+info.Reason)
+		if effMode == "poll" {
+			c.emit(r.rule.ID, "warn", "已降级为轮询："+effReason)
 		} else {
 			c.emit(r.rule.ID, "info", "监控已启动：inotify")
 		}
@@ -358,6 +381,7 @@ func (c *Ctrl) newSource(r *ruleRuntime, info watch.Info) (watch.Source, error) 
 	opts := watch.DetectOpts{
 		Host: r.rule.Host, User: r.rule.User, RemotePath: r.rule.RemotePath,
 		ForcePoll: r.rule.ForcePoll, PollInterval: time.Duration(r.rule.PollIntervalS) * time.Second,
+		FileRoot: r.rule.Kind == "file",
 	}
 	logf := func(level, msg string) { c.emit(r.rule.ID, level, msg) }
 	// kind=file 强制轮询：inotify 下根路径就是那个文件，%w%f 的 rel 恒为空串，
@@ -395,6 +419,9 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 				// 强制对账：把整棵远端树重新比一遍，并暂停删除直到确认。
 				r.stats.SourceMissing = ev.Kind == watch.KindRootGone
 				r.blockDels = true
+				// 远端视图已不可信，残留的"可确认"必须立即作废（FIX 2 residual）：
+				// 若随后的 align 也失败/不完整，闸门将无法再被评估，绝不能留下可点的确认。
+				r.invalidateDeleteConfirm()
 				r.mu.Unlock()
 				c.align(r)
 				continue
@@ -414,6 +441,9 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 				continue
 			}
 			r.queue[ev.RelPath] = ev.Kind
+			// 收到范围内的文件事件 ⇒ 远端源可读，源缺失标记必须复位
+			// （单文件规则靠它从"源缺失"恢复）。
+			r.stats.SourceMissing = false
 			overflowed := len(r.queue) > maxQueuePaths
 			if overflowed {
 				r.queue = map[string]watch.Kind{}
@@ -575,6 +605,51 @@ func (c *Ctrl) emitThrottled(r *ruleRuntime, key, level, msg string) {
 	}
 }
 
+// refreshDeleteFingerprint 从**当前** r.pendingDel 重新计算删除指纹与统计。
+// **必须在持有 r.mu 时调用**。
+//
+// 非空集合的指纹格式与旧 align 内联实现**完全一致**（轮次时间戳 + 路径集合 FNV），
+// 因此 ConfirmDeletes 的等值校验无需改动。**空集合是有意的例外**：旧实现即使
+// pendingDel 为空也会写一个非空指纹（DeletePaths 为空 slice），本 helper 改为
+// delFP="" / DeleteFingerprint="" / DeletePaths=nil ——「当前没有任何挂起删除」
+// 本就不该被表示成一个可被确认的指纹。
+//
+// 统一收口的原因：事件路径（applyOne 的 ActionDelete）也会往 pendingDel 追加，
+// 若只有 align 写指纹，事件路径挂起的删除永远无法确认；且 pendingDel 变大后
+// 旧指纹不刷新，用户会确认一批与 UI 所示不符的删除。
+func (r *ruleRuntime) refreshDeleteFingerprint() {
+	// 任何一次清单/指纹重算都作废"可确认"状态：集合一变，先前闸门的 NeedsConfirm
+	// 结论就不再适用于新集合，必须由 maybeDelete 重新过闸门后才可再次确认（FIX 2）。
+	r.stats.DeleteNeedsConfirm = false
+	if len(r.pendingDel) == 0 {
+		r.delFP = ""
+		r.stats.DeletePending = 0
+		r.stats.DeleteFingerprint = ""
+		r.stats.DeletePaths = nil
+		return
+	}
+	h := fnv.New64a()
+	for _, rel := range r.pendingDel {
+		_, _ = h.Write([]byte(rel))
+		_, _ = h.Write([]byte{0})
+	}
+	r.delFP = fmt.Sprintf("%d-%x", time.Now().UnixNano(), h.Sum64())
+	r.stats.DeletePending = len(r.pendingDel)
+	r.stats.DeleteFingerprint = r.delFP
+	r.stats.DeletePaths = append([]string{}, r.pendingDel...)
+}
+
+// invalidateDeleteConfirm 作废"可确认"状态。远端视图一旦不可信（根目录消失/队列溢出/
+// 扫描不完整），删除闸门在下一轮完整对账前无法被重新评估；此时若残留
+// DeleteNeedsConfirm=true，UI 会继续提供确认入口，而 fetchMeta 把不可列的路径当作
+// "远端已删"直接跳过（metas 为空、取消循环零次迭代），用户的单次确认就会清掉整批
+// 本地文件——正是闸门要防的场景。
+// pendingDel 本身不动：下一轮**完整** align 会重算它并重跑闸门，那才是判定能否确认的
+// 正确时机。**必须在持有 r.mu 时调用**；本 helper 内不得再取 state.mu。
+func (r *ruleRuntime) invalidateDeleteConfirm() {
+	r.stats.DeleteNeedsConfirm = false
+}
+
 func (c *Ctrl) align(r *ruleRuntime) {
 	if c.d.ListMany == nil {
 		return
@@ -585,6 +660,11 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	}
 	snap, err := watch.ScanTree(context.Background(), c.d.ListMany, r.rule.Host, r.rule.User, r.rule.RemotePath, r.rule.MaxDepth, r.rule.Excludes)
 	if err != nil || !snap.Complete {
+		// 本轮不重算清单、也不跑闸门；旧的可确认标记必须作废，否则它会带着陈旧的
+		// 指纹存活，让 ConfirmDeletes 绕过一个无法再被评估的闸门（FIX 2 residual）。
+		r.mu.Lock()
+		r.invalidateDeleteConfirm()
+		r.mu.Unlock()
 		c.emit(r.rule.ID, "warn", "对账扫描未完成，跳过本轮")
 		return
 	}
@@ -626,20 +706,11 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	})
 	r.mu.Lock()
 	r.pendingDel = dels
-	// 指纹 = 轮次号 + 路径集合摘要：路径集合一变，指纹就变，确认即失效。
-	h := fnv.New64a()
-	for _, rel := range dels {
-		_, _ = h.Write([]byte(rel))
-		_, _ = h.Write([]byte{0})
-	}
-	r.delFP = fmt.Sprintf("%d-%x", time.Now().UnixNano(), h.Sum64())
-	r.stats.DeletePaths = append([]string{}, dels...)
+	r.refreshDeleteFingerprint()
 	r.logCount = map[string]int{} // 每轮对账后重置节流计数
 	// 完整扫描成功即视为已完成对账，主动解除删除暂停。因此 RootGone/Overflow
 	// 两个闸门臂只在事件路径（blockDels 仍可能为真、且没有全量扫描背书）上生效。
 	r.blockDels = false
-	r.stats.DeletePending = len(dels)
-	r.stats.DeleteFingerprint = r.delFP
 	r.stats.Pending = len(snap.Entries)
 	r.mu.Unlock()
 	_ = r.state.Flush()
@@ -752,12 +823,15 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 			r.mu.Unlock()
 			r.state.With(func(d *StateFile) {
 				d.Failed = append(d.Failed, FailedItem{RelPath: rel, Err: lastErr.Error(),
-					At: time.Now().Format(time.RFC3339)})
+					At: time.Now().Format(time.RFC3339), Action: action, Forced: hasForced})
 			})
 			return
 		}
 		if saveAs {
-			r.state.With(func(d *StateFile) { removeConflict(d, rel) })
+			r.state.With(func(d *StateFile) {
+				removeConflict(d, rel)
+				r.refreshConflicts(d)
+			})
 			c.emit(r.rule.ID, "info", "远端副本已另存为 "+path.Base(target))
 			return
 		}
@@ -781,6 +855,7 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 				e.RemoteSize, e.RemoteMTime = ent.RemoteSize, ent.RemoteMTime
 			}
 			removeConflict(d, rel)
+			r.refreshConflicts(d)
 		})
 		r.mu.Lock()
 		r.stats.Done++
@@ -806,17 +881,15 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 		r.state.With(func(d *StateFile) {
 			UpsertConflict(d, Conflict{RelPath: rel, RemoteSize: remoteSize, RemoteMTime: remoteMTime,
 				LocalSize: st.Size, LocalMTime: st.ModTime, DetectedAt: time.Now().Format(time.RFC3339)})
+			r.refreshConflicts(d)
 		})
-		r.mu.Lock()
-		r.stats.Conflicts++
-		r.mu.Unlock()
 		c.emit(r.rule.ID, "warn", rel+" 本地已修改，未覆盖")
 	case ActionDelete:
 		// 绝不在 applyOne 里直接删：删除必须统一过六重闸门。这里只登记，
 		// 由 maybeDelete 在闸门放行后才真正执行。
 		r.mu.Lock()
 		r.pendingDel = append(r.pendingDel, rel)
-		r.stats.DeletePending = len(r.pendingDel)
+		r.refreshDeleteFingerprint()
 		r.mu.Unlock()
 		c.emit(r.rule.ID, "info", "待删除本地 "+rel+"（"+reason+"）")
 	}
@@ -837,6 +910,11 @@ func (c *Ctrl) maybeDelete(r *ruleRuntime, curCount int) {
 		CountKnown: curCount >= 0, PrevCount: curCount + pending, CurCount: curCount, PendingCount: pending,
 	})
 	if !res.Allowed {
+		r.mu.Lock()
+		// 只有"数量阈值挂起"才是用户可确认的批次；其余硬拒绝臂显式清回 false，
+		// 否则上一轮遗留的 true 会让卡片错误地提供确认入口（FIX 2a）。
+		r.stats.DeleteNeedsConfirm = res.NeedsConfirm
+		r.mu.Unlock()
 		if res.NeedsConfirm {
 			c.emit(r.rule.ID, "warn", fmt.Sprintf("本轮待删 %d 个文件，已挂起等待确认", pending))
 		} else if pending > 0 {
@@ -845,11 +923,10 @@ func (c *Ctrl) maybeDelete(r *ruleRuntime, curCount int) {
 		return
 	}
 	// 闸门放行：清空清单与确认指纹（批次已快照），再执行这一批。
+	// refreshDeleteFingerprint 会把 DeleteNeedsConfirm 清回 false。
 	r.mu.Lock()
 	r.pendingDel = nil
-	r.delFP = ""
-	r.stats.DeletePending = 0
-	r.stats.DeleteFingerprint = ""
+	r.refreshDeleteFingerprint()
 	r.mu.Unlock()
 	c.executeDeletes(r, batch)
 }
@@ -903,6 +980,10 @@ func (c *Ctrl) ResolveConflict(id, rel string, action ConflictAction, local Loca
 	var err error
 	r.state.With(func(d *StateFile) {
 		req, err = ResolveConflict(d, rel, action, local, time.Now().Format(time.RFC3339))
+		if err == nil {
+			// 裁决即移除一条冲突：计数必须同步下降，卡片上的「冲突」按钮才会消失。
+			r.refreshConflicts(d)
+		}
 	})
 	if err != nil {
 		return err
@@ -937,6 +1018,13 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 		return fmt.Errorf("规则未在运行: %s", id)
 	}
 	r.mu.Lock()
+	// FIX 2b 纵深防御：只有闸门以"数量阈值"臂挂起的批次才允许确认。硬拒绝臂
+	// （镜像关闭/根消失/扫描不完整/溢出/首轮/远端疑似清空）绝不提供确认入口；
+	// 没有该标记时即使指纹碰巧匹配也必须拒绝。
+	if !r.stats.DeleteNeedsConfirm {
+		r.mu.Unlock()
+		return fmt.Errorf("没有等待确认的删除批次：删除闸门未以数量阈值挂起本批")
+	}
 	if r.delFP != fingerprint {
 		r.mu.Unlock()
 		return fmt.Errorf("确认已过期：删除清单已变化，请重新查看")
@@ -961,20 +1049,98 @@ func (c *Ctrl) ConfirmDeletes(id, fingerprint string) error {
 		}
 	}
 	// fetchMeta 是锁外网络往返，期间并发 align 可能换掉清单。删除前**重新**校验
-	// 指纹并取最后一份快照，保证删掉的正是用户确认过的那一批。
+	// 指纹与可确认标记并取最后一份快照，保证删掉的正是用户确认过的那一批。
 	r.mu.Lock()
+	if !r.stats.DeleteNeedsConfirm {
+		r.mu.Unlock()
+		return fmt.Errorf("没有等待确认的删除批次：删除闸门未以数量阈值挂起本批")
+	}
 	if r.delFP != fingerprint {
 		r.mu.Unlock()
 		return fmt.Errorf("确认已过期：删除清单已变化，请重新查看")
 	}
 	final := append([]string{}, r.pendingDel...)
 	r.pendingDel = nil
-	r.delFP = ""
-	r.stats.DeletePending = 0
-	r.stats.DeleteFingerprint = ""
+	r.refreshDeleteFingerprint()
 	r.mu.Unlock()
 	c.executeDeletes(r, final)
 	return nil
+}
+
+// RetryFailed 把状态文件里记录的失败项重新入队并唤醒 loop goroutine。
+// 与 ResolveConflict 同一约束：**只入队与唤醒，绝不自己传输** —— UI 线程持状态锁
+// 去下载会与引擎的串行传输形成 ABBA 死锁。
+func (c *Ctrl) RetryFailed(id string) (int, error) {
+	c.mu.Lock()
+	r := c.run[id]
+	c.mu.Unlock()
+	if r == nil {
+		return 0, fmt.Errorf("规则未在运行: %s", id)
+	}
+	type retryItem struct {
+		rel    string
+		action Action
+		forced bool
+	}
+	var items []retryItem
+	r.state.With(func(d *StateFile) {
+		if len(d.Failed) == 0 {
+			return
+		}
+		items = make([]retryItem, 0, len(d.Failed))
+		for _, f := range d.Failed {
+			if f.RelPath != "" {
+				items = append(items, retryItem{rel: f.RelPath, action: f.Action, forced: f.Forced})
+			}
+		}
+		d.Failed = nil
+	})
+	r.mu.Lock()
+	for _, it := range items {
+		r.queue[it.rel] = watch.KindWrite
+		if it.forced {
+			// 重放用户当初的裁决（take_remote→ActionGet、save_as→ActionSaveAs），走引擎
+			// 已有的强制动作通道。绝不能重跑 Decide：对同一冲突状态它只会再判一次
+			// Conflict，用户点过的「用远端覆盖」会被一张全新的冲突卡片顶掉。
+			// 判据必须是 Forced 而不是 Action —— Decide 推导的普通下载同样是 ActionGet，
+			// 按 Action 特判会把普通下载误当成用户裁决。
+			if r.resolved == nil {
+				r.resolved = map[string]Action{}
+			}
+			r.resolved[it.rel] = it.action
+		}
+	}
+	// 只减去本次真正重排的条数，**不能直接清零**：r.state.With 摘除 d.Failed 之后、
+	// 这里更新 stats 之前，引擎 goroutine 可能又记下一个新失败（r.stats.Failed++ 并
+	// append 到 d.Failed）。硬清零会把这个新失败的计数抹掉、又不会重新入队，卡片于是
+	// 显示「失败 0」而失败清单里仍有条目（-race 看不到这种逻辑竞态）。
+	if r.stats.Failed > len(items) {
+		r.stats.Failed -= len(items)
+	} else {
+		r.stats.Failed = 0
+	}
+	r.mu.Unlock()
+	// FIX 4：即使 items 为空（Failed 里全是空 RelPath 被过滤掉），也必须 Flush，
+	// 否则刚清空的 d.Failed 不落盘，重启后又冒出来。
+	_ = r.state.Flush()
+	if len(items) == 0 {
+		return 0, nil
+	}
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+	return len(items), nil
+}
+
+// refreshConflicts 让 r.stats.Conflicts 等于状态文件里**当前仍挂起**的冲突数。
+// 必须在 r.state.With 的回调内调用（此时已持 state.mu）：内部只加 r.mu，维持
+// state.mu → r.mu 的锁顺序。所有改动 d.Conflicts 的分支都要经它刷新，否则计数会
+// 与清单漂移 —— 按钮该消失时不消失，或显示一个背后没有任何冲突的计数。
+func (r *ruleRuntime) refreshConflicts(d *StateFile) {
+	r.mu.Lock()
+	r.stats.Conflicts = len(d.Conflicts)
+	r.mu.Unlock()
 }
 
 func removeConflict(d *StateFile, rel string) {

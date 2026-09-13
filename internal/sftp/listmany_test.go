@@ -31,7 +31,7 @@ const listManyStderr = "Can't ls: \"/tmp/ldm/nope\" not found\r\n"
 // 这是回归测试：真机 stdout 里失败目录只有回显行、没有错误行，旧实现把它当成了空目录。
 func TestParseListManyDistinguishesUnknownFromEmpty(t *testing.T) {
 	paths := []string{"/tmp/ldm/a", "/tmp/ldm/nope", "/tmp/ldm/empty"}
-	got := parseListMany(listManyFixture, paths)
+	got := parseListMany(listManyFixture, listManyStderr, paths)
 
 	if items, ok := got["/tmp/ldm/nope"]; ok {
 		t.Fatalf("stdout 只有回显行的失败目录必须缺席(未知), 得到 %#v", items)
@@ -54,10 +54,12 @@ func TestParseListManyDistinguishesUnknownFromEmpty(t *testing.T) {
 
 // 回显块少于请求数（批处理被截断）时，多出来的路径必须缺席而不是空。
 func TestParseListManyMissingBlocksAreUnknown(t *testing.T) {
-	paths := []string{"/tmp/ldm/a", "/tmp/ldm/never-listed"}
-	got := parseListMany(listManyFixture, paths)
-	if _, ok := got["/tmp/ldm/never-listed"]; ok {
-		t.Fatal("没有对应输出块的路径必须缺席")
+	fixture := "sftp> -ls -la \"/x\"\n"
+	got := parseListMany(fixture, "", []string{"/x", "/y", "/z"})
+	for _, p := range []string{"/y", "/z"} {
+		if _, ok := got[p]; ok {
+			t.Fatalf("没有对应输出块的路径必须缺席: %s", p)
+		}
 	}
 }
 
@@ -68,9 +70,10 @@ func TestParseListManyToleratesCRLFStdout(t *testing.T) {
 		"sftp> -ls -la \"/y\"\r\n" +
 		"drwxr-xr-x    2 lan      lan          4096 Sep 10 20:46 .\r\n" +
 		"drwxr-xr-x    4 lan      lan          4096 Sep 10 20:46 ..\r\n"
-	got := parseListMany(fixture, []string{"/x", "/y"})
+	// /x 的 stderr 有失败原文 ⇒ 未知；/y 的块含 . / .. ⇒ 在场且为空。
+	got := parseListMany(fixture, "Can't ls: \"/x\" not found\r\n", []string{"/x", "/y"})
 	if _, ok := got["/x"]; ok {
-		t.Fatal("CRLF 下回显后无列表内容的块必须判未知")
+		t.Fatal("stderr 有失败原文的空块必须判未知")
 	}
 	y, ok := got["/y"]
 	if !ok || len(y) != 0 {
@@ -78,7 +81,22 @@ func TestParseListManyToleratesCRLFStdout(t *testing.T) {
 	}
 }
 
-// blockFailed 是次级防御（主不变量是「空块=未知」）：
+// 回归：Windows OpenSSH 的成功 ls -la **不输出** "." / ".."，空目录在 stdout 里
+// 就是空块。此时 stderr 没有该路径的失败原文，必须判为"存在且为空"，而不是未知。
+// 否则 Windows 上任何空同步目录都会连续 5 轮扫描失败并让规则进 error。
+func TestParseListManyWindowsShapedEmptyDirIsPresent(t *testing.T) {
+	fixture := "sftp> -ls -la \"/C:/x/empty\"\r\n"
+	got := parseListMany(fixture, "", []string{"/C:/x/empty"})
+	items, ok := got["/C:/x/empty"]
+	if !ok {
+		t.Fatal("stdout 空块 + stderr 无失败原文 ⇒ 必须判为存在且为空")
+	}
+	if len(items) != 0 {
+		t.Fatalf("空目录应为 0 条，得到 %#v", items)
+	}
+}
+
+// blockFailed 是次级防御（主判据是「该路径的 stderr 失败原文」）：
 // 只认紧凑前缀，正常列表行不得因文件名含 "not found" 而误判。
 func TestBlockFailedTightPrefixes(t *testing.T) {
 	if !blockFailed("Can't ls: \"/x\" not found\r\n") {

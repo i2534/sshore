@@ -5,6 +5,7 @@ import { useLogStore } from './stores/logs'
 import { useSettingsStore } from './stores/settings'
 import ForwardView from './views/ForwardView.vue'
 import SftpView from './views/SftpView.vue'
+import SyncView from './views/SyncView.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 
 const active = ref('forward')
@@ -39,13 +40,15 @@ onUnmounted(() => {
     <nav class="sidebar">
       <button :class="{ active: active === 'forward' }" @click="active = 'forward'">端口转发</button>
       <button :class="{ active: active === 'sftp' }" @click="active = 'sftp'">SFTP</button>
+      <button :class="{ active: active === 'sync' }" @click="active = 'sync'">文件同步</button>
       <button class="settings" @click="settingsVisible = true">⚙ 设置</button>
     </nav>
     <main class="workspace">
       <div v-if="fatal" class="fatal">⚠ 界面错误: {{ fatal }} <button class="fatal-close" @click="dismissFatal">×</button></div>
       <KeepAlive>
         <ForwardView v-if="active === 'forward'" key="forward" />
-        <SftpView v-else key="sftp" />
+        <SftpView v-else-if="active === 'sftp'" key="sftp" />
+        <SyncView v-else key="sync" />
       </KeepAlive>
     </main>
     <SettingsDialog :visible="settingsVisible" @close="settingsVisible = false" />

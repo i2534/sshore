@@ -735,6 +735,12 @@ func (a *App) ConfirmSyncRuleDeletes(id, fingerprint string) error {
 	return a.sync.ConfirmDeletes(id, fingerprint)
 }
 
+// RetrySyncRuleFailures 让引擎重试该规则记录在案的失败项。只入队，不在这里传输。
+func (a *App) RetrySyncRuleFailures(id string) error {
+	_, err := a.sync.RetryFailed(id)
+	return err
+}
+
 func (a *App) findSyncRule(id string) (config.SyncRule, bool) {
 	if a.cfg == nil {
 		return config.SyncRule{}, false
