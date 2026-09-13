@@ -92,11 +92,19 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - name: Build linux/amd64 (webkit2_41 tag via Makefile)
         run: make linux
-      - name: Upload linux binary
+      - name: Package linux/amd64 (versioned, platform-suffixed)
+        shell: bash
+        run: |
+          VERSION="$(git describe --tags 2>/dev/null || echo dev)"
+          mkdir -p build/pkg build/dist
+          cp build/bin/sshore README.md LICENSE build/pkg/
+          tar -czf "build/dist/sshore-${VERSION}-linux-amd64.tar.gz" -C build/pkg .
+          ls -la build/dist
+      - name: Upload linux artifact
         uses: actions/upload-artifact@v7
         with:
           name: sshore-linux
-          path: build/bin/sshore
+          path: build/dist/*
 
   build-windows:
     runs-on: windows-latest
@@ -116,11 +124,20 @@ jobs:
         run: |
           VERSION="$(git describe --tags 2>/dev/null || echo dev)"
           wails build -platform windows/amd64 -skipbindings -ldflags "-s -w -X main.Version=$VERSION" -trimpath -upx
-      - name: Upload windows binary
+      - name: Package windows/amd64 (versioned, platform-suffixed)
+        shell: pwsh
+        run: |
+          $v = (git describe --tags 2>$null)
+          if (-not $v) { $v = "dev" }
+          New-Item -ItemType Directory -Force build/pkg, build/dist | Out-Null
+          Copy-Item build/bin/sshore.exe, README.md, LICENSE build/pkg/
+          Compress-Archive -Path "build/pkg/*" -DestinationPath "build/dist/sshore-$v-windows-amd64.zip" -Force
+          Get-ChildItem build/dist | Select-Object Name, Length
+      - name: Upload windows artifact
         uses: actions/upload-artifact@v7
         with:
           name: sshore-windows
-          path: build/bin/sshore.exe
+          path: build/dist/*
 
   release:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
@@ -142,11 +159,17 @@ jobs:
             echo "workflow_dispatch 需要 release_tag 输入" >&2
             exit 1
           fi
+          # 只上传打包产物（.tar.gz/.zip）：文件名自带版本与平台，且压缩包不会
+          # 触发浏览器对可执行文件的"可能有害/删除"拦截。
+          mapfile -t FILES < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "没有找到可上传的打包产物" >&2
+            exit 1
+          fi
+          printf 'release %s:\n' "$RELEASE_TAG"
+          printf '  %s\n' "${FILES[@]}"
           gh release create "$RELEASE_TAG" \
             --title "$RELEASE_TAG" \
             --generate-notes \
-            artifacts/sshore-linux/sshore \
-            artifacts/sshore-windows/sshore.exe 2>/dev/null \
-          || gh release upload "$RELEASE_TAG" \
-            artifacts/sshore-linux/sshore \
-            artifacts/sshore-windows/sshore.exe --clobber
+            "${FILES[@]}" 2>/dev/null \
+          || gh release upload "$RELEASE_TAG" "${FILES[@]}" --clobber
