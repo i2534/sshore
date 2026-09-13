@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"sshore/internal/config"
+	"sshore/internal/osutil"
 	"sshore/internal/sftp"
 	"sshore/internal/watch"
 )
@@ -36,6 +38,13 @@ func (s *scriptedListMany) set(dir string, items ...sftp.Item) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tree[dir] = items
+}
+
+// del 让该路径"列不出来"（map 缺 key），模拟远端源文件/目录消失。
+func (s *scriptedListMany) del(dir string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tree, dir)
 }
 
 // fakeXfer 把"远端内容"落到本地，用于验证原子写与冲突规则。
@@ -984,5 +993,165 @@ func TestAlignIncompleteScanClearsDeleteConfirm(t *testing.T) {
 	}
 	if _, err := os.Stat(target); err != nil {
 		t.Fatalf("被拒绝的确认绝不能删本地文件: %v", err)
+	}
+}
+
+// 回归：真实 sftp 对**文件根**把 Item.Name 返回为完整远端路径（目录根才是
+// basename）。引擎曾照抄该 Name 当 rel，导致运行期内事件被 inScope 静默丢弃
+// 或被 SafeRelPath 拒绝 —— 单文件规则只在启动对齐时同步一次，之后永不更新。
+// 本用例用"文件根返回完整路径"的真实形状锁死该行为。
+func TestEngineFileRuleFullPathRootDetectsChange(t *testing.T) {
+	const remotePath = "/r/a.txt"
+	item := func(size int64, mtime string) sftp.Item {
+		return sftp.Item{Name: remotePath, Size: size, ModTime: mtime}
+	}
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{
+		remotePath: {item(5, "2026-09-10 10:00")},
+	}}
+	xf := &fakeXfer{remote: map[string]string{remotePath: "hello"}}
+	local := t.TempDir()
+	rule := config.SyncRule{
+		ID: "single", Host: "h", Kind: "file", RemotePath: remotePath,
+		LocalPath: local, PollIntervalS: 1, ForcePoll: true, Enabled: true,
+	}
+	rule.Normalize()
+	c := NewCtrl(Deps{
+		ListMany: lm.list, Transfer: xf, StateDir: t.TempDir(),
+		After: func(time.Duration) <-chan struct{} { return nil },
+	})
+	if err := c.Start(rule); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Stop(rule.ID)
+
+	target := filepath.Join(local, "a.txt")
+	wait := func(want string) bool {
+		b, err := os.ReadFile(target)
+		return err == nil && string(b) == want
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !wait("hello") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !wait("hello") {
+		t.Fatalf("首轮未落地：%+v", c.Stats()[rule.ID])
+	}
+
+	// 远端内容变更（大小 + mtime 都变）：轮询应产出事件并重新下载。
+	lm.set(remotePath, item(11, "2026-09-10 11:00"))
+	xf.mu.Lock()
+	xf.remote[remotePath] = "hello world"
+	xf.mu.Unlock()
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !wait("hello world") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !wait("hello world") {
+		got, _ := os.ReadFile(target)
+		t.Fatalf("单文件规则未响应远端变更（回归）：本地=%q stats=%+v", got, c.Stats()[rule.ID])
+	}
+}
+
+// 回归：单文件规则的远端源消失**不是**扫描失败。期望：标记 SourceMissing、
+// 保持 connected（不进 error）、本地保留；源恢复后重新下载并清除标记。
+func TestEngineFileRuleSourceMissingKeepsRuleAlive(t *testing.T) {
+	const remotePath = "/r/a.txt"
+	item := func(size int64, mtime string) sftp.Item {
+		return sftp.Item{Name: remotePath, Size: size, ModTime: mtime}
+	}
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{remotePath: {item(5, "t1")}}}
+	xf := &fakeXfer{remote: map[string]string{remotePath: "hello"}}
+	local := t.TempDir()
+	rule := config.SyncRule{
+		ID: "single-missing", Host: "h", Kind: "file", RemotePath: remotePath,
+		LocalPath: local, PollIntervalS: 1, ForcePoll: true, Enabled: true,
+	}
+	rule.Normalize()
+	c := NewCtrl(Deps{
+		ListMany: lm.list, Transfer: xf, StateDir: t.TempDir(),
+		After: func(time.Duration) <-chan struct{} { return nil },
+	})
+	if err := c.Start(rule); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Stop(rule.ID)
+
+	target := filepath.Join(local, "a.txt")
+	waitState := func(f func(SyncRuleStat) bool, d time.Duration) bool {
+		deadline := time.Now().Add(d)
+		for time.Now().Before(deadline) {
+			if f(c.Stats()[rule.ID]) {
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return false
+	}
+	if !waitState(func(s SyncRuleStat) bool { return s.Done >= 1 }, 5*time.Second) {
+		t.Fatalf("首轮未完成：%+v", c.Stats()[rule.ID])
+	}
+
+	lm.del(remotePath)
+	if !waitState(func(s SyncRuleStat) bool { return s.SourceMissing }, 5*time.Second) {
+		t.Fatalf("源缺失未被标记：%+v", c.Stats()[rule.ID])
+	}
+	if st := c.States()[rule.ID]; st == "error" {
+		t.Fatalf("源缺失不得让规则进 error，state=%s", st)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "hello" {
+		t.Fatalf("源缺失时本地被改动：%q", b)
+	}
+
+	lm.set(remotePath, item(11, "t2"))
+	xf.mu.Lock()
+	xf.remote[remotePath] = "hello again"
+	xf.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, _ := os.ReadFile(target); string(b) == "hello again" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "hello again" {
+		t.Fatalf("源恢复后未重新下载：%q stats=%+v", b, c.Stats()[rule.ID])
+	}
+	if !waitState(func(s SyncRuleStat) bool { return !s.SourceMissing }, 5*time.Second) {
+		t.Fatalf("源恢复后 SourceMissing 未清除：%+v", c.Stats()[rule.ID])
+	}
+}
+
+// 回归：kind=file 恒定走轮询，即使 Detect 返回 inotify 也不得把 stats.Mode
+// 报成 inotify（否则卡片徽章谎报“实时”）。
+func TestEngineFileRuleReportsPollEvenWhenInotifyPresent(t *testing.T) {
+	const remotePath = "/r/a.txt"
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{
+		remotePath: {{Name: remotePath, Size: 1, ModTime: "t1"}},
+	}}
+	xf := &fakeXfer{remote: map[string]string{remotePath: "x"}}
+	// Detect 会执行远端 command -v inotifywait：这里模拟“远端有 inotifywait”。
+	runner := func(ctx context.Context, name string, args ...string) (osutil.Outcome, error) {
+		return osutil.Outcome{ExitCode: 0, Stdout: "/usr/bin/inotifywait"}, nil
+	}
+	rule := config.SyncRule{
+		ID: "fmode", Host: "h", Kind: "file", RemotePath: remotePath,
+		LocalPath: t.TempDir(), PollIntervalS: 1, Enabled: true,
+	}
+	rule.Normalize()
+	c := NewCtrl(Deps{
+		Runner: runner, ListMany: lm.list, Transfer: xf, StateDir: t.TempDir(),
+		After: func(time.Duration) <-chan struct{} { return nil },
+	})
+	if err := c.Start(rule); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Stop(rule.ID)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && c.Stats()[rule.ID].Mode == "" {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := c.Stats()[rule.ID]; got.Mode != "poll" {
+		t.Fatalf("kind=file 在 inotify 主机上也必须报告 poll，得到 %q (Reason=%q)", got.Mode, got.Reason)
 	}
 }

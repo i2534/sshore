@@ -217,3 +217,31 @@ func TestPollSourceStopsOnContextCancel(t *testing.T) {
 		t.Fatal("ctx 取消未关闭 channel")
 	}
 }
+
+// 回归：文件根的真实形状（Item.Name 为完整远端路径）下，变更事件 rel 必须是
+// basename —— 否则引擎侧 inScope/SafeRelPath 会把它丢掉或拒绝（见 scan.go）。
+func TestPollSourceFileRootEmitsBasename(t *testing.T) {
+	const f = "/r/a.txt"
+	fs := newFakeRemote()
+	fs.set(f, sftp.Item{Name: f, Size: 1, ModTime: "t1"})
+	tk := newFakeTicker()
+	src := NewPollSource(fs.list, DetectOpts{RemotePath: f}, 0, nil, tk.after, func(string, string) {})
+	ch, err := src.Start(context.Background())
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer src.Close()
+
+	// 首轮建立基线后改动远端，再推进一轮。
+	fs.set(f, sftp.Item{Name: f, Size: 2, ModTime: "t2"})
+	tk.ch <- time.Now()
+
+	select {
+	case ev := <-ch:
+		if ev.RelPath != "a.txt" || ev.Kind != KindWrite {
+			t.Fatalf("文件根事件 rel 必须是 basename：got %q/%v", ev.RelPath, ev.Kind)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("未收到文件根变更事件")
+	}
+}
