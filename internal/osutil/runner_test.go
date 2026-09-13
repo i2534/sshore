@@ -3,6 +3,7 @@ package osutil
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -29,9 +30,19 @@ func TestExecResult(t *testing.T) {
 	}
 }
 
+// aliveCmd 返回一个能自持数秒的真实命令，且不依赖 Git for Windows 自带的
+// sh/sleep：Windows 用系统 ping，Unix 用 sleep。
+func aliveCmd() (string, []string) {
+	if runtime.GOOS == "windows" {
+		return "ping", []string{"-n", "31", "127.0.0.1"}
+	}
+	return "sleep", []string{"30"}
+}
+
 func TestSpawnerStartKill(t *testing.T) {
 	sp := NewSpawner()
-	p, err := sp.Start("sleep", []string{"30"}, nil)
+	name, args := aliveCmd()
+	p, err := sp.Start(name, args, nil)
 	if err != nil {
 		t.Fatalf("spawn failed: %v", err)
 	}
@@ -47,11 +58,19 @@ func TestSpawnerStartKill(t *testing.T) {
 
 func TestProcessSignal(t *testing.T) {
 	sp := NewSpawner()
-	p, err := sp.Start("sleep", []string{"30"}, nil)
+	name, args := aliveCmd()
+	p, err := sp.Start(name, args, nil)
 	if err != nil {
 		t.Fatalf("spawn failed: %v", err)
 	}
-	if err := p.Signal(); err != nil {
+	err = p.Signal()
+	if runtime.GOOS == "windows" {
+		// Windows 的 os.Process.Signal 不支持 SIGTERM（sigint_windows 返回 SIGTERM），
+		// 返回错误是预期行为；forward.Stop 会在 Signal 失败时回退 Kill。
+		if err == nil {
+			t.Fatal("windows 上 Signal 应返回不支持的错误")
+		}
+	} else if err != nil {
 		t.Fatalf("signal should not error: %v", err)
 	}
 	_ = p.Kill()
@@ -136,8 +155,14 @@ func TestCtxRunnerCancelsProcess(t *testing.T) {
 	r := NewCtxRunner()
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
+	// 直接用 sleep/ping，不经 shell：Windows 上杀掉经 shell 启动的父进程不会连带杀掉
+	// 孙进程，管道要等孙进程自然结束，测不出「取消生效」。
+	name, args := "sleep", []string{"30"}
+	if runtime.GOOS == "windows" {
+		name, args = "ping", []string{"-n", "31", "127.0.0.1"}
+	}
 	start := time.Now()
-	if _, err := r(ctx, "sh", "-c", "sleep 30"); err == nil {
+	if _, err := r(ctx, name, args...); err == nil {
 		t.Fatal("want error from cancelled command")
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {

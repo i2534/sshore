@@ -141,7 +141,9 @@ func exitProcess(t *testing.T, code int) (*osutil.Process, error) {
 func aliveProcess(t *testing.T) (*osutil.Process, error) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
-		return osutil.NewSpawner().Start("cmd", []string{"/c", "timeout", "/t", "30", "/nobreak"}, nil)
+		// 不能用 timeout：stdin/stderr 非控制台时它会立刻报错退出，进程不存活。
+		// ping -n 31 自持约 30s，且不依赖控制台。
+		return osutil.NewSpawner().Start("ping", []string{"-n", "31", "127.0.0.1"}, nil)
 	}
 	return osutil.NewSpawner().Start("sh", []string{"-c", "sleep 30"}, nil)
 }
@@ -357,6 +359,11 @@ func TestAutoReconnectSuccessAfterFirstRetry(t *testing.T) {
 		t.Fatalf("expected a retry spawn, calls=%d", calls)
 	}
 	mu.Unlock()
+	// 等状态落定：假时钟下 respawnLoop 可能在 calls 计数可见之后才写 StateConnected，
+	// 直接断言会撞上调度竞态（Windows 上尤其明显）。
+	for dl := time.Now().Add(3 * time.Second); time.Now().Before(dl) && ctrl.State(tr.ID) != StateConnected; {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if got := ctrl.State(tr.ID); got != StateConnected {
 		t.Fatalf("state should be connected after successful retry, got %s", got)
 	}
@@ -475,6 +482,10 @@ func TestAutoReconnectBackoffSequenceAcrossRetries(t *testing.T) {
 	if firstWarnIdx == -1 || reconnectedIdx == -1 || firstWarnIdx >= reconnectedIdx {
 		t.Fatalf("first entering-reconnect warn must precede the reconnected info; warnIdx=%d reconnectedIdx=%d emitted=%+v",
 			firstWarnIdx, reconnectedIdx, emitted)
+	}
+	// 同上：等状态落定，避免与假时钟下的调度竞态。
+	for dl := time.Now().Add(3 * time.Second); time.Now().Before(dl) && ctrl.State(tr.ID) != StateConnected; {
+		time.Sleep(5 * time.Millisecond)
 	}
 	if got := ctrl.State(tr.ID); got != StateConnected {
 		t.Fatalf("final state should be connected, got %s", got)

@@ -3,6 +3,7 @@ package sync
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -26,7 +27,8 @@ func TestStateStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if st.Mode().Perm() != 0600 {
+	// Windows 无 chmod 语义（权限由 ACL 决定），跳过权限断言。
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0600 {
 		t.Fatalf("状态文件权限应为 0600，得到 %v", st.Mode().Perm())
 	}
 
