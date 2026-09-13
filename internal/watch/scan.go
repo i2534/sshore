@@ -20,6 +20,10 @@ type Meta struct {
 type Snapshot struct {
 	Entries  map[string]Meta
 	Complete bool
+	// RootMissing 表示"根路径本身未知"（depth==0 那一批里 ListMany 缺了根的 key），
+	// 与"某个子目录未知"区分开：单文件规则据此把"远端源文件缺失"识别出来，
+	// 而不是当成连续扫描失败。
+	RootMissing bool
 }
 
 type ListManyFunc func(host, user string, paths []string) (map[string][]sftp.Item, error)
@@ -108,10 +112,19 @@ func ScanTree(ctx context.Context, list ListManyFunc, host, user, root string, m
 			items, ok := res[n.dir]
 			if !ok {
 				snap.Complete = false // 未知，绝不当作空目录
+				if n.depth == 0 {
+					snap.RootMissing = true
+				}
 				continue
 			}
 			for _, it := range items {
-				rel := it.Name
+				// 本层（n.depth==0）的 key 一律取 basename：真实 sftp 对**目录根**
+				// 返回 basename，但对**文件根**（kind=file 的单个远端文件）
+				// sftp ls -l <file> 会把完整远端路径当作 Item.Name 返回。若照抄，
+				// 事件 rel 就成了绝对路径，单文件规则会被 inScope 丢弃或被
+				// SafeRelPath 拒绝，运行中的远端变更永远收不到。文件名不含 "/"，
+				// 所以对目录根取 basename 是恒等的无损操作。
+				rel := path.Base(it.Name)
 				if n.depth > 0 {
 					rel = strings.TrimPrefix(strings.TrimPrefix(n.dir, root), "/") + "/" + it.Name
 				}

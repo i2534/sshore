@@ -283,16 +283,26 @@ func (c *Ctrl) loop(r *ruleRuntime) {
 			c.emit(r.rule.ID, "error", "无法启动探测："+err.Error())
 			return
 		}
+		// kind=file 恒定走轮询（newSource 里 inotify 分支显式排除单文件），
+		// 所以即使远端装了 inotifywait，也必须如实报告 poll —— 否则卡片徽章
+		// 会谎报“实时”，而实际是每 N 秒轮询。
+		effMode, effReason := info.Mode, info.Reason
+		if r.rule.Kind == "file" {
+			effMode = "poll"
+			if effReason == "" {
+				effReason = "单文件规则使用轮询探测"
+			}
+		}
 		r.mu.Lock()
 		r.src = src
 		r.status = "connected"
 		r.stableAt = time.Now()
-		r.stats.Mode = info.Mode
-		r.stats.Reason = info.Reason
+		r.stats.Mode = effMode
+		r.stats.Reason = effReason
 		r.stats.PollIntervalS = r.rule.PollIntervalS
 		r.mu.Unlock()
-		if info.Mode == "poll" {
-			c.emit(r.rule.ID, "warn", "已降级为轮询："+info.Reason)
+		if effMode == "poll" {
+			c.emit(r.rule.ID, "warn", "已降级为轮询："+effReason)
 		} else {
 			c.emit(r.rule.ID, "info", "监控已启动：inotify")
 		}
@@ -371,6 +381,7 @@ func (c *Ctrl) newSource(r *ruleRuntime, info watch.Info) (watch.Source, error) 
 	opts := watch.DetectOpts{
 		Host: r.rule.Host, User: r.rule.User, RemotePath: r.rule.RemotePath,
 		ForcePoll: r.rule.ForcePoll, PollInterval: time.Duration(r.rule.PollIntervalS) * time.Second,
+		FileRoot: r.rule.Kind == "file",
 	}
 	logf := func(level, msg string) { c.emit(r.rule.ID, level, msg) }
 	// kind=file 强制轮询：inotify 下根路径就是那个文件，%w%f 的 rel 恒为空串，
@@ -430,6 +441,9 @@ func (c *Ctrl) consume(r *ruleRuntime, ch <-chan watch.Event) bool {
 				continue
 			}
 			r.queue[ev.RelPath] = ev.Kind
+			// 收到范围内的文件事件 ⇒ 远端源可读，源缺失标记必须复位
+			// （单文件规则靠它从"源缺失"恢复）。
+			r.stats.SourceMissing = false
 			overflowed := len(r.queue) > maxQueuePaths
 			if overflowed {
 				r.queue = map[string]watch.Kind{}
