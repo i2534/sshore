@@ -62,3 +62,7 @@ snake_case。生成的 `frontend/wailsjs/go/main/App.d.ts` 声明为
   宜包进 venv。
 - 前端测试套件在执行环境未能运行（`frontend/node_modules` 未安装），最终复审需说明前端侧
   未经验证。
+- **同步视图日志量（spec §11 W7）**：`sync` 与 `sftp` 两条来源都保留时，每个文件产生
+  3–4 条 info，1000 条环形缓冲约 300 个文件即刷满。首要缓解手段：抑制 `internal/sftp` 的
+  `get done` 行（`internal/sftp/ctrl.go:416`）。本前端计划刻意不实现它——改的是 sftp 的日志
+  行为，属另一主题；若实测噪声过大应立即启用。

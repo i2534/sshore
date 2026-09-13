@@ -17,6 +17,9 @@ type DetectOpts struct {
 	RemotePath   string
 	ForcePoll    bool
 	PollInterval time.Duration
+	// FileRoot 表示 RemotePath 是单个文件（kind=file）。轮询源据此把"源文件
+	// 缺失"识别成根消失（KindRootGone）而不是扫描失败。
+	FileRoot bool
 }
 
 // detectTimeout 探测自身的上限。osutil.CtxRunner 会在超时后真正结束子进程，

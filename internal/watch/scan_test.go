@@ -131,3 +131,21 @@ func TestMatchExclude(t *testing.T) {
 		}
 	}
 }
+
+// 回归：真实 sftp 的 ls -l <file> 会把完整远端路径当作 Item.Name（目录根才是
+// basename）。文件根的快照 key 必须是 basename，否则事件 rel 变成绝对路径，
+// 单文件规则会被 inScope 丢弃或被 SafeRelPath 拒绝，运行中永不更新。
+func TestScanTreeFileRootUsesBasename(t *testing.T) {
+	const f = "/r/a.txt"
+	tree := map[string][]sftp.Item{f: {file(f)}}
+	snap, err := ScanTree(context.Background(), fakeList(tree), "h", "", f, 0, nil)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if _, ok := snap.Entries["a.txt"]; !ok {
+		t.Fatalf("文件根必须按 basename 建 key，得到 %#v", snap.Entries)
+	}
+	if _, ok := snap.Entries[f]; ok {
+		t.Fatalf("不得出现绝对路径 key，得到 %#v", snap.Entries)
+	}
+}

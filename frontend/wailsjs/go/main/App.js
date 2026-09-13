@@ -102,6 +102,10 @@ export function ResolveSyncConflict(arg1, arg2, arg3) {
   return window['go']['main']['App']['ResolveSyncConflict'](arg1, arg2, arg3);
 }
 
+export function RetrySyncRuleFailures(arg1) {
+  return window['go']['main']['App']['RetrySyncRuleFailures'](arg1);
+}
+
 export function SetSettings(arg1) {
   return window['go']['main']['App']['SetSettings'](arg1);
 }

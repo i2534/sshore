@@ -111,6 +111,17 @@ func (p *PollSource) Close() error {
 // round 执行一轮扫描与比对。失败或不完整 ⇒ 零事件 + 失败计数。
 func (p *PollSource) round(ctx context.Context, ch chan Event) {
 	snap, err := ScanTree(ctx, p.list, p.opts.Host, p.opts.User, p.opts.RemotePath, p.maxDepth, p.excludes)
+	// 单文件源缺失不是"扫描失败"：上报根消失，由引擎标记 SourceMissing 并保留
+	// 本地（文件很可能稍后回来）。否则连续 5 轮失败会让整条规则进 error 停摆。
+	if err == nil && p.opts.FileRoot && snap.RootMissing {
+		p.mu.Lock()
+		p.failures = 0
+		// prev 归零：文件回来时按"新增"重新下载。
+		p.prev, p.hasPrev = snap.Entries, true
+		p.mu.Unlock()
+		p.emit(ctx, ch, Event{Kind: KindRootGone})
+		return
+	}
 	if err != nil || !snap.Complete {
 		p.mu.Lock()
 		p.failures++

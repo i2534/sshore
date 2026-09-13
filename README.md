@@ -50,6 +50,10 @@ wails dev
 
 - **SSH port forwarding**: local `-L`, remote `-R`, dynamic SOCKS `-D`, jump host `-J`
 - **SFTP file management**: browse / upload / download / recursive download / delete / rename / mkdir
+- **Remote folder sync**: monitor a remote directory or a single file and sync changes to local;
+  local files are never deleted by default (mirror-delete must be enabled explicitly); a
+  locally-modified file is not overwritten but queued as a conflict for you to resolve
+  (keep local / overwrite with remote / save remote copy)
 - **Config**: reads `~/.ssh/config` read-only (no credential storage); tunnel rules stored in
   `~/.config/sshore/sshore.toml` (`%APPDATA%\sshore\sshore.toml` on Windows)
 - **Import** a pasted `ssh -L/-R/-D ...` command into rules
@@ -71,7 +75,7 @@ wails dev
   machine, port pre-check, error classification
 - `internal/sftp` — one `sftp -b` process per operation, `ls -la` parsing
 - `internal/importer` — tokenize `ssh -L/-R/-D` command lines into rules (inject-safe)
-- `frontend/src` — Vue 3 UI (left-nav module switcher: Forward / SFTP) + Pinia log store
+- `frontend/src` — Vue 3 UI (left-nav module switcher: Forward / SFTP / File Sync) + Pinia log store
 
 ## Test
 

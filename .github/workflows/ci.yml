@@ -34,6 +34,30 @@ jobs:
       - name: Test
         run: go test ./... -race -count=1
 
+  # Windows 上才会执行的分支（osutil 的 CREATE_NO_WINDOW/Cancel、sftp 的 isWindows
+  # 每命令模式、app.go 的卷根判断、%APPDATA% 配置路径、Windows OpenSSH 的 ls 输出形状等）
+  # 在 ubuntu 的 go job 里覆盖不到，这里在真实 Windows runner 上跑同一套测试。
+  # 不加 -race：Windows 上 race 检测需要 C 工具链，而 ubuntu job 已用 -race 覆盖竞态检测。
+  go-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Build frontend (embed assets for go:embed)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Vet (windows)
+        run: go vet ./...
+      - name: Test (windows)
+        run: go test ./... -count=1
+
   frontend:
     runs-on: ubuntu-latest
     defaults:

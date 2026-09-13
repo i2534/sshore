@@ -49,6 +49,9 @@ wails dev
 
 - **SSH 端口转发**：本地 `-L`、远程 `-R`、动态 SOCKS `-D`、跳板机 `-J`
 - **SFTP 文件管理**：浏览 / 上传 / 下载 / 递归下载 / 删除 / 重命名 / 建目录
+- **远程文件夹同步**：监控远端目录或单个文件，变化同步到本地；默认不删除本地文件
+  （镜像删除需显式开启）；本地被改动时不覆盖，改为进入冲突队列由用户裁决
+  （保留本地 / 用远端覆盖 / 另存远端版本）
 - **配置**：只读解析 `~/.ssh/config`（不存储凭据）；隧道规则保存在
   `~/.config/sshore/sshore.toml`（Windows 为 `%APPDATA%\sshore\sshore.toml`）
 - **命令导入**：将粘贴的 `ssh -L/-R/-D ...` 命令解析为规则
@@ -70,7 +73,7 @@ wails dev
   端口预检、错误分类
 - `internal/sftp` — 每次操作一个 `sftp -b` 进程，`ls -la` 输出解析
 - `internal/importer` — 将 `ssh -L/-R/-D` 命令行分词为规则（注入安全）
-- `frontend/src` — Vue 3 UI（左侧导航模块切换：转发 / SFTP）+ Pinia 日志存储
+- `frontend/src` — Vue 3 UI（左侧导航模块切换：转发 / SFTP / 文件同步）+ Pinia 日志存储
 
 ## 测试
 
