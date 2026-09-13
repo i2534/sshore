@@ -75,7 +75,7 @@ wails dev
   machine, port pre-check, error classification
 - `internal/sftp` — one `sftp -b` process per operation, `ls -la` parsing
 - `internal/importer` — tokenize `ssh -L/-R/-D` command lines into rules (inject-safe)
-- `frontend/src` — Vue 3 UI (left-nav module switcher: Forward / SFTP / Sync) + Pinia log store
+- `frontend/src` — Vue 3 UI (left-nav module switcher: Forward / SFTP / File Sync) + Pinia log store
 
 ## Test
 
