@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,27 @@ import (
 	"sshore/internal/sftp"
 	"sshore/internal/sync"
 )
+
+// TestMain 把 os.UserConfigDir() 锚定到临时目录，作为「测试绝不可写用户真实配置」的
+// 兜底：任何遗漏 cfgPath 的用例都会写到这里，而不是 ~/.config/sshore/sshore.toml。
+// 这不是修具体用例的替代品——TestImportCommandCreatesTunnels 已显式设置 cfgPath。
+// 注意：os.UserConfigDir 在 Windows 读 %AppData%、unix 读 $XDG_CONFIG_HOME，
+// 所以两处都要设；darwin 读 ~/Library/Application Support，这里不覆盖（避免动 HOME）。
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "sshore-test-config-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "创建测试配置目录失败:", err)
+		os.Exit(1)
+	}
+	if runtime.GOOS == "windows" {
+		_ = os.Setenv("APPDATA", dir)
+	} else {
+		_ = os.Setenv("XDG_CONFIG_HOME", dir)
+	}
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 // appWithFakeSFTP 返回一个 sftp 控制器由假 runner 支撑的 App：
 // 所有 sftp 调用成功，stdout 为给定的固定输出（不启动真实进程）。
@@ -180,6 +202,9 @@ func TestSetSettingsInvalidThemeFallsBackToSystem(t *testing.T) {
 func TestImportCommandCreatesTunnels(t *testing.T) {
 	a := NewApp()
 	a.Init(func(forward.Event) {})
+	// ImportCommand→CreateTunnel 会 saveConfig；不设 cfgPath 时它会落到
+	// config.DefaultConfigPath()，即用户真实的 ~/.config/sshore/sshore.toml。
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 	ts, err := a.ImportCommand("ssh -N -L 5432:127.0.0.1:5432 prod-db")
 	if err != nil {
 		t.Fatalf("import err: %v", err)
