@@ -39,8 +39,8 @@ onUnmounted(() => {
   <div class="app">
     <nav class="sidebar">
       <button :class="{ active: active === 'forward' }" @click="active = 'forward'">端口转发</button>
-      <button :class="{ active: active === 'sftp' }" @click="active = 'sftp'">SFTP</button>
       <button :class="{ active: active === 'sync' }" @click="active = 'sync'">文件同步</button>
+      <button :class="{ active: active === 'sftp' }" @click="active = 'sftp'">SFTP</button>
       <button class="settings" @click="settingsVisible = true">⚙ 设置</button>
     </nav>
     <main class="workspace">
