@@ -88,7 +88,7 @@ watch(
           <span v-else>—</span>
         </p>
         <p class="docs">
-          <a href="https://github.com/i2534/sshore/blob/master/README.zh-CN.md" target="_blank" rel="noopener">在线帮助文档 →</a>
+          <a href="https://github.com/i2534/sshore/blob/master/README.md" target="_blank" rel="noopener">在线帮助文档 →</a>
         </p>
       </section>
 
