@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -395,5 +396,74 @@ func TestMigrateRoundTripsThroughDisk(t *testing.T) {
 	}
 	if !back.LegacyMigrated || len(back.RemoteRecent) != 1 {
 		t.Fatalf("round trip lost data: %+v", back)
+	}
+}
+
+func TestPresetsTemplateRoundTrip(t *testing.T) {
+	seed := []Preset{
+		{Name: "主目录", Scope: "local", Path: "/home/u"},
+		{Name: "桌面", Scope: "local", Path: `C:\Users\u\Desktop`}, // Windows 反斜杠必须被正确转义
+		{Name: "主目录", Scope: "remote", Path: "~"},
+		{Name: "生产日志", Scope: "remote", Host: "prod", Path: "/var/log"},
+	}
+	data := PresetsTemplate(seed)
+	// 模板必须带说明注释（这是用户唯一的使用入口）
+	if !strings.Contains(string(data), "# ") || !strings.Contains(string(data), "[[presets]]") {
+		t.Fatalf("模板应带注释与 [[presets]] 段：\n%s", data)
+	}
+	dir := t.TempDir()
+	p := filepath.Join(dir, "presets.toml")
+	if err := SavePresets(p, data); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadPresets(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(seed) {
+		t.Fatalf("往返丢条目：got %d want %d", len(got), len(seed))
+	}
+	for i := range seed {
+		if got[i] != seed[i] {
+			t.Fatalf("第 %d 条往返不一致：got %+v want %+v", i, got[i], seed[i])
+		}
+	}
+}
+
+func TestLoadPresetsNormalizesScopeAndKeepsFileOnError(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "presets.toml")
+
+	// 缺文件 → os.ErrNotExist（调用方据此决定是否播种）
+	if _, err := LoadPresets(p); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("缺文件必须返回 os.ErrNotExist，实得 %v", err)
+	}
+
+	// 手写的大小写/空白笔误必须归一（预设层是精确比较）
+	raw := "[[presets]]\nname = \"a\"\nscope = \"Remote\"\npath = \"/x\"\n\n[[presets]]\nname = \"b\"\nscope = \" remote \"\npath = \"/y\"\n\n[[presets]]\nname = \"c\"\npath = \"/z\"\n"
+	if err := os.WriteFile(p, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadPresets(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, w := range []string{"remote", "remote", "local"} {
+		if got[i].Scope != w {
+			t.Fatalf("第 %d 条 scope 归一失败：got %q want %q", i, got[i].Scope, w)
+		}
+	}
+
+	// 解析失败：返回错误，且 LoadPresets **绝不修改**用户文件
+	bad := "[presets]\nbroken = \n"
+	if err := os.WriteFile(p, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPresets(p); err == nil {
+		t.Fatal("坏 TOML 必须返回错误")
+	}
+	after, _ := os.ReadFile(p)
+	if string(after) != bad {
+		t.Fatalf("LoadPresets 不得修改用户文件：\n%s", after)
 	}
 }

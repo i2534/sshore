@@ -86,6 +86,10 @@ export function ListLocations() {
   return window['go']['main']['App']['ListLocations']();
 }
 
+export function ListPresets() {
+  return window['go']['main']['App']['ListPresets']();
+}
+
 export function ListSyncRules() {
   return window['go']['main']['App']['ListSyncRules']();
 }

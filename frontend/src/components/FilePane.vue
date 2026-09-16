@@ -19,6 +19,9 @@ const props = defineProps({
   bookmarks: { type: Array, default: () => [] },
   recents: { type: Array, default: () => [] },
   bookmarked: { type: Boolean, default: false },
+  // 位置下拉里的固定预设与 Windows 盘符，由父组件按面板给出（内容来自 ListPresets）。
+  presets: { type: Array, default: () => [] },
+  disks: { type: Array, default: () => [] },
 })
 const emit = defineEmits(['select', 'open', 'context', 'visible', 'focus', 'dragstart', 'dropon', 'clear', 'action', 'pick-position', 'toggle-bookmark', 'search'])
 const menuOpen = ref(false)
@@ -98,6 +101,16 @@ function fmtSize(bytes) {
       <span class="curpath">{{ path }}</span>
       <select class="pos" :value="''" @change="onPick($event)">
         <option value="" disabled selected>📍 位置</option>
+        <!-- key 必须含 name（以及 host）：后端 preset.User 的去重键是 name+path+host，
+             "同一路径配不同名字都要保留"是被 TestUserFilterDedupeAndOrder 锁住的语义；
+             同名同路径但 host 限定不同的远端条目也会同时出现。只按 path 做 key 会撞 key
+             （Vue 重复 key 警告 + 更新期节点复用不可预期）。磁盘组无需如此：盘符天然唯一。 -->
+        <optgroup v-if="presets.length" label="预设">
+          <option v-for="p in presets" :key="'p' + p.name + p.path + (p.host || '')" :value="p.path" :title="p.path">{{ p.name }}</option>
+        </optgroup>
+        <optgroup v-if="disks.length" label="磁盘">
+          <option v-for="d in disks" :key="'d' + d.path" :value="d.path" :title="d.path">{{ d.name }}</option>
+        </optgroup>
         <optgroup v-if="bookmarks.length" label="书签">
           <option v-for="b in bookmarks" :key="'b' + b.path" :value="b.path">{{ b.name || b.path }}</option>
         </optgroup>
