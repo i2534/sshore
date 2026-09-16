@@ -342,3 +342,58 @@ func TestNewSyncIDIsStableFormat(t *testing.T) {
 		t.Fatalf("id 不带前缀/连字符，得到 %q", a)
 	}
 }
+
+func TestMigrateLegacyRecentsSplitsAndDedupes(t *testing.T) {
+	cfg := &AppConfig{
+		RecentSFTP: []RecentSFTP{
+			{Host: "prod", RemoteDir: "/var/log", LocalDir: "/tmp/a", TS: "2026-09-01T00:00:00Z"},
+			{Host: "prod", RemoteDir: "/var/log", LocalDir: "/tmp/b", TS: "2026-09-02T00:00:00Z"},
+			{Host: "db", RemoteDir: "/srv", LocalDir: "/tmp/b", TS: "2026-09-03T00:00:00Z"},
+		},
+	}
+	if !MigrateLegacyRecents(cfg) {
+		t.Fatal("expected migration to happen")
+	}
+	if !cfg.LegacyMigrated {
+		t.Fatal("migration must set the explicit flag")
+	}
+	if len(cfg.RemoteRecent) != 2 {
+		t.Fatalf("remote recents = %+v", cfg.RemoteRecent)
+	}
+	if cfg.RemoteRecent[0].Host != "db" {
+		t.Fatalf("must be sorted by ts desc: %+v", cfg.RemoteRecent)
+	}
+	if len(cfg.LocalRecent) != 2 {
+		t.Fatalf("local recents = %+v", cfg.LocalRecent)
+	}
+}
+
+func TestMigrateIsIdempotentAndDoesNotResurrect(t *testing.T) {
+	cfg := &AppConfig{RecentSFTP: []RecentSFTP{{Host: "prod", RemoteDir: "/x", LocalDir: "/y", TS: "t"}}}
+	MigrateLegacyRecents(cfg)
+	cfg.RemoteRecent = nil
+	cfg.LocalRecent = nil
+	if MigrateLegacyRecents(cfg) {
+		t.Fatal("second run must be a no-op (flag already set)")
+	}
+	if len(cfg.RemoteRecent) != 0 {
+		t.Fatalf("cleared recents must not be resurrected: %+v", cfg.RemoteRecent)
+	}
+}
+
+func TestMigrateRoundTripsThroughDisk(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sshore.toml")
+	cfg := &AppConfig{RecentSFTP: []RecentSFTP{{Host: "prod", RemoteDir: "/x", LocalDir: "/y", TS: "t"}}}
+	MigrateLegacyRecents(cfg)
+	if err := SaveConfig(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	back, err := LoadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !back.LegacyMigrated || len(back.RemoteRecent) != 1 {
+		t.Fatalf("round trip lost data: %+v", back)
+	}
+}

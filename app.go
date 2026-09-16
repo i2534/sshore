@@ -83,6 +83,12 @@ func (a *App) startup(ctx context.Context) {
 	if err != nil {
 		a.cfgLoadErr = err
 	}
+	// 迁移落盘放在 startup 而不是 LoadConfig：读函数不写盘（且文件不存在时
+	// LoadConfig 会提前 return，迁移根本不会被触发）。internal/config 没有 dirty
+	// 机制，所以这里显式保存一次；MigrateLegacyRecents 幂等，后续启动是 no-op。
+	if config.MigrateLegacyRecents(cfg) {
+		_ = config.SaveConfig(p, cfg)
+	}
 }
 
 // Init wires controllers. emit forwards subsystem events to the frontend.
