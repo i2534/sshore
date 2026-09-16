@@ -509,15 +509,83 @@ func TestRemoveRecursiveEmptyDirOnlyRmdir(t *testing.T) {
 	}
 }
 
-func TestRemoveRecursivePartialFailureIsReported(t *testing.T) {
+// 实测形状 1：'-rm' 失败**不带引号**，且 '-' 前缀下 EXIT 恒为 0。
+// 一次性 sshd + internal-sftp 实测原文： remote delete /tmp/.../f.txt: Permission denied
+// （旧夹具喂的 Can't rm: "<path>": ... 在实测中并不存在，已替换。）
+func TestRemoveRecursiveRmFailureIsReported(t *testing.T) {
 	fr := &fakeRunner{}
 	c := NewCtrl(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("a.txt", false, 10))})
-	// '-' 前缀让失败不中止整批，退出码仍是 0 —— 只能靠 stderr 发现部分失败。
-	fr.push(osutil.Outcome{ExitCode: 0, Stderr: "Can't rm: \"/root/a.txt\": Permission denied\r\n"})
+	fr.push(osutil.Outcome{ExitCode: 0, Stderr: "remote delete /root/a.txt: Permission denied\r\n"})
 	err := c.RemoveRecursive("h", "", "/root")
 	if err == nil || !strings.Contains(err.Error(), "/root/a.txt") {
-		t.Fatalf("部分失败必须报错并带路径, got %v", err)
+		t.Fatalf("'-rm' 部分失败必须报错并带路径, got %v", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "/root:") {
+		t.Fatalf("只应报告真正失败的 /root/a.txt，不得把 /root 也算上: %v", err)
+	}
+}
+
+// 实测形状 2：'-rmdir' 失败**自带双引号**： remote rmdir "<path>": Failure
+func TestRemoveRecursiveRmdirFailureIsReported(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("sub", true, 0))})
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root/sub")})
+	fr.push(osutil.Outcome{ExitCode: 0, Stderr: "remote rmdir \"/root/sub\": Failure\r\n"})
+	err := c.RemoveRecursive("h", "", "/root")
+	if err == nil || !strings.Contains(err.Error(), "/root/sub") {
+		t.Fatalf("'-rmdir' 部分失败必须报错并带路径, got %v", err)
+	}
+}
+
+// 反模糊匹配：stderr 提到的是**别的**路径时，绝不能把请求路径判成失败
+// （/root/a.txt 不得命中 /root/a.txt.bak 或 "/root/a.txtX"）。
+func TestRemoveRecursiveFailureMatchingIsPathExact(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("a.txt", false, 10))})
+	fr.push(osutil.Outcome{ExitCode: 0, Stderr: "remote delete /root/a.txt.bak: Permission denied\r\n" +
+		"remote rmdir \"/root/a.txtX\": Failure\r\n"})
+	if err := c.RemoveRecursive("h", "", "/root"); err != nil {
+		t.Fatalf("无关路径的 stderr 不得命中请求路径: %v", err)
+	}
+}
+
+// 目录目标内部恰有一个**同名非目录子项**：目录参数的列表返回 basename（"foo" != "/root/foo"），
+// 因此不得走单文件特判（否则只发 -rm 目录、漏删整棵子树），必须正常 BFS。
+func TestRemoveRecursiveSameNameChildIsNotSingleFile(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root/foo", lsLine("foo", false, 1))})
+	fr.push(osutil.Outcome{ExitCode: 0})
+	if err := c.RemoveRecursive("h", "", "/root/foo"); err != nil {
+		t.Fatalf("RemoveRecursive: %v", err)
+	}
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if got, want := string(fr.batches[len(fr.batches)-1]), "-rm \"/root/foo/foo\"\n-rmdir \"/root/foo\"\n"; got != want {
+		t.Fatalf("目录目标不得走单文件特判: batch = %q, want %q", got, want)
+	}
+}
+
+// 文件目标：OpenSSH 对文件参数返回**完整远端路径**，此时才走单文件特判（只发 -rm）。
+// 与上面同名子项用例成对，锁死 items[0].Name == path 这一判别依据。
+func TestRemoveRecursiveFileTargetUsesFullPath(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root/a.txt", lsLine("/root/a.txt", false, 10))})
+	fr.push(osutil.Outcome{ExitCode: 0})
+	if err := c.RemoveRecursive("h", "", "/root/a.txt"); err != nil {
+		t.Fatalf("RemoveRecursive: %v", err)
+	}
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if len(fr.calls) != 2 {
+		t.Fatalf("文件目标应只有 列举+删除 两次调用, got %d", len(fr.calls))
+	}
+	if got, want := string(fr.batches[len(fr.batches)-1]), "-rm \"/root/a.txt\"\n"; got != want {
+		t.Fatalf("文件目标 batch = %q, want %q", got, want)
 	}
 }
 
