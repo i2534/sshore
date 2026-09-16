@@ -295,7 +295,10 @@ function onConflictConfirm(policy) { conflict.visible = false; if (conflict.reso
 function onConflictCancel() { conflict.visible = false; if (conflict.resolve) conflict.resolve(null) }
 
 // direction: 'download' | 'upload'
-async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, systemPaths }) {
+// gesture: 'single' | 'batch'（默认 batch）。判别依据是**手势来源**而不是项数（spec 决策 7）：
+//   右键单项下载/上传、跨面板单项拖拽 = single → 不弹冲突框，对已存在目标有意直接覆盖；
+//   面板头下拉、多选批量、系统拖入 = batch → 保留 needsConfirm/askConflict 流程。
+async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, systemPaths, gesture = 'batch' }) {
   const sourceSelection = direction === 'upload' ? localSelection : remoteSelection
   const targetItems = direction === 'download' ? localItems.value : remoteItems.value
   const tasks = systemPaths
@@ -306,7 +309,10 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   const { clean, conflicts } = classify(tasks, existing)
   let run = clean
   let skipped = []
-  if (needsConfirm({ conflictCount: conflicts.length, hiddenSelected: hidden })) {
+  if (gesture === 'single') {
+    // 单文件手势免确认：冲突项直接进 run（覆盖语义），也不追问隐藏选中项。
+    run = clean.concat(conflicts)
+  } else if (needsConfirm({ conflictCount: conflicts.length, hiddenSelected: hidden })) {
     const policy = await askConflict({ conflicts, total: tasks.length, target: targetDir, hiddenSelected: hidden }, hidden)
     if (policy === null) return null
     const applied = applyPolicy(conflicts, policy, existing)
@@ -455,14 +461,15 @@ async function doAction(name) {
   const targetDir = pane === 'remote' ? (localPath.value || '/') : remotePath.value
   const sourceItems = itemsFor(pane)
   closeMenu()
-  if (name === 'download') return runBatch({ direction: 'download', names, sourceDir, targetDir, sourceItems })
+  const gesture = names.length === 1 ? 'single' : 'batch'
+  if (name === 'download') return runBatch({ direction: 'download', names, sourceDir, targetDir, sourceItems, gesture })
   // 上传按面板分派（spec §6.2：远程面板的动作表里没有"上传"项）：
   // 远程面板右键的「上传…」语义 = 选本地文件上传，沿用既有 PickLocalFile 行为；
   // 只有本地面板的「上传到远程」才是"上传选中项"。
   // 绝不能用远程 names + 本地 sourceDir 去跑 runBatch：那会把远端路径当本地源执行 SftpPut。
   if (name === 'upload') {
     if (pane === 'remote') return uploadPicked()
-    return runBatchFor('local', 'upload')
+    return runBatch({ direction: 'upload', names, sourceDir: localPath.value || '/', targetDir: remotePath.value, sourceItems: localItems.value, gesture })
   }
   if (name === 'remove') return removeSelected(pane)
   return legacyAction(name, pane, it)
@@ -498,10 +505,11 @@ async function onPaneDrop(targetPane, { event }) {
   if (!payload || payload.pane === targetPane) return
   const guard = canDropInto({ sourcePane: payload.pane, targetPane, item: { isDir: true }, connected: connected.value })
   if (!guard.ok) { err(guard.reason); return }
+  const gesture = payload.names.length === 1 ? 'single' : 'batch'
   if (payload.pane === 'remote') {
-    await runBatch({ direction: 'download', names: payload.names, sourceDir: remotePath.value, targetDir: localPath.value, sourceItems: remoteItems.value })
+    await runBatch({ direction: 'download', names: payload.names, sourceDir: remotePath.value, targetDir: localPath.value, sourceItems: remoteItems.value, gesture })
   } else {
-    await runBatch({ direction: 'upload', names: payload.names, sourceDir: localPath.value, targetDir: remotePath.value, sourceItems: localItems.value })
+    await runBatch({ direction: 'upload', names: payload.names, sourceDir: localPath.value, targetDir: remotePath.value, sourceItems: localItems.value, gesture })
   }
 }
 
@@ -538,6 +546,7 @@ async function onMoveDrop(pane, { item, event }) {
   for (const t of skipped) {
     transfers.value.push({ direction: 'move', name: t.name, src: t.src, dst: t.dst, size: 0, status: '跳过', elapsed: 0 })
   }
+  const done = []
   for (const t of run) {
     const rec = { direction: 'move', name: t.name, src: t.src, dst: t.dst, size: 0, status: '处理中', startedAt: Date.now() }
     transfers.value.push(rec)
@@ -545,6 +554,7 @@ async function onMoveDrop(pane, { item, event }) {
       if (pane === 'local') await RenameLocal(t.src, t.dst)
       else await SftpMove(host.value, '', t.src, t.dst)
       rec.status = '完成'
+      done.push(t.name)
     } catch (e) {
       rec.status = '失败'
       rec.reason = String((e && e.message) || e)
@@ -553,7 +563,8 @@ async function onMoveDrop(pane, { item, event }) {
     rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
   }
   await (pane === 'local' ? loadLocal() : loadRemote())
-  sel.remove(pane === 'local' ? localSelection : remoteSelection, payload.names)
+  // spec §6.4：失败/跳过的项还留在原处，必须保持选中便于重试——只移除确实完成的项。
+  sel.remove(pane === 'local' ? localSelection : remoteSelection, done)
 }
 
 // ===== 路径③：系统文件管理器拖入 =====

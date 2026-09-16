@@ -445,6 +445,8 @@ type PathInfo struct {
 }
 
 // StatPaths 批量 Lstat；单项失败不整体失败（前端据此跳过该项并提示）。
+// 非常规类型（符号链接 / FIFO / 设备 / socket）同样置 Err：localfs.Copy 对符号链接是**静默跳过**，
+// 若这里不报错，前端会把它记成「完成」却什么都没复制（静默假成功）。
 func (a *App) StatPaths(paths []string) []PathInfo {
 	out := make([]PathInfo, 0, len(paths))
 	for _, p := range paths {
@@ -452,6 +454,16 @@ func (a *App) StatPaths(paths []string) []PathInfo {
 		st, err := os.Lstat(p)
 		if err != nil {
 			info.Err = err.Error()
+			out = append(out, info)
+			continue
+		}
+		// Lstat 不跟随链接，因此 mode 是链接本身的 mode，ModeSymlink 判定成立。
+		if !st.IsDir() && !st.Mode().IsRegular() {
+			if st.Mode()&os.ModeSymlink != 0 {
+				info.Err = "符号链接暂不支持"
+			} else {
+				info.Err = "非常规文件类型暂不支持"
+			}
 			out = append(out, info)
 			continue
 		}
