@@ -10,8 +10,12 @@ import AppDialog from '../components/AppDialog.vue'
 import ConflictDialog from '../components/ConflictDialog.vue'
 import * as sel from '../utils/selection'
 import { actionFor } from '../utils/keys'
-import { planTasks, classify, applyPolicy, needsConfirm, summarize } from '../utils/batch'
+import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName } from '../utils/batch'
 import { failureText } from '../utils/queue'
+import { payloadFor, parsePayload, hitPane, canDropInto } from '../utils/dnd'
+import { EventsOn } from '../../wailsjs/runtime/runtime'
+// 说明：StatPaths / CopyLocal / SftpMove / ListLocal / RenameLocal 已在既有 import 行里，
+// 这里**不重复声明**（重复 import 同名标识符会让 vite build 直接 SyntaxError）。
 
 const logStore = useLogStore()
 const hosts = ref([])
@@ -480,6 +484,133 @@ function onKeydown(ev) {
   else if (action === 'escape') { sel.clear(s) }
 }
 
+// ===== 拖拽：拖起 =====
+function onDragStart(pane, { item, event }) {
+  const s = selectionFor(pane)
+  if (!sel.isSelected(s, item.name)) sel.single(s, item.name)
+  event.dataTransfer.effectAllowed = 'copyMove'
+  event.dataTransfer.setData('application/x-sshore', payloadFor(pane, [...s.keys]))
+}
+
+// ===== 路径①②：面板互拖（落到面板空白处 = 投递到对方当前目录）=====
+async function onPaneDrop(targetPane, { event }) {
+  const payload = parsePayload(event.dataTransfer.getData('application/x-sshore'))
+  if (!payload || payload.pane === targetPane) return
+  const guard = canDropInto({ sourcePane: payload.pane, targetPane, item: { isDir: true }, connected: connected.value })
+  if (!guard.ok) { err(guard.reason); return }
+  if (payload.pane === 'remote') {
+    await runBatch({ direction: 'download', names: payload.names, sourceDir: remotePath.value, targetDir: localPath.value, sourceItems: remoteItems.value })
+  } else {
+    await runBatch({ direction: 'upload', names: payload.names, sourceDir: localPath.value, targetDir: remotePath.value, sourceItems: localItems.value })
+  }
+}
+
+// ===== 路径④：面板内移动到子目录行 =====
+async function onMoveDrop(pane, { item, event }) {
+  const payload = parsePayload(event.dataTransfer.getData('application/x-sshore'))
+  if (!payload || payload.pane !== pane || !payload.names.length) return
+  if (!item.isDir) { err('只能放到目录上'); return }
+  const base = pane === 'local' ? (localPath.value || '/') : remotePath.value
+  const targetDir = base.replace(/\/+$/, '') + '/' + item.name
+  // 非法落点（自嵌套 / 拖到目录自己那一行）必须在发请求前拒绝
+  for (const n of payload.names) {
+    const guard = canDropInto({ sourcePane: pane, targetPane: pane, item: { name: n, isDir: true }, sourceDir: base, targetDir: targetDir + '/' + n, connected: connected.value })
+    if (!guard.ok) { err(guard.reason); return }
+  }
+  // 目标子目录内容未加载 → 先按需加载一次再判重（spec 决策 25）；Windows 上
+  // os.Rename 目标存在会直接失败，所以必须走同一套冲突策略而不是硬干。
+  const targetItems = pane === 'local'
+    ? await ListLocal(targetDir)
+    : await SftpList(host.value, '', targetDir)
+  const existing = (targetItems || []).map((it) => it.name)
+  const prefix = base.replace(/\/+$/, '')
+  const planned = payload.names.map((n) => ({ name: n, src: prefix + '/' + n, dst: targetDir + '/' + n }))
+  const { clean, conflicts } = classify(planned, existing)
+  let run = clean
+  let skipped = conflicts
+  if (conflicts.length) {
+    const policy = await askConflict({ conflicts, total: planned.length, target: targetDir, hiddenSelected: 0 }, 0)
+    if (policy === null) return
+    const applied = applyPolicy(conflicts, policy, existing)
+    run = clean.concat(applied.run)
+    skipped = applied.skipped
+  }
+  for (const t of skipped) {
+    transfers.value.push({ direction: 'move', name: t.name, src: t.src, dst: t.dst, size: 0, status: '跳过', elapsed: 0 })
+  }
+  for (const t of run) {
+    const rec = { direction: 'move', name: t.name, src: t.src, dst: t.dst, size: 0, status: '处理中', startedAt: Date.now() }
+    transfers.value.push(rec)
+    try {
+      if (pane === 'local') await RenameLocal(t.src, t.dst)
+      else await SftpMove(host.value, '', t.src, t.dst)
+      rec.status = '完成'
+    } catch (e) {
+      rec.status = '失败'
+      rec.reason = String((e && e.message) || e)
+      err(e)
+    }
+    rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
+  }
+  await (pane === 'local' ? loadLocal() : loadRemote())
+  sel.remove(pane === 'local' ? localSelection : remoteSelection, payload.names)
+}
+
+// ===== 路径③：系统文件管理器拖入 =====
+let offDrop = null
+
+function onFilesDropped(payload) {
+  if (!payload || !payload.paths || !payload.paths.length) return
+  const localEl = document.querySelector('[data-pane="local"]')
+  const remoteEl = document.querySelector('[data-pane="remote"]')
+  if (!localEl || !remoteEl) return
+  const rects = { local: localEl.getBoundingClientRect(), remote: remoteEl.getBoundingClientRect() }
+  // 坐标单位 / DPI 缩放需实测（spec R3）；命中失败只会提示"落点无效"，不会误操作。
+  const pane = hitPane({ x: payload.x, y: payload.y }, rects)
+  if (!pane) { err('落点无效：请拖到左侧本地或右侧远程面板'); return }
+  handleSystemDrop(pane, payload.paths)
+}
+
+async function handleSystemDrop(pane, paths) {
+  const infos = await StatPaths(paths)
+  // PathInfo.Err 带 omitempty：成功项的 JSON 里**没有** err 键，因此只能用 if (i.err) 判失败。
+  for (const i of infos) if (i.err) err(i.path + '：' + i.err)
+  const ok = infos.filter((i) => !i.err)
+  if (!ok.length) return
+  if (pane === 'remote') {
+    if (!connected.value) { err('远程未连接，无法上传'); return }
+    await runBatch({ direction: 'upload', names: ok.map((i) => i.name), sourceDir: '', targetDir: remotePath.value, sourceItems: localItems.value, systemPaths: ok })
+    return
+  }
+  const base = (localPath.value || '/').replace(/\/+$/, '')
+  const existing = (localItems.value || []).map((it) => it.name)
+  const conflicts = ok.filter((i) => existing.includes(i.name))
+  let policy = 'skip'
+  if (needsConfirm({ conflictCount: conflicts.length, hiddenSelected: 0 })) {
+    const chosen = await askConflict({ conflicts: conflicts.map((i) => ({ name: i.name })), total: ok.length, target: base, hiddenSelected: 0 }, 0)
+    if (chosen === null) return
+    policy = chosen
+  }
+  for (const i of ok) {
+    const hasConflict = existing.includes(i.name)
+    if (hasConflict && policy === 'skip') {
+      transfers.value.push({ direction: 'copy', name: i.name, src: i.path, dst: base + '/' + i.name, size: i.size, status: '跳过', elapsed: 0 })
+      continue
+    }
+    let name = i.name
+    if (hasConflict && policy === 'rename') {
+      name = copyName(i.name, existing)
+      existing.push(name) // 累积已占用的名字，否则两个同名源会算出同一个新名
+    }
+    const dst = base + '/' + name
+    const rec = { direction: 'copy', name, src: i.path, dst, size: i.size, status: '处理中', startedAt: Date.now() }
+    transfers.value.push(rec)
+    try { await CopyLocal(i.path, dst); rec.status = '完成' } catch (e) { rec.status = '失败'; rec.reason = String((e && e.message) || e); err(e) }
+    rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
+  }
+  await loadLocal()
+}
+
 onMounted(async () => {
   await loadHosts()
   // local starts at current working dir
@@ -517,6 +648,9 @@ async function syncConnection() {
 onActivated(() => {
   window.addEventListener('click', outsideClick)
   window.addEventListener('keydown', onKeydown)
+  // 系统拖入订阅同样成对挂摘：KeepAlive 下 setup 只跑一次，切走标签必须退订，
+  // 否则「端口转发/文件同步」标签下拖入文件也会投递到 SFTP 面板。
+  offDrop = EventsOn('files:dropped', onFilesDropped)
   startClock()
   syncConnection()
   loadRecents()
@@ -524,11 +658,13 @@ onActivated(() => {
 onDeactivated(() => {
   window.removeEventListener('click', outsideClick)
   window.removeEventListener('keydown', onKeydown)
+  if (offDrop) { offDrop(); offDrop = null }
   stopClock()
 })
 onUnmounted(() => {
   window.removeEventListener('click', outsideClick)
   window.removeEventListener('keydown', onKeydown)
+  if (offDrop) { offDrop(); offDrop = null }
   stopClock()
 })
 </script>
@@ -551,16 +687,22 @@ onUnmounted(() => {
       </select>
     </div>
     <div class="panes">
-      <FilePane title="本地" :path="localPath || '/'" :items="localItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
-        :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
-        @select="onSelect('local', $event)" @open="openLocal" @action="onPaneAction('local', $event)"
-        @clear="sel.clear(localSelection)"
-        @context="showMenu('local', $event)" @visible="localVisible = $event" @focus="focusedPane = 'local'" />
-      <FilePane title="远程" :path="remotePath" :items="remoteItems" :sel-keys="[...remoteSelection.keys]" :anchor="remoteSelection.anchor"
-        :show-hidden="showAll" :loading="remoteLoading" :actions="actionsFor('remote')" :hidden-selected="hiddenFor('remote')"
-        @select="onSelect('remote', $event)" @open="openRemote" @action="onPaneAction('remote', $event)"
-        @clear="sel.clear(remoteSelection)"
-        @context="showMenu('remote', $event)" @visible="remoteVisible = $event" @focus="focusedPane = 'remote'" />
+      <div class="pane-wrap" data-pane="local" @dragover.prevent @drop.prevent="onPaneDrop('local', $event)">
+        <FilePane title="本地" :path="localPath || '/'" :items="localItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
+          :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
+          @select="onSelect('local', $event)" @open="openLocal" @action="onPaneAction('local', $event)"
+          @clear="sel.clear(localSelection)"
+          @context="showMenu('local', $event)" @visible="localVisible = $event" @focus="focusedPane = 'local'"
+          @dragstart="onDragStart('local', $event)" @dropon="onMoveDrop('local', $event)" />
+      </div>
+      <div class="pane-wrap" data-pane="remote" @dragover.prevent @drop.prevent="onPaneDrop('remote', $event)">
+        <FilePane title="远程" :path="remotePath" :items="remoteItems" :sel-keys="[...remoteSelection.keys]" :anchor="remoteSelection.anchor"
+          :show-hidden="showAll" :loading="remoteLoading" :actions="actionsFor('remote')" :hidden-selected="hiddenFor('remote')"
+          @select="onSelect('remote', $event)" @open="openRemote" @action="onPaneAction('remote', $event)"
+          @clear="sel.clear(remoteSelection)"
+          @context="showMenu('remote', $event)" @visible="remoteVisible = $event" @focus="focusedPane = 'remote'"
+          @dragstart="onDragStart('remote', $event)" @dropon="onMoveDrop('remote', $event)" />
+      </div>
     </div>
     <TransferQueue :transfers="transfers" :now="now" @copy-failures="copyFailures" />
     <div class="logpane ui-panel"><LogPanel :source-types="['sftp', 'system']" /></div>
@@ -601,6 +743,8 @@ onUnmounted(() => {
 .sftp { display: flex; flex-direction: column; height: 100%; gap: 8px; }
 .toolbar { display: flex; gap: 8px; align-items: center; }
 .panes { display: flex; gap: 8px; flex: 1; min-height: 0; }
+/* 放置区容器：承接 .panes 的伸缩；data-pane 同时是系统拖入命中测试的锚点 */
+.pane-wrap { flex: 1; display: flex; min-width: 0; }
 .logpane { height: 140px; flex-shrink: 0; padding: 12px; overflow: auto; }
 .hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: var(--fs-12); color: var(--text-dim); }
 .recent { max-width: 280px; font-size: var(--fs-12); color: var(--text-dim); margin-left: auto; }
