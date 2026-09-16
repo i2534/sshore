@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -592,7 +593,7 @@ func TestSftpGetRecordsRecent(t *testing.T) {
 		t.Fatalf("want 1 remote recent, got %d: %+v", len(cfg.RemoteRecent), cfg.RemoteRecent)
 	}
 	e := cfg.RemoteRecent[0]
-	if wantR := filepath.Dir("/var/log/app.log"); e.Host != "prod-db" || e.Path != wantR {
+	if wantR := path.Dir("/var/log/app.log"); e.Host != "prod-db" || e.Path != wantR {
 		t.Fatalf("wrong remote entry: %+v", e)
 	}
 	if _, perr := time.Parse(time.RFC3339, e.TS); perr != nil || e.TS == "" {
@@ -622,7 +623,7 @@ func TestSftpPutRecordsRecent(t *testing.T) {
 	if len(cfg.RemoteRecent) != 1 {
 		t.Fatalf("want 1 remote recent, got %d: %+v", len(cfg.RemoteRecent), cfg.RemoteRecent)
 	}
-	if wantR := filepath.Dir("/var/log/app.log"); cfg.RemoteRecent[0].Host != "prod-db" || cfg.RemoteRecent[0].Path != wantR {
+	if wantR := path.Dir("/var/log/app.log"); cfg.RemoteRecent[0].Host != "prod-db" || cfg.RemoteRecent[0].Path != wantR {
 		t.Fatalf("wrong remote entry: %+v", cfg.RemoteRecent[0])
 	}
 	if len(cfg.LocalRecent) != 1 || cfg.LocalRecent[0].Path != filepath.Dir("/tmp/dl/app.log") {
@@ -683,8 +684,29 @@ func TestRecordRecentSFTPDedupMovesToFront(t *testing.T) {
 	if len(cfg.LocalRecent) != 2 {
 		t.Fatalf("want 2 local recents (dedup), got %d: %+v", len(cfg.LocalRecent), cfg.LocalRecent)
 	}
-	if cfg.LocalRecent[0].Path != "/l1" || cfg.LocalRecent[1].Path != "/l2" {
+	// 本地路径的 dir 由 filepath.Dir 推导（Linux = /l1、Windows = \l1）⇒ 期望值同源推导
+	if wantL1, wantL2 := filepath.Dir("/l1/x"), filepath.Dir("/l2/y"); cfg.LocalRecent[0].Path != wantL1 || cfg.LocalRecent[1].Path != wantL2 {
 		t.Fatalf("local recents must dedupe and move to front: %+v", cfg.LocalRecent)
+	}
+}
+
+// 回归护栏（Windows 上才有分辨力）：远端是 POSIX 语义，远端最近位置里**绝不能出现反斜杠**。
+// 旧实现用 filepath.Dir，Windows 上 filepath.Dir("/a/b/c.txt") == "\a\b" ⇒ 本用例会在
+// CI 的 go-windows job 上变红；Linux 上 path.Dir 与 filepath.Dir 对 POSIX 输入等价，
+// 所以这条在 Linux 是"恒真"的护栏，真正的判别力在 Windows。
+func TestRemoteRecentNeverContainsBackslash(t *testing.T) {
+	a := appWithFakeSFTP(t, "")
+	if err := a.SftpGet("prod", "", "/a/b/c.txt", "/l/c.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.cfg.RemoteRecent) != 1 {
+		t.Fatalf("want 1 remote recent, got %+v", a.cfg.RemoteRecent)
+	}
+	if got := a.cfg.RemoteRecent[0].Path; strings.Contains(got, `\`) {
+		t.Fatalf("远端路径必须是 POSIX 语义，不得出现反斜杠: %q", got)
+	}
+	if got := a.cfg.RemoteRecent[0].Path; got != "/a/b" {
+		t.Fatalf("远端目录应为 POSIX 的 /a/b，got %q", got)
 	}
 }
 
@@ -708,8 +730,9 @@ func TestRecordRecentSFTPCapsAtTwenty(t *testing.T) {
 	if cfg.RemoteRecent[0].Host != "hosty" || cfg.RemoteRecent[19].Host != "hostf" {
 		t.Fatalf("newest-first order broken: %+v", cfg.RemoteRecent)
 	}
-	// 注意 "/local" 是单段路径，filepath.Dir("/local") == "/"；25 次都记同一个 "/" ⇒ 去重成 1 条。
-	if len(cfg.LocalRecent) != 1 || cfg.LocalRecent[0].Path != "/" {
+	// 注意 "/local" 是单段路径 ⇒ filepath.Dir("/local") 在 Linux 是 "/"、在 Windows 是 "\"；
+	// 25 次都记同一个值 ⇒ 去重成 1 条（期望值用同一个变换推导，避免平台差异）。
+	if wantL := filepath.Dir("/local"); len(cfg.LocalRecent) != 1 || cfg.LocalRecent[0].Path != wantL {
 		t.Fatalf("同目录 25 次必须去重成 1 条: %+v", cfg.LocalRecent)
 	}
 }
