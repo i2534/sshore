@@ -558,3 +558,25 @@ func TestRemoveRecursiveRejectsGlobPaths(t *testing.T) {
 		t.Fatalf("must not spawn any process, got %d calls", len(fr.calls))
 	}
 }
+
+func TestBuildBatchPutRecursive(t *testing.T) {
+	c := NewCtrl(nil, nil)
+	b, err := c.buildBatch("putr", "/remote/dir", "/local/dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b); got != "put -r \"/local/dir\" \"/remote/dir\"\n" {
+		t.Fatalf("putr batch = %q", got)
+	}
+}
+
+func TestPutRecursiveRunsSftp(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	if err := c.PutRecursive("h", "", "/local/dir", "/remote/dir"); err != nil {
+		t.Fatalf("PutRecursive: %v", err)
+	}
+	if len(fr.calls) != 1 || fr.calls[0].name != "sftp" {
+		t.Fatalf("calls = %+v", fr.calls)
+	}
+}
