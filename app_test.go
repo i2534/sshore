@@ -574,7 +574,8 @@ func TestStartupMigratesLegacyRecentsToDisk(t *testing.T) {
 	}
 }
 
-// M7: SftpGet 成功后记录 (host, dir(remote), dir(local))，且持久化落盘。
+// P2: SftpGet 成功后把 (host, dir(remote)) 记入 RemoteRecent、dir(local) 记入
+// LocalRecent，且持久化落盘；旧 recent_sftp 不再被写入（spec §10.2）。
 func TestSftpGetRecordsRecent(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
 	if err := a.SftpGet("prod-db", "alice", "/var/log/app.log", "/tmp/dl/app.log"); err != nil {
@@ -584,19 +585,28 @@ func TestSftpGetRecordsRecent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.RecentSFTP) != 1 {
-		t.Fatalf("want 1 recent entry, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	if len(cfg.RecentSFTP) != 0 {
+		t.Fatalf("旧字段不得再被写回: %+v", cfg.RecentSFTP)
 	}
-	e := cfg.RecentSFTP[0]
-	if wantR, wantL := filepath.Dir("/var/log/app.log"), filepath.Dir("/tmp/dl/app.log"); e.Host != "prod-db" || e.RemoteDir != wantR || e.LocalDir != wantL {
-		t.Fatalf("wrong entry: %+v", e)
+	if len(cfg.RemoteRecent) != 1 {
+		t.Fatalf("want 1 remote recent, got %d: %+v", len(cfg.RemoteRecent), cfg.RemoteRecent)
+	}
+	e := cfg.RemoteRecent[0]
+	if wantR := filepath.Dir("/var/log/app.log"); e.Host != "prod-db" || e.Path != wantR {
+		t.Fatalf("wrong remote entry: %+v", e)
 	}
 	if _, perr := time.Parse(time.RFC3339, e.TS); perr != nil || e.TS == "" {
 		t.Fatalf("TS must be RFC3339, got %q", e.TS)
 	}
+	if len(cfg.LocalRecent) != 1 {
+		t.Fatalf("want 1 local recent, got %d: %+v", len(cfg.LocalRecent), cfg.LocalRecent)
+	}
+	if wantL := filepath.Dir("/tmp/dl/app.log"); cfg.LocalRecent[0].Path != wantL {
+		t.Fatalf("wrong local entry: %+v", cfg.LocalRecent[0])
+	}
 }
 
-// M7: SftpPut 成功后同样记录（remote/local 目录与 Get 对称）。
+// P2: SftpPut 成功后同样写双侧新字段（remote/local 目录与 Get 对称）。
 func TestSftpPutRecordsRecent(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
 	if err := a.SftpPut("prod-db", "alice", "/tmp/dl/app.log", "/var/log/app.log"); err != nil {
@@ -606,16 +616,21 @@ func TestSftpPutRecordsRecent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.RecentSFTP) != 1 {
-		t.Fatalf("want 1 recent entry, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	if len(cfg.RecentSFTP) != 0 {
+		t.Fatalf("旧字段不得再被写回: %+v", cfg.RecentSFTP)
 	}
-	e := cfg.RecentSFTP[0]
-	if wantR, wantL := filepath.Dir("/var/log/app.log"), filepath.Dir("/tmp/dl/app.log"); e.Host != "prod-db" || e.RemoteDir != wantR || e.LocalDir != wantL {
-		t.Fatalf("wrong entry: %+v", e)
+	if len(cfg.RemoteRecent) != 1 {
+		t.Fatalf("want 1 remote recent, got %d: %+v", len(cfg.RemoteRecent), cfg.RemoteRecent)
+	}
+	if wantR := filepath.Dir("/var/log/app.log"); cfg.RemoteRecent[0].Host != "prod-db" || cfg.RemoteRecent[0].Path != wantR {
+		t.Fatalf("wrong remote entry: %+v", cfg.RemoteRecent[0])
+	}
+	if len(cfg.LocalRecent) != 1 || cfg.LocalRecent[0].Path != filepath.Dir("/tmp/dl/app.log") {
+		t.Fatalf("wrong local recents: %+v", cfg.LocalRecent)
 	}
 }
 
-// M7: SftpHome 成功后记录 (host, home, "")。
+// P2: SftpHome 成功后只记远端 (host, home)，local 侧为空 ⇒ LocalRecent 不落条目。
 func TestSftpHomeRecordsRecent(t *testing.T) {
 	a := appWithFakeSFTP(t, "sftp> pwd\nRemote working directory: /home/alice\n")
 	home, err := a.SftpHome("prod-db")
@@ -629,17 +644,21 @@ func TestSftpHomeRecordsRecent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.RecentSFTP) != 1 {
-		t.Fatalf("want 1 recent entry, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	if len(cfg.RecentSFTP) != 0 {
+		t.Fatalf("旧字段不得再被写回: %+v", cfg.RecentSFTP)
 	}
-	e := cfg.RecentSFTP[0]
-	if e.Host != "prod-db" || e.RemoteDir != "/home/alice" || e.LocalDir != "" {
-		t.Fatalf("wrong entry: %+v", e)
+	if len(cfg.RemoteRecent) != 1 {
+		t.Fatalf("want 1 remote recent, got %d: %+v", len(cfg.RemoteRecent), cfg.RemoteRecent)
+	}
+	if e := cfg.RemoteRecent[0]; e.Host != "prod-db" || e.Path != "/home/alice" {
+		t.Fatalf("wrong remote entry: %+v", e)
+	}
+	if len(cfg.LocalRecent) != 0 {
+		t.Fatalf("无本地目录时不得写 LocalRecent: %+v", cfg.LocalRecent)
 	}
 }
 
-// M7: 重复记录同一 (host, remoteDir, localDir) 时旧条目被移除、新条目置顶，
-// 不产生重复项。
+// P2: 重复记录同一 (host, path) 时旧条目被移除、新条目置顶；本地侧同理按 path 去重。
 func TestRecordRecentSFTPDedupMovesToFront(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
 	if err := a.SftpGet("h1", "", "/a/x", "/l1/x"); err != nil {
@@ -655,18 +674,24 @@ func TestRecordRecentSFTPDedupMovesToFront(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.RecentSFTP) != 2 {
-		t.Fatalf("want 2 entries (dedup), got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	if len(cfg.RemoteRecent) != 2 {
+		t.Fatalf("want 2 remote recents (dedup), got %d: %+v", len(cfg.RemoteRecent), cfg.RemoteRecent)
 	}
-	if cfg.RecentSFTP[0].Host != "h1" || cfg.RecentSFTP[1].Host != "h2" {
-		t.Fatalf("re-recorded entry must move to front: %+v", cfg.RecentSFTP)
+	if cfg.RemoteRecent[0].Host != "h1" || cfg.RemoteRecent[1].Host != "h2" {
+		t.Fatalf("re-recorded entry must move to front: %+v", cfg.RemoteRecent)
+	}
+	if len(cfg.LocalRecent) != 2 {
+		t.Fatalf("want 2 local recents (dedup), got %d: %+v", len(cfg.LocalRecent), cfg.LocalRecent)
+	}
+	if cfg.LocalRecent[0].Path != "/l1" || cfg.LocalRecent[1].Path != "/l2" {
+		t.Fatalf("local recents must dedupe and move to front: %+v", cfg.LocalRecent)
 	}
 }
 
-// M7: 最近使用列表上限 10 条，最旧的被挤出。
-func TestRecordRecentSFTPCapsAtTen(t *testing.T) {
+// P2: 最近使用列表上限 20 条，最旧的被挤出；本地侧按 path 去重（25 次同目录只剩 1 条）。
+func TestRecordRecentSFTPCapsAtTwenty(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
-	for i := 0; i < 12; i++ {
+	for i := 0; i < 25; i++ {
 		host := "host" + string(rune('a'+i))
 		if err := a.SftpGet(host, "", "/r"+string(rune('0'+i)), "/local"); err != nil {
 			t.Fatal(err)
@@ -676,15 +701,22 @@ func TestRecordRecentSFTPCapsAtTen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.RecentSFTP) != 10 {
-		t.Fatalf("want cap 10, got %d: %+v", len(cfg.RecentSFTP), cfg.RecentSFTP)
+	if len(cfg.RemoteRecent) != 20 {
+		t.Fatalf("want cap 20, got %d: %+v", len(cfg.RemoteRecent), cfg.RemoteRecent)
 	}
-	if cfg.RecentSFTP[0].Host != "hostl" || cfg.RecentSFTP[9].Host != "hostc" {
-		t.Fatalf("newest-first order broken: %+v", cfg.RecentSFTP)
+	// 每轮 host 不同 ⇒ (host, "/") 全不相同；最新在前，末尾是被挤剩下的第 6 新（i=5 → hostf）。
+	if cfg.RemoteRecent[0].Host != "hosty" || cfg.RemoteRecent[19].Host != "hostf" {
+		t.Fatalf("newest-first order broken: %+v", cfg.RemoteRecent)
+	}
+	// 注意 "/local" 是单段路径，filepath.Dir("/local") == "/"；25 次都记同一个 "/" ⇒ 去重成 1 条。
+	if len(cfg.LocalRecent) != 1 || cfg.LocalRecent[0].Path != "/" {
+		t.Fatalf("同目录 25 次必须去重成 1 条: %+v", cfg.LocalRecent)
 	}
 }
 
-// M7: ListRecentSFTP 契约——最新在前；无任何记录时返回空切片而非 nil。
+// P2（裁决：ListRecentSFTP 的删除推迟到 T9）：本用例不再断言旧字段里的 3 条记录，
+// 改为锁定「旧字段不再被写入 + 最近位置落在新字段」，同时保留 ListRecentSFTP
+// 自身的"空切片而非 nil"契约。
 func TestListRecentSFTPNewestFirstAndEmptyNotNil(t *testing.T) {
 	a := NewApp()
 	a.Init(func(forward.Event) {})
@@ -703,15 +735,27 @@ func TestListRecentSFTPNewestFirstAndEmptyNotNil(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got := a3.ListRecentSFTP()
-	if len(got) != 3 {
-		t.Fatalf("want 3 entries, got %d: %+v", len(got), got)
+	// 旧字段不再被写入：落盘后 recent_sftp 必须为空。
+	cfg3, err := config.LoadConfig(a3.cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg3.RecentSFTP) != 0 {
+		t.Fatalf("旧字段不得再被写回: %+v", cfg3.RecentSFTP)
+	}
+	// 最近位置落在新字段：RemoteRecent 最新在前。
+	if len(cfg3.RemoteRecent) != 3 {
+		t.Fatalf("want 3 remote recents, got %d: %+v", len(cfg3.RemoteRecent), cfg3.RemoteRecent)
 	}
 	want := []string{"h3", "h2", "h1"}
 	for i, h := range want {
-		if got[i].Host != h {
-			t.Fatalf("index %d: want %s got %+v", i, h, got[i])
+		if cfg3.RemoteRecent[i].Host != h {
+			t.Fatalf("index %d: want %s got %+v", i, h, cfg3.RemoteRecent[i])
 		}
+	}
+	// ListRecentSFTP 仍保留（T9 才删），它读的是旧字段 ⇒ 迁移后应为空。
+	if got := a3.ListRecentSFTP(); len(got) != 0 {
+		t.Fatalf("ListRecentSFTP 读旧字段，recordRecentSFTP 改写后必须为空: %+v", got)
 	}
 }
 
@@ -957,5 +1001,53 @@ func TestStatPathsReportsSymlinkAsError(t *testing.T) {
 	}
 	if got[1].Err != "" {
 		t.Fatalf("普通文件不应带 Err: %+v", got[1])
+	}
+}
+
+func TestSearchDepthNormalization(t *testing.T) {
+	if got := normDepth(0); got != 5 {
+		t.Fatalf("0 must normalize to 5, got %d", got)
+	}
+	if got := normDepth(-1); got != -1 {
+		t.Fatalf("-1 means unlimited, got %d", got)
+	}
+	if got := normDepth(3); got != 3 {
+		t.Fatalf("explicit depth must pass through, got %d", got)
+	}
+}
+
+func TestAddAndRemoveBookmark(t *testing.T) {
+	dir := t.TempDir()
+	a := NewApp()
+	a.cfgPath = filepath.Join(dir, "sshore.toml")
+	a.cfg = config.DefaultAppConfig()
+	b := config.Bookmark{Name: "日志", Scope: "remote", Host: "prod", Path: "/var/log"}
+	if err := a.AddBookmark(b); err != nil {
+		t.Fatalf("AddBookmark: %v", err)
+	}
+	if got := a.ListLocations().Bookmarks; len(got) != 1 || got[0].Path != "/var/log" {
+		t.Fatalf("bookmarks = %+v", got)
+	}
+	if err := a.RemoveBookmark("remote", "prod", "/var/log"); err != nil {
+		t.Fatalf("RemoveBookmark: %v", err)
+	}
+	if got := a.ListLocations().Bookmarks; len(got) != 0 {
+		t.Fatalf("bookmark not removed: %+v", got)
+	}
+}
+
+func TestAddRemoteRecentDedupesAndCaps(t *testing.T) {
+	dir := t.TempDir()
+	a := NewApp()
+	a.cfgPath = filepath.Join(dir, "sshore.toml")
+	a.cfg = config.DefaultAppConfig()
+	for i := 0; i < 25; i++ {
+		if err := a.AddRemoteRecent("prod", "/p"+string(rune('a'+i%26))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := a.ListLocations().RemoteRecents
+	if len(got) > 20 {
+		t.Fatalf("must cap at 20, got %d", len(got))
 	}
 }
