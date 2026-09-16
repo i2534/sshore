@@ -324,13 +324,13 @@ Expected: FAIL —— `no Go files in …/internal/preset`
 ```go
 // internal/preset/preset.go
 // Package preset 提供「📍 位置」下拉里的三组内容：
-//   - 预设组的渲染（User / All）：内容完全来自配置文件，首次启动由 Defaults() 播种；
+//   - 预设组的渲染（User / All）：内容完全来自 presets.toml，首次生成该文件时由 Defaults() 播种；
 //   - 默认播种源（Defaults = Local + Remote；**不含盘符**）；
-//   - Windows 盘符（Drives，每次实时枚举，不进配置）。
-// 平台差异收在 platform_windows.go / platform_other.go；不 import internal/config（叶子包只依赖标准库）。
+//   - Windows 盘符（Drives，每次实时枚举，不进配置文件）。
 //
 // 计算逻辑与"目录是否存在"的判定分离（exists 注入），平台差异收在
-// platform_windows.go / platform_other.go 里，因此三组预设都能在任何平台上单测。
+// platform_windows.go / platform_other.go 里，因此三组预设都能在任何平台上单测；
+// 本包不 import internal/config（叶子包只依赖标准库）。
 package preset
 
 import (
