@@ -349,7 +349,10 @@ async function removeSelected(pane) {
   const names = [...s.keys]
   if (!names.length) return
   const items = itemsFor(pane)
-  const hidden = hiddenSelectedCount(s, items)
+  // hiddenSelectedCount 的第二个参数必须是**可见名字**数组（与 FilePane 上抛的 @visible 同源），
+  // 不是 item 对象数组：传 items 会让 vis.has(name) 恒假，把"被过滤隐藏的项数"恒算成选中总数，
+  // 删除确认框就会恒显示「（其中 N 项被过滤隐藏）」，误导用户。
+  const hidden = hiddenSelectedCount(s, visibleFor(pane))
   const hasDir = (items || []).some((it) => s.keys.has(it.name) && it.isDir)
   const msg = '删除' + (pane === 'local' ? '本地' : '远程') + ' ' + names.length + ' 项？' +
     (hasDir ? '（含目录，将递归删除）' : '') + (hidden ? '（其中 ' + hidden + ' 项被过滤隐藏）' : '')
