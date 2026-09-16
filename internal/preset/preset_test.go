@@ -67,13 +67,37 @@ func TestLocalPrefersKnownDirs(t *testing.T) {
 }
 
 func TestDrives(t *testing.T) {
+	ready := func(string) bool { return true }
 	// bit0=A: bit2=C: bit3=D:
-	eq(t, names(Drives(1|4|8)), []string{`A:=A:\`, `C:=C:\`, `D:=D:\`})
-	if got := Drives(0); got == nil || len(got) != 0 {
+	eq(t, names(Drives(1|4|8, ready)), []string{`A:=A:\`, `C:=C:\`, `D:=D:\`})
+	if got := Drives(0, ready); got == nil || len(got) != 0 {
 		t.Fatalf("空磁盘组必须是非 nil 空切片（nil 经 JSON 变 null）：%#v", got)
 	}
-	if got := Drives(1 << 25); len(got) != 1 || got[0].Path != `Z:\` {
+	if got := Drives(1<<25, ready); len(got) != 1 || got[0].Path != `Z:\` {
 		t.Fatalf("bit25 必须是 Z:\\，实得 %v", names(got))
+	}
+}
+
+// 无介质的盘符必须被过滤：真机实测 D: 是空光驱，os.ReadDir("D:\") 报
+// "The device is not ready" —— 列出来只会让用户点一次吃一次错。
+func TestDrivesSkipNotReady(t *testing.T) {
+	ready := map[string]bool{`A:\`: true, `C:\`: true, `Z:\`: true} // D: 无介质
+	got := Drives(1|4|8|(1<<25), func(p string) bool { return ready[p] })
+	eq(t, names(got), []string{`A:=A:\`, `C:=C:\`, `Z:=Z:\`})
+	if bad := Drives(1|4, func(string) bool { return false }); len(bad) != 0 {
+		t.Fatalf("全部不可用时应为空组：%v", names(bad))
+	}
+}
+
+// 真机不变量（这条在 Windows 上跑才有意义，Linux 上磁盘组恒为空）：
+// 磁盘组列出的每一项都必须真的能被 os.Stat 到，否则点进去必然报错。
+func TestDiskPresetsAreUsableOnThisMachine(t *testing.T) {
+	_, disks, _ := All(nil)
+	t.Logf("本机磁盘组 = %v", names(disks))
+	for _, d := range disks {
+		if fi, err := os.Stat(d.Path); err != nil || !fi.IsDir() {
+			t.Fatalf("列出的盘符必须可用：%s（err=%v）", d.Path, err)
+		}
 	}
 }
 

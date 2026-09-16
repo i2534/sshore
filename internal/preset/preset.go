@@ -115,14 +115,23 @@ func Local(home string, exists func(string) bool) []Preset {
 }
 
 // Drives 把 GetLogicalDrives 的位掩码翻译成盘符预设（bit0=A: … bit25=Z:）。
-func Drives(mask uint32) []Preset {
+//
+// ready 是"这个盘现在能用吗"的判定（注入以便单测）。**必须过滤不可用的盘**：
+// 位掩码包含空光驱 / 空读卡器 / 断线的网络盘这类"有盘符但没介质"的项，
+// 例如无盘光驱 D: 会让 os.ReadDir("D:\") 报 "The device is not ready"——
+// 列出来只会让用户点一次吃一次错（真机实测）。
+func Drives(mask uint32, ready func(string) bool) []Preset {
 	out := []Preset{}
 	for i := 0; i < 26; i++ {
 		if mask&(1<<uint(i)) == 0 {
 			continue
 		}
 		letter := string(rune('A' + i))
-		out = append(out, Preset{Name: letter + ":", Path: letter + `:\`})
+		p := letter + `:\`
+		if !ready(p) {
+			continue
+		}
+		out = append(out, Preset{Name: letter + ":", Path: p})
 	}
 	return out
 }
@@ -136,12 +145,13 @@ func Remote() []Preset {
 }
 
 // All 组装位置下拉需要的三组预设。预设组（local/remote）**完全来自配置文件条目**；
-// 磁盘组每次实时枚举（盘符不进配置：插拔 U 盘后重开面板就该看到新盘）。
+// 磁盘组每次实时枚举（盘符不进配置：插拔 U 盘后重开面板就该看到新盘），
+// 且只列**当前可用**的盘（空光驱/空读卡器/断线网络盘不列）。
 // 三组都保证非 nil：nil 切片经 JSON 会变成 null，前端就得处处判空。
 func All(user []Entry) (local, disks, remote []Preset) {
 	home, _ := os.UserHomeDir()
 	// 本地面板的 "~" / "~/xxx" 展开为主目录；远端条目的 "~" 是 sentinel，必须原样保留。
-	return User("local", expandLocalTilde(user, home)), Drives(logicalDriveMask()), User("remote", user)
+	return User("local", expandLocalTilde(user, home)), Drives(logicalDriveMask(), dirExists), User("remote", user)
 }
 
 // expandLocalTilde 把 local 条目里 "~" / "~/xxx" 的 path 展开成 home：
