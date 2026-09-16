@@ -3,7 +3,6 @@ package sftp
 import (
 	"fmt"
 	"os"
-	pathpkg "path"
 	"runtime"
 	"strings"
 	"sync"
@@ -617,10 +616,12 @@ func (c *Ctrl) RemoveRecursive(host, user, path string) error {
 			if !ok {
 				return fmt.Errorf("sftp rm -r %s: 目录不可读 %s", path, dir)
 			}
-			// 单文件目标：sftp ls -l <file> 只返回它自己（实测 Item.Name 可能是完整路径，
-			// 见 watch/scan.go:121-127 的同类处理）。此时只发 -rm，绝不 rmdir 父目录。
+			// 单文件目标：sftp ls -l <file> 只返回它自己，且实测 Item.Name 就是**完整远端路径**
+			// （见 watch/scan.go:121-127 的同类处理）。判别必须用 Name == path 逐字比较：
+			// 目录参数的列表返回的是子项 basename，因此"目录 /root/foo 里恰有一个同名文件 foo"
+			// 不会被误判成单文件（否则只发 -rm、漏删整棵子树）。
 			if dir == path && len(items) == 1 && !items[0].IsDir &&
-				pathpkg.Base(items[0].Name) == pathpkg.Base(path) {
+				items[0].Name == path {
 				return c.removeBatch(host, user, []string{path}, nil)
 			}
 			for _, it := range items {
@@ -687,8 +688,13 @@ func (c *Ctrl) removeBatch(host, user string, files, dirsBottomUp []string) erro
 }
 
 // failedDeletePaths 按 stderr 原文反查哪些路径删除失败。
-// 实测 OpenSSH 的客户端错误行形如 Can't rm: "<path>": <原因> / Can't rmdir: ...，
-// 与 listmany_parse.go 的 stderrListFailure 同一思路（按请求路径逐字反查）。
+// 实测 OpenSSH（internal-sftp，'-' 前缀，EXIT 恒为 0）给出**两种**形状：
+//  1. '-rm' 失败**不带引号**： remote delete /tmp/x/f.txt: Permission denied
+//  2. '-rmdir' 失败**带引号**： remote rmdir "/tmp/x/d": Failure
+//
+// 只认**请求路径**逐字匹配（见 deleteFailureMentions），不做模糊子串匹配：
+// 请求 /a 时绝不能命中 /ab 或 /a.txt.bak 的失败行。
+// 与 listmany_parse.go 的 stderrListFailure 同一思路。
 func failedDeletePaths(stderr string, paths []string) []string {
 	if stderr == "" {
 		return nil
@@ -697,13 +703,36 @@ func failedDeletePaths(stderr string, paths []string) []string {
 	for _, p := range paths {
 		for _, line := range strings.Split(stderr, "\n") {
 			l := strings.TrimSpace(strings.TrimRight(line, "\r"))
-			if strings.Contains(l, "\""+p+"\"") {
+			if deleteFailureMentions(l, p) {
 				out = append(out, p)
 				break
 			}
 		}
 	}
 	return out
+}
+
+// deleteFailureMentions 判断一行 stderr 是否就是「请求路径 p 删除失败」的远端原文。
+// 覆盖实测的两种动词（remote delete / remote rmdir）× 两种路径写法（裸路径 / 双引号包裹），
+// 且一律要求路径之后**紧跟** ": "，因此是路径级精确匹配。
+func deleteFailureMentions(line, p string) bool {
+	quoted := ""
+	if q, err := quoteArg(p); err == nil {
+		quoted = q // 形如 "/tmp/x/d"
+	}
+	for _, verb := range []string{"remote delete ", "remote rmdir "} {
+		rest, ok := strings.CutPrefix(line, verb)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(rest, p+": ") {
+			return true
+		}
+		if quoted != "" && strings.HasPrefix(rest, quoted+": ") {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Ctrl) Mkdir(host, user, path string) error {
