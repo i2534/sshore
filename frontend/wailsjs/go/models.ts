@@ -92,24 +92,6 @@ export namespace config {
 	        this.ts = source["ts"];
 	    }
 	}
-	export class RecentSFTP {
-	    host: string;
-	    remote_dir: string;
-	    local_dir: string;
-	    ts: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new RecentSFTP(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.host = source["host"];
-	        this.remote_dir = source["remote_dir"];
-	        this.local_dir = source["local_dir"];
-	        this.ts = source["ts"];
-	    }
-	}
 	export class SyncRule {
 	    id: string;
 	    name: string;

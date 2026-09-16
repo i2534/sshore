@@ -864,18 +864,6 @@ func (a *App) recordRecentSFTP(host, remoteDir, localDir string) {
 	}
 }
 
-// ListRecentSFTP 返回 SFTP 最近使用列表（最新在前，最多 10 条）；
-// 无数据时返回空切片而非 nil（前端契约）。
-func (a *App) ListRecentSFTP() []config.RecentSFTP {
-	if a.cfg == nil {
-		return []config.RecentSFTP{}
-	}
-	if a.cfg.RecentSFTP == nil {
-		return []config.RecentSFTP{}
-	}
-	return a.cfg.RecentSFTP
-}
-
 func (a *App) OnShutdown() {
 	// OnShutdown 可能早于 Init 被调用（Wails 生命周期边界），此时 cfg 与三个
 	// 控制器都可能为 nil，必须逐项守卫而不是直接解引用。

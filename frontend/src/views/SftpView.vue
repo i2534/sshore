@@ -1,7 +1,9 @@
 <script setup>
 import { ref, reactive, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, ListRecentSFTP, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
+import { useLocationsStore } from '../stores/locations'
+import SearchOverlay from '../components/SearchOverlay.vue'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
 import LogPanel from '../components/LogPanel.vue'
@@ -18,6 +20,9 @@ import { EventsOn } from '../../wailsjs/runtime/runtime'
 // 这里**不重复声明**（重复 import 同名标识符会让 vite build 直接 SyntaxError）。
 
 const logStore = useLogStore()
+const locations = useLocationsStore()
+// 浮层 watch 没有 immediate ⇒ visible 初值必须是 false，只由用户动作置 true。
+const search = reactive({ visible: false, pane: 'remote' })
 const hosts = ref([])
 const host = ref('')
 
@@ -46,8 +51,8 @@ const showAll = ref(false)
 // explicit connect/disconnect state for the remote host
 const connected = ref(false)
 
-// M7: 最近 SFTP 位置（后端在 connect/传输成功时记录），用于一键回到上次目录
-const recents = ref([])
+// pendingPath：位置下拉点到"未连接的主机"时先记下目标目录，由 connect() 消费
+// （同机已连接则直接跳转，不走这里）。
 const pendingPath = ref('')
 
 const transfers = ref([])
@@ -95,9 +100,6 @@ async function loadHosts() {
   try { hosts.value = (await ListHosts()) || [] } catch (e) { err(e) }
   if (hosts.value.length && !host.value) host.value = hosts.value[0]
 }
-async function loadRecents() {
-  try { recents.value = (await ListRecentSFTP()) || [] } catch { recents.value = [] }
-}
 async function err(e) {
   logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'error', message: String(e), ts: new Date().toISOString() })
 }
@@ -135,38 +137,54 @@ async function connect() {
     pendingPath.value = ''
     connected.value = true
     await loadRemote()
+    await locations.addRemoteRecent(h, remotePath.value)
   } catch (e) {
     err(e)
     if (host.value === h) connected.value = false
   }
 }
 
-// 选中最近位置：预填主机与目录。同机已连接则直接跳转，
-// 否则触发 connect()——它会优先消费 pendingPath 而不是落 home。
-function applyRecent(e) {
-  const idx = Number(e.target.value)
-  e.target.value = ''
-  if (!Number.isInteger(idx) || idx < 0 || !recents.value[idx]) return
-  const r = recents.value[idx]
-  if (host.value !== r.host) {
-    host.value = r.host // 程序化切换：手动执行与 @change 一致的重置
-    remoteSeq++
-    remoteItems.value = []
-    sel.clear(remoteSelection)
-    connected.value = false
+// 面板头「📍 位置」选中一项：本地面板直接跳转；远程面板同机已连接则直接跳转，
+// 未连接则记入 pendingPath 后交给既有的 connect()（它内部消费 pendingPath）。
+async function pickPosition(pane, path) {
+  if (pane === 'local') { localPath.value = path; await loadLocal(); await locations.addLocalRecent(path); return }
+  if (host.value && connected.value) { remotePath.value = path; await loadRemote(); await locations.addRemoteRecent(host.value, path); return }
+  pendingPath.value = path
+  await connect()
+}
+
+// 当前目录是否已收藏：本地面板看书签 scope=local，远程面板还要匹配当前主机。
+function bookmarkedFor(pane) {
+  const p = pane === 'local' ? localPath.value : remotePath.value
+  return locations.bookmarks.some((b) =>
+    b.path === p && (pane === 'local' ? b.scope === 'local' : (b.scope === 'remote' && b.host === host.value)))
+}
+
+async function toggleBookmark(pane) {
+  const p = pane === 'local' ? localPath.value : remotePath.value
+  if (!p) return
+  const existing = locations.bookmarks.find((b) =>
+    b.path === p && (pane === 'local' ? b.scope === 'local' : (b.scope === 'remote' && b.host === host.value)))
+  if (existing) await locations.removeBookmark(existing.scope, existing.host, existing.path)
+  else await locations.addBookmark({ name: p, scope: pane, host: pane === 'remote' ? host.value : '', path: p })
+}
+
+// 双击深搜结果 → 跳到所在目录并选中该项
+async function openHit(hit) {
+  const dir = hit.path.includes('/') ? hit.path.slice(0, hit.path.lastIndexOf('/')) : ''
+  const name = hit.path.includes('/') ? hit.path.slice(hit.path.lastIndexOf('/') + 1) : hit.path
+  if (search.pane === 'local') {
+    const next = dir ? (localPath.value.replace(/\/+$/, '') + '/' + dir) : localPath.value
+    localPath.value = next
+    await loadLocal()
+    if (name) sel.single(localSelection, name)
+  } else {
+    const next = dir ? (remotePath.value.replace(/\/+$/, '') + '/' + dir) : remotePath.value
+    remotePath.value = next
+    await loadRemote()
+    if (name) sel.single(remoteSelection, name)
   }
-  pendingPath.value = r.remote_dir || '/'
-  if (r.local_dir && r.local_dir !== localPath.value) {
-    localPath.value = r.local_dir
-    loadLocal()
-  }
-  if (connected.value) {
-    remotePath.value = pendingPath.value
-    pendingPath.value = ''
-    loadRemote()
-    return
-  }
-  connect()
+  search.visible = false
 }
 
 async function disconnect() {
@@ -178,7 +196,10 @@ async function disconnect() {
 }
 async function loadLocal() {
   localLoading.value = true
-  try { localItems.value = (await ListLocal(localPath.value || '/')) || [] }
+  try {
+    localItems.value = (await ListLocal(localPath.value || '/')) || []
+    await locations.addLocalRecent(localPath.value) // 只在成功时记；条数上限由后端负责
+  }
   catch (e) { err(e) }
   finally { localLoading.value = false }
 }
@@ -624,10 +645,10 @@ async function handleSystemDrop(pane, paths) {
 
 onMounted(async () => {
   await loadHosts()
+  await locations.load() // 书签与双侧最近位置（T6 store），供两个面板头的位置下拉使用
   // local starts at current working dir
   try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
   await loadLocal()
-  loadRecents()
 })
 
 function startClock() {
@@ -664,7 +685,6 @@ onActivated(() => {
   offDrop = EventsOn('files:dropped', onFilesDropped)
   startClock()
   syncConnection()
-  loadRecents()
 })
 onDeactivated(() => {
   window.removeEventListener('click', outsideClick)
@@ -692,24 +712,24 @@ onUnmounted(() => {
       <label class="hidden-toggle">
         <input type="checkbox" v-model="showAll" /> 显示隐藏文件
       </label>
-      <select v-if="recents.length" class="recent" @change="applyRecent">
-        <option value="" disabled selected>🕘 最近位置</option>
-        <option v-for="(r, i) in recents" :key="i" :value="String(i)">{{ r.host }} · {{ r.remote_dir || '/' }}</option>
-      </select>
     </div>
     <div class="panes">
       <div class="pane-wrap" data-pane="local" @dragover.prevent @drop.prevent="onPaneDrop('local', $event)">
-        <FilePane title="本地" :path="localPath || '/'" :items="localItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
+        <FilePane title="本地" pane="local" host="" :path="localPath || '/'" :items="localItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
           :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
+          :bookmarks="locations.bookmarksForPane('local', '')" :recents="locations.recentsForPane('local', '')" :bookmarked="bookmarkedFor('local')"
           @select="onSelect('local', $event)" @open="openLocal" @action="onPaneAction('local', $event)"
+          @pick-position="pickPosition('local', $event)" @toggle-bookmark="toggleBookmark('local')" @search="search.pane = 'local'; search.visible = true"
           @clear="sel.clear(localSelection)"
           @context="showMenu('local', $event)" @visible="localVisible = $event" @focus="focusedPane = 'local'"
           @dragstart="onDragStart('local', $event)" @dropon="onMoveDrop('local', $event)" />
       </div>
       <div class="pane-wrap" data-pane="remote" @dragover.prevent @drop.prevent="onPaneDrop('remote', $event)">
-        <FilePane title="远程" :path="remotePath" :items="remoteItems" :sel-keys="[...remoteSelection.keys]" :anchor="remoteSelection.anchor"
+        <FilePane title="远程" pane="remote" :host="host" :path="remotePath" :items="remoteItems" :sel-keys="[...remoteSelection.keys]" :anchor="remoteSelection.anchor"
           :show-hidden="showAll" :loading="remoteLoading" :actions="actionsFor('remote')" :hidden-selected="hiddenFor('remote')"
+          :bookmarks="locations.bookmarksForPane('remote', host)" :recents="locations.recentsForPane('remote', host)" :bookmarked="bookmarkedFor('remote')"
           @select="onSelect('remote', $event)" @open="openRemote" @action="onPaneAction('remote', $event)"
+          @pick-position="pickPosition('remote', $event)" @toggle-bookmark="toggleBookmark('remote')" @search="search.pane = 'remote'; search.visible = true"
           @clear="sel.clear(remoteSelection)"
           @context="showMenu('remote', $event)" @visible="remoteVisible = $event" @focus="focusedPane = 'remote'"
           @dragstart="onDragStart('remote', $event)" @dropon="onMoveDrop('remote', $event)" />
@@ -747,6 +767,10 @@ onUnmounted(() => {
     <ConflictDialog :visible="conflict.visible" :target="conflict.plan && conflict.plan.target"
       :total="conflict.plan && conflict.plan.total" :conflicts="conflict.plan ? conflict.plan.conflicts.map((c) => c.name) : []"
       :hidden-selected="conflict.hiddenSelected" @confirm="onConflictConfirm" @cancel="onConflictCancel" />
+
+    <!-- 只挂一个实例，用 :scope 切换面板（组件内用全局 querySelector 聚焦，两个实例会打架） -->
+    <SearchOverlay :visible="search.visible" :scope="search.pane" :host="host" :root="search.pane === 'local' ? localPath : remotePath"
+      @close="search.visible = false" @open-hit="openHit" />
   </div>
 </template>
 
@@ -758,5 +782,4 @@ onUnmounted(() => {
 .pane-wrap { flex: 1; display: flex; min-width: 0; }
 .logpane { height: 140px; flex-shrink: 0; padding: 12px; overflow: auto; }
 .hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: var(--fs-12); color: var(--text-dim); }
-.recent { max-width: 280px; font-size: var(--fs-12); color: var(--text-dim); margin-left: auto; }
 </style>

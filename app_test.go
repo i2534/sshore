@@ -714,21 +714,10 @@ func TestRecordRecentSFTPCapsAtTwenty(t *testing.T) {
 	}
 }
 
-// P2（裁决：ListRecentSFTP 的删除推迟到 T9）：本用例不再断言旧字段里的 3 条记录，
-// 改为锁定「旧字段不再被写入 + 最近位置落在新字段」，同时保留 ListRecentSFTP
-// 自身的"空切片而非 nil"契约。
-func TestListRecentSFTPNewestFirstAndEmptyNotNil(t *testing.T) {
-	a := NewApp()
-	a.Init(func(forward.Event) {})
-	if got := a.ListRecentSFTP(); got == nil || len(got) != 0 {
-		t.Fatalf("no-data must return empty slice (not nil), got %#v", got)
-	}
-	a2 := NewApp()
-	a2.cfg = &config.AppConfig{}
-	if got := a2.ListRecentSFTP(); got == nil || len(got) != 0 {
-		t.Fatalf("empty config must return empty slice (not nil), got %#v", got)
-	}
-
+// P2/T9：ListRecentSFTP 绑定已随 T9 移除（spec §3 决策 20），原用例中依赖它的
+// "空切片而非 nil" 断言一并退场；这里保留原用例最有价值的部分——锁定
+// 「旧字段 recent_sftp 不再被写入」且「最近位置落在 RemoteRecent 且最新在前」。
+func TestRecordRecentWritesNewFieldsOnly(t *testing.T) {
 	a3 := appWithFakeSFTP(t, "")
 	for _, host := range []string{"h1", "h2", "h3"} {
 		if err := a3.SftpGet(host, "", "/r/"+host, "/l/"+host); err != nil {
@@ -753,9 +742,9 @@ func TestListRecentSFTPNewestFirstAndEmptyNotNil(t *testing.T) {
 			t.Fatalf("index %d: want %s got %+v", i, h, cfg3.RemoteRecent[i])
 		}
 	}
-	// ListRecentSFTP 仍保留（T9 才删），它读的是旧字段 ⇒ 迁移后应为空。
-	if got := a3.ListRecentSFTP(); len(got) != 0 {
-		t.Fatalf("ListRecentSFTP 读旧字段，recordRecentSFTP 改写后必须为空: %+v", got)
+	// 内存里的旧字段同样应为空（recordRecentSFTP 只写新字段）。
+	if len(a3.cfg.RecentSFTP) != 0 {
+		t.Fatalf("内存中旧字段也不应被写入: %+v", a3.cfg.RecentSFTP)
 	}
 }
 

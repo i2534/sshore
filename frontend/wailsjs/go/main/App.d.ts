@@ -47,8 +47,6 @@ export function ListLocal(arg1:string):Promise<Array<sftp.Item>>;
 
 export function ListLocations():Promise<main.Locations>;
 
-export function ListRecentSFTP():Promise<Array<config.RecentSFTP>>;
-
 export function ListSyncRules():Promise<Array<config.SyncRule>>;
 
 export function ListTunnels():Promise<Array<config.Tunnel>>;
