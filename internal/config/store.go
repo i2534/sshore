@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -59,6 +60,25 @@ type RecentSFTP struct {
 	RemoteDir string `toml:"remote_dir" json:"remote_dir"`
 	LocalDir  string `toml:"local_dir" json:"local_dir"`
 	TS        string `toml:"ts" json:"ts"`
+}
+
+// Bookmark 是一个手动固定的位置；scope=remote 时 host 有意义。
+type Bookmark struct {
+	Name  string `toml:"name" json:"name"`
+	Scope string `toml:"scope" json:"scope"`
+	Host  string `toml:"host" json:"host"`
+	Path  string `toml:"path" json:"path"`
+}
+
+type RecentLocal struct {
+	Path string `toml:"path" json:"path"`
+	TS   string `toml:"ts" json:"ts"`
+}
+
+type RecentRemote struct {
+	Host string `toml:"host" json:"host"`
+	Path string `toml:"path" json:"path"`
+	TS   string `toml:"ts" json:"ts"`
 }
 
 // SyncRule 是一条"监控远端路径并同步到本地"的规则。
@@ -124,6 +144,11 @@ type AppConfig struct {
 	Tunnels    []Tunnel     `toml:"tunnels" json:"tunnels"`
 	RecentSFTP []RecentSFTP `toml:"recent_sftp" json:"recent_sftp"`
 	Syncs      []SyncRule   `toml:"syncs" json:"syncs"`
+
+	Bookmarks      []Bookmark     `toml:"bookmarks" json:"bookmarks"`
+	LocalRecent    []RecentLocal  `toml:"local_recent" json:"local_recent"`
+	RemoteRecent   []RecentRemote `toml:"remote_recent" json:"remote_recent"`
+	LegacyMigrated bool           `toml:"legacy_migrated" json:"legacy_migrated"`
 }
 
 // normalize applies per-field defaults to the whole config (currently just App).
@@ -171,6 +196,43 @@ func LoadConfig(path string) (*AppConfig, error) {
 	// 显式写入的空/非法值在此统一兜底，保证读到的设置总是可用的。
 	cfg.normalize()
 	return cfg, nil
+}
+
+const maxRecent = 20
+
+// MigrateLegacyRecents 把旧 recent_sftp（{host, remote_dir, local_dir, ts}）拆成
+// 双侧最近位置。用显式标记 LegacyMigrated 判定，**不用**「新字段为空」——否则用户
+// 清空书签/最近后旧数据会被复活。幂等；迁移后由调用方 saveConfig 落盘。
+func MigrateLegacyRecents(cfg *AppConfig) bool {
+	if cfg == nil || cfg.LegacyMigrated {
+		return false
+	}
+	cfg.LegacyMigrated = true
+	if len(cfg.RecentSFTP) == 0 {
+		return true
+	}
+	sort.SliceStable(cfg.RecentSFTP, func(i, j int) bool { return cfg.RecentSFTP[i].TS > cfg.RecentSFTP[j].TS })
+	seenR := map[string]bool{}
+	seenL := map[string]bool{}
+	for _, r := range cfg.RecentSFTP {
+		if r.Host != "" && r.RemoteDir != "" {
+			k := r.Host + "\x00" + r.RemoteDir
+			if !seenR[k] && len(cfg.RemoteRecent) < maxRecent {
+				seenR[k] = true
+				cfg.RemoteRecent = append(cfg.RemoteRecent, RecentRemote{Host: r.Host, Path: r.RemoteDir, TS: r.TS})
+			}
+		}
+		if r.LocalDir != "" {
+			if !seenL[r.LocalDir] && len(cfg.LocalRecent) < maxRecent {
+				seenL[r.LocalDir] = true
+				cfg.LocalRecent = append(cfg.LocalRecent, RecentLocal{Path: r.LocalDir, TS: r.TS})
+			}
+		}
+	}
+	// 迁移完成即清空旧字段：否则 SaveConfig 的全量编码会继续把 recent_sftp 写回磁盘
+	// （spec §10.2「旧字段只读兼容、不再写回」）。
+	cfg.RecentSFTP = nil
+	return true
 }
 
 // SaveConfig writes the config to path with 0600 perms, creating parents.

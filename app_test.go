@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -544,6 +545,32 @@ func TestCreateTunnelSamePortDifferentHostAllowed(t *testing.T) {
 	}
 	if len(a.cfg.Tunnels) != 2 {
 		t.Fatalf("want 2 tunnels, got %d", len(a.cfg.Tunnels))
+	}
+}
+
+// startup 必须把旧 recent_sftp 迁移成新字段并显式落盘（裁决：读函数不写盘），
+// 且迁移后旧字段不得再被写回。用 TestMain 锚定的临时配置目录，不碰真实 ~/.config。
+func TestStartupMigratesLegacyRecentsToDisk(t *testing.T) {
+	p, err := config.DefaultConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveConfig(p, &config.AppConfig{
+		RecentSFTP: []config.RecentSFTP{{Host: "prod", RemoteDir: "/x", LocalDir: "/y", TS: "t"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a := NewApp()
+	a.startup(context.Background())
+	back, err := config.LoadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !back.LegacyMigrated || len(back.RemoteRecent) != 1 || len(back.LocalRecent) != 1 {
+		t.Fatalf("startup 未迁移: %+v", back)
+	}
+	if len(back.RecentSFTP) != 0 {
+		t.Fatalf("旧字段不得被写回: %+v", back.RecentSFTP)
 	}
 }
 
