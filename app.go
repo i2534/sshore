@@ -817,6 +817,10 @@ type Presets struct {
 	Local      []preset.Preset `json:"local"`
 	LocalDisks []preset.Preset `json:"localDisks"`
 	Remote     []preset.Preset `json:"remote"`
+	// Err 非空 = presets.toml 读/解析失败（前端据此在日志面板提示用户）。
+	// 预设组同时退化为空，但**绝不覆盖**用户文件；不能只靠 startup 的 Init 事件——
+	// 那个事件可能早于前端订阅而丢失（Task 8 真机发现）。
+	Err string `json:"err,omitempty"`
 }
 
 // ListPresets 返回位置下拉的预设：每次调用都重新读 presets.toml 并实时枚举盘符。
@@ -824,15 +828,19 @@ type Presets struct {
 // 注意前端只在进入 SFTP 页时拉一次 → 手改文件后需要重启应用生效。
 func (a *App) ListPresets() Presets {
 	var entries []preset.Entry
+	var perr string
 	if a.presetsPath != "" {
 		ps, err := config.LoadPresets(a.presetsPath)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			ps = nil // 坏文件：只降级，不覆盖用户文件
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				perr = err.Error() // 坏文件：只降级、只报告，绝不覆盖用户文件
+			}
+			ps = nil
 		}
 		entries = presetEntries(ps)
 	}
 	local, disks, remote := preset.All(entries)
-	return Presets{Local: local, LocalDisks: disks, Remote: remote}
+	return Presets{Local: local, LocalDisks: disks, Remote: remote, Err: perr}
 }
 
 func (a *App) ListLocations() Locations {

@@ -1149,6 +1149,19 @@ func TestListPresetsDegradesOnBadFile(t *testing.T) {
 	if after, _ := os.ReadFile(path); string(after) != bad {
 		t.Fatal("坏文件绝不能被改写或覆盖")
 	}
+	if p.Err == "" {
+		t.Fatal("坏文件必须通过 Presets.Err 上报：只发一次 Init 事件会在前端订阅前丢失（Task 8 真机发现）")
+	}
+	// 好文件不得带 err
+	good := filepath.Join(dir, "ok.toml")
+	if err := config.SavePresets(good, config.PresetsTemplate([]config.Preset{{Name: "项目", Scope: "local", Path: "/work"}})); err != nil {
+		t.Fatal(err)
+	}
+	a2 := NewApp()
+	a2.presetsPath = good
+	if got := a2.ListPresets(); got.Err != "" {
+		t.Fatalf("好文件不得带 err：%q", got.Err)
+	}
 	// presetsPath 为空（路径解析失败）时也不能炸、也不能是 nil
 	if got := NewApp().ListPresets(); got.Local == nil || got.LocalDisks == nil || got.Remote == nil {
 		t.Fatalf("presetsPath 为空时三组应是非 nil 空切片：%+v", got)
@@ -1160,6 +1173,8 @@ func TestStartupSeedsPresetsFileOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 本用例会把坏 TOML 留在默认预设路径上；不清掉会污染同进程后续用例（评审 Minor）
+	t.Cleanup(func() { _ = os.Remove(pp) })
 	_ = os.Remove(pp) // 模拟"从 v0.5.0 升级上来"：还没有预设文件
 	a := NewApp()
 	a.startup(context.Background())

@@ -326,6 +326,7 @@ export namespace main {
 	    local: preset.Preset[];
 	    localDisks: preset.Preset[];
 	    remote: preset.Preset[];
+	    err?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Presets(source);
@@ -336,6 +337,7 @@ export namespace main {
 	        this.local = this.convertValues(source["local"], preset.Preset);
 	        this.localDisks = this.convertValues(source["localDisks"], preset.Preset);
 	        this.remote = this.convertValues(source["remote"], preset.Preset);
+	        this.err = source["err"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
