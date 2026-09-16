@@ -110,6 +110,47 @@ echo "--- sftp output ---"
 echo "$sftp_out"
 echo "$sftp_out" | grep -q "a.txt" && echo "PASS: sftp ls lists file" || { echo "FAIL: sftp ls"; exit 1; }
 
+echo "== PROBE A/B/C: sftp 语义（供 spec R1/R2/R9 取值） =="
+PB="$TMPD/home/probe"
+SFTP_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no -o IdentitiesOnly=yes
+  -F "$HOME/.ssh/config" -o "UserKnownHostsFile /dev/null")
+run_batch() { sftp "${SFTP_OPTS[@]}" -b "$1" e2e-test 2>&1 || true; }
+
+# --- PROBE A: put -r 目标同名目录已存在：并入还是嵌套？ ---
+rm -rf "$PB"; mkdir -p "$PB/localdir/sub" "$PB/remote/localdir"
+echo A > "$PB/localdir/a.txt"
+echo BB > "$PB/localdir/sub/b.txt"
+echo EXISTING > "$PB/remote/localdir/existing.txt"
+echo LOCAL_ONLY > "$PB/remote/localdir/a.txt"
+printf 'put -r %s %s\n' "$PB/localdir" "$PB/remote" > "$PB/pa.bat"
+PA_OUT="$(run_batch "$PB/pa.bat")"
+echo "--- probe A output ---"; echo "$PA_OUT"
+if [ -d "$PB/remote/localdir/localdir" ]; then
+  echo "PUT-R: nest"
+elif [ -f "$PB/remote/localdir/a.txt" ] && [ -f "$PB/remote/localdir/sub/b.txt" ]; then
+  echo "PUT-R: merge"
+  echo "PUT-R-OVERWRITE: $(cat "$PB/remote/localdir/a.txt")"
+else
+  echo "PUT-R: error-or-other"
+fi
+
+# --- PROBE B: rename 覆盖已存在目标 ---
+printf 'OLD' > "$PB/r_old.txt"; printf 'NEW' > "$PB/r_new.txt"
+printf 'rename %s %s\n' "$PB/r_old.txt" "$PB/r_new.txt" > "$PB/pb.bat"
+PB_OUT="$(run_batch "$PB/pb.bat")"
+echo "--- probe B output ---"; echo "$PB_OUT"
+if [ -f "$PB/r_new.txt" ]; then echo "RENAME-OVERWRITE: yes content=$(cat "$PB/r_new.txt")"; else echo "RENAME-OVERWRITE: target-gone"; fi
+[ -f "$PB/r_old.txt" ] && echo "RENAME-SOURCE: still-exists" || echo "RENAME-SOURCE: moved"
+
+# --- PROBE C: rm 路径含 glob 元字符是否被远端展开 ---
+mkdir -p "$PB/glob"
+echo ONE > "$PB/glob/lit*name.txt"
+echo TWO > "$PB/glob/litZZname.txt"
+printf 'rm %s\n' "$PB/glob/lit*name.txt" > "$PB/pc.bat"
+PC_OUT="$(run_batch "$PB/pc.bat")"
+echo "--- probe C output ---"; echo "$PC_OUT"
+echo "GLOB-RM: star-file=$([ -f "$PB/glob/lit*name.txt" ] && echo kept || echo deleted) zz-file=$([ -f "$PB/glob/litZZname.txt" ] && echo kept || echo deleted)"
+
 echo "== sync e2e (Go side) =="
 REMOTE_DIR="$TMPD/remote-conf"
 mkdir -p "$REMOTE_DIR"
