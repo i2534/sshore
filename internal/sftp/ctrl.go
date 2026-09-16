@@ -3,6 +3,7 @@ package sftp
 import (
 	"fmt"
 	"os"
+	pathpkg "path"
 	"runtime"
 	"strings"
 	"sync"
@@ -541,6 +542,129 @@ func (c *Ctrl) Remove(host, user, path string) error {
 	}
 	c.logEvent(host, "info", "sftp rm done")
 	return nil
+}
+
+// RemoveRecursive 递归删除远端路径（文件或目录）。
+// 约束（spec §5.1 / 决策 27、28）：
+//  1. 每条命令加 '-' 前缀：否则任一条失败即中止整批，留下半棵树。
+//  2. 不用 '@' 前缀：保留回显，便于按 stderr 反查失败路径。
+//  3. 路径含 glob 元字符（* ? [）→ 直接拒绝：sftp 会对参数做远端 glob 展开，可能删错文件。
+//
+// 失败语义：部分删除不回滚，错误里带上远端原文。
+func (c *Ctrl) RemoveRecursive(host, user, path string) error {
+	if path == "" || path == "/" {
+		return fmt.Errorf("拒绝递归删除根路径: %q", path)
+	}
+	if strings.ContainsAny(path, "*?[") {
+		return fmt.Errorf("路径含通配符 %s，暂不支持递归删除（避免远端 glob 误删）", path)
+	}
+	c.logEvent(host, "info", "sftp rm -r "+path)
+
+	var files []string
+	var dirsByDepth []string // 自底向上
+	queue := []string{path}
+	for len(queue) > 0 {
+		batch := queue
+		if len(batch) > 64 {
+			batch = queue[:64]
+		}
+		queue = queue[len(batch):]
+		res, err := c.ListMany(host, user, batch)
+		if err != nil {
+			return fmt.Errorf("sftp rm -r %s: 列举失败: %w", path, err)
+		}
+		for _, dir := range batch {
+			items, ok := res[dir]
+			if !ok {
+				return fmt.Errorf("sftp rm -r %s: 目录不可读 %s", path, dir)
+			}
+			// 单文件目标：sftp ls -l <file> 只返回它自己（实测 Item.Name 可能是完整路径，
+			// 见 watch/scan.go:121-127 的同类处理）。此时只发 -rm，绝不 rmdir 父目录。
+			if dir == path && len(items) == 1 && !items[0].IsDir &&
+				pathpkg.Base(items[0].Name) == pathpkg.Base(path) {
+				return c.removeBatch(host, user, []string{path}, nil)
+			}
+			for _, it := range items {
+				full := dir + "/" + it.Name
+				if strings.ContainsAny(full, "*?[") {
+					// 子项名可能自带通配符：sftp 的 rm 会对参数做远端 glob 展开，
+					// 顶层检查拦不住它（spec 决策 28 / R9），只能拒绝整次递归删除。
+					return fmt.Errorf("子路径含通配符 %s，暂不支持递归删除（避免远端 glob 误删）", full)
+				}
+				if it.IsDir {
+					queue = append(queue, full)
+					dirsByDepth = append([]string{full}, dirsByDepth...) // 深度越深越靠前
+				} else {
+					files = append(files, full)
+				}
+			}
+		}
+	}
+
+	return c.removeBatch(host, user, files, append(dirsByDepth, path))
+}
+
+// removeBatch 把删除命令压成一个批处理：每条加 '-' 前缀（一项失败不中止整批），
+// 先删文件，再按深度倒序删空目录。dirsBottomUp 必须已自底向上排好。
+func (c *Ctrl) removeBatch(host, user string, files, dirsBottomUp []string) error {
+	var sb strings.Builder
+	write := func(cmd, p string) error {
+		q, err := quoteArg(p)
+		if err != nil {
+			return err
+		}
+		sb.WriteString("-" + cmd + " " + q + "\n")
+		return nil
+	}
+	for _, f := range files {
+		if err := write("rm", f); err != nil {
+			return err
+		}
+	}
+	for _, d := range dirsBottomUp {
+		if err := write("rmdir", d); err != nil {
+			return err
+		}
+	}
+	out, err := c.run(host, user, []byte(sb.String()))
+	if err != nil {
+		c.logEvent(host, "error", "sftp rm -r failed: "+commandErr(out))
+		return fmt.Errorf("sftp rm -r: %w (%s)", err, commandErr(out))
+	}
+	// '-' 前缀抑制了逐命令中止，退出码无法区分【全部成功】与【部分失败】：
+	// 必须按 stderr 反查失败路径，否则调用方会把部分失败当成整批成功，
+	// 进而把没删掉的项也从选中集合里移除。
+	if failed := failedDeletePaths(out.Stderr, append(append([]string{}, files...), dirsBottomUp...)); len(failed) > 0 {
+		msg := "删除失败: " + strings.Join(failed, ", ") + "（" + commandErr(out) + "）"
+		c.logEvent(host, "error", "sftp rm -r partial: "+msg)
+		return fmt.Errorf("sftp rm -r: %s", msg)
+	}
+	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp rm -r failed: "+commandErr(out))
+		return fmt.Errorf("sftp rm -r failed: %s", commandErr(out))
+	}
+	c.logEvent(host, "info", "sftp rm -r done")
+	return nil
+}
+
+// failedDeletePaths 按 stderr 原文反查哪些路径删除失败。
+// 实测 OpenSSH 的客户端错误行形如 Can't rm: "<path>": <原因> / Can't rmdir: ...，
+// 与 listmany_parse.go 的 stderrListFailure 同一思路（按请求路径逐字反查）。
+func failedDeletePaths(stderr string, paths []string) []string {
+	if stderr == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range paths {
+		for _, line := range strings.Split(stderr, "\n") {
+			l := strings.TrimSpace(strings.TrimRight(line, "\r"))
+			if strings.Contains(l, "\""+p+"\"") {
+				out = append(out, p)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (c *Ctrl) Mkdir(host, user, path string) error {
