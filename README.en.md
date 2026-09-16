@@ -77,10 +77,12 @@ wails dev
 - **Auto reconnect**: per-rule toggle. An unexpected drop is retried with backoff
   (`Ns 后第 N 次重连`) and the card shows `reconnecting` / `error` instead of
   silently pretending to be connected
-- **SFTP file management**: dual-pane browse / upload / download / recursive
-  download / delete / rename / mkdir; "show hidden files" toggle; "recent
-  locations" to jump back to a previous host + directory pair; a transfer queue
-  with elapsed time; right-click context menu for file operations
+- **SFTP file management**: dual-pane browse / multi-select (Ctrl-click, Shift-range,
+  Ctrl+A) / batch download, upload and delete / right-click menu / drag-and-drop
+  delivery (pane to pane, dropped in from the OS, dragged onto a subdirectory to
+  move) / per-pane "recent locations" and instant filter; "show hidden files"
+  toggle; transfer queue showing direction, source to target, and skipped/failure
+  reasons
 - **Remote folder sync**: monitor a remote directory *or a single file* and sync
   changes to local using `inotifywait` when available, falling back to polling
   (or force polling with `force_poll`); configurable `max_depth` (`-1` =
