@@ -13,10 +13,19 @@ const props = defineProps({
   // 面板本身不懂语义，只负责渲染与上抛（spec §6.2 / 决策 3）。
   actions: { type: Array, default: () => [] },
   hiddenSelected: { type: Number, default: 0 },
+  // P2：面板头的位置下拉/收藏/深搜入口。位置数据由父组件按面板+主机过滤后传入。
+  pane: { type: String, default: 'remote' },
+  host: { type: String, default: '' },
+  bookmarks: { type: Array, default: () => [] },
+  recents: { type: Array, default: () => [] },
+  bookmarked: { type: Boolean, default: false },
 })
-const emit = defineEmits(['select', 'open', 'context', 'visible', 'focus', 'dragstart', 'dropon', 'clear', 'action'])
+const emit = defineEmits(['select', 'open', 'context', 'visible', 'focus', 'dragstart', 'dropon', 'clear', 'action', 'pick-position', 'toggle-bookmark', 'search'])
 const menuOpen = ref(false)
 function pick(name) { menuOpen.value = false; emit('action', name) }
+
+// 位置下拉：选中后立刻清零，避免同一个位置连选两次不触发 change。
+function onPick(e) { const v = e.target.value; e.target.value = ''; if (v) emit('pick-position', v) }
 
 // Sort state: key in 'name' | 'size' | 'modTime'; dir 1 = asc, -1 = desc.
 const sortKey = ref('name')
@@ -87,6 +96,17 @@ function fmtSize(bytes) {
     <div class="head">
       <span class="title">{{ title }}</span>
       <span class="curpath">{{ path }}</span>
+      <select class="pos" :value="''" @change="onPick($event)">
+        <option value="" disabled selected>📍 位置</option>
+        <optgroup v-if="bookmarks.length" label="书签">
+          <option v-for="b in bookmarks" :key="'b' + b.path" :value="b.path">{{ b.name || b.path }}</option>
+        </optgroup>
+        <optgroup v-if="recents.length" label="最近">
+          <option v-for="r in recents" :key="'r' + r.path" :value="r.path">{{ r.path }}</option>
+        </optgroup>
+      </select>
+      <button class="star" :class="{ on: bookmarked }" :title="bookmarked ? '取消收藏' : '收藏当前目录'" @click="emit('toggle-bookmark')">☆</button>
+      <button class="find" title="递归深搜" @click="emit('search')">🔍</button>
       <span class="count">{{ shown.length }} 项</span>
       <div v-if="selKeys.length || actions.length" class="batch" @click.stop>
         <button class="chip" @click="menuOpen = !menuOpen">
@@ -140,6 +160,8 @@ function fmtSize(bytes) {
 .title { font-weight: 600; }
 .curpath { font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px; flex: 1; text-align: center; }
 .count { font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); }
+.pos { max-width: 150px; font-size: var(--fs-11); }
+.star.on { color: var(--seed); }
 .batch { position: relative; }
 .batch .chip { font-size: var(--fs-11); }
 .bmenu { position: absolute; right: 0; top: 100%; z-index: 20; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 3px 0; min-width: 160px; }
