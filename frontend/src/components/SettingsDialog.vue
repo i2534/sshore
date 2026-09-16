@@ -11,7 +11,7 @@ const err = ref('')
 const appInfo = ref({ name: '', version: '', repo: '' })
 
 async function loadAppInfo() {
-  try { appInfo.value = await GetAppInfo() } catch (e) { appInfo.value = { name: 'sshore', version: '', repo: '' } }
+  try { appInfo.value = await GetAppInfo() } catch (e) { appInfo.value = { name: 'SSHore', version: '', repo: '' } }
 }
 
 watch(() => props.visible, (v) => { if (v) { err.value = ''; loadAppInfo() } })
@@ -83,7 +83,7 @@ watch(
 
       <section class="group help">
         <h3>帮助</h3>
-        <p class="meta">应用 {{ appInfo.name || 'sshore' }} · 版本 {{ appInfo.version || 'dev' }} · 仓库
+        <p class="meta">应用 {{ appInfo.name || 'SSHore' }} · 版本 {{ appInfo.version || 'dev' }} · 仓库
           <a v-if="appInfo.repo" :href="appInfo.repo" target="_blank" rel="noopener">{{ appInfo.repo }}</a>
           <span v-else>—</span>
         </p>

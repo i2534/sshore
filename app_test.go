@@ -140,11 +140,21 @@ func TestAutoStartEnabledSkippedWhenDisabled(t *testing.T) {
 func TestGetAppInfo(t *testing.T) {
 	a := NewApp()
 	info := a.GetAppInfo()
-	if info.Name != "sshore" {
+	if info.Name != "SSHore" {
 		t.Fatalf("app name: %q", info.Name)
 	}
 	if info.Version == "" || info.Repo == "" {
 		t.Fatalf("version/repo should be non-empty: %+v", info)
+	}
+}
+
+// 窗口标题必须是「SSHore <版本>」，随构建注入的 Version 一起变化。
+func TestAppTitle(t *testing.T) {
+	if got, want := appTitle(), "SSHore "+Version; got != want {
+		t.Fatalf("app title: got %q, want %q", got, want)
+	}
+	if got := appTitle(); !strings.HasPrefix(got, "SSHore ") {
+		t.Fatalf("app title should start with %q: %q", "SSHore ", got)
 	}
 }
 

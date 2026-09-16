@@ -37,6 +37,10 @@ var (
 	Repo    = "https://github.com/i2534/sshore"
 )
 
+// appTitle 返回主窗口标题："SSHore <版本>"。版本取自构建注入的 Version
+// （未注入时为 dev），使发布包与开发态窗口标题都带版本号（见 Makefile LDFLAGS）。
+func appTitle() string { return "SSHore " + Version }
+
 // AppInfo 供前端「帮助」展示的应用元信息。
 type AppInfo struct {
 	Name    string `json:"name"`
@@ -151,7 +155,7 @@ func (a *App) ListTunnels() []config.Tunnel {
 
 // GetAppInfo returns app metadata (name/version/repo) for the help panel.
 func (a *App) GetAppInfo() AppInfo {
-	return AppInfo{Name: "sshore", Version: Version, Repo: Repo}
+	return AppInfo{Name: "SSHore", Version: Version, Repo: Repo}
 }
 
 // SyncWindowBackground aligns the native window background with the active theme
