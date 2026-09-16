@@ -1,8 +1,20 @@
 <script setup>
+import { computed } from 'vue'
+import { statusClass, summarizeQueue, directionArrow } from '../utils/queue'
+
 const props = defineProps({
   transfers: { type: Array, default: () => [] },
   now: { type: Number, default: () => Date.now() },
 })
+const emit = defineEmits(['copy-failures'])
+
+const summary = computed(() => summarizeQueue(props.transfers))
+
+function line(t) {
+  // 兼容历史记录（无 direction/src/dst）：只显示文件名，保持既有渲染不变。
+  if (!t.direction && !t.src && !t.dst) return t.name
+  return directionArrow(t.direction) + ' ' + (t.src || t.name) + ' → ' + (t.dst || '')
+}
 
 function fmtSize(bytes) {
   if (!bytes) return '--'
@@ -23,22 +35,20 @@ function fmtElapsed(t) {
   const m = Math.floor(s / 60)
   return m + 'm ' + (s % 60) + 's'
 }
-
-function statusClass(status) {
-  if (status === '完成') return 'done'
-  if (status === '失败') return 'err'
-  return 'doing'
-}
 </script>
 
 <template>
   <div class="queue">
     <div v-for="(t, i) in transfers" :key="i" class="t">
-      <span class="name">{{ t.name }}</span>
+      <span class="name">{{ line(t) }}</span>
       <span class="meta">{{ fmtSize(t.size) }} | {{ fmtElapsed(t) }}</span>
       <span class="status" :class="statusClass(t.status)">{{ t.status }}</span>
     </div>
     <div v-if="!transfers.length" class="empty">无传输任务</div>
+    <div v-if="transfers.length" class="qsum">
+      成功 {{ summary.ok }} · 跳过 {{ summary.skipped }} · 失败 {{ summary.failed }} · 进行中 {{ summary.running }}
+      <button v-if="summary.failed" class="copy" @click="emit('copy-failures')">复制失败清单</button>
+    </div>
   </div>
 </template>
 
@@ -50,5 +60,7 @@ function statusClass(status) {
 .status.doing { color: var(--accent); }
 .status.done { color: var(--success); }
 .status.err { color: var(--danger); }
+.status.skip { color: var(--text-faint); }
+.qsum { padding: 3px 8px; color: var(--text-faint); display: flex; gap: 8px; align-items: center; }
 .empty { padding: 3px 8px; color: var(--text-faint); }
 </style>
