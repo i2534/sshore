@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	stdsync "sync"
 	"time"
@@ -395,7 +396,7 @@ func (a *App) SftpGet(host, user, remote, local string) error {
 	if err := a.sftp.Get(host, user, remote, local); err != nil {
 		return err
 	}
-	a.recordRecentSFTP(host, filepath.Dir(remote), filepath.Dir(local))
+	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
 	return nil
 }
 
@@ -404,14 +405,14 @@ func (a *App) SftpGetDir(host, user, remote, local string) error {
 	if err := a.sftp.GetRecursive(host, user, remote, local); err != nil {
 		return err
 	}
-	a.recordRecentSFTP(host, filepath.Dir(remote), filepath.Dir(local))
+	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
 	return nil
 }
 func (a *App) SftpPut(host, user, local, remote string) error {
 	if err := a.sftp.Put(host, user, local, remote); err != nil {
 		return err
 	}
-	a.recordRecentSFTP(host, filepath.Dir(remote), filepath.Dir(local))
+	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
 	return nil
 }
 func (a *App) SftpRemove(host, user, path string) error {
@@ -437,7 +438,7 @@ func (a *App) SftpPutRecursive(host, user, local, remoteDir string) error {
 	if err := a.sftp.PutRecursive(host, user, local, remoteDir); err != nil {
 		return err
 	}
-	a.recordRecentSFTP(host, filepath.Dir(remoteDir), filepath.Dir(local))
+	a.recordRecentSFTP(host, path.Dir(remoteDir), filepath.Dir(local))
 	return nil
 }
 
@@ -862,6 +863,9 @@ func (a *App) AddRemoteRecent(host, path string) error {
 // recordRecentSFTP 记录一次成功的 SFTP 操作：远端目录进 RemoteRecent、本地目录进
 // LocalRecent（各自去重置顶、上限 20，见 AddRemoteRecent/AddLocalRecent）；
 // 落盘沿用 saveConfig 的 fire-and-forget 模式（见 OnShutdown）。
+// remoteDir 必须是 **POSIX 语义**的远端目录（调用方用 path.Dir —— 远端没有 Windows
+// 反斜杠概念，Windows 上 filepath.Dir("/a/x") 会得到 "\a"）；localDir 是本机目录
+// （调用方用 filepath.Dir，Windows 上自然得到反斜杠）。
 func (a *App) recordRecentSFTP(host, remoteDir, localDir string) {
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
