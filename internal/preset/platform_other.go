@@ -1,4 +1,3 @@
-// internal/preset/platform_other.go
 //go:build !windows
 
 package preset

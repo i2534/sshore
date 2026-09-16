@@ -327,7 +327,7 @@ type Preset struct {
 }
 
 // NormalizeScope 归一 scope：大小写/首尾空白是手写配置的常见笔误，而预设层是精确比较，
-// 不归一就等于"配了却什么都没有"。（store.go 需新增 import "strings"）
+// 不归一就等于"配了却什么都没有"。
 func NormalizeScope(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	if s == "" {

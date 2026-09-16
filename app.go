@@ -824,7 +824,8 @@ type Presets struct {
 }
 
 // ListPresets 返回位置下拉的预设：每次调用都重新读 presets.toml 并实时枚举盘符。
-// 坏文件不让面板整体失败：预设组退化为空（错误已在 startup 记录、Init 时上报）。
+// 坏文件不让面板整体失败：预设组退化为空，并通过返回值的 Err 让前端把解析错误写进日志面板
+// （startup 阶段也会记录一次，供 Init 时补发事件；两条路径都不改写用户文件）。
 // 注意前端只在进入 SFTP 页时拉一次 → 手改文件后需要重启应用生效。
 func (a *App) ListPresets() Presets {
 	var entries []preset.Entry
