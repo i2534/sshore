@@ -16,6 +16,7 @@ vi.mock('../../wailsjs/go/main/App', () => ({
   AddRemoteRecent: vi.fn(async () => {}),
 }))
 
+import { AddLocalRecent, AddRemoteRecent } from '../../wailsjs/go/main/App'
 import { useLocationsStore } from './locations'
 
 describe('locations store', () => {
@@ -54,5 +55,30 @@ describe('locations store', () => {
     await s.load()
     await s.addBookmark({ name: 'x', scope: 'local', host: '', path: '/tmp' })
     expect(s.bookmarks.some((b) => b.path === '/tmp')).toBe(true)
+  })
+
+  it('重复记录同一最近位置时短路：不发 IPC、列表不变', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const beforeL = JSON.stringify(s.localRecents)
+    const beforeR = JSON.stringify(s.remoteRecents)
+    AddLocalRecent.mockClear()
+    AddRemoteRecent.mockClear()
+
+    // 队首分别是 /home/u/a 与 (prod, /var/log)，重复记录必须短路
+    await s.addLocalRecent('/home/u/a')
+    await s.addRemoteRecent('prod', '/var/log')
+    expect(AddLocalRecent).not.toHaveBeenCalled()
+    expect(AddRemoteRecent).not.toHaveBeenCalled()
+    expect(JSON.stringify(s.localRecents)).toBe(beforeL)
+    expect(JSON.stringify(s.remoteRecents)).toBe(beforeR)
+
+    // 不同路径仍要照常写盘并置顶
+    await s.addLocalRecent('/tmp/other')
+    await s.addRemoteRecent('db', '/srv')
+    expect(AddLocalRecent).toHaveBeenCalledTimes(1)
+    expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
+    expect(s.localRecents[0].path).toBe('/tmp/other')
+    expect(s.remoteRecents[0].host).toBe('db')
   })
 })
