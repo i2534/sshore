@@ -86,10 +86,6 @@ export function ListLocations() {
   return window['go']['main']['App']['ListLocations']();
 }
 
-export function ListRecentSFTP() {
-  return window['go']['main']['App']['ListRecentSFTP']();
-}
-
 export function ListSyncRules() {
   return window['go']['main']['App']['ListSyncRules']();
 }

@@ -86,7 +86,7 @@ onUnmounted(() => {
     <div class="panel">
       <div class="head">
         <span class="ftitle">{{ title() }}</span>
-        <span v-if="running" class="dim">搜索中… 已扫描 {{ scanned }} 个目录</span>
+        <span v-if="running && scope === 'remote'" class="dim">搜索中… 已扫描 {{ scanned }} 个目录</span>
         <button v-if="running" @click="cancel">取消</button>
         <button @click="emit('close')">关闭</button>
       </div>
