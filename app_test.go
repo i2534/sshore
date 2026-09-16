@@ -855,3 +855,49 @@ func TestRetrySyncRuleFailuresRejectsNonRunningRule(t *testing.T) {
 		t.Fatal("未运行的规则必须返回错误")
 	}
 }
+
+func TestCopyLocalRejectsSubtree(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "a")
+	if err := os.MkdirAll(filepath.Join(src, "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{}
+	if err := a.CopyLocal(src, filepath.Join(src, "inner", "copy")); err == nil {
+		t.Fatal("expected rejection when dst is inside src")
+	}
+}
+
+func TestCopyLocalCopiesFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "x.txt")
+	_ = os.WriteFile(src, []byte("hi"), 0o644)
+	a := &App{}
+	if err := a.CopyLocal(src, filepath.Join(dir, "y.txt")); err != nil {
+		t.Fatalf("CopyLocal: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "y.txt")); string(b) != "hi" {
+		t.Fatalf("copy failed: %q", b)
+	}
+}
+
+func TestStatPathsReportsTypeAndName(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.txt")
+	_ = os.WriteFile(file, []byte("12345"), 0o644)
+	a := &App{}
+	got := a.StatPaths([]string{file, dir, filepath.Join(dir, "nope")})
+	if len(got) != 3 {
+		t.Fatalf("len = %d", len(got))
+	}
+	if got[0].Name != "a.txt" || got[0].IsDir || got[0].Size != 5 {
+		t.Fatalf("file info = %+v", got[0])
+	}
+	if !got[1].IsDir {
+		t.Fatalf("dir info = %+v", got[1])
+	}
+	if got[2].Err == "" {
+		t.Fatalf("missing path must carry Err: %+v", got[2])
+	}
+}
+
