@@ -80,9 +80,11 @@ wails dev
 - **SFTP file management**: dual-pane browse / multi-select (Ctrl-click, Shift-range,
   Ctrl+A) / batch download, upload and delete / right-click menu / drag-and-drop
   delivery (pane to pane, dropped in from the OS, dragged onto a subdirectory to
-  move) / per-pane "recent locations" and instant filter; "show hidden files"
-  toggle; transfer queue showing direction, source to target, and skipped/failure
-  reasons
+  move) / instant filter in both panes; per-pane 📍 location dropdown (bookmarks +
+  recents, up to 20 each, remote recents isolated per host) and ☆ bookmark toggle /
+  recursive deep search in both panes (cancellable, 5 levels by default, up to 500
+  hits, unreadable directories reported honestly) / "show hidden files" toggle;
+  transfer queue showing direction, source to target, and skipped/failure reasons
 - **Remote folder sync**: monitor a remote directory *or a single file* and sync
   changes to local using `inotifywait` when available, falling back to polling
   (or force polling with `force_poll`); configurable `max_depth` (`-1` =
@@ -115,6 +117,8 @@ empty/invalid values (theme, `font_scale`, `max_depth`, `poll_interval_s`,
 missing exclude list) are normalized on load.
 
 ```toml
+legacy_migrated = true           # legacy recent_sftp already migrated (never written back; parsed for one release so downgrades still work)
+
 [app]
   theme = "dark"                 # dark | light | system
   font_scale = 1.0               # 0.9 | 1.0 | 1.15
@@ -123,7 +127,10 @@ missing exclude list) are normalized on load.
 
 [[tunnels]]                      # port-forward rules (-L / -R / -D)
 [[syncs]]                        # remote → local sync rules
-[[recent_sftp]]                  # recent SFTP host + directories
+[[bookmarks]]                    # pinned locations (scope = local | remote)
+[[local_recent]]                 # local recent locations (recorded automatically, max 20)
+[[remote_recent]]                # remote recent locations (isolated per host, max 20)
+[[recent_sftp]]                  # legacy field: migrated on first launch into the two above; still parsed for downgrades
 ```
 
 ## Architecture
