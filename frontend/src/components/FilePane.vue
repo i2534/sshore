@@ -19,6 +19,9 @@ const props = defineProps({
   bookmarks: { type: Array, default: () => [] },
   recents: { type: Array, default: () => [] },
   bookmarked: { type: Boolean, default: false },
+  // 位置下拉里的固定预设与 Windows 盘符，由父组件按面板给出（内容来自 ListPresets）。
+  presets: { type: Array, default: () => [] },
+  disks: { type: Array, default: () => [] },
 })
 const emit = defineEmits(['select', 'open', 'context', 'visible', 'focus', 'dragstart', 'dropon', 'clear', 'action', 'pick-position', 'toggle-bookmark', 'search'])
 const menuOpen = ref(false)
@@ -98,6 +101,12 @@ function fmtSize(bytes) {
       <span class="curpath">{{ path }}</span>
       <select class="pos" :value="''" @change="onPick($event)">
         <option value="" disabled selected>📍 位置</option>
+        <optgroup v-if="presets.length" label="预设">
+          <option v-for="p in presets" :key="'p' + p.path" :value="p.path" :title="p.path">{{ p.name }}</option>
+        </optgroup>
+        <optgroup v-if="disks.length" label="磁盘">
+          <option v-for="d in disks" :key="'d' + d.path" :value="d.path" :title="d.path">{{ d.name }}</option>
+        </optgroup>
         <optgroup v-if="bookmarks.length" label="书签">
           <option v-for="b in bookmarks" :key="'b' + b.path" :value="b.path">{{ b.name || b.path }}</option>
         </optgroup>
