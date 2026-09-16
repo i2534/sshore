@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,8 +18,10 @@ import (
 // exact ssh/sftp argument list. It also creates the ControlPath socket file on
 // demand so Connect's post-spawn poll succeeds without a real ssh master.
 type fakeRunner struct {
-	mu    sync.Mutex
-	calls []runnerCall
+	mu      sync.Mutex
+	calls   []runnerCall
+	batches [][]byte         // 每次批处理的实际内容（从 -b 指向的临时文件读回）
+	queued  []osutil.Outcome // 非空时按序弹出，用于喂 ls 输出
 }
 
 type runnerCall struct {
@@ -26,16 +29,41 @@ type runnerCall struct {
 	args []string
 }
 
+func (f *fakeRunner) push(o osutil.Outcome) {
+	f.mu.Lock()
+	f.queued = append(f.queued, o)
+	f.mu.Unlock()
+}
+
 func (f *fakeRunner) run(name string, args ...string) (osutil.Outcome, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, runnerCall{name: name, args: args})
+	if i := indexOf(args, "-b"); i >= 0 && i+1 < len(args) {
+		if b, err := os.ReadFile(args[i+1]); err == nil {
+			f.batches = append(f.batches, b)
+		}
+	}
+	var out osutil.Outcome
+	if len(f.queued) > 0 {
+		out = f.queued[0]
+		f.queued = f.queued[1:]
+	}
 	f.mu.Unlock()
 	for _, a := range args {
 		if strings.HasPrefix(a, "ControlPath=") {
 			_ = os.WriteFile(strings.TrimPrefix(a, "ControlPath="), nil, 0600)
 		}
 	}
-	return osutil.Outcome{ExitCode: 0}, nil
+	return out, nil
+}
+
+func indexOf(xs []string, want string) int {
+	for i, x := range xs {
+		if x == want {
+			return i
+		}
+	}
+	return -1
 }
 
 func hasArg(args []string, want string) bool {
@@ -402,5 +430,131 @@ func TestHostOnlyAPIsUseRememberedUserSocket(t *testing.T) {
 	}
 	if c.Connected("never-seen") {
 		t.Fatal("未知 host 的回退路径不应存在")
+	}
+}
+
+// mockLs 生成**真实形状**的批处理输出：每段以 'sftp> -ls -la "<path>"' 回显开头。
+// parseListMany 正是靠这个前缀切块并**按发送顺序**归属路径；缺了它整块会被丢弃，
+// 测试会得到'目录未知'而不是'列出了内容'（见 internal/sftp/listmany_parse.go:52-76）。
+// 另：ctrl_test.go 的 import 需补 "fmt"。
+func mockLs(path string, lines ...string) string {
+	out := "sftp> -ls -la \"" + path + "\"\n"
+	for _, l := range lines {
+		out += l + "\n"
+	}
+	return out
+}
+
+func lsLine(name string, isDir bool, size int64) string {
+	kind := "-"
+	if isDir {
+		kind = "d"
+	}
+	return fmt.Sprintf("%srw-r--r-- 1 u g %d Jan  1 00:00 %s", kind, size, name)
+}
+
+func TestRemoveRecursiveBuildsDashPrefixedBatch(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	// 第 1 批：列 /root → 1 个文件 + 1 个子目录
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("a.txt", false, 10), lsLine("sub", true, 0))})
+	// 第 2 批：列 /root/sub → 回显在场、内容为空 ⇒ 存在但为空的目录
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root/sub")})
+	// 第 3 批：删除批
+	fr.push(osutil.Outcome{ExitCode: 0})
+
+	if err := c.RemoveRecursive("h", "", "/root"); err != nil {
+		t.Fatalf("RemoveRecursive: %v", err)
+	}
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if len(fr.calls) != 3 {
+		t.Fatalf("want 3 runner calls (list root, list sub, delete), got %d", len(fr.calls))
+	}
+	bat := fr.batches[len(fr.batches)-1]
+	want := "-rm \"/root/a.txt\"\n-rmdir \"/root/sub\"\n-rmdir \"/root\"\n"
+	if string(bat) != want {
+		t.Fatalf("delete batch = %q, want %q", bat, want)
+	}
+}
+
+func TestRemoveRecursiveSingleFileOnlyRm(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	// sftp ls -l <file> 返回它自己，且 Item.Name 可能是完整路径。
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root/a.txt", lsLine("/root/a.txt", false, 10))})
+	fr.push(osutil.Outcome{ExitCode: 0})
+	if err := c.RemoveRecursive("h", "", "/root/a.txt"); err != nil {
+		t.Fatalf("RemoveRecursive: %v", err)
+	}
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if got, want := string(fr.batches[len(fr.batches)-1]), "-rm \"/root/a.txt\"\n"; got != want {
+		t.Fatalf("single-file batch = %q, want %q", got, want)
+	}
+}
+
+func TestRemoveRecursiveEmptyDirOnlyRmdir(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/empty")})
+	fr.push(osutil.Outcome{ExitCode: 0})
+	if err := c.RemoveRecursive("h", "", "/empty"); err != nil {
+		t.Fatalf("RemoveRecursive: %v", err)
+	}
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if got, want := string(fr.batches[len(fr.batches)-1]), "-rmdir \"/empty\"\n"; got != want {
+		t.Fatalf("empty dir batch = %q, want %q", got, want)
+	}
+}
+
+func TestRemoveRecursivePartialFailureIsReported(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("a.txt", false, 10))})
+	// '-' 前缀让失败不中止整批，退出码仍是 0 —— 只能靠 stderr 发现部分失败。
+	fr.push(osutil.Outcome{ExitCode: 0, Stderr: "Can't rm: \"/root/a.txt\": Permission denied\r\n"})
+	err := c.RemoveRecursive("h", "", "/root")
+	if err == nil || !strings.Contains(err.Error(), "/root/a.txt") {
+		t.Fatalf("部分失败必须报错并带路径, got %v", err)
+	}
+}
+
+func TestRemoveRecursivePathWithSpace(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/my dir", lsLine("a b.txt", false, 1))})
+	fr.push(osutil.Outcome{ExitCode: 0})
+	if err := c.RemoveRecursive("h", "", "/my dir"); err != nil {
+		t.Fatalf("RemoveRecursive: %v", err)
+	}
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if got, want := string(fr.batches[len(fr.batches)-1]), "-rm \"/my dir/a b.txt\"\n-rmdir \"/my dir\"\n"; got != want {
+		t.Fatalf("space path batch = %q, want %q", got, want)
+	}
+}
+
+func TestRemoveRecursiveRejectsGlobInChild(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("lit*name.txt", false, 1))})
+	if err := c.RemoveRecursive("h", "", "/root"); err == nil {
+		t.Fatal("子项名含通配符必须拒绝整次递归删除")
+	}
+	if len(fr.calls) != 1 { // 只应有列举调用，绝无删除批
+		t.Fatalf("must not run delete batch, calls=%d", len(fr.calls))
+	}
+}
+
+func TestRemoveRecursiveRejectsGlobPaths(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewCtrl(fr.run, nil)
+	if err := c.RemoveRecursive("h", "", "/root/lit*name.txt"); err == nil {
+		t.Fatal("expected error for glob metachar path")
+	}
+	if len(fr.calls) != 0 {
+		t.Fatalf("must not spawn any process, got %d calls", len(fr.calls))
 	}
 }
