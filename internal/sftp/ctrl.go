@@ -253,6 +253,17 @@ func (c *Ctrl) buildBatch(op, remote, local string) ([]byte, error) {
 			return nil, err
 		}
 		return []byte(fmt.Sprintf("put %s %s\n", l, r)), nil
+	case "putr":
+		// 递归上传：sftp put -r <local> <remoteDir>。
+		l, err := quoteArg(local)
+		if err != nil {
+			return nil, err
+		}
+		r, err := quoteArg(remote)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("put -r %s %s\n", l, r)), nil
 	case "rm":
 		r, err := quoteArg(remote)
 		if err != nil {
@@ -523,6 +534,34 @@ func (c *Ctrl) Put(host, user, local, remote string) error {
 	return nil
 }
 
+// PutRecursive 递归上传本地目录到远端目录（sftp put -r）。
+// 目标语义由 e2e 探针实测确定（spec §13 R1，verdict "PUT-R: merge"）：
+//   - 远端 remoteDir 下没有同名目录时，sftp 建出 remoteDir/<base(local)>/... ；
+//   - 远端 remoteDir 下已存在同名目录时**并入**该目录，不嵌套出 remoteDir/<base>/<base> ；
+//   - 并入时同名文件被本地内容覆盖（实测另一行 "PUT-R-OVERWRITE: A"）。
+//
+// 本方法只负责把命令送出去并把结果转成 error；调用方若要"整树替换"，
+// 必须先自行删除远端同名目录（put -r 不会清理远端独有的旧文件）。
+func (c *Ctrl) PutRecursive(host, user, local, remoteDir string) error {
+	c.logEvent(host, "info", "sftp put -r "+local+" → "+remoteDir)
+	batch, err := c.buildBatch("putr", remoteDir, local)
+	if err != nil {
+		c.logEvent(host, "error", "sftp put -r failed: "+err.Error())
+		return err
+	}
+	out, err := c.run(host, user, batch)
+	if err != nil {
+		c.logEvent(host, "error", "sftp put -r failed: "+commandErr(out))
+		return fmt.Errorf("sftp put -r %s: %w (%s)", host, err, commandErr(out))
+	}
+	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp put -r failed: "+commandErr(out))
+		return fmt.Errorf("sftp put -r failed: %s", commandErr(out))
+	}
+	c.logEvent(host, "info", "sftp put -r done")
+	return nil
+}
+
 func (c *Ctrl) Remove(host, user, path string) error {
 	c.logEvent(host, "info", "sftp rm "+path)
 	batch, err := c.buildBatch("rm", path, "")
@@ -541,6 +580,159 @@ func (c *Ctrl) Remove(host, user, path string) error {
 	}
 	c.logEvent(host, "info", "sftp rm done")
 	return nil
+}
+
+// RemoveRecursive 递归删除远端路径（文件或目录）。
+// 约束（spec §5.1 / 决策 27、28）：
+//  1. 每条命令加 '-' 前缀：否则任一条失败即中止整批，留下半棵树。
+//  2. 不用 '@' 前缀：保留回显，便于按 stderr 反查失败路径。
+//  3. 路径含 glob 元字符（* ? [）→ 直接拒绝：sftp 会对参数做远端 glob 展开，可能删错文件。
+//
+// 失败语义：部分删除不回滚，错误里带上远端原文。
+func (c *Ctrl) RemoveRecursive(host, user, path string) error {
+	if path == "" || path == "/" {
+		return fmt.Errorf("拒绝递归删除根路径: %q", path)
+	}
+	if strings.ContainsAny(path, "*?[") {
+		return fmt.Errorf("路径含通配符 %s，暂不支持递归删除（避免远端 glob 误删）", path)
+	}
+	c.logEvent(host, "info", "sftp rm -r "+path)
+
+	var files []string
+	var dirsByDepth []string // 自底向上
+	queue := []string{path}
+	for len(queue) > 0 {
+		batch := queue
+		if len(batch) > 64 {
+			batch = queue[:64]
+		}
+		queue = queue[len(batch):]
+		res, err := c.ListMany(host, user, batch)
+		if err != nil {
+			return fmt.Errorf("sftp rm -r %s: 列举失败: %w", path, err)
+		}
+		for _, dir := range batch {
+			items, ok := res[dir]
+			if !ok {
+				return fmt.Errorf("sftp rm -r %s: 目录不可读 %s", path, dir)
+			}
+			// 单文件目标：sftp ls -l <file> 只返回它自己，且实测 Item.Name 就是**完整远端路径**
+			// （见 watch/scan.go:121-127 的同类处理）。判别必须用 Name == path 逐字比较：
+			// 目录参数的列表返回的是子项 basename，因此"目录 /root/foo 里恰有一个同名文件 foo"
+			// 不会被误判成单文件（否则只发 -rm、漏删整棵子树）。
+			if dir == path && len(items) == 1 && !items[0].IsDir &&
+				items[0].Name == path {
+				return c.removeBatch(host, user, []string{path}, nil)
+			}
+			for _, it := range items {
+				full := dir + "/" + it.Name
+				if strings.ContainsAny(full, "*?[") {
+					// 子项名可能自带通配符：sftp 的 rm 会对参数做远端 glob 展开，
+					// 顶层检查拦不住它（spec 决策 28 / R9），只能拒绝整次递归删除。
+					return fmt.Errorf("子路径含通配符 %s，暂不支持递归删除（避免远端 glob 误删）", full)
+				}
+				if it.IsDir {
+					queue = append(queue, full)
+					dirsByDepth = append([]string{full}, dirsByDepth...) // 深度越深越靠前
+				} else {
+					files = append(files, full)
+				}
+			}
+		}
+	}
+
+	return c.removeBatch(host, user, files, append(dirsByDepth, path))
+}
+
+// removeBatch 把删除命令压成一个批处理：每条加 '-' 前缀（一项失败不中止整批），
+// 先删文件，再按深度倒序删空目录。dirsBottomUp 必须已自底向上排好。
+func (c *Ctrl) removeBatch(host, user string, files, dirsBottomUp []string) error {
+	var sb strings.Builder
+	write := func(cmd, p string) error {
+		q, err := quoteArg(p)
+		if err != nil {
+			return err
+		}
+		sb.WriteString("-" + cmd + " " + q + "\n")
+		return nil
+	}
+	for _, f := range files {
+		if err := write("rm", f); err != nil {
+			return err
+		}
+	}
+	for _, d := range dirsBottomUp {
+		if err := write("rmdir", d); err != nil {
+			return err
+		}
+	}
+	out, err := c.run(host, user, []byte(sb.String()))
+	if err != nil {
+		c.logEvent(host, "error", "sftp rm -r failed: "+commandErr(out))
+		return fmt.Errorf("sftp rm -r: %w (%s)", err, commandErr(out))
+	}
+	// '-' 前缀抑制了逐命令中止，退出码无法区分【全部成功】与【部分失败】：
+	// 必须按 stderr 反查失败路径，否则调用方会把部分失败当成整批成功，
+	// 进而把没删掉的项也从选中集合里移除。
+	if failed := failedDeletePaths(out.Stderr, append(append([]string{}, files...), dirsBottomUp...)); len(failed) > 0 {
+		msg := "删除失败: " + strings.Join(failed, ", ") + "（" + commandErr(out) + "）"
+		c.logEvent(host, "error", "sftp rm -r partial: "+msg)
+		return fmt.Errorf("sftp rm -r: %s", msg)
+	}
+	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp rm -r failed: "+commandErr(out))
+		return fmt.Errorf("sftp rm -r failed: %s", commandErr(out))
+	}
+	c.logEvent(host, "info", "sftp rm -r done")
+	return nil
+}
+
+// failedDeletePaths 按 stderr 原文反查哪些路径删除失败。
+// 实测 OpenSSH（internal-sftp，'-' 前缀，EXIT 恒为 0）给出**两种**形状：
+//  1. '-rm' 失败**不带引号**： remote delete /tmp/x/f.txt: Permission denied
+//  2. '-rmdir' 失败**带引号**： remote rmdir "/tmp/x/d": Failure
+//
+// 只认**请求路径**逐字匹配（见 deleteFailureMentions），不做模糊子串匹配：
+// 请求 /a 时绝不能命中 /ab 或 /a.txt.bak 的失败行。
+// 与 listmany_parse.go 的 stderrListFailure 同一思路。
+func failedDeletePaths(stderr string, paths []string) []string {
+	if stderr == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range paths {
+		for _, line := range strings.Split(stderr, "\n") {
+			l := strings.TrimSpace(strings.TrimRight(line, "\r"))
+			if deleteFailureMentions(l, p) {
+				out = append(out, p)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// deleteFailureMentions 判断一行 stderr 是否就是「请求路径 p 删除失败」的远端原文。
+// 覆盖实测的两种动词（remote delete / remote rmdir）× 两种路径写法（裸路径 / 双引号包裹），
+// 且一律要求路径之后**紧跟** ": "，因此是路径级精确匹配。
+func deleteFailureMentions(line, p string) bool {
+	quoted := ""
+	if q, err := quoteArg(p); err == nil {
+		quoted = q // 形如 "/tmp/x/d"
+	}
+	for _, verb := range []string{"remote delete ", "remote rmdir "} {
+		rest, ok := strings.CutPrefix(line, verb)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(rest, p+": ") {
+			return true
+		}
+		if quoted != "" && strings.HasPrefix(rest, quoted+": ") {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Ctrl) Mkdir(host, user, path string) error {

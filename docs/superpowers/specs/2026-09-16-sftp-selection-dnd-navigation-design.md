@@ -130,7 +130,7 @@ app.go（接线：绑定方法 + 事件转发；不写业务算法）
 // PutRecursive 递归上传本地目录到远端目录（sftp put -r）。
 // 预期语义：把 local 目录及其内容放到 remoteDir 之下，即 remoteDir/<base(local)>/...；
 // remoteDir 必须已存在（不存在则报错，不隐式建树）。
-// ⚠️ 该语义待 §13 R1 实测确认后写入实现与注释（put -r 对已存在同名目录的行为未证实）。
+// 实测结论（spec §13 R1，2026-09-16）：remoteDir 下已存在同名目录时是**并入**、不嵌套，且其中的同名文件被本地内容覆盖。
 func (c *Ctrl) PutRecursive(host, user, local, remoteDir string) error
 
 // RemoveRecursive 递归删除远端路径（文件或目录）。
@@ -471,15 +471,15 @@ legacy_migrated = true
 
 | # | 风险 | 处置 |
 |---|---|---|
-| R1 | `sftp put -r` 在「远端同名目录已存在」时是**并入**还是**嵌套**，未实测 | §12.3 第 2 条探针实测；`PutRecursive` 行为与注释以实测结论为准；实测前该分支的 UI 文案不得写死 |
-| R2 | 远端 `rename` 覆盖已存在目标的成败（取决于 `posix-rename@openssh.com`）；本地在 Windows 上 `os.Rename` 目标存在**必然失败** | 探针实测远端；本地移动前先判存在，Windows 分支按「先删后改名」实现并单测 |
+| R1 | `sftp put -r` 在「远端同名目录已存在」时是**并入**还是**嵌套**，未实测 | §12.3 第 2 条探针实测；`PutRecursive` 行为与注释以实测结论为准；实测前该分支的 UI 文案不得写死；实测结论（2026-09-16）：`PUT-R: merge`（远端同名目录已存在时**并入**、不嵌套；且同名文件被本地内容覆盖，探针另一行 `PUT-R-OVERWRITE: A`） |
+| R2 | 远端 `rename` 覆盖已存在目标的成败（取决于 `posix-rename@openssh.com`）；本地在 Windows 上 `os.Rename` 目标存在**必然失败** | 探针实测远端；本地移动前先判存在，Windows 分支按「先删后改名」实现并单测；实测结论（2026-09-16）：`RENAME-OVERWRITE: yes content=OLD`（远端 `rename` 覆盖已存在目标**成功**，目标内容被源文件替换，源路径消失 `RENAME-SOURCE: moved`） |
 | R3 | `OnFileDrop` 坐标单位 / DPI 缩放不准 → 命中面板出错 | 实测；退化方案：以最后悬停面板为目标并在拖入期间高亮两侧确认 |
 | R4 | ~~用 `DisableWebViewDragAndDrop` 隔离~~ —— 字段名不存在；真实字段 `DisableWebViewDrop` 会全局关掉 webview 拖放接收，**同时废掉本源拖入** | **不得使用该开关**；真正的回退是"拖入期间忽略面板内 DnD 高亮"，JS 侧本来就按 `e.dataTransfer.types.includes("Files")` 区分外部文件拖入与内部 HTML5 拖拽（旁证缓解本风险） |
 | R5 | 深搜在大目录树上耗时（如 `/`） | 默认 `maxDepth=5`、`limit=500`、可取消；不提供无限深度入口 |
 | R6 | 本地面板被过滤隐藏的选中项被误删 | 面板头 + 确认框双重提示数量；删除确认始终显示实际将删的项数；判重用原始 items |
 | R7 | 远端递归删除**不可中断、部分失败不回滚**（删到一半失败会留下半棵子树）；确认与执行之间存在 TOCTOU | `-` 前缀保证一项失败不拖垮整批；失败按项进失败清单并明确「已删除 N 项」；**不承诺原子性**；R7 的"压成单批"只对删除阶段成立——BFS 收集阶段每层一个 `ListMany` 批次，收集与删除之间新增的文件会让对应 `rmdir` 失败，此时如实报错 |
 | R8 | 键盘快捷键误触（过滤框内 `Delete` 删文件） | §6.1 键盘守卫 + §12.2 `keys.js` 单测 + §12.3 第 9 条人工验收 |
-| R9 | glob 元字符路径的**正确**处理方式未证实（转义能不能被远端 sftp 接受取决于 sftp 端 glob 解析与 quote 顺序） | 本轮对删除采取**保守拒绝**（决策 28）；§12.3 第 2 条探针给出结论后再决定是否放开转义 |
+| R9 | glob 元字符路径的**正确**处理方式未证实（转义能不能被远端 sftp 接受取决于 sftp 端 glob 解析与 quote 顺序） | 本轮对删除采取**保守拒绝**（决策 28）；§12.3 第 2 条探针给出结论后再决定是否放开转义；实测结论（2026-09-16）：`GLOB-RM: star-file=deleted zz-file=deleted`——远端 glob 把同目录的 `litZZname.txt` 一并**误删**，误删成立，保守拒绝为必需，**不得放开转义** |
 | R10 | Wails 绑定「err != nil 丢结果」这一约束容易被后续实现者忘记 | 写进 §5.1 注释与 §12.1 用例（取消必须 resolve 而非 reject）；实现时 `SftpSearch` 显式吞掉 `context.Canceled`/`DeadlineExceeded` |
 
 ## 14. 后续子项（另行评审，不在本轮）

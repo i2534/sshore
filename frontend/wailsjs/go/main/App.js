@@ -10,6 +10,10 @@ export function ConfirmSyncRuleDeletes(arg1, arg2) {
   return window['go']['main']['App']['ConfirmSyncRuleDeletes'](arg1, arg2);
 }
 
+export function CopyLocal(arg1, arg2) {
+  return window['go']['main']['App']['CopyLocal'](arg1, arg2);
+}
+
 export function CreateSyncRule(arg1) {
   return window['go']['main']['App']['CreateSyncRule'](arg1);
 }
@@ -142,12 +146,24 @@ export function SftpMkdir(arg1, arg2, arg3) {
   return window['go']['main']['App']['SftpMkdir'](arg1, arg2, arg3);
 }
 
+export function SftpMove(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['SftpMove'](arg1, arg2, arg3, arg4);
+}
+
 export function SftpPut(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['SftpPut'](arg1, arg2, arg3, arg4);
 }
 
+export function SftpPutRecursive(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['SftpPutRecursive'](arg1, arg2, arg3, arg4);
+}
+
 export function SftpRemove(arg1, arg2, arg3) {
   return window['go']['main']['App']['SftpRemove'](arg1, arg2, arg3);
+}
+
+export function SftpRemoveRecursive(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SftpRemoveRecursive'](arg1, arg2, arg3);
 }
 
 export function SftpRename(arg1, arg2, arg3, arg4) {
@@ -164,6 +180,10 @@ export function StartTunnel(arg1) {
 
 export function StatLocal(arg1) {
   return window['go']['main']['App']['StatLocal'](arg1);
+}
+
+export function StatPaths(arg1) {
+  return window['go']['main']['App']['StatPaths'](arg1);
 }
 
 export function StopSyncRule(arg1) {

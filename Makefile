@@ -90,8 +90,9 @@ fmt:
 e2e:
 	bash e2e/test_local.sh
 
-## Run everything CI runs: vet + Go tests (-race) + frontend tests.
+## Run everything CI runs: vet + Go tests (-race) + frontend tests + frontend build.
 ci:
 	$(GO) vet ./...
 	$(GO) test ./... -race -count=1
 	cd frontend && npx vitest run
+	cd frontend && npm run build

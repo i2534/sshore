@@ -855,3 +855,80 @@ func TestRetrySyncRuleFailuresRejectsNonRunningRule(t *testing.T) {
 		t.Fatal("未运行的规则必须返回错误")
 	}
 }
+
+func TestCopyLocalRejectsSubtree(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "a")
+	if err := os.MkdirAll(filepath.Join(src, "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	a := &App{}
+	if err := a.CopyLocal(src, filepath.Join(src, "inner", "copy")); err == nil {
+		t.Fatal("expected rejection when dst is inside src")
+	}
+}
+
+func TestCopyLocalCopiesFile(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "x.txt")
+	_ = os.WriteFile(src, []byte("hi"), 0o644)
+	a := &App{}
+	if err := a.CopyLocal(src, filepath.Join(dir, "y.txt")); err != nil {
+		t.Fatalf("CopyLocal: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "y.txt")); string(b) != "hi" {
+		t.Fatalf("copy failed: %q", b)
+	}
+}
+
+func TestStatPathsReportsTypeAndName(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "a.txt")
+	_ = os.WriteFile(file, []byte("12345"), 0o644)
+	a := &App{}
+	got := a.StatPaths([]string{file, dir, filepath.Join(dir, "nope")})
+	if len(got) != 3 {
+		t.Fatalf("len = %d", len(got))
+	}
+	if got[0].Name != "a.txt" || got[0].IsDir || got[0].Size != 5 {
+		t.Fatalf("file info = %+v", got[0])
+	}
+	if !got[1].IsDir {
+		t.Fatalf("dir info = %+v", got[1])
+	}
+	if got[2].Err == "" {
+		t.Fatalf("missing path must carry Err: %+v", got[2])
+	}
+}
+
+// 符号链接必须如实报错：localfs.Copy 对符号链接是静默跳过，若 StatPaths 不置 Err，
+// 前端（handleSystemDrop 的 `if (i.err)` 分支）会把它记成「完成」却什么都没复制。
+// 这里同时锁定「第二道防线」（localfs.Copy 仍然静默跳过）不被误改。
+func TestStatPathsReportsSymlinkAsError(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real.txt")
+	if err := os.WriteFile(real, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("无法创建符号链接（环境不支持）: %v", err)
+	}
+	a := &App{}
+	got := a.StatPaths([]string{link, real})
+	if len(got) != 2 {
+		t.Fatalf("len = %d", len(got))
+	}
+	if got[0].Err == "" {
+		t.Fatalf("符号链接必须带 Err，否则拖入会被记成「完成」却什么都没复制: %+v", got[0])
+	}
+	if !strings.Contains(got[0].Err, "符号链接") {
+		t.Fatalf("Err 应说明符号链接, got %q", got[0].Err)
+	}
+	if got[0].IsDir || got[0].Size != 0 {
+		t.Fatalf("符号链接不应被当成目录/带大小: %+v", got[0])
+	}
+	if got[1].Err != "" {
+		t.Fatalf("普通文件不应带 Err: %+v", got[1])
+	}
+}
