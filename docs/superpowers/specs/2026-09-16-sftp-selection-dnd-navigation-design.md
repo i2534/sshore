@@ -130,7 +130,7 @@ app.go（接线：绑定方法 + 事件转发；不写业务算法）
 // PutRecursive 递归上传本地目录到远端目录（sftp put -r）。
 // 预期语义：把 local 目录及其内容放到 remoteDir 之下，即 remoteDir/<base(local)>/...；
 // remoteDir 必须已存在（不存在则报错，不隐式建树）。
-// ⚠️ 该语义待 §13 R1 实测确认后写入实现与注释（put -r 对已存在同名目录的行为未证实）。
+// 实测结论（spec §13 R1，2026-09-16）：remoteDir 下已存在同名目录时是**并入**、不嵌套，且其中的同名文件被本地内容覆盖。
 func (c *Ctrl) PutRecursive(host, user, local, remoteDir string) error
 
 // RemoveRecursive 递归删除远端路径（文件或目录）。
