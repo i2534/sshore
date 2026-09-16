@@ -9,6 +9,8 @@ export function AutoStartEnabled():Promise<void>;
 
 export function ConfirmSyncRuleDeletes(arg1:string,arg2:string):Promise<void>;
 
+export function CopyLocal(arg1:string,arg2:string):Promise<void>;
+
 export function CreateSyncRule(arg1:config.SyncRule):Promise<config.SyncRule>;
 
 export function CreateTunnel(arg1:config.Tunnel):Promise<void>;
@@ -75,9 +77,15 @@ export function SftpList(arg1:string,arg2:string,arg3:string):Promise<Array<sftp
 
 export function SftpMkdir(arg1:string,arg2:string,arg3:string):Promise<void>;
 
+export function SftpMove(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+
 export function SftpPut(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
+export function SftpPutRecursive(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+
 export function SftpRemove(arg1:string,arg2:string,arg3:string):Promise<void>;
+
+export function SftpRemoveRecursive(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function SftpRename(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
@@ -86,6 +94,8 @@ export function StartSyncRule(arg1:string):Promise<void>;
 export function StartTunnel(arg1:string):Promise<void>;
 
 export function StatLocal(arg1:string):Promise<number>;
+
+export function StatPaths(arg1:Array<string>):Promise<Array<main.PathInfo>>;
 
 export function StopSyncRule(arg1:string):Promise<void>;
 

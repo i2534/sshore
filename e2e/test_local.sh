@@ -110,6 +110,92 @@ echo "--- sftp output ---"
 echo "$sftp_out"
 echo "$sftp_out" | grep -q "a.txt" && echo "PASS: sftp ls lists file" || { echo "FAIL: sftp ls"; exit 1; }
 
+echo "== PROBE A/B/C: sftp 语义（供 spec R1/R2/R9 取值） =="
+PB="$TMPD/home/probe"
+SFTP_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=no -o IdentitiesOnly=yes
+  -F "$HOME/.ssh/config" -o "UserKnownHostsFile /dev/null")
+run_batch() { sftp "${SFTP_OPTS[@]}" -b "$1" e2e-test 2>&1 || true; }
+
+# --- PROBE A: put -r 目标同名目录已存在：并入还是嵌套？ ---
+rm -rf "$PB"; mkdir -p "$PB/localdir/sub" "$PB/remote/localdir"
+echo A > "$PB/localdir/a.txt"
+echo BB > "$PB/localdir/sub/b.txt"
+echo EXISTING > "$PB/remote/localdir/existing.txt"
+echo LOCAL_ONLY > "$PB/remote/localdir/a.txt"
+printf 'put -r %s %s\n' "$PB/localdir" "$PB/remote" > "$PB/pa.bat"
+PA_OUT="$(run_batch "$PB/pa.bat")"
+echo "--- probe A output ---"; echo "$PA_OUT"
+if [ -d "$PB/remote/localdir/localdir" ]; then
+  echo "PUT-R: nest"
+elif [ -f "$PB/remote/localdir/a.txt" ] && [ -f "$PB/remote/localdir/sub/b.txt" ]; then
+  echo "PUT-R: merge"
+  echo "PUT-R-OVERWRITE: $(cat "$PB/remote/localdir/a.txt")"
+else
+  echo "PUT-R: error-or-other"
+fi
+
+# --- PROBE B: rename 覆盖已存在目标 ---
+printf 'OLD' > "$PB/r_old.txt"; printf 'NEW' > "$PB/r_new.txt"
+printf 'rename %s %s\n' "$PB/r_old.txt" "$PB/r_new.txt" > "$PB/pb.bat"
+PB_OUT="$(run_batch "$PB/pb.bat")"
+echo "--- probe B output ---"; echo "$PB_OUT"
+if [ -f "$PB/r_new.txt" ]; then echo "RENAME-OVERWRITE: yes content=$(cat "$PB/r_new.txt")"; else echo "RENAME-OVERWRITE: target-gone"; fi
+[ -f "$PB/r_old.txt" ] && echo "RENAME-SOURCE: still-exists" || echo "RENAME-SOURCE: moved"
+
+# --- PROBE C: rm 路径含 glob 元字符是否被远端展开 ---
+mkdir -p "$PB/glob"
+echo ONE > "$PB/glob/lit*name.txt"
+echo TWO > "$PB/glob/litZZname.txt"
+printf 'rm %s\n' "$PB/glob/lit*name.txt" > "$PB/pc.bat"
+PC_OUT="$(run_batch "$PB/pc.bat")"
+echo "--- probe C output ---"; echo "$PC_OUT"
+echo "GLOB-RM: star-file=$([ -f "$PB/glob/lit*name.txt" ] && echo kept || echo deleted) zz-file=$([ -f "$PB/glob/litZZname.txt" ] && echo kept || echo deleted)"
+
+echo "== PROBE D: 真机 stderr 形状回归（T8 的 failedDeletePaths 依赖它） =="
+# 背景：T8 最初的测试夹具是手写的 Can't rm: "<path>"，与真实 OpenSSH 不符——
+# 真机上 '-' 前缀下 -rm 失败**不带引号**（remote delete <path>: ...），只有 -rmdir 失败带引号。
+# 那段误判曾让 -rm 失败被当成整批成功（Critical）。这里用同一次 sshd 把两种形状钉死：
+# 形状一变，本节立刻 FAIL 并打印实际输出，避免再次只靠"评审期一次性证据"。
+SHAPE_FAIL=0
+rm -rf "$PB/shape"; mkdir -p "$PB/shape/ro" "$PB/shape/nonempty"
+echo X > "$PB/shape/ro/f.txt"
+echo Y > "$PB/shape/nonempty/child.txt"
+
+# 形状 1：把父目录设为不可写 ⇒ '-rm' 失败（unlink 需要父目录写权限）
+chmod 555 "$PB/shape/ro"
+printf -- '-rm %s\n' "$PB/shape/ro/f.txt" > "$PB/pd1.bat"
+PD1_OUT="$(run_batch "$PB/pd1.bat")"
+chmod 755 "$PB/shape/ro" # 立刻恢复，否则 cleanup 的 rm -rf 会因权限失败
+echo "--- probe D1 output (expect: remote delete <path> … 不带引号) ---"; echo "$PD1_OUT"
+if printf '%s' "$PD1_OUT" | grep -qF "remote delete $PB/shape/ro/f.txt"; then
+  echo "RM-STDERR-SHAPE: ok"
+else
+  echo "RM-STDERR-SHAPE: FAIL（真机 -rm 失败文案不再是 'remote delete <path>'，T8 的 failedDeletePaths 需同步）"
+  SHAPE_FAIL=1
+fi
+if printf '%s' "$PD1_OUT" | grep -qF "\"$PB/shape/ro/f.txt\""; then
+  echo "RM-STDERR-QUOTING: FAIL（-rm 失败本该**不带引号**；若变成带引号，T8 的两种形状判定需重新评估）"
+  SHAPE_FAIL=1
+else
+  echo "RM-STDERR-QUOTING: ok (unquoted)"
+fi
+
+# 形状 2：对非空目录执行 '-rmdir' ⇒ 失败，且文案**自带双引号**
+printf -- '-rmdir %s\n' "$PB/shape/nonempty" > "$PB/pd2.bat"
+PD2_OUT="$(run_batch "$PB/pd2.bat")"
+echo "--- probe D2 output (expect: remote rmdir \"<path>\": Failure) ---"; echo "$PD2_OUT"
+if printf '%s' "$PD2_OUT" | grep -qF "remote rmdir \"$PB/shape/nonempty\""; then
+  echo "RMDIR-STDERR-SHAPE: ok"
+else
+  echo "RMDIR-STDERR-SHAPE: FAIL（真机 -rmdir 失败文案不再是 'remote rmdir \"<path>\"'，T8 的 failedDeletePaths 需同步）"
+  SHAPE_FAIL=1
+fi
+
+if [ "$SHAPE_FAIL" -ne 0 ]; then
+  echo "FAIL: sftp 失败 stderr 形状与 internal/sftp 的 failedDeletePaths 解析不一致" >&2
+  exit 1
+fi
+
 echo "== sync e2e (Go side) =="
 REMOTE_DIR="$TMPD/remote-conf"
 mkdir -p "$REMOTE_DIR"

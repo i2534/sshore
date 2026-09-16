@@ -14,6 +14,7 @@ import (
 	"sshore/internal/config"
 	"sshore/internal/forward"
 	"sshore/internal/importer"
+	"sshore/internal/localfs"
 	"sshore/internal/osutil"
 	"sshore/internal/sftp"
 	"sshore/internal/sync"
@@ -410,6 +411,93 @@ func (a *App) SftpMkdir(host, user, path string) error {
 func (a *App) SftpRename(host, user, oldPath, newPath string) error {
 	return a.sftp.Rename(host, user, oldPath, newPath)
 }
+
+// SftpRemoveRecursive 删除远端文件或目录（目录递归）。
+// 目录语义见 sftp.RemoveRecursive：BFS 收集 + 单条 '-' 前缀批处理；含 glob 元字符的路径直接拒绝。
+func (a *App) SftpRemoveRecursive(host, user, path string) error {
+	return a.sftp.RemoveRecursive(host, user, path)
+}
+
+// SftpPutRecursive 递归上传本地目录到远端目录。
+// 透传 sftp.PutRecursive：put -r 在远端同名目录已存在时是**并入**（同名文件被本地内容覆盖），
+// 本绑定不加"整树替换"补偿；需要整树替换的调用方须先自行删除远端同名目录。
+func (a *App) SftpPutRecursive(host, user, local, remoteDir string) error {
+	if err := a.sftp.PutRecursive(host, user, local, remoteDir); err != nil {
+		return err
+	}
+	a.recordRecentSFTP(host, filepath.Dir(remoteDir), filepath.Dir(local))
+	return nil
+}
+
+// SftpMove 语义等于远端 Rename（跨目录移动）。
+func (a *App) SftpMove(host, user, oldPath, newPath string) error {
+	return a.sftp.Rename(host, user, oldPath, newPath)
+}
+
+// PathInfo 描述一个本地路径（供前端处理系统拖入的文件/目录）。
+// Err 非空表示该项 Lstat 失败，前端据此跳过该项。
+type PathInfo struct {
+	Path  string `json:"path"`
+	Name  string `json:"name"`
+	IsDir bool   `json:"isDir"`
+	Size  int64  `json:"size"`
+	Err   string `json:"err,omitempty"`
+}
+
+// StatPaths 批量 Lstat；单项失败不整体失败（前端据此跳过该项并提示）。
+// 非常规类型（符号链接 / FIFO / 设备 / socket）同样置 Err：localfs.Copy 对符号链接是**静默跳过**，
+// 若这里不报错，前端会把它记成「完成」却什么都没复制（静默假成功）。
+func (a *App) StatPaths(paths []string) []PathInfo {
+	out := make([]PathInfo, 0, len(paths))
+	for _, p := range paths {
+		info := PathInfo{Path: p, Name: filepath.Base(p)}
+		st, err := os.Lstat(p)
+		if err != nil {
+			info.Err = err.Error()
+			out = append(out, info)
+			continue
+		}
+		// Lstat 不跟随链接，因此 mode 是链接本身的 mode，ModeSymlink 判定成立。
+		if !st.IsDir() && !st.Mode().IsRegular() {
+			if st.Mode()&os.ModeSymlink != 0 {
+				info.Err = "符号链接暂不支持"
+			} else {
+				info.Err = "非常规文件类型暂不支持"
+			}
+			out = append(out, info)
+			continue
+		}
+		info.IsDir = st.IsDir()
+		if !st.IsDir() {
+			info.Size = st.Size()
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+// CopyLocal 复制本地文件/目录到 dst。拒绝把 src 复制进它自己的子树。
+// 与远端无关：复用 internal/localfs（纯本地、只依赖标准库）。
+func (a *App) CopyLocal(src, dst string) error {
+	sp, err := filepath.Abs(src)
+	if err != nil {
+		return err
+	}
+	dp, err := filepath.Abs(dst)
+	if err != nil {
+		return err
+	}
+	if sp == dp {
+		// 源与目标同一路径：继续下去 copyFile 会先把源文件 O_TRUNC 成 0 字节，
+		// 再读到空内容（把文件拖到它自己所在面板即可命中）。
+		return nil
+	}
+	if localfs.IsSubPath(sp, dp) {
+		return fmt.Errorf("拒绝复制到自身子树: %s → %s", sp, dp)
+	}
+	return localfs.Copy(sp, dp)
+}
+
 func (a *App) SftpConnect(host string) error {
 	return a.sftp.Connect(host, "")
 }
