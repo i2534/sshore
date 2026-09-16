@@ -254,6 +254,17 @@ func (c *Ctrl) buildBatch(op, remote, local string) ([]byte, error) {
 			return nil, err
 		}
 		return []byte(fmt.Sprintf("put %s %s\n", l, r)), nil
+	case "putr":
+		// 递归上传：sftp put -r <local> <remoteDir>。
+		l, err := quoteArg(local)
+		if err != nil {
+			return nil, err
+		}
+		r, err := quoteArg(remote)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("put -r %s %s\n", l, r)), nil
 	case "rm":
 		r, err := quoteArg(remote)
 		if err != nil {
@@ -521,6 +532,34 @@ func (c *Ctrl) Put(host, user, local, remote string) error {
 		done += fmt.Sprintf(" (%s)", humanSize(size))
 	}
 	c.logEvent(host, "info", done)
+	return nil
+}
+
+// PutRecursive 递归上传本地目录到远端目录（sftp put -r）。
+// 目标语义由 e2e 探针实测确定（spec §13 R1，verdict "PUT-R: merge"）：
+//   - 远端 remoteDir 下没有同名目录时，sftp 建出 remoteDir/<base(local)>/... ；
+//   - 远端 remoteDir 下已存在同名目录时**并入**该目录，不嵌套出 remoteDir/<base>/<base> ；
+//   - 并入时同名文件被本地内容覆盖（实测另一行 "PUT-R-OVERWRITE: A"）。
+//
+// 本方法只负责把命令送出去并把结果转成 error；调用方若要"整树替换"，
+// 必须先自行删除远端同名目录（put -r 不会清理远端独有的旧文件）。
+func (c *Ctrl) PutRecursive(host, user, local, remoteDir string) error {
+	c.logEvent(host, "info", "sftp put -r "+local+" → "+remoteDir)
+	batch, err := c.buildBatch("putr", remoteDir, local)
+	if err != nil {
+		c.logEvent(host, "error", "sftp put -r failed: "+err.Error())
+		return err
+	}
+	out, err := c.run(host, user, batch)
+	if err != nil {
+		c.logEvent(host, "error", "sftp put -r failed: "+commandErr(out))
+		return fmt.Errorf("sftp put -r %s: %w (%s)", host, err, commandErr(out))
+	}
+	if out.ExitCode != 0 {
+		c.logEvent(host, "error", "sftp put -r failed: "+commandErr(out))
+		return fmt.Errorf("sftp put -r failed: %s", commandErr(out))
+	}
+	c.logEvent(host, "info", "sftp put -r done")
 	return nil
 }
 
