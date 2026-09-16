@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -301,4 +302,100 @@ func NewTunnelID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// DefaultPresetsPath 返回预设文件路径：与主配置同目录（unix 是 ~/.config/sshore/presets.toml，
+// Windows 是 %AppData%/sshore/presets.toml）。
+//
+// 单独一个文件是有意为之：预设是**用户手改**的，而主配置会被应用频繁整份重编码
+// （任何书签/最近保存都走 SaveConfig），放一起会反复抹掉用户写的注释；且旧版本
+// 二进制不认识这个文件，**降级不会丢预设**（放主配置里会被旧版保存时整段抹掉）。
+func DefaultPresetsPath() (string, error) {
+	cfg, err := DefaultConfigPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(cfg), "presets.toml"), nil
+}
+
+// Preset 是预设文件里的一条预设；scope 缺省 local。
+type Preset struct {
+	Name  string `toml:"name" json:"name"`
+	Scope string `toml:"scope,omitempty" json:"scope,omitempty"` // local | remote
+	Host  string `toml:"host,omitempty" json:"host,omitempty"`   // 仅 scope=remote：留空 = 所有主机
+	Path  string `toml:"path" json:"path"`
+}
+
+// NormalizeScope 归一 scope：大小写/首尾空白是手写配置的常见笔误，而预设层是精确比较，
+// 不归一就等于"配了却什么都没有"。（store.go 需新增 import "strings"）
+func NormalizeScope(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return "local"
+	}
+	return s
+}
+
+// LoadPresets 读取预设文件。文件不存在返回 (nil, os.ErrNotExist)，调用方据此决定是否播种；
+// 解析失败返回错误，并且**绝不改写用户文件**（调用方只记录 + 降级，不覆盖）。
+func LoadPresets(path string) ([]Preset, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var doc struct {
+		Presets []Preset `toml:"presets"`
+	}
+	if _, err := toml.Decode(string(data), &doc); err != nil {
+		return nil, fmt.Errorf("解析预设文件 %s: %w", path, err)
+	}
+	for i := range doc.Presets {
+		doc.Presets[i].Scope = NormalizeScope(doc.Presets[i].Scope)
+	}
+	return doc.Presets, nil
+}
+
+// SavePresets 以 0600 原子写入预设文件（先写 <path>.tmp-<pid>-<seq> 再 rename，与 SaveConfig
+// 同一套原语）。**只在"首次生成"时被调用**，之后应用不再改写这个文件。
+func SavePresets(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	tmp := fmt.Sprintf("%s.tmp-%d-%d", path, os.Getpid(), atomic.AddInt64(&tmpSeq, 1))
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := renameWithRetry(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+const presetsHeader = "# SSHore 位置预设（「📍位置」下拉里的「预设」组 = 本文件的全部内容）\n" +
+	"#\n" +
+	"# 这个文件只在你首次启动时由应用生成一次，之后应用**不会**再改写它 ——\n" +
+	"# 你可以放心加注释、调顺序、改名、删条目。\n" +
+	"#   - 删掉哪条，下拉里就没有哪条；保留文件但删光条目 = 预设组消失（不会重建）\n" +
+	"#   - 本地面板的 path 用绝对路径（~/xxx 会展开为主目录）；远端的 \"~\" 表示远端 home\n" +
+	"#   - scope 缺省 local；remote 条目可用 host 限定主机（留空 = 所有主机）\n" +
+	"#   - Windows 路径推荐用单引号字面量（双引号里反斜杠是转义符，写错会让文件解析失败）\n" +
+	"#   - 改完重启应用生效\n\n"
+
+// PresetsTemplate 渲染"首次生成"用的文件内容：说明注释 + 默认条目。
+// 字段一律用 %q 写出，Windows 反斜杠会被正确转义，保证生成的文件一定能被解析。
+func PresetsTemplate(seed []Preset) []byte {
+	var b strings.Builder
+	b.WriteString(presetsHeader)
+	for _, p := range seed {
+		b.WriteString("[[presets]]\n")
+		fmt.Fprintf(&b, "name = %q\n", p.Name)
+		fmt.Fprintf(&b, "scope = %q\n", NormalizeScope(p.Scope))
+		if p.Host != "" {
+			fmt.Fprintf(&b, "host = %q\n", p.Host)
+		}
+		fmt.Fprintf(&b, "path = %q\n\n", p.Path)
+	}
+	return []byte(b.String())
 }
