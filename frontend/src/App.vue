@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
 import { EventsOn } from '../wailsjs/runtime/runtime'
+import { GetAppInfo } from '../wailsjs/go/main/App'
 import { useLogStore } from './stores/logs'
 import { useSettingsStore } from './stores/settings'
 import ForwardView from './views/ForwardView.vue'
@@ -22,6 +23,14 @@ onMounted(() => {
   // 叠加注册，导致每条日志重复入 store（M6b）。
   offLog = EventsOn('log', (evt) => logStore.add(evt))
   window.addEventListener('sshore:error', onErr)
+  // HTML 标题与 Wails 窗口标题保持一致：均为「SSHore <版本>」。index.html 里
+  // 只留静态兜底 "SSHore"，版本需运行时从后端取；失败则保持兜底标题。
+  GetAppInfo()
+    .then((info) => {
+      if (!info || !info.name) return
+      document.title = info.version ? `${info.name} ${info.version}` : info.name
+    })
+    .catch(() => {})
   // 加载并应用用户设置（主题/字号/字体/启动自动连接）。失败不阻断界面，
   // 仅借全局错误通道提示，避免设置读取失败导致整个应用挂掉。
   settingsStore.load().catch((e) => {
