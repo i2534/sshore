@@ -8,6 +8,9 @@ export const useLocationsStore = defineStore('locations', {
     bookmarks: [], localRecents: [], remoteRecents: [],
     // 固定预设（local/remote 来自 presets.toml，localDisks 由后端实时枚举），与用户位置数据分开存。
     presets: { local: [], localDisks: [], remote: [] },
+    // 后端 ListPresets 返回的 err：presets.toml 读/解析失败时非空。
+    // 由 SftpView 在 load() 之后写进日志面板（只发一次 Init 事件会在前端订阅前丢失）。
+    presetsError: '',
     loaded: false,
   }),
   actions: {
@@ -26,6 +29,7 @@ export const useLocationsStore = defineStore('locations', {
         localDisks: (presetData && presetData.localDisks) || [],
         remote: (presetData && presetData.remote) || [],
       }
+      this.presetsError = (presetData && presetData.err) || ''
       this.loaded = true
     },
     async addBookmark(b) {

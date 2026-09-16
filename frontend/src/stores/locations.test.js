@@ -116,6 +116,13 @@ describe('locations store', () => {
     expect(s.disksForPane('remote')).toEqual([])
   })
 
+  it('后端上报预设文件错误时存进 presetsError（供日志面板提示）', async () => {
+    ListPresets.mockResolvedValueOnce({ local: [], localDisks: [], remote: [], err: '解析预设文件 x: boom' })
+    const s = useLocationsStore()
+    await s.load()
+    expect(s.presetsError).toBe('解析预设文件 x: boom')
+  })
+
   it('后端返回 null 时兜底为空数组', async () => {
     ListPresets.mockResolvedValueOnce(null)
     const s = useLocationsStore()
@@ -123,5 +130,6 @@ describe('locations store', () => {
     expect(s.presetsForPane('local')).toEqual([])
     expect(s.disksForPane('local')).toEqual([])
     expect(s.presetsForPane('remote')).toEqual([])
+    expect(s.presetsError).toBe('')
   })
 })

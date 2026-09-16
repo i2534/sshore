@@ -659,6 +659,8 @@ async function handleSystemDrop(pane, paths) {
 onMounted(async () => {
   await loadHosts()
   await locations.load() // 书签与双侧最近位置（T6 store），供两个面板头的位置下拉使用
+  // presets.toml 坏掉时只发一次 startup 事件可能早于前端订阅而丢失，所以由这里补一次用户可见提示
+  if (locations.presetsError) err('预设文件解析失败：' + locations.presetsError)
   // local starts at current working dir
   try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
   await loadLocal()
