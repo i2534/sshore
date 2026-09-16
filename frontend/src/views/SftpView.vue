@@ -1,12 +1,17 @@
 <script setup>
-import { ref, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, ListRecentSFTP, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ref, reactive, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
+import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, ListRecentSFTP, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
 import LogPanel from '../components/LogPanel.vue'
 import ContextMenu from '../components/ContextMenu.vue'
 import AppDialog from '../components/AppDialog.vue'
+import ConflictDialog from '../components/ConflictDialog.vue'
+import * as sel from '../utils/selection'
+import { actionFor } from '../utils/keys'
+import { planTasks, classify, applyPolicy, needsConfirm, summarize } from '../utils/batch'
+import { failureText } from '../utils/queue'
 
 const logStore = useLogStore()
 const hosts = ref([])
@@ -15,14 +20,21 @@ const host = ref('')
 // remote pane — start at filesystem root so '..' can navigate the whole tree
 const remotePath = ref('/')
 const remoteItems = ref([])
-const remoteSel = ref(null)
+const remoteSelection = reactive(sel.createSelection())
+const remoteVisible = ref([])
 const remoteLoading = ref(false)
 
 // local pane — start at cwd so '..' can navigate up to '/'
 const localPath = ref('')
 const localItems = ref([])
-const localSel = ref(null)
+const localSelection = reactive(sel.createSelection())
+const localVisible = ref([])
 const localLoading = ref(false)
+
+// 键盘分派与批量动作归属的面板（由 FilePane 的 @focus 维护）
+const focusedPane = ref('remote')
+// 冲突对话框状态：resolve 是 runBatch 里 await 的 promise resolver
+const conflict = reactive({ visible: false, resolve: null, plan: null, hiddenSelected: 0 })
 
 // shared "show hidden files" toggle (both panes)
 const showAll = ref(false)
@@ -103,7 +115,7 @@ function onHostChange() {
   remoteSeq++ // 使在途的远程请求全部过期
   connected.value = false
   remoteItems.value = []
-  remoteSel.value = null
+  sel.clear(remoteSelection)
 }
 
 async function connect() {
@@ -136,7 +148,7 @@ function applyRecent(e) {
     host.value = r.host // 程序化切换：手动执行与 @change 一致的重置
     remoteSeq++
     remoteItems.value = []
-    remoteSel.value = null
+    sel.clear(remoteSelection)
     connected.value = false
   }
   pendingPath.value = r.remote_dir || '/'
@@ -158,7 +170,7 @@ async function disconnect() {
   try { await SftpDisconnect(host.value) } catch (e) { err(e) }
   connected.value = false
   remoteItems.value = []
-  remoteSel.value = null
+  sel.clear(remoteSelection)
 }
 async function loadLocal() {
   localLoading.value = true
@@ -168,16 +180,18 @@ async function loadLocal() {
 }
 
 function openRemote(it) {
-  if (it.name === '..') { remotePath.value = parentOf(remotePath.value); loadRemote(); return }
+  if (it.name === '..') { remotePath.value = parentOf(remotePath.value); loadRemote(); sel.clear(remoteSelection); return }
   if (!it.isDir) return
   remotePath.value = join(remotePath.value, it.name)
   loadRemote()
+  sel.clear(remoteSelection)
 }
 function openLocal(it) {
-  if (it.name === '..') { localPath.value = parentOf(localPath.value); loadLocal(); return }
+  if (it.name === '..') { localPath.value = parentOf(localPath.value); loadLocal(); sel.clear(localSelection); return }
   if (!it.isDir) return
   localPath.value = join(localPath.value, it.name)
   loadLocal()
+  sel.clear(localSelection)
 }
 
 // Absolute-path helpers (POSIX-style). '/' is the root; going up stops there.
@@ -204,58 +218,172 @@ function showMenu(pane, { item, event }) {
   }
 }
 
-async function download() {
-  const it = menu.value.item || remoteSel.value
-  if (!it || it.name === '..') { closeMenu(); return }
-  // Save directly to the local pane's current directory (no picker dialog).
-  const dir = localPath.value || '.'
-  const t = { name: it.name, size: it.size || 0, status: '处理中', startedAt: Date.now() }
-  try {
-    transfers.value.push(t)
-    const remote = join(remotePath.value, it.name)
-    const local = join(dir, it.name)
-    // Directories use `sftp get -r` (recursive); files use plain get.
-    if (it.isDir) {
-      await SftpGetDir(host.value, '', remote, local)
-    } else {
-      await SftpGet(host.value, '', remote, local)
-    }
-    t.status = '完成'
-    t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
-    await loadLocal()
-  } catch (e) {
-    err(e)
-    t.status = '失败'
-    t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
+function itemsFor(pane) { return pane === 'remote' ? remoteItems.value : localItems.value }
+function visibleFor(pane) { return pane === 'remote' ? remoteVisible.value : localVisible.value }
+function selectionFor(pane) { return pane === 'remote' ? remoteSelection : localSelection }
+
+// 用可见集合（@visible 上抛的 showAll ∩ filter 结果）而不是原始 items：
+// 原始 items 里包含被过滤隐藏的 dotfile，拿它当可见集会把计数恒算成 0（spec 决策 15 / §8.1）。
+function hiddenSelectedCount(selection, visibleKeys) {
+  const vis = new Set(visibleKeys || [])
+  let n = 0
+  for (const k of selection.keys) if (!vis.has(k)) n++
+  return n
+}
+function hiddenFor(pane) { return hiddenSelectedCount(selectionFor(pane), visibleFor(pane)) }
+
+// 面板头「已选 N 项 ▾」的动作表：语义按面板决定，面板本身不懂（spec §6.2）。
+function actionsFor(pane) {
+  const s = selectionFor(pane)
+  const n = s.keys.size
+  const tail = [
+    { name: 'rename', label: '重命名', disabled: n !== 1 },
+    { name: 'remove', label: '删除 (' + n + ')' },
+    { name: 'select-all', label: '全选' },
+    { name: 'clear', label: '清空' },
+  ]
+  if (n === 0 && pane === 'remote') return tail
+  const head = pane === 'remote'
+    ? [{ name: 'download', label: '下载到本地 (' + n + ')' }]
+    : [{ name: 'upload', label: '上传到远程 (' + n + ')' }, { name: 'upload-picked', label: '上传文件…' }]
+  return head.concat(tail)
+}
+
+function onPaneAction(pane, name) {
+  const s = selectionFor(pane)
+  if (name === 'select-all') return sel.all(s, visibleFor(pane))
+  if (name === 'clear') return sel.clear(s)
+  if (name === 'remove') return removeSelected(pane)
+  if (name === 'upload-picked') return uploadPicked()
+  if (name === 'rename') return renameItem(pane, itemsFor(pane).find((it) => s.keys.has(it.name)))
+  if (name === 'download' || name === 'upload') return runBatchFor(pane, name)
+}
+
+function runBatchFor(pane, name) {
+  const s = selectionFor(pane)
+  const names = [...s.keys]
+  if (!names.length) return null
+  if (name === 'download') {
+    return runBatch({ direction: 'download', names, sourceDir: remotePath.value, targetDir: localPath.value || '/', sourceItems: remoteItems.value })
   }
-  closeMenu()
+  // 上传只可能来自本地面板（远程面板没有上传入口，spec §6.2）
+  return runBatch({ direction: 'upload', names, sourceDir: localPath.value || '/', targetDir: remotePath.value, sourceItems: localItems.value })
 }
 
-async function remove() {
-  const it = menu.value.item || remoteSel.value
-  const pane = menu.value.pane
-  if (!it || it.name === '..') { closeMenu(); return }
-  const ok = await openConfirm('确认删除', `删除${pane === 'local' ? '本地' : '远程'}「${it.name}」？`)
-  if (!ok) { closeMenu(); return }
-  try {
-    if (pane === 'local') {
-      await DeleteLocal(join(localPath.value, it.name))
-      await loadLocal()
-    } else {
-      await SftpRemove(host.value, '', join(remotePath.value, it.name))
-      await loadRemote()
+function onSelect(pane, { item, event }) {
+  const s = selectionFor(pane)
+  const vis = visibleFor(pane)
+  focusedPane.value = pane
+  if (event && (event.ctrlKey || event.metaKey)) sel.toggle(s, item.name)
+  else if (event && event.shiftKey) sel.rangeTo(s, vis, item.name)
+  else sel.single(s, item.name)
+}
+
+function askConflict(plan, hiddenSelected) {
+  return new Promise((resolve) => {
+    conflict.visible = true
+    conflict.resolve = resolve
+    conflict.plan = plan
+    conflict.hiddenSelected = hiddenSelected
+  })
+}
+function onConflictConfirm(policy) { conflict.visible = false; if (conflict.resolve) conflict.resolve(policy) }
+function onConflictCancel() { conflict.visible = false; if (conflict.resolve) conflict.resolve(null) }
+
+// direction: 'download' | 'upload'
+async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, systemPaths }) {
+  const sourceSelection = direction === 'upload' ? localSelection : remoteSelection
+  const targetItems = direction === 'download' ? localItems.value : remoteItems.value
+  const tasks = systemPaths
+    ? systemPaths.map((i) => ({ name: i.name, src: i.path, dst: targetDir.replace(/\/+$/, '') + '/' + i.name, isDir: i.isDir }))
+    : planTasks({ direction, names, sourceDir, targetDir, isDirMap: (sourceItems || []).reduce((m, it) => (m[it.name] = it.isDir, m), {}) })
+  const hidden = hiddenSelectedCount(sourceSelection, visibleFor(direction === 'upload' ? 'local' : 'remote'))
+  const existing = (targetItems || []).map((it) => it.name)
+  const { clean, conflicts } = classify(tasks, existing)
+  let run = clean
+  let skipped = []
+  if (needsConfirm({ conflictCount: conflicts.length, hiddenSelected: hidden })) {
+    const policy = await askConflict({ conflicts, total: tasks.length, target: targetDir, hiddenSelected: hidden }, hidden)
+    if (policy === null) return null
+    const applied = applyPolicy(conflicts, policy, existing)
+    skipped = applied.skipped
+    run = clean.concat(applied.run)
+  }
+  const results = skipped.map((t) => ({ ...t, status: '跳过' }))
+  for (const t of skipped) transfers.value.push({ direction, name: t.name, src: t.src, dst: t.dst, size: 0, status: '跳过', elapsed: 0 })
+  for (const t of run) {
+    const rec = { direction, name: t.name, src: t.src, dst: t.dst, size: 0, status: '处理中', startedAt: Date.now() }
+    transfers.value.push(rec)
+    try {
+      if (direction === 'download') await (t.isDir ? SftpGetDir(host.value, '', t.src, t.dst) : SftpGet(host.value, '', t.src, t.dst))
+      else await (t.isDir ? SftpPutRecursive(host.value, '', t.src, t.dst) : SftpPut(host.value, '', t.src, t.dst))
+      rec.status = '完成'
+    } catch (e) {
+      rec.status = '失败'
+      rec.reason = String((e && e.message) || e)
+      err(e)
     }
-  } catch (e) { err(e) }
-  closeMenu()
+    rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
+    results.push(rec)
+  }
+  await (direction === 'download' ? loadLocal() : loadRemote())
+  const s = summarize(results)
+  logStore.add({ source_id: 'sftp', source_type: 'sftp', level: s.failed ? 'error' : 'info', ts: new Date().toISOString(),
+    message: '批量' + direction + ' ' + results.length + ' 项：成功 ' + s.ok + ' 跳过 ' + s.skipped + ' 失败 ' + s.failed })
+  const doneNames = results.filter((r) => r.status === '完成').map((r) => r.name)
+  sel.remove(sourceSelection, doneNames) // 只移除成功项：失败/留在原地的项仍应保持选中（spec §6.4）
+  return s
 }
 
-async function rename() {
-  const it = menu.value.item || remoteSel.value
+// 「复制失败清单」：队列只负责 emit，落盘/剪贴板由编排层做（避免出现死按钮）。
+async function copyFailures() {
+  const failed = transfers.value.filter((t) => t.status === '失败')
+  if (!failed.length) return
+  const text = failed.map((t) => failureText(t)).join('\n')
+  try { await navigator.clipboard.writeText(text) } catch (e) { err(e) }
+}
+
+// 删除（唯一不可撤销的批量动作，单独走确认）
+async function removeSelected(pane) {
+  const s = selectionFor(pane)
+  const names = [...s.keys]
+  if (!names.length) return
+  const items = itemsFor(pane)
+  const hidden = hiddenSelectedCount(s, items)
+  const hasDir = (items || []).some((it) => s.keys.has(it.name) && it.isDir)
+  const msg = '删除' + (pane === 'local' ? '本地' : '远程') + ' ' + names.length + ' 项？' +
+    (hasDir ? '（含目录，将递归删除）' : '') + (hidden ? '（其中 ' + hidden + ' 项被过滤隐藏）' : '')
+  const ok = await openConfirm('确认删除', msg)
+  if (!ok) return
+  const base = pane === 'local' ? (localPath.value || '/') : remotePath.value
+  for (const n of names) {
+    const full = base.replace(/\/+$/, '') + '/' + n
+    const rec = { direction: pane === 'local' ? 'move' : 'download', name: n, src: full, dst: '', size: 0, status: '处理中', startedAt: Date.now() }
+    transfers.value.push(rec)
+    try {
+      if (pane === 'local') await DeleteLocal(full)
+      else await SftpRemoveRecursive(host.value, '', full)
+      rec.status = '完成'
+    } catch (e) {
+      rec.status = '失败'
+      rec.reason = String((e && e.message) || e)
+      err(e)
+    }
+    rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
+  }
+  await (pane === 'local' ? loadLocal() : loadRemote())
+  // 只把成功删掉的项移出选中集合：失败项还留在原地，保持选中便于重试（spec §6.4）。
+  const removed = names.filter((n) => !transfers.value.some((t) => t.name === n && t.status === '失败'))
+  sel.remove(s, removed)
+}
+
+// rename / mkdir 仍是单项手势，保持原有实现（由 doAction 与面板动作表调用）。
+async function renameItem(pane, it) {
   if (!it || it.name === '..') { closeMenu(); return }
   const newName = await openPrompt('重命名', '新名称：', it.name)
   if (!newName || newName === it.name) { closeMenu(); return }
   try {
-    if (menu.value.pane === 'local') {
+    if (pane === 'local') {
       await renameLocal(join(localPath.value, it.name), join(localPath.value, newName))
       await loadLocal()
     } else {
@@ -271,9 +399,7 @@ async function renameLocal(oldPath, newPath) {
   await RenameLocal(oldPath, newPath)
 }
 
-async function mkdir() {
-  const pane = menu.value.pane
-  closeMenu()
+async function mkdirIn(pane) {
   const name = await openPrompt('新建文件夹', '新建文件夹名称：', '')
   if (!name) return
   try {
@@ -287,24 +413,15 @@ async function mkdir() {
   } catch (e) { err(e) }
 }
 
-async function upload() {
-  const it = menu.value.item
-  const pane = menu.value.pane
-  closeMenu()
+// uploadPicked = 既有 upload() 的"选文件上传"分支：右键上传已由批量入口 runBatch 承接
+// （doAction('upload')），面板动作「上传文件…」只负责弹 PickLocalFile 后上传单个文件。
+async function uploadPicked() {
   let t = null
   try {
-    // If a specific local file was right-clicked, upload it directly
-    // (no system dialog). Otherwise (toolbar / remote pane) pick a file.
-    let local, name
-    if (pane === 'local' && it && it.name !== '..' && !it.isDir) {
-      local = join(localPath.value, it.name)
-      name = it.name
-    } else {
-      local = await PickLocalFile()
-      if (!local) return
-      name = local.split(/[\\/]/).pop()
-    }
-    t = { name, size: 0, status: '处理中', startedAt: Date.now() }
+    const local = await PickLocalFile()
+    if (!local) return
+    const name = local.split(/[\\/]/).pop()
+    t = { direction: 'upload', name, src: local, dst: join(remotePath.value, name), size: 0, status: '处理中', startedAt: Date.now() }
     try { t.size = await StatLocal(local) } catch (e) { t.size = 0 }
     transfers.value.push(t)
     await SftpPut(host.value, '', local, join(remotePath.value, name))
@@ -320,14 +437,37 @@ async function upload() {
   }
 }
 
+// 右键菜单：download/upload/remove 走批量入口（右键项不在集合内时先 single()，与 §3 决策 5 一致）。
 async function doAction(name) {
-  switch (name) {
-    case 'download': return download()
-    case 'upload': return upload()
-    case 'remove': return remove()
-    case 'mkdir': return mkdir()
-    case 'rename': return rename()
-  }
+  const pane = menu.value.pane
+  const s = selectionFor(pane)
+  const it = menu.value.item
+  if (it && it.name !== '..' && !sel.isSelected(s, it.name)) sel.single(s, it.name)
+  const names = [...s.keys]
+  const sourceDir = pane === 'remote' ? remotePath.value : (localPath.value || '/')
+  const targetDir = pane === 'remote' ? (localPath.value || '/') : remotePath.value
+  const sourceItems = itemsFor(pane)
+  closeMenu()
+  if (name === 'download') return runBatch({ direction: 'download', names, sourceDir, targetDir, sourceItems })
+  if (name === 'upload') return runBatch({ direction: 'upload', names, sourceDir, targetDir, sourceItems })
+  if (name === 'remove') return removeSelected(pane)
+  return legacyAction(name, pane, it)
+}
+
+// rename / mkdir 仍是单项手势，保持原有实现：
+function legacyAction(name, pane, it) {
+  if (name === 'rename') return renameItem(pane, it)
+  if (name === 'mkdir') return mkdirIn(pane)
+}
+
+function onKeydown(ev) {
+  const action = actionFor(ev)
+  if (!action) return
+  const s = selectionFor(focusedPane.value)
+  const vis = visibleFor(focusedPane.value)
+  if (action === 'delete') { ev.preventDefault(); removeSelected(focusedPane.value) }
+  else if (action === 'select-all') { ev.preventDefault(); sel.all(s, vis) }
+  else if (action === 'escape') { sel.clear(s) }
 }
 
 onMounted(async () => {
@@ -361,18 +501,24 @@ async function syncConnection() {
 }
 
 // KeepAlive 生命周期：切入时挂菜单监听、重启时钟并同步连接状态；切出时停时钟。
+// 必须成对挂摘：SftpView 被 <KeepAlive> 缓存，setup 只跑一次（App.vue:57-61）。
+// 在 setup 顶层注册会让「端口转发/文件同步」标签下按 Delete 弹出 SFTP 的删除确认框，
+// 因此注册写进既有的 onActivated（那里已经在挂 click 监听）。
 onActivated(() => {
   window.addEventListener('click', outsideClick)
+  window.addEventListener('keydown', onKeydown)
   startClock()
   syncConnection()
   loadRecents()
 })
 onDeactivated(() => {
   window.removeEventListener('click', outsideClick)
+  window.removeEventListener('keydown', onKeydown)
   stopClock()
 })
 onUnmounted(() => {
   window.removeEventListener('click', outsideClick)
+  window.removeEventListener('keydown', onKeydown)
   stopClock()
 })
 </script>
@@ -395,12 +541,18 @@ onUnmounted(() => {
       </select>
     </div>
     <div class="panes">
-      <FilePane title="本地" :path="localPath || '/'" :items="localItems" :selected="localSel && localSel.name" :show-hidden="showAll" :loading="localLoading"
-        @select="localSel = $event" @open="openLocal" @context="showMenu('local', $event)" />
-      <FilePane title="远程" :path="remotePath" :items="remoteItems" :selected="remoteSel && remoteSel.name" :show-hidden="showAll" :loading="remoteLoading"
-        @select="remoteSel = $event" @open="openRemote" @context="showMenu('remote', $event)" />
+      <FilePane title="本地" :path="localPath || '/'" :items="localItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
+        :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
+        @select="onSelect('local', $event)" @open="openLocal" @action="onPaneAction('local', $event)"
+        @clear="sel.clear(localSelection)"
+        @context="showMenu('local', $event)" @visible="localVisible = $event" @focus="focusedPane = 'local'" />
+      <FilePane title="远程" :path="remotePath" :items="remoteItems" :sel-keys="[...remoteSelection.keys]" :anchor="remoteSelection.anchor"
+        :show-hidden="showAll" :loading="remoteLoading" :actions="actionsFor('remote')" :hidden-selected="hiddenFor('remote')"
+        @select="onSelect('remote', $event)" @open="openRemote" @action="onPaneAction('remote', $event)"
+        @clear="sel.clear(remoteSelection)"
+        @context="showMenu('remote', $event)" @visible="remoteVisible = $event" @focus="focusedPane = 'remote'" />
     </div>
-    <TransferQueue :transfers="transfers" :now="now" />
+    <TransferQueue :transfers="transfers" :now="now" @copy-failures="copyFailures" />
     <div class="logpane ui-panel"><LogPanel :source-types="['sftp', 'system']" /></div>
 
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
@@ -428,6 +580,10 @@ onUnmounted(() => {
       @ok="onDialogOk"
       @cancel="onDialogCancel"
     />
+
+    <ConflictDialog :visible="conflict.visible" :target="conflict.plan && conflict.plan.target"
+      :total="conflict.plan && conflict.plan.total" :conflicts="conflict.plan ? conflict.plan.conflicts.map((c) => c.name) : []"
+      :hidden-selected="conflict.hiddenSelected" @confirm="onConflictConfirm" @cancel="onConflictCancel" />
   </div>
 </template>
 
