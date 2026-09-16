@@ -812,6 +812,11 @@ func (a *App) AddLocalRecent(path string) error {
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
 	}
+	// 队首已是同一路径 ⇒ 直接返回：语义与"去重置顶"完全一致（它本来就会落到队首），
+	// 但省掉一次 TOML 全量编码 + tmp + rename。前端 store 有同构短路（T10）。
+	if len(a.cfg.LocalRecent) > 0 && a.cfg.LocalRecent[0].Path == path {
+		return nil
+	}
 	rec := config.RecentLocal{Path: path, TS: time.Now().Format(time.RFC3339)}
 	kept := a.cfg.LocalRecent[:0]
 	for _, e := range a.cfg.LocalRecent {
@@ -833,6 +838,11 @@ func (a *App) AddRemoteRecent(host, path string) error {
 	}
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
+	}
+	// 同上：队首已是同一 (host, path) 时不再写盘。一次成功传输最多触发两次保存，
+	// 批量传输时这是主要写放大来源（100 个文件约 200 次磁盘写）。
+	if len(a.cfg.RemoteRecent) > 0 && a.cfg.RemoteRecent[0].Host == host && a.cfg.RemoteRecent[0].Path == path {
+		return nil
 	}
 	rec := config.RecentRemote{Host: host, Path: path, TS: time.Now().Format(time.RFC3339)}
 	kept := a.cfg.RemoteRecent[:0]

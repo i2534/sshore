@@ -91,8 +91,7 @@ func Search(ctx context.Context, root, pattern string, o SearchOpts) ([]Hit, int
 		}
 		return nil
 	})
-	if err != nil && ctx.Err() != nil {
-		return hits, skipped, truncated, err
-	}
+	// 取消（ctx 错误）时同样返回已扫描到的部分结果 + err；调用方（app.go）会把它转成
+	// Cancelled=true 的正常返回，以免 Wails 因 err != nil 丢弃 Result。
 	return hits, skipped, truncated, err
 }

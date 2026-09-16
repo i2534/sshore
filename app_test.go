@@ -1025,6 +1025,44 @@ func TestAddAndRemoveBookmark(t *testing.T) {
 	}
 }
 
+// F1：队首已是同一项时必须短路——不刷新 TS、不重复写盘（与前端 store 的短路同构）。
+// 用"手工设置的旧 TS"做断言，避免 RFC3339 秒级精度导致假绿。
+func TestAddRecentHeadShortCircuit(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.LocalRecent = []config.RecentLocal{{Path: "/l", TS: "2000-01-01T00:00:00Z"}}
+	a.cfg.RemoteRecent = []config.RecentRemote{{Host: "prod", Path: "/r", TS: "2000-01-01T00:00:00Z"}}
+
+	if err := a.AddLocalRecent("/l"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.LocalRecent[0].TS; got != "2000-01-01T00:00:00Z" {
+		t.Fatalf("本地队首同项必须短路（TS 不应刷新），got %q", got)
+	}
+	if got := a.cfg.RemoteRecent[0].TS; got != "2000-01-01T00:00:00Z" {
+		t.Fatalf("远程队首同项必须短路（TS 不应刷新），got %q", got)
+	}
+	if len(a.cfg.LocalRecent) != 1 || len(a.cfg.RemoteRecent) != 1 {
+		t.Fatalf("短路不得产生重复项: %+v / %+v", a.cfg.LocalRecent, a.cfg.RemoteRecent)
+	}
+
+	// 非队首项的重复记录仍要照常去重、置顶并刷新 TS。
+	if err := a.AddRemoteRecent("db", "/srv"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.cfg.RemoteRecent) != 2 || a.cfg.RemoteRecent[0].Host != "prod" {
+		t.Fatalf("重复记录非队首项必须置顶: %+v", a.cfg.RemoteRecent)
+	}
+	if a.cfg.RemoteRecent[0].TS == "2000-01-01T00:00:00Z" {
+		t.Fatal("非队首项的重复记录应刷新 TS")
+	}
+}
+
 func TestAddRemoteRecentDedupesAndCaps(t *testing.T) {
 	dir := t.TempDir()
 	a := NewApp()
