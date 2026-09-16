@@ -322,6 +322,42 @@ export namespace main {
 	        this.err = source["err"];
 	    }
 	}
+	export class Presets {
+	    local: preset.Preset[];
+	    localDisks: preset.Preset[];
+	    remote: preset.Preset[];
+	    err?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Presets(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.local = this.convertValues(source["local"], preset.Preset);
+	        this.localDisks = this.convertValues(source["localDisks"], preset.Preset);
+	        this.remote = this.convertValues(source["remote"], preset.Preset);
+	        this.err = source["err"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class RemoteSearchRequest {
 	    id: string;
 	    host: string;
@@ -342,6 +378,27 @@ export namespace main {
 	        this.pattern = source["pattern"];
 	        this.maxDepth = source["maxDepth"];
 	        this.limit = source["limit"];
+	    }
+	}
+
+}
+
+export namespace preset {
+	
+	export class Preset {
+	    name: string;
+	    path: string;
+	    host?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Preset(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.path = source["path"];
+	        this.host = source["host"];
 	    }
 	}
 

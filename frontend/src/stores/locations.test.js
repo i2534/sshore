@@ -10,13 +10,22 @@ vi.mock('../../wailsjs/go/main/App', () => ({
       { host: 'db', path: '/srv', ts: '1' },
     ],
   })),
+  ListPresets: vi.fn(async () => ({
+    local: [{ name: '项目', path: '/work/proj' }, { name: '主目录', path: '/home/u' }, { name: '根目录', path: '/' }],
+    localDisks: [],
+    remote: [
+      { name: '主目录', path: '~' },
+      { name: '根目录', path: '/' },
+      { name: '生产日志', path: '/var/log', host: 'prod' },
+    ],
+  })),
   AddBookmark: vi.fn(async () => {}),
   RemoveBookmark: vi.fn(async () => {}),
   AddLocalRecent: vi.fn(async () => {}),
   AddRemoteRecent: vi.fn(async () => {}),
 }))
 
-import { AddLocalRecent, AddRemoteRecent } from '../../wailsjs/go/main/App'
+import { AddLocalRecent, AddRemoteRecent, ListPresets } from '../../wailsjs/go/main/App'
 import { useLocationsStore } from './locations'
 
 describe('locations store', () => {
@@ -80,5 +89,47 @@ describe('locations store', () => {
     expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
     expect(s.localRecents[0].path).toBe('/tmp/other')
     expect(s.remoteRecents[0].host).toBe('db')
+  })
+
+  it('load 同时拉取三组固定预设', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    expect(s.presetsForPane('local', '').map((p) => p.path)).toEqual(['/work/proj', '/home/u', '/'])
+    expect(s.presetsForPane('remote', 'prod').map((p) => p.path)).toEqual(['~', '/', '/var/log'])
+    expect(s.disksForPane('local')).toEqual([])
+  })
+
+  it('远程预设按当前主机过滤（host 留空 = 所有主机）', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    expect(s.presetsForPane('remote', 'db').map((p) => p.path)).toEqual(['~', '/'])
+    // 还没选主机时不筛，退化为"全部显示"
+    expect(s.presetsForPane('remote', '').map((p) => p.path)).toEqual(['~', '/', '/var/log'])
+    expect(s.presetsForPane('remote').length).toBe(3)
+  })
+
+  it('磁盘组只属于本地面板', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    s.presets.localDisks = [{ name: 'C:', path: 'C:\\' }]
+    expect(s.disksForPane('local').map((p) => p.name)).toEqual(['C:'])
+    expect(s.disksForPane('remote')).toEqual([])
+  })
+
+  it('后端上报预设文件错误时存进 presetsError（供日志面板提示）', async () => {
+    ListPresets.mockResolvedValueOnce({ local: [], localDisks: [], remote: [], err: '解析预设文件 x: boom' })
+    const s = useLocationsStore()
+    await s.load()
+    expect(s.presetsError).toBe('解析预设文件 x: boom')
+  })
+
+  it('后端返回 null 时兜底为空数组', async () => {
+    ListPresets.mockResolvedValueOnce(null)
+    const s = useLocationsStore()
+    await s.load()
+    expect(s.presetsForPane('local')).toEqual([])
+    expect(s.disksForPane('local')).toEqual([])
+    expect(s.presetsForPane('remote')).toEqual([])
+    expect(s.presetsError).toBe('')
   })
 })

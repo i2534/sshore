@@ -11,6 +11,7 @@ import ContextMenu from '../components/ContextMenu.vue'
 import AppDialog from '../components/AppDialog.vue'
 import ConflictDialog from '../components/ConflictDialog.vue'
 import * as sel from '../utils/selection'
+import { join as localJoin, parentOf as localParent, joinRel, splitPath } from '../utils/localpath'
 import { actionFor } from '../utils/keys'
 import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName } from '../utils/batch'
 import { failureText } from '../utils/queue'
@@ -23,6 +24,9 @@ const logStore = useLogStore()
 const locations = useLocationsStore()
 // 浮层 watch 没有 immediate ⇒ visible 初值必须是 false，只由用户动作置 true。
 const search = reactive({ visible: false, pane: 'remote' })
+// 远程「主目录」预设的 sentinel：必须与 Go 侧 preset.RemoteHomeToken 字面量一致。
+// 远端 home 要先连上主机 pwd 才知道，所以下拉里传的是占位符而不是路径。
+const REMOTE_HOME = '~'
 const hosts = ref([])
 const host = ref('')
 
@@ -133,7 +137,8 @@ async function connect() {
     try { dest = await SftpHome(h) } catch { dest = '/' }
     if (host.value !== h) return // await 期间已切换主机，丢弃结果
     // 「最近位置」预设了目标目录时优先进它，否则落到 home
-    remotePath.value = pendingPath.value && pendingPath.value !== '/' ? pendingPath.value : dest
+    // 只有空串才是"未指定"：把 '/' 当未指定会让「远程 根目录」预设落到 home
+    remotePath.value = pendingPath.value ? pendingPath.value : dest
     pendingPath.value = ''
     connected.value = true
     await loadRemote()
@@ -148,6 +153,13 @@ async function connect() {
 // 未连接则记入 pendingPath 后交给既有的 connect()（它内部消费 pendingPath）。
 async function pickPosition(pane, path) {
   if (pane === 'local') { localPath.value = path; await loadLocal(); await locations.addLocalRecent(path); return }
+  if (path === REMOTE_HOME) {
+    if (!host.value) { err('请先选择主机'); return }
+    if (!connected.value) { pendingPath.value = ''; await connect(); return }
+    try { remotePath.value = await SftpHome(host.value) } catch (e) { err(e); return }
+    await loadRemote()
+    return
+  }
   if (host.value && connected.value) { remotePath.value = path; await loadRemote(); await locations.addRemoteRecent(host.value, path); return }
   pendingPath.value = path
   await connect()
@@ -171,16 +183,17 @@ async function toggleBookmark(pane) {
 
 // 双击深搜结果 → 跳到所在目录并选中该项
 async function openHit(hit) {
-  const dir = hit.path.includes('/') ? hit.path.slice(0, hit.path.lastIndexOf('/')) : ''
-  const name = hit.path.includes('/') ? hit.path.slice(hit.path.lastIndexOf('/') + 1) : hit.path
+  // hit.path 是**根相对路径**且后端已 filepath.ToSlash（恒用 '/' 分隔）；
+  // 本地拼回绝对路径时要按基目录的风格输出分隔符（Windows 上是 '\\'）。
+  const { dir, name } = splitPath(hit.path)
   if (search.pane === 'local') {
-    const next = dir ? (localPath.value.replace(/\/+$/, '') + '/' + dir) : localPath.value
-    localPath.value = next
+    if (dir) localPath.value = joinRel(localPath.value, dir)
     await loadLocal()
     if (name) sel.single(localSelection, name)
   } else {
-    const next = dir ? (remotePath.value.replace(/\/+$/, '') + '/' + dir) : remotePath.value
-    remotePath.value = next
+    // 远程必须继续用 POSIX 助手：sepOf() 只要发现路径里有反斜杠就返回 '\'，
+    // 而远端路径里出现反斜杠是合法的（文件名），joinRel 会产出混合分隔符。
+    if (dir) remotePath.value = posixJoin(remotePath.value, dir)
     await loadRemote()
     if (name) sel.single(remoteSelection, name)
   }
@@ -205,26 +218,26 @@ async function loadLocal() {
 }
 
 function openRemote(it) {
-  if (it.name === '..') { remotePath.value = parentOf(remotePath.value); loadRemote(); sel.clear(remoteSelection); return }
+  if (it.name === '..') { remotePath.value = posixParentOf(remotePath.value); loadRemote(); sel.clear(remoteSelection); return }
   if (!it.isDir) return
-  remotePath.value = join(remotePath.value, it.name)
+  remotePath.value = posixJoin(remotePath.value, it.name)
   loadRemote()
   sel.clear(remoteSelection)
 }
 function openLocal(it) {
-  if (it.name === '..') { localPath.value = parentOf(localPath.value); loadLocal(); sel.clear(localSelection); return }
+  if (it.name === '..') { localPath.value = localParent(localPath.value); loadLocal(); sel.clear(localSelection); return }
   if (!it.isDir) return
-  localPath.value = join(localPath.value, it.name)
+  localPath.value = localJoin(localPath.value, it.name)
   loadLocal()
   sel.clear(localSelection)
 }
 
 // Absolute-path helpers (POSIX-style). '/' is the root; going up stops there.
-function join(base, name) {
+function posixJoin(base, name) {
   if (base === '/' || base === '') return '/' + name
   return base.replace(/\/+$/, '') + '/' + name
 }
-function parentOf(p) {
+function posixParentOf(p) {
   if (!p || p === '/') return '/'
   const trimmed = p.replace(/\/+$/, '')
   const idx = trimmed.lastIndexOf('/')
@@ -323,7 +336,7 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   const sourceSelection = direction === 'upload' ? localSelection : remoteSelection
   const targetItems = direction === 'download' ? localItems.value : remoteItems.value
   const tasks = systemPaths
-    ? systemPaths.map((i) => ({ name: i.name, src: i.path, dst: targetDir.replace(/\/+$/, '') + '/' + i.name, isDir: i.isDir }))
+    ? systemPaths.map((i) => ({ name: i.name, src: i.path, dst: (direction === 'download' ? localJoin : posixJoin)(targetDir, i.name), isDir: i.isDir }))
     : planTasks({ direction, names, sourceDir, targetDir, isDirMap: (sourceItems || []).reduce((m, it) => (m[it.name] = it.isDir, m), {}) })
   const hidden = hiddenSelectedCount(sourceSelection, visibleFor(direction === 'upload' ? 'local' : 'remote'))
   const existing = (targetItems || []).map((it) => it.name)
@@ -391,7 +404,7 @@ async function removeSelected(pane) {
   if (!ok) return
   const base = pane === 'local' ? (localPath.value || '/') : remotePath.value
   for (const n of names) {
-    const full = base.replace(/\/+$/, '') + '/' + n
+    const full = pane === 'local' ? localJoin(base, n) : posixJoin(base, n)
     const rec = { direction: pane === 'local' ? 'move' : 'download', name: n, src: full, dst: '', size: 0, status: '处理中', startedAt: Date.now() }
     transfers.value.push(rec)
     try {
@@ -418,10 +431,10 @@ async function renameItem(pane, it) {
   if (!newName || newName === it.name) { closeMenu(); return }
   try {
     if (pane === 'local') {
-      await renameLocal(join(localPath.value, it.name), join(localPath.value, newName))
+      await renameLocal(localJoin(localPath.value, it.name), localJoin(localPath.value, newName))
       await loadLocal()
     } else {
-      await SftpRename(host.value, '', join(remotePath.value, it.name), join(remotePath.value, newName))
+      await SftpRename(host.value, '', posixJoin(remotePath.value, it.name), posixJoin(remotePath.value, newName))
       await loadRemote()
     }
   } catch (e) { err(e) }
@@ -438,10 +451,10 @@ async function mkdirIn(pane) {
   if (!name) return
   try {
     if (pane === 'local') {
-      await MkdirLocal(join(localPath.value, name))
+      await MkdirLocal(localJoin(localPath.value, name))
       await loadLocal()
     } else {
-      await SftpMkdir(host.value, '', join(remotePath.value, name))
+      await SftpMkdir(host.value, '', posixJoin(remotePath.value, name))
       await loadRemote()
     }
   } catch (e) { err(e) }
@@ -455,10 +468,10 @@ async function uploadPicked() {
     const local = await PickLocalFile()
     if (!local) return
     const name = local.split(/[\\/]/).pop()
-    t = { direction: 'upload', name, src: local, dst: join(remotePath.value, name), size: 0, status: '处理中', startedAt: Date.now() }
+    t = { direction: 'upload', name, src: local, dst: posixJoin(remotePath.value, name), size: 0, status: '处理中', startedAt: Date.now() }
     try { t.size = await StatLocal(local) } catch (e) { t.size = 0 }
     transfers.value.push(t)
-    await SftpPut(host.value, '', local, join(remotePath.value, name))
+    await SftpPut(host.value, '', local, posixJoin(remotePath.value, name))
     t.status = '完成'
     t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
     await loadRemote()
@@ -614,7 +627,7 @@ async function handleSystemDrop(pane, paths) {
     await runBatch({ direction: 'upload', names: ok.map((i) => i.name), sourceDir: '', targetDir: remotePath.value, sourceItems: localItems.value, systemPaths: ok })
     return
   }
-  const base = (localPath.value || '/').replace(/\/+$/, '')
+  const base = localPath.value || '/'
   const existing = (localItems.value || []).map((it) => it.name)
   const conflicts = ok.filter((i) => existing.includes(i.name))
   let policy = 'skip'
@@ -626,7 +639,7 @@ async function handleSystemDrop(pane, paths) {
   for (const i of ok) {
     const hasConflict = existing.includes(i.name)
     if (hasConflict && policy === 'skip') {
-      transfers.value.push({ direction: 'copy', name: i.name, src: i.path, dst: base + '/' + i.name, size: i.size, status: '跳过', elapsed: 0 })
+      transfers.value.push({ direction: 'copy', name: i.name, src: i.path, dst: localJoin(base, i.name), size: i.size, status: '跳过', elapsed: 0 })
       continue
     }
     let name = i.name
@@ -634,7 +647,7 @@ async function handleSystemDrop(pane, paths) {
       name = copyName(i.name, existing)
       existing.push(name) // 累积已占用的名字，否则两个同名源会算出同一个新名
     }
-    const dst = base + '/' + name
+    const dst = localJoin(base, name)
     const rec = { direction: 'copy', name, src: i.path, dst, size: i.size, status: '处理中', startedAt: Date.now() }
     transfers.value.push(rec)
     try { await CopyLocal(i.path, dst); rec.status = '完成' } catch (e) { rec.status = '失败'; rec.reason = String((e && e.message) || e); err(e) }
@@ -646,6 +659,8 @@ async function handleSystemDrop(pane, paths) {
 onMounted(async () => {
   await loadHosts()
   await locations.load() // 书签与双侧最近位置（T6 store），供两个面板头的位置下拉使用
+  // presets.toml 坏掉时只发一次 startup 事件可能早于前端订阅而丢失，所以由这里补一次用户可见提示
+  if (locations.presetsError) err('预设文件解析失败：' + locations.presetsError)
   // local starts at current working dir
   try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
   await loadLocal()
@@ -717,6 +732,7 @@ onUnmounted(() => {
       <div class="pane-wrap" data-pane="local" @dragover.prevent @drop.prevent="onPaneDrop('local', $event)">
         <FilePane title="本地" pane="local" host="" :path="localPath || '/'" :items="localItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
           :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
+          :presets="locations.presetsForPane('local', '')" :disks="locations.disksForPane('local')"
           :bookmarks="locations.bookmarksForPane('local', '')" :recents="locations.recentsForPane('local', '')" :bookmarked="bookmarkedFor('local')"
           @select="onSelect('local', $event)" @open="openLocal" @action="onPaneAction('local', $event)"
           @pick-position="pickPosition('local', $event)" @toggle-bookmark="toggleBookmark('local')" @search="search.pane = 'local'; search.visible = true"
@@ -727,6 +743,7 @@ onUnmounted(() => {
       <div class="pane-wrap" data-pane="remote" @dragover.prevent @drop.prevent="onPaneDrop('remote', $event)">
         <FilePane title="远程" pane="remote" :host="host" :path="remotePath" :items="remoteItems" :sel-keys="[...remoteSelection.keys]" :anchor="remoteSelection.anchor"
           :show-hidden="showAll" :loading="remoteLoading" :actions="actionsFor('remote')" :hidden-selected="hiddenFor('remote')"
+          :presets="locations.presetsForPane('remote', host)"
           :bookmarks="locations.bookmarksForPane('remote', host)" :recents="locations.recentsForPane('remote', host)" :bookmarked="bookmarkedFor('remote')"
           @select="onSelect('remote', $event)" @open="openRemote" @action="onPaneAction('remote', $event)"
           @pick-position="pickPosition('remote', $event)" @toggle-bookmark="toggleBookmark('remote')" @search="search.pane = 'remote'; search.visible = true"
