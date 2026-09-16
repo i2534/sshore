@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, nextTick } from 'vue'
 import { POLICY_SKIP, POLICY_OVERWRITE, POLICY_RENAME } from '../utils/batch'
 
 const props = defineProps({
@@ -11,16 +11,25 @@ const props = defineProps({
 })
 const emit = defineEmits(['confirm', 'cancel'])
 const policy = ref(POLICY_SKIP)
+const overlay = ref(null)
 const MAX_LIST = 8
 
-watch(() => props.visible, (v) => { if (v) policy.value = POLICY_SKIP })
+watch(() => props.visible, async (v) => {
+  if (!v) return
+  policy.value = POLICY_SKIP
+  // 遮罩没有 tabindex 时键盘事件不会落在它上面，@keyup.esc 形同虚设。
+  // 打开后把焦点移到遮罩（tabindex="-1" 使其可编程聚焦），Esc 即可关闭；
+  // 焦点落在内部单选/按钮上时，keyup 也会冒泡到遮罩，同样生效。
+  await nextTick()
+  if (overlay.value) overlay.value.focus()
+})
 
 function shown() { return props.conflicts.slice(0, MAX_LIST) }
 function more() { return Math.max(0, props.conflicts.length - MAX_LIST) }
 </script>
 
 <template>
-  <div v-if="visible" class="ui-overlay" @click.self="emit('cancel')" @keyup.esc="emit('cancel')">
+  <div v-if="visible" ref="overlay" tabindex="-1" class="ui-overlay" @click.self="emit('cancel')" @keyup.esc="emit('cancel')">
     <div class="dialog" role="dialog" aria-label="投递确认">
       <div class="dtitle">{{ conflicts.length ? '目标已存在同名项' : '确认投递' }}</div>
       <p class="dmsg">
@@ -48,6 +57,8 @@ function more() { return Math.max(0, props.conflicts.length - MAX_LIST) }
 </template>
 
 <style scoped>
+/* 遮罩靠 tabindex="-1" 接收 Esc；焦点环画在整个遮罩上没有意义，隐掉 */
+.ui-overlay:focus { outline: none; }
 .dialog { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; padding: 20px; width: 440px; text-align: left; }
 .dtitle { font-weight: 600; color: var(--text); }
 .dmsg { color: var(--text-dim); font-size: var(--fs-13); }
