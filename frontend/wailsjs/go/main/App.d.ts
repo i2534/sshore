@@ -5,6 +5,12 @@ import {main} from '../models';
 import {sftp} from '../models';
 import {sync} from '../models';
 
+export function AddBookmark(arg1:config.Bookmark):Promise<void>;
+
+export function AddLocalRecent(arg1:string):Promise<void>;
+
+export function AddRemoteRecent(arg1:string,arg2:string):Promise<void>;
+
 export function AutoStartEnabled():Promise<void>;
 
 export function ConfirmSyncRuleDeletes(arg1:string,arg2:string):Promise<void>;
@@ -39,11 +45,13 @@ export function ListHostsDetailed():Promise<Array<config.Host>>;
 
 export function ListLocal(arg1:string):Promise<Array<sftp.Item>>;
 
-export function ListRecentSFTP():Promise<Array<config.RecentSFTP>>;
+export function ListLocations():Promise<main.Locations>;
 
 export function ListSyncRules():Promise<Array<config.SyncRule>>;
 
 export function ListTunnels():Promise<Array<config.Tunnel>>;
+
+export function LocalSearch(arg1:main.LocalSearchRequest):Promise<main.LocalSearchOutcome>;
 
 export function MkdirLocal(arg1:string):Promise<void>;
 
@@ -53,11 +61,15 @@ export function PickLocalDir():Promise<string>;
 
 export function PickLocalFile():Promise<string>;
 
+export function RemoveBookmark(arg1:string,arg2:string,arg3:string):Promise<void>;
+
 export function RenameLocal(arg1:string,arg2:string):Promise<void>;
 
 export function ResolveSyncConflict(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function RetrySyncRuleFailures(arg1:string):Promise<void>;
+
+export function SearchCancel(arg1:string):Promise<void>;
 
 export function SetSettings(arg1:config.AppSettings):Promise<void>;
 
@@ -88,6 +100,8 @@ export function SftpRemove(arg1:string,arg2:string,arg3:string):Promise<void>;
 export function SftpRemoveRecursive(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function SftpRename(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+
+export function SftpSearch(arg1:main.RemoteSearchRequest):Promise<sftp.SearchOutcome>;
 
 export function StartSyncRule(arg1:string):Promise<void>;
 

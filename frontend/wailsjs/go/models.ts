@@ -22,6 +22,24 @@ export namespace config {
 	        this.auto_start_on_launch = source["auto_start_on_launch"];
 	    }
 	}
+	export class Bookmark {
+	    name: string;
+	    scope: string;
+	    host: string;
+	    path: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Bookmark(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.scope = source["scope"];
+	        this.host = source["host"];
+	        this.path = source["path"];
+	    }
+	}
 	export class Host {
 	    alias: string;
 	    host_name: string;
@@ -44,21 +62,33 @@ export namespace config {
 	        this.proxy_jump = source["proxy_jump"];
 	    }
 	}
-	export class RecentSFTP {
-	    host: string;
-	    remote_dir: string;
-	    local_dir: string;
+	export class RecentLocal {
+	    path: string;
 	    ts: string;
 	
 	    static createFrom(source: any = {}) {
-	        return new RecentSFTP(source);
+	        return new RecentLocal(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	        this.ts = source["ts"];
+	    }
+	}
+	export class RecentRemote {
+	    host: string;
+	    path: string;
+	    ts: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new RecentRemote(source);
 	    }
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.host = source["host"];
-	        this.remote_dir = source["remote_dir"];
-	        this.local_dir = source["local_dir"];
+	        this.path = source["path"];
 	        this.ts = source["ts"];
 	    }
 	}
@@ -139,6 +169,29 @@ export namespace config {
 
 }
 
+export namespace localfs {
+	
+	export class Hit {
+	    path: string;
+	    isDir: boolean;
+	    size: number;
+	    modTime: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Hit(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	        this.isDir = source["isDir"];
+	        this.size = source["size"];
+	        this.modTime = source["modTime"];
+	    }
+	}
+
+}
+
 export namespace main {
 	
 	export class AppInfo {
@@ -156,6 +209,98 @@ export namespace main {
 	        this.version = source["version"];
 	        this.repo = source["repo"];
 	    }
+	}
+	export class LocalSearchOutcome {
+	    hits: localfs.Hit[];
+	    scanned: number;
+	    unreadable: number;
+	    truncated: boolean;
+	    cancelled: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new LocalSearchOutcome(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.hits = this.convertValues(source["hits"], localfs.Hit);
+	        this.scanned = source["scanned"];
+	        this.unreadable = source["unreadable"];
+	        this.truncated = source["truncated"];
+	        this.cancelled = source["cancelled"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class LocalSearchRequest {
+	    id: string;
+	    root: string;
+	    pattern: string;
+	    maxDepth: number;
+	    limit: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new LocalSearchRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.root = source["root"];
+	        this.pattern = source["pattern"];
+	        this.maxDepth = source["maxDepth"];
+	        this.limit = source["limit"];
+	    }
+	}
+	export class Locations {
+	    bookmarks: config.Bookmark[];
+	    localRecents: config.RecentLocal[];
+	    remoteRecents: config.RecentRemote[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Locations(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.bookmarks = this.convertValues(source["bookmarks"], config.Bookmark);
+	        this.localRecents = this.convertValues(source["localRecents"], config.RecentLocal);
+	        this.remoteRecents = this.convertValues(source["remoteRecents"], config.RecentRemote);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 	export class PathInfo {
 	    path: string;
@@ -175,6 +320,28 @@ export namespace main {
 	        this.isDir = source["isDir"];
 	        this.size = source["size"];
 	        this.err = source["err"];
+	    }
+	}
+	export class RemoteSearchRequest {
+	    id: string;
+	    host: string;
+	    root: string;
+	    pattern: string;
+	    maxDepth: number;
+	    limit: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new RemoteSearchRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.host = source["host"];
+	        this.root = source["root"];
+	        this.pattern = source["pattern"];
+	        this.maxDepth = source["maxDepth"];
+	        this.limit = source["limit"];
 	    }
 	}
 
@@ -201,6 +368,62 @@ export namespace sftp {
 	        this.mode = source["mode"];
 	        this.modTime = source["modTime"];
 	    }
+	}
+	export class SearchHit {
+	    path: string;
+	    isDir: boolean;
+	    size: number;
+	    modTime: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SearchHit(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	        this.isDir = source["isDir"];
+	        this.size = source["size"];
+	        this.modTime = source["modTime"];
+	    }
+	}
+	export class SearchOutcome {
+	    hits: SearchHit[];
+	    scanned: number;
+	    unreadable: number;
+	    truncated: boolean;
+	    cancelled: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new SearchOutcome(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.hits = this.convertValues(source["hits"], SearchHit);
+	        this.scanned = source["scanned"];
+	        this.unreadable = source["unreadable"];
+	        this.truncated = source["truncated"];
+	        this.cancelled = source["cancelled"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 
 }
