@@ -157,6 +157,26 @@ export namespace main {
 	        this.repo = source["repo"];
 	    }
 	}
+	export class PathInfo {
+	    path: string;
+	    name: string;
+	    isDir: boolean;
+	    size: number;
+	    err?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new PathInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	        this.name = source["name"];
+	        this.isDir = source["isDir"];
+	        this.size = source["size"];
+	        this.err = source["err"];
+	    }
+	}
 
 }
 
