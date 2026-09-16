@@ -94,7 +94,7 @@
 - Create: `internal/preset/platform_windows.go`
 - Create: `internal/preset/platform_other.go`
 - Test: `internal/preset/preset_test.go`
-- Modify: `internal/config/store.go`（`type Preset` + `AppConfig.Presets` + `normalize()` 缺省 scope）
+- Modify: `internal/config/store.go`（sidecar：`DefaultPresetsPath` / `Preset` / `NormalizeScope` / `LoadPresets` / `SavePresets` / `PresetsTemplate`；**`AppConfig` 不动**）
 - Test: `internal/config/store_test.go`
 
 **Interfaces:**
@@ -103,11 +103,13 @@
   - `type Preset struct { Name string \`json:"name"\`; Path string \`json:"path"\`; Host string \`json:"host,omitempty"\` }`
   - `type Entry struct { Name, Scope, Host, Path string }`（配置文件条目，app 层转换；`preset` **不** import `internal/config`）
   - `func User(scope string, entries []Entry) []Preset`（配置条目过滤/去重）
-  - `func Local(home string, exists func(string) bool) []Preset`（内置）
+  - `func Local(home string, exists func(string) bool) []Preset`（**默认播种源**，渲染路径不调用）
   - `func Drives(mask uint32) []Preset`
-  - `func Remote() []Preset`（内置）
+  - `func Remote() []Preset`（**默认播种源**，渲染路径不调用）
   - `func All(user []Entry) (local, disks, remote []Preset)`
-  - `type config.Preset struct { Name, Scope, Host, Path string }` + `AppConfig.Presets []Preset`
+  - `func expandLocalTilde(entries []Entry, home string) []Entry`（仅 local 展开 `~`/`~/x`；远端 `~` 是 sentinel 不展开）
+  - `type config.Preset struct { Name, Scope, Host, Path string }`（`toml`/`json` tag）
+  - `func config.DefaultPresetsPath() (string, error)` / `NormalizeScope(string) string` / `LoadPresets(path) ([]Preset, error)` / `SavePresets(path string, data []byte) error` / `PresetsTemplate(seed []Preset) []byte`
 - 供 Task 2（`ListPresets`）使用。
 
 - [ ] **Step 1: 写失败测试**
