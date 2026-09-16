@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	stdsync "sync"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -30,6 +31,11 @@ type App struct {
 	// H2: startup 早于 Init 注入 emit，加载错误先记录于此，Init 时补发事件
 	emit       func(forward.Event)
 	cfgLoadErr error
+
+	// 深搜取消表：id → cancel。app.go 已 import "sshore/internal/sync"，
+	// 标准库互斥锁必须用 stdsync 别名，否则与 sync.Ctrl 冲突。
+	searchMu      stdsync.Mutex
+	searchCancels map[string]context.CancelFunc
 }
 
 var (
@@ -651,31 +657,211 @@ func (a *App) SftpHome(host string) (string, error) {
 	return home, nil
 }
 
-// recordRecentSFTP 记录一次成功的 SFTP 操作到最近使用列表：
-// 相同 (host, remoteDir, localDir) 的旧条目移除后新条目置顶，上限 10 条，
-// 最新在前；落盘沿用 saveConfig 的 fire-and-forget 模式（见 OnShutdown）。
+// normDepth：绑定层把 0 当"未设置"归一为 5；-1 表示无限（仓库惯例，UI 不给入口）；>0 原样。
+func normDepth(d int) int {
+	if d == 0 {
+		return 5
+	}
+	return d
+}
+
+type RemoteSearchRequest struct {
+	ID       string `json:"id"`
+	Host     string `json:"host"`
+	Root     string `json:"root"`
+	Pattern  string `json:"pattern"`
+	MaxDepth int    `json:"maxDepth"`
+	Limit    int    `json:"limit"`
+}
+
+type LocalSearchRequest struct {
+	ID       string `json:"id"`
+	Root     string `json:"root"`
+	Pattern  string `json:"pattern"`
+	MaxDepth int    `json:"maxDepth"`
+	Limit    int    `json:"limit"`
+}
+
+// LocalSearchOutcome 是本地深搜的结果快照。
+// Scanned 恒为 0：WalkDir 不分层，前端对本地不显示"已扫描 N 个目录"的进度。
+type LocalSearchOutcome struct {
+	Hits       []localfs.Hit `json:"hits"`
+	Scanned    int           `json:"scanned"`
+	Unreadable int           `json:"unreadable"`
+	Truncated  bool          `json:"truncated"`
+	Cancelled  bool          `json:"cancelled"`
+}
+
+func (a *App) trackSearch(id string) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.searchMu.Lock()
+	if a.searchCancels == nil {
+		a.searchCancels = map[string]context.CancelFunc{}
+	}
+	if old, ok := a.searchCancels[id]; ok {
+		old()
+	}
+	a.searchCancels[id] = cancel
+	a.searchMu.Unlock()
+	return ctx, cancel
+}
+
+// SearchCancel 取消指定搜索；完成后由调用方调用（幂等）。
+func (a *App) SearchCancel(id string) {
+	a.searchMu.Lock()
+	if c, ok := a.searchCancels[id]; ok {
+		c()
+		delete(a.searchCancels, id)
+	}
+	a.searchMu.Unlock()
+}
+
+// SftpSearch 远端深搜。取消**不**作为 error 返回：Wails 在 err != nil 时会丢弃
+// 第一个返回值，前端将拿不到部分结果（spec §3 决策 18）。
+func (a *App) SftpSearch(req RemoteSearchRequest) (sftp.SearchOutcome, error) {
+	ctx, cancel := a.trackSearch(req.ID)
+	defer func() { cancel(); a.SearchCancel(req.ID) }()
+	out, err := a.sftp.Search(ctx, req.Host, "", req.Root, req.Pattern, normDepth(req.MaxDepth), req.Limit,
+		func(scanned int) {
+			if a.ctx != nil {
+				runtime.EventsEmit(a.ctx, "sftp:search-progress", map[string]any{"id": req.ID, "scanned": scanned})
+			}
+		})
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		out.Cancelled = true
+		return out, nil
+	}
+	return out, err
+}
+
+// LocalSearch 本地深搜。localfs.Search 取消时**只**返回 err（没有 Cancelled 字段），
+// 这里统一转成 Cancelled=true + nil error，与远端保持一致（否则前端拿不到部分结果）。
+func (a *App) LocalSearch(req LocalSearchRequest) (LocalSearchOutcome, error) {
+	ctx, cancel := a.trackSearch(req.ID)
+	defer func() { cancel(); a.SearchCancel(req.ID) }()
+	hits, skipped, truncated, err := localfs.Search(ctx, req.Root, req.Pattern, localfs.SearchOpts{
+		MaxDepth: normDepth(req.MaxDepth), Limit: req.Limit,
+	})
+	out := LocalSearchOutcome{Hits: hits, Unreadable: skipped, Truncated: truncated}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		out.Cancelled = true
+		return out, nil
+	}
+	return out, err
+}
+
+type Locations struct {
+	Bookmarks     []config.Bookmark     `json:"bookmarks"`
+	LocalRecents  []config.RecentLocal  `json:"localRecents"`
+	RemoteRecents []config.RecentRemote `json:"remoteRecents"`
+}
+
+func (a *App) ListLocations() Locations {
+	if a.cfg == nil {
+		return Locations{Bookmarks: []config.Bookmark{}, LocalRecents: []config.RecentLocal{}, RemoteRecents: []config.RecentRemote{}}
+	}
+	out := Locations{
+		Bookmarks:     a.cfg.Bookmarks,
+		LocalRecents:  a.cfg.LocalRecent,
+		RemoteRecents: a.cfg.RemoteRecent,
+	}
+	if out.Bookmarks == nil {
+		out.Bookmarks = []config.Bookmark{}
+	}
+	if out.LocalRecents == nil {
+		out.LocalRecents = []config.RecentLocal{}
+	}
+	if out.RemoteRecents == nil {
+		out.RemoteRecents = []config.RecentRemote{}
+	}
+	return out
+}
+
+func (a *App) AddBookmark(b config.Bookmark) error {
+	if b.Path == "" || (b.Scope != "local" && b.Scope != "remote") {
+		return errors.New("invalid bookmark")
+	}
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	for _, e := range a.cfg.Bookmarks {
+		if e.Scope == b.Scope && e.Host == b.Host && e.Path == b.Path {
+			return nil
+		}
+	}
+	a.cfg.Bookmarks = append(a.cfg.Bookmarks, b)
+	return a.saveConfig()
+}
+
+func (a *App) RemoveBookmark(scope, host, path string) error {
+	if a.cfg == nil {
+		return nil
+	}
+	kept := a.cfg.Bookmarks[:0]
+	for _, e := range a.cfg.Bookmarks {
+		if e.Scope == scope && e.Host == host && e.Path == path {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	a.cfg.Bookmarks = kept
+	return a.saveConfig()
+}
+
+func (a *App) AddLocalRecent(path string) error {
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	rec := config.RecentLocal{Path: path, TS: time.Now().Format(time.RFC3339)}
+	kept := a.cfg.LocalRecent[:0]
+	for _, e := range a.cfg.LocalRecent {
+		if e.Path == path {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	a.cfg.LocalRecent = append([]config.RecentLocal{rec}, kept...)
+	if len(a.cfg.LocalRecent) > 20 {
+		a.cfg.LocalRecent = a.cfg.LocalRecent[:20]
+	}
+	return a.saveConfig()
+}
+
+func (a *App) AddRemoteRecent(host, path string) error {
+	if host == "" || path == "" {
+		return nil
+	}
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	rec := config.RecentRemote{Host: host, Path: path, TS: time.Now().Format(time.RFC3339)}
+	kept := a.cfg.RemoteRecent[:0]
+	for _, e := range a.cfg.RemoteRecent {
+		if e.Host == host && e.Path == path {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	a.cfg.RemoteRecent = append([]config.RecentRemote{rec}, kept...)
+	if len(a.cfg.RemoteRecent) > 20 {
+		a.cfg.RemoteRecent = a.cfg.RemoteRecent[:20]
+	}
+	return a.saveConfig()
+}
+
+// recordRecentSFTP 记录一次成功的 SFTP 操作：远端目录进 RemoteRecent、本地目录进
+// LocalRecent（各自去重置顶、上限 20，见 AddRemoteRecent/AddLocalRecent）；
+// 落盘沿用 saveConfig 的 fire-and-forget 模式（见 OnShutdown）。
 func (a *App) recordRecentSFTP(host, remoteDir, localDir string) {
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
 	}
-	rec := config.RecentSFTP{
-		Host:      host,
-		RemoteDir: remoteDir,
-		LocalDir:  localDir,
-		TS:        time.Now().Format(time.RFC3339),
+	if host != "" && remoteDir != "" {
+		_ = a.AddRemoteRecent(host, remoteDir)
 	}
-	kept := a.cfg.RecentSFTP[:0]
-	for _, e := range a.cfg.RecentSFTP {
-		if e.Host == host && e.RemoteDir == remoteDir && e.LocalDir == localDir {
-			continue // 去重：旧条目丢弃，由新条目顶替并置顶
-		}
-		kept = append(kept, e)
+	if localDir != "" {
+		_ = a.AddLocalRecent(localDir)
 	}
-	a.cfg.RecentSFTP = append([]config.RecentSFTP{rec}, kept...)
-	if len(a.cfg.RecentSFTP) > 10 {
-		a.cfg.RecentSFTP = a.cfg.RecentSFTP[:10]
-	}
-	_ = a.saveConfig()
 }
 
 // ListRecentSFTP 返回 SFTP 最近使用列表（最新在前，最多 10 条）；
