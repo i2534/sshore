@@ -449,7 +449,14 @@ async function doAction(name) {
   const sourceItems = itemsFor(pane)
   closeMenu()
   if (name === 'download') return runBatch({ direction: 'download', names, sourceDir, targetDir, sourceItems })
-  if (name === 'upload') return runBatch({ direction: 'upload', names, sourceDir, targetDir, sourceItems })
+  // 上传按面板分派（spec §6.2：远程面板的动作表里没有"上传"项）：
+  // 远程面板右键的「上传…」语义 = 选本地文件上传，沿用既有 PickLocalFile 行为；
+  // 只有本地面板的「上传到远程」才是"上传选中项"。
+  // 绝不能用远程 names + 本地 sourceDir 去跑 runBatch：那会把远端路径当本地源执行 SftpPut。
+  if (name === 'upload') {
+    if (pane === 'remote') return uploadPicked()
+    return runBatchFor('local', 'upload')
+  }
   if (name === 'remove') return removeSelected(pane)
   return legacyAction(name, pane, it)
 }
