@@ -18,6 +18,7 @@ import (
 	"sshore/internal/importer"
 	"sshore/internal/localfs"
 	"sshore/internal/osutil"
+	"sshore/internal/preset"
 	"sshore/internal/sftp"
 	"sshore/internal/sync"
 )
@@ -37,6 +38,11 @@ type App struct {
 	// 标准库互斥锁必须用 stdsync 别名，否则与 sync.Ctrl 冲突。
 	searchMu      stdsync.Mutex
 	searchCancels map[string]context.CancelFunc
+
+	// H2 同构：startup 阶段发现的预设文件问题（首次生成失败 / 坏文件），
+	// Init 时 emit 补发，前端日志面板可见。
+	presetsPath string
+	presetsErr  error
 }
 
 var (
@@ -96,6 +102,20 @@ func (a *App) startup(ctx context.Context) {
 	if config.MigrateLegacyRecents(cfg) {
 		_ = config.SaveConfig(p, cfg)
 	}
+	// 预设文件只在"不存在"时生成一次；之后永不改写（用户的注释/顺序必须永久保留）。
+	// 判据是**文件存在性**，不是某个标记字段 —— "删条目"与"删文件"语义不同，见 README。
+	pp, perr := config.DefaultPresetsPath()
+	a.presetsPath = pp
+	if perr != nil {
+		a.presetsErr = perr
+	} else if _, statErr := os.Stat(pp); errors.Is(statErr, os.ErrNotExist) {
+		if werr := config.SavePresets(pp, config.PresetsTemplate(toConfigPresets(preset.Defaults()))); werr != nil {
+			a.presetsErr = fmt.Errorf("生成默认预设文件 %s 失败: %w", pp, werr)
+		}
+	} else if _, lerr := config.LoadPresets(pp); lerr != nil {
+		// 坏文件：只记录、只降级，绝不覆盖用户文件
+		a.presetsErr = lerr
+	}
 }
 
 // Init wires controllers. emit forwards subsystem events to the frontend.
@@ -126,6 +146,16 @@ func (a *App) Init(emit func(forward.Event)) {
 			TS:         time.Now().Format(time.RFC3339),
 			Level:      "error",
 			Message:    a.cfgLoadErr.Error(),
+		})
+	}
+	// 预设文件的问题同样补发（坏文件只降级不覆盖，用户需要看到原因）
+	if a.presetsErr != nil && a.emit != nil {
+		a.emit(forward.Event{
+			SourceType: "system",
+			SourceID:   "app",
+			TS:         time.Now().Format(time.RFC3339),
+			Level:      "error",
+			Message:    a.presetsErr.Error(),
 		})
 	}
 }
@@ -755,6 +785,54 @@ type Locations struct {
 	Bookmarks     []config.Bookmark     `json:"bookmarks"`
 	LocalRecents  []config.RecentLocal  `json:"localRecents"`
 	RemoteRecents []config.RecentRemote `json:"remoteRecents"`
+}
+
+// toConfigPresets / presetEntries 是 app 层**唯一**的类型转换点：
+// internal/preset 刻意不 import internal/config（叶子包只依赖标准库）。
+func toConfigPresets(es []preset.Entry) []config.Preset {
+	out := make([]config.Preset, 0, len(es))
+	for _, e := range es {
+		out = append(out, config.Preset{Name: e.Name, Scope: e.Scope, Host: e.Host, Path: e.Path})
+	}
+	return out
+}
+
+func presetEntries(ps []config.Preset) []preset.Entry {
+	out := make([]preset.Entry, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, preset.Entry{
+			Name:  p.Name,
+			Scope: config.NormalizeScope(p.Scope), // 与 LoadPresets 同一条归一规则，双保险
+			Host:  p.Host,
+			Path:  p.Path,
+		})
+	}
+	return out
+}
+
+// Presets 是「📍 位置」下拉里的固定预设：本地面板（local）、Windows 的逻辑盘
+// （localDisks）、远程面板（remote）。local/remote 完全来自 presets.toml，
+// localDisks 每次实时枚举；remote 条目的 Host 由前端按当前主机过滤。
+type Presets struct {
+	Local      []preset.Preset `json:"local"`
+	LocalDisks []preset.Preset `json:"localDisks"`
+	Remote     []preset.Preset `json:"remote"`
+}
+
+// ListPresets 返回位置下拉的预设：每次调用都重新读 presets.toml 并实时枚举盘符。
+// 坏文件不让面板整体失败：预设组退化为空（错误已在 startup 记录、Init 时上报）。
+// 注意前端只在进入 SFTP 页时拉一次 → 手改文件后需要重启应用生效。
+func (a *App) ListPresets() Presets {
+	var entries []preset.Entry
+	if a.presetsPath != "" {
+		ps, err := config.LoadPresets(a.presetsPath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			ps = nil // 坏文件：只降级，不覆盖用户文件
+		}
+		entries = presetEntries(ps)
+	}
+	local, disks, remote := preset.All(entries)
+	return Presets{Local: local, LocalDisks: disks, Remote: remote}
 }
 
 func (a *App) ListLocations() Locations {

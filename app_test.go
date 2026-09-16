@@ -18,6 +18,7 @@ import (
 	"sshore/internal/config"
 	"sshore/internal/forward"
 	"sshore/internal/osutil"
+	"sshore/internal/preset"
 	"sshore/internal/sftp"
 	"sshore/internal/sync"
 )
@@ -1099,5 +1100,130 @@ func TestAddRemoteRecentDedupesAndCaps(t *testing.T) {
 	got := a.ListLocations().RemoteRecents
 	if len(got) > 20 {
 		t.Fatalf("must cap at 20, got %d", len(got))
+	}
+}
+
+func TestListPresetsReadsPresetsFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "presets.toml")
+	if err := config.SavePresets(path, config.PresetsTemplate([]config.Preset{
+		{Name: "项目", Scope: "local", Path: "/work/proj"},
+		{Name: "生产日志", Scope: "remote", Host: "prod", Path: "/var/log"},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	a := NewApp()
+	a.presetsPath = path
+	p := a.ListPresets()
+	// 预设组必须完全等于文件内容：不得混入任何硬编码条目
+	if len(p.Local) != 1 || p.Local[0].Name != "项目" {
+		t.Fatalf("本地面板预设必须完全等于文件内容：%+v", p.Local)
+	}
+	if len(p.Remote) != 1 || p.Remote[0].Path != "/var/log" || p.Remote[0].Host != "prod" {
+		t.Fatalf("远端条目必须透传 host：%+v", p.Remote)
+	}
+	if runtime.GOOS == "windows" && len(p.LocalDisks) == 0 {
+		t.Fatal("Windows 上磁盘组不得为空")
+	}
+	if runtime.GOOS != "windows" && len(p.LocalDisks) != 0 {
+		t.Fatalf("非 Windows 不应有磁盘组：%+v", p.LocalDisks)
+	}
+}
+
+func TestListPresetsDegradesOnBadFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "presets.toml")
+	bad := "[presets]\nbroken = \n"
+	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := NewApp()
+	a.presetsPath = path
+	p := a.ListPresets() // 坏文件不能让整个面板失败
+	if p.Local == nil || p.LocalDisks == nil || p.Remote == nil {
+		t.Fatalf("坏文件时三组也必须非 nil：%+v", p)
+	}
+	if len(p.Local) != 0 || len(p.Remote) != 0 {
+		t.Fatalf("坏文件时预设组应退化为空：%+v %+v", p.Local, p.Remote)
+	}
+	if after, _ := os.ReadFile(path); string(after) != bad {
+		t.Fatal("坏文件绝不能被改写或覆盖")
+	}
+	// presetsPath 为空（路径解析失败）时也不能炸、也不能是 nil
+	if got := NewApp().ListPresets(); got.Local == nil || got.LocalDisks == nil || got.Remote == nil {
+		t.Fatalf("presetsPath 为空时三组应是非 nil 空切片：%+v", got)
+	}
+}
+
+func TestStartupSeedsPresetsFileOnce(t *testing.T) {
+	pp, err := config.DefaultPresetsPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(pp) // 模拟"从 v0.5.0 升级上来"：还没有预设文件
+	a := NewApp()
+	a.startup(context.Background())
+	if a.presetsErr != nil {
+		t.Fatalf("首次生成不应报错：%v", a.presetsErr)
+	}
+	data, err := os.ReadFile(pp)
+	if err != nil {
+		t.Fatalf("首次启动必须生成 presets.toml：%v", err)
+	}
+	if !strings.Contains(string(data), "# ") || !strings.Contains(string(data), "[[presets]]") {
+		t.Fatalf("生成的模板必须带注释与条目：\n%s", data)
+	}
+	if ps, err := config.LoadPresets(pp); err != nil || len(ps) == 0 {
+		t.Fatalf("生成的模板必须能被自己解析出条目：%v %+v", err, ps)
+	}
+
+	// 用户改动之后重启：绝不改写（注释/顺序/新增内容必须永久保留）
+	custom := string(data) + "\n# 我加的注释\n"
+	if err := os.WriteFile(pp, []byte(custom), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a2 := NewApp()
+	a2.startup(context.Background())
+	if after, _ := os.ReadFile(pp); string(after) != custom {
+		t.Fatal("已存在的预设文件绝不能被启动流程改写")
+	}
+
+	// 保留文件但删光条目：重启不得复活默认项
+	empty := "# 我只要磁盘组\n"
+	if err := os.WriteFile(pp, []byte(empty), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a3 := NewApp()
+	a3.startup(context.Background())
+	if got := a3.ListPresets(); len(got.Local) != 0 {
+		t.Fatalf("用户清空条目后不得复活默认预设：%+v", got.Local)
+	}
+
+	// 坏文件：不覆盖，并把错误如实记到 presetsErr（Init 时补发事件，用户才看得到）
+	bad := "[presets]\nbroken = \n"
+	if err := os.WriteFile(pp, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a4 := NewApp()
+	a4.startup(context.Background())
+	if a4.presetsErr == nil {
+		t.Fatal("坏文件必须在 startup 阶段被记录（否则用户看不到任何提示）")
+	}
+	if after, _ := os.ReadFile(pp); string(after) != bad {
+		t.Fatal("坏文件不得被覆盖")
+	}
+}
+
+// 评审 M8：config.Preset 与 preset.Entry 是两个结构体，字段漂移没有编译期保护，
+// 用对称性（转过去再转回来逐字段相等）把它钉住。
+func TestPresetConvertersAreSymmetric(t *testing.T) {
+	src := []preset.Entry{{Name: "a", Scope: "remote", Host: "prod", Path: "/x"}}
+	back := presetEntries(toConfigPresets(src))
+	if len(back) != 1 || back[0] != src[0] {
+		t.Fatalf("转换必须保字段：%+v -> %+v", src, back)
+	}
+	got := presetEntries([]config.Preset{{Name: "b", Path: "/y"}})
+	if len(got) != 1 || got[0].Scope != "local" || got[0].Name != "b" || got[0].Path != "/y" {
+		t.Fatalf("scope 缺省应为 local 且字段不得丢：%+v", got)
 	}
 }
