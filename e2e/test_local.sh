@@ -11,11 +11,14 @@ usage() {
   E2E_RUN  逗号分隔的**用例全名**列表（不是正则，也不接受 | 等正则元字符）。
            每个名字都必须在该后端的 go test 输出里出现 "--- PASS: <名字>"，
            少一个就判失败；防线 1/2（有 SKIP / 一个 PASS 都没有）同时生效。
-           未设置时使用脚本内置的完整期望名单：
+           未设置时使用脚本内置的完整期望名单（该名单会与 go test -list 实际存在的
+           E2E 用例做集合相等校验：新增用例忘了登记会直接 FAIL，不会假绿）：
              TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E,TestSyncE2E,TestCapabilitiesE2E,TestNoLeftoverOnCloseE2E,TestCloseAllCleansRegisteredPartsE2E
            （TestSyncE2E 由 Task 13 追加：GoBackend.ListMany 落地后两个后端才都真绿；
              TestCloseAllCleansRegisteredPartsE2E 由 Task 15 追加：补 CloseAll 后 CleanupParts
              重新 dial 删除「登记在册」的远端/本地 .part 这条清理路径）
+           每个用例必须打印 SSHORE_E2E_BACKEND=<batch|gosftp|go-direct>；harness 要求
+           两轮迭代各自实测到 batch / gosftp（互不相同），并以实测值打印矩阵。
            例：E2E_RUN='TestGoBackendE2E,TestSyncE2E,TestCapabilitiesE2E' bash e2e/test_local.sh
 USAGE
 }
@@ -79,14 +82,12 @@ if [[ "$E2E_RUN" == ,* || "$E2E_RUN" == *, ]]; then
   exit 2
 fi
 IFS=',' read -r -a E2E_NAMES <<< "$E2E_RUN"
-if [ "${#E2E_NAMES[@]}" -eq 0 ]; then
-  echo "FAIL: E2E_RUN 为空：需要至少一个用例全名" >&2
-  exit 2
-fi
+# 注：E2E_RUN 要么是内置默认名单、要么被 ${E2E_RUN:-...} 兜住，永远非空；原来的
+# 「数组长度为 0」分支不可达（Task 15 复审 M6），已删除。
 # 若允许 ERE，用户传 "." 会把「任一用例 PASS」悄悄变成「目标用例 PASS」（Task 6 重审 I2）。
 # 故逐字拒绝正则元字符与 /。不用 case 的括号类：bash 对括号类里的 ( ) 有配对歧义，
 # 实测 *[][.\*?+^$(){}|/]* 会把 "." 判成合法。
-E2E_BAD_CHARS='][.*?+^$(){}|/\\'
+E2E_BAD_CHARS='][.*?+^$(){}|/\'
 for _name in "${E2E_NAMES[@]}"; do
   if [ -z "$_name" ]; then
     echo "FAIL: E2E_RUN 名单里含空项：'$E2E_RUN'" >&2
@@ -101,6 +102,26 @@ for _name in "${E2E_NAMES[@]}"; do
   done
 done
 unset _i _c _name
+
+# --- 默认名单 × go test -list 交叉校验（Task 15 复审 M3）---
+# 默认名单是手写的：新增一个 E2E 用例却忘了登记 ⇒ harness 永远不跑它 = 假绿。
+# 用 go test -list 列出两个包里**真实存在**的 E2E 用例，做集合相等校验：
+#   - 名单里有、实际不存在 → FAIL（名字打错）；
+#   - 实际存在、名单里没有 → FAIL（新用例漏登记）。
+# -list 只编译不执行，不需要 sshd / SSHORE_E2E_*，也不会碰到垫片。
+echo "== 校验默认 E2E 名单与 go test -list 一致 =="
+AVAILABLE_E2E="$(GOPATH="$REAL_GOPATH" GOMODCACHE="$REAL_GOMODCACHE" GOCACHE="$REAL_GOCACHE" go test ./internal/sftp/ ./internal/sync/ -list '^Test.*E2E$' -count=1 2>/dev/null | grep -E '^Test.*E2E$' | sort -u || true)"
+if [ -z "$AVAILABLE_E2E" ]; then
+  echo "FAIL: go test -list 没有列出任何 E2E 用例（编译失败或包路径变了）" >&2
+  exit 1
+fi
+DEFAULT_E2E_NAMES="$(printf '%s' "$E2E_DEFAULT_LIST" | tr ',' '\n' | sort -u)"
+if [ "$DEFAULT_E2E_NAMES" != "$AVAILABLE_E2E" ]; then
+  echo "FAIL: 内置默认名单与实际存在的 E2E 用例不一致（左=默认名单，右=go test -list）：" >&2
+  diff <(printf '%s\n' "$DEFAULT_E2E_NAMES") <(printf '%s\n' "$AVAILABLE_E2E") >&2 || true
+  exit 1
+fi
+echo "PASS: 默认名单与 go test -list 完全一致（共 $(printf '%s\n' "$AVAILABLE_E2E" | grep -c .) 个用例）"
 
 echo "== generating test keys =="
 ssh-keygen -t ed25519 -N "" -f "$TMPD/hostkey" -q
@@ -295,16 +316,41 @@ chmod 600 "$HOME/.ssh/config"
 # go 测试里的 ssh/sftp 仍会去读真实 ~/.ssh/config，找不到 sshore-e2e。这里生成只作用于
 # 本次 go test 的 ssh/sftp 垫片，用 -F 指向临时配置（垫片在 $TMPD 内，PATH 仅本命令前置）。
 SHIM="$TMPD/shim"
+SHIM_USED_LOG="$TMPD/shim_used.log"
+export SSHORE_SHIM_LOG="$SHIM_USED_LOG"
 mkdir -p "$SHIM"
-cat > "$SHIM/ssh" <<SHIMSH
+: > "$SHIM_USED_LOG"
+# 垫片每次被真实调用都追一行到日志（仅在 SSHORE_SHIM_LOG 与 SSHORE_SHIM_TAG 都在时）。
+# SSHORE_SHIM_TAG 只在 go test 迭代里导出，所以日志能证明「go test 真的走了垫片」，而不是
+# PATH 没生效、悄悄用了真 ssh（Task 15 复审 M7）。用引号定界符的 heredoc：$HOME/$@
+# 一律留到垫片运行期展开，harness 侧不参与转义。
+cat > "$SHIM/ssh" <<'SHIMSH'
 #!/usr/bin/env bash
-exec /usr/bin/ssh -F "$HOME/.ssh/config" -o IdentitiesOnly=yes "\$@"
+if [ -n "$SSHORE_SHIM_LOG" ] && [ -n "$SSHORE_SHIM_TAG" ]; then
+  printf 'ssh:%s\n' "$SSHORE_SHIM_TAG" >> "$SSHORE_SHIM_LOG"
+fi
+exec /usr/bin/ssh -F "$HOME/.ssh/config" -o IdentitiesOnly=yes "$@"
 SHIMSH
-cat > "$SHIM/sftp" <<SHIMSF
+cat > "$SHIM/sftp" <<'SHIMSF'
 #!/usr/bin/env bash
-exec /usr/bin/sftp -F "$HOME/.ssh/config" -o IdentitiesOnly=yes "\$@"
+if [ -n "$SSHORE_SHIM_LOG" ] && [ -n "$SSHORE_SHIM_TAG" ]; then
+  printf 'sftp:%s\n' "$SSHORE_SHIM_TAG" >> "$SSHORE_SHIM_LOG"
+fi
+exec /usr/bin/sftp -F "$HOME/.ssh/config" -o IdentitiesOnly=yes "$@"
 SHIMSF
 chmod +x "$SHIM/ssh" "$SHIM/sftp"
+
+# PATH 优先级自检（Task 15 复审 M7）：前置 $SHIM 后 command -v 必须解析到垫片本身。
+# 若解析到真二进制，整套「-F 指向临时配置」的机制会静默失效 —— 这里是响亮 FAIL。
+for _shim_cmd in ssh sftp; do
+  _resolved="$(PATH="$SHIM:$PATH" command -v "$_shim_cmd" || true)"
+  if [ "$_resolved" != "$SHIM/$_shim_cmd" ]; then
+    echo "FAIL: PATH 垫片未生效：command -v $_shim_cmd => '$_resolved'，期望 '$SHIM/$_shim_cmd'" >&2
+    exit 1
+  fi
+done
+unset _shim_cmd _resolved
+echo "PASS: PATH 垫片优先（ssh/sftp 均解析到 $SHIM 下的垫片）"
 
 # —— 垫片 `-s` 透传自检（Task 0 事实：GoBackend 用 `ssh -s <host> sftp`）——
 # 探针请求一个不存在的子系统：真 ssh 收到 `-s <host> <subsystem>` 会作为子系统请求发给
@@ -339,19 +385,23 @@ fi
 # （名字里的 | 会被 go test 当正则，静默跑到名单外的用例上）。每次 go test 的 stdout 与
 # stderr 分文件收集，防线只读 stdout（--- PASS / SKIP 行），编译错误留在 stderr 里可读。
 E2E_FAIL=0
-# 用例 × 后端的实际执行矩阵：只记「该后端真的 PASS 了」的项（防线 3 判定后写入），
-# 供 Task 16 真机验收一眼读出每个用例落在哪个后端上，而不是只看脚本回显的 -run 意图。
+# 用例 × 迭代**实测**矩阵。每行：<迭代> <用例自报的实测后端> <用例名>。实测后端来自用例内的
+# SSHORE_E2E_BACKEND= 标记（门面用例=batch/gosftp，直连 GoBackend 的用例=go-direct），
+# **不是**循环变量、也不是 -run 的意图 —— 这样「两轮其实都跑了 batch」会立刻暴露
+# （Important-1 / Minor-4）。
 : > "$TMPD/backend_matrix"
+# 只收门面用例的实测后端（<迭代> <实测>），用于后端身份断言。
+: > "$TMPD/facade_obs"
 for backend in batch gosftp; do
-  echo "--- backend=$backend run=$E2E_RUN ---"
+  echo "--- 迭代 backend=$backend（实测后端见末尾矩阵）run=$E2E_RUN ---"
   OUT=""
   for _name in "${E2E_NAMES[@]}"; do
-    printf '>>> -run ^%s$ (backend=%s)\n' "$_name" "$backend"
+    printf '>>> -run ^%s$ (迭代 backend=%s)\n' "$_name" "$backend"
     _iter_out="$(mktemp)"; _iter_err="$(mktemp)"
     if PATH="$SHIM:$PATH" \
          GOPATH="$REAL_GOPATH" GOMODCACHE="$REAL_GOMODCACHE" GOCACHE="$REAL_GOCACHE" \
          SSHORE_E2E_HOST=sshore-e2e SSHORE_E2E_REMOTE="$REMOTE_DIR" \
-         SSHORE_SFTP_TRANSPORT="$backend" \
+         SSHORE_SFTP_TRANSPORT="$backend" SSHORE_SHIM_TAG="$backend" \
          HOME="$HOME" go test ./internal/sftp/ ./internal/sync/ -run "^$_name\$" -count=1 -v >"$_iter_out" 2>"$_iter_err"; then
       :
     else
@@ -359,7 +409,36 @@ for backend in batch gosftp; do
     fi
     cat "$_iter_out"
     if [ -s "$_iter_err" ]; then cat "$_iter_err" >&2; fi
-    OUT="$OUT$(cat "$_iter_out")"$'\n'
+    _iter_text="$(cat "$_iter_out")"
+    OUT="$OUT$_iter_text"$'\n'
+    # 用例必须**自报**实测后端；缺失/矛盾都说明矩阵不可信 —— 判失败（Important-1）。
+    _obs="$(printf '%s\n' "$_iter_text" | sed -n 's/^.*SSHORE_E2E_BACKEND=\([A-Za-z0-9_-]*\).*$/\1/p' | sort -u | tr '\n' ',')"
+    _obs="${_obs%,}"
+    if [ -z "$_obs" ]; then
+      echo "FAIL: backend=$backend 用例 $_name 没有声明实测后端（缺 SSHORE_E2E_BACKEND= 标记）—— 矩阵不可信" >&2
+      E2E_FAIL=1
+      _obs="MISSING"
+    elif [ "$_obs" != "${_obs%%,*}" ]; then
+      echo "FAIL: backend=$backend 用例 $_name 声明了互相矛盾的多个实测后端：'$_obs'" >&2
+      E2E_FAIL=1
+    fi
+    printf '%s %s %s\n' "$backend" "$_obs" "$_name" >> "$TMPD/backend_matrix"
+    case "$_obs" in
+      batch|gosftp)
+        printf '%s %s\n' "$backend" "$_obs" >> "$TMPD/facade_obs"
+        if [ "$_obs" != "$backend" ]; then
+          echo "FAIL: backend=$backend 迭代里用例 $_name 实测后端为 '$_obs'，与本次导出不符 —— 选择器没跟着 SSHORE_SFTP_TRANSPORT 走" >&2
+          E2E_FAIL=1
+        fi
+        ;;
+      go-direct) : ;;
+      *)
+        if [ "$_obs" != "MISSING" ] && [ "$_obs" != "unknown" ]; then
+          echo "FAIL: backend=$backend 用例 $_name 声明了未知实测后端 '$_obs'" >&2
+          E2E_FAIL=1
+        fi
+        ;;
+    esac
     rm -f "$_iter_out" "$_iter_err"
   done
   # 假绿防线 1：任何用例 SKIP 都说明环境没送达（缺 env / 垫片失效），必须失败。
@@ -381,16 +460,38 @@ for backend in batch gosftp; do
     if [ -z "$PASSED_NAMES" ] || ! printf '%s\n' "$PASSED_NAMES" | grep -qxF -- "$_name"; then
       echo "FAIL: backend=$backend 没有名字**精确等于** E2E_RUN 名单项 '$_name' 的用例真正 PASS（目标用例被改名 / 被 -run 漏掉）" >&2
       E2E_FAIL=1
-    else
-      printf '%s %s\n' "$backend" "$_name" >> "$TMPD/backend_matrix"
     fi
   done
 done
 unset _name
+
+# —— 后端身份（Important-1(b)）——
+# 两轮迭代必须各自实测到 batch / gosftp，且互不相同。只有门面用例能提供这个证据；
+# 名单里一个门面用例都没有时，本次运行根本无法证明「两个后端都真跑过」—— 判失败，
+# 绝不打一句 batch/gosftp 就假装矩阵成立。
+BATCH_OBS="$(awk '$1=="batch"{print $2}' "$TMPD/facade_obs" 2>/dev/null | sort -u | tr '\n' ',')"
+GOSFTP_OBS="$(awk '$1=="gosftp"{print $2}' "$TMPD/facade_obs" 2>/dev/null | sort -u | tr '\n' ',')"
+if [ "${BATCH_OBS:-}" != "batch," ] || [ "${GOSFTP_OBS:-}" != "gosftp," ]; then
+  echo "FAIL: 两轮迭代的实测后端未各自钉死（batch 迭代实测='${BATCH_OBS:-空}'，gosftp 迭代实测='${GOSFTP_OBS:-空}'）—— 需要名单里至少一个走门面的用例" >&2
+  E2E_FAIL=1
+fi
+
+# —— 垫片真的被 go test 用到（Minor-7）——
+# SSHORE_SHIM_TAG 只在迭代里导出，因此两轮都必须留下垫片（ssh 或 sftp）的调用记录；
+# 没有记录 = PATH 前缀没生效、go test 用的是真二进制（别名解析全部失效，可能全 SKIP）。
+for _b in batch gosftp; do
+  if ! grep -qE "^(ssh|sftp):$_b$" "$SHIM_USED_LOG" 2>/dev/null; then
+    echo "FAIL: backend=$_b 迭代里没有任何垫片调用记录 —— go test 没走 PATH 垫片（用的可能是真二进制）" >&2
+    E2E_FAIL=1
+  fi
+done
+unset _b
+
 [ "$E2E_FAIL" -eq 0 ] || exit 1
 
-echo "== 用例 × 后端 实际执行矩阵（Task 16 真机验收一眼可读） =="
-awk '{ m[$2] = m[$2] " " $1 } END { for (c in m) printf "  %-40s %s\n", c, m[c] }' \
+echo "== 用例 × 迭代 实测后端矩阵（左=迭代 backend 循环变量，右=用例自报的实测后端） =="
+echo "   （batch/gosftp = 门面真实选中；go-direct = 直连 GoBackend，与迭代无关）"
+awk '{ m[$3] = m[$3] sprintf("  %s→%s", $1, $2) } END { for (c in m) printf "  %-42s%s\n", c, m[c] }' \
   "$TMPD/backend_matrix" | sort
 
-echo "== ALL E2E TESTS PASSED (backend matrix: batch + gosftp; E2E_RUN=$E2E_RUN) =="
+echo "== ALL E2E TESTS PASSED (观测后端: batch 迭代=batch, gosftp 迭代=gosftp; E2E_RUN=$E2E_RUN) =="

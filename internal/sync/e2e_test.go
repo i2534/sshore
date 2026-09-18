@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,8 +25,9 @@ import (
 // 本用例除了「文件真的同步下来」，还是 D18 内置忽略的**端到端**验证（Task 15 补）：
 // 远端业务文件旁边混着内部临时文件（.sshore-sftppart- 中缀的 .part / 备份）时，后者既不
 // 能进候选、更不能被下载到本地（unit 级的 TestEngineIgnoresInternalTempRemoteFiles 只钉了
-// 引擎行为，这里用真实 sshd + 真实文件系统再钉一次）。本地同时预置一份内部临时文件，
-// 断言内置忽略不会误删/误改本地文件（sync 是远端→本地单向，不涉及上传）。
+// 引擎行为，这里用真实 sshd + 真实文件系统再钉一次）。
+// 「本地预置一份内部临时文件并断言它保留」曾在这里，但因无判别力已删（Task 15 复审 M2）：
+// sync 的候选集只来自远端扫描，本地文件从不进 state，去掉忽略那条断言照样通过。
 func TestSyncE2E(t *testing.T) {
 	host := os.Getenv("SSHORE_E2E_HOST")
 	remote := os.Getenv("SSHORE_E2E_REMOTE")
@@ -63,16 +65,37 @@ func TestSyncE2E(t *testing.T) {
 		}
 	}
 
+	// Important-1：本用例走门面，门面必须真的按 SSHORE_SFTP_TRANSPORT 选后端，否则两次
+	// 迭代跑的是同一后端。harness 会拿下面的 SSHORE_E2E_BACKEND= 行做跨迭代身份断言。
+	rawTransport := strings.TrimSpace(os.Getenv("SSHORE_SFTP_TRANSPORT"))
+	var wantKind sftp.BackendKind
+	switch strings.ToLower(rawTransport) {
+	case "batch":
+		wantKind = sftp.KindBatch
+	case "gosftp":
+		wantKind = sftp.KindGo
+	default:
+		t.Fatalf("SSHORE_SFTP_TRANSPORT 未送达/非法（%q）：后端身份无法证明", rawTransport)
+	}
 	ctrl := sftp.NewCtrl(osutil.NewRunner(), nil)
 	defer ctrl.CloseAll()
-	t.Logf("sync e2e backend=%v（门面 TransportKind，便于真机按用例读后端）", ctrl.TransportKind())
+	obsName := "unknown"
+	switch ctrl.TransportKind() {
+	case sftp.KindBatch:
+		obsName = "batch"
+	case sftp.KindGo:
+		obsName = "gosftp"
+	}
+	t.Logf("SSHORE_E2E_BACKEND=%s", obsName)
+	if ctrl.TransportKind() != wantKind {
+		t.Fatalf("门面未按 SSHORE_SFTP_TRANSPORT=%q 选后端：实测 %s", rawTransport, obsName)
+	}
 	transfer, lister := NewSftpAdapter(ctrl)
 	local := t.TempDir()
-	// 本地也放一份内部临时文件：内置忽略对本地事件同样生效，它必须原样保留。
-	localPart := filepath.Join(local, "stale.conf"+sftp.PartMarker+"e2e-cd")
-	if err := os.WriteFile(localPart, []byte(internalContent), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// 说明（Task 15 复审 M2）：这里曾预置一份**本地**内部临时文件并断言它原样保留，但那条断言
+	// 没有判别力 —— sync 的候选集只来自远端扫描，本地文件从不登记进 state，去掉内置忽略它照样
+	// 通过。与其留一条恒真的断言冒充防线，不如删掉；真正有判别力的是下面「远端临时文件不得落
+	// 到本地」的检查（去掉忽略后远端 .part 会作为新条目被下载，该检查必然失败）。
 
 	rule := config.SyncRule{
 		ID: "e2e", Host: host, Kind: "dir", RemotePath: syncRemote,
@@ -107,15 +130,18 @@ func TestSyncE2E(t *testing.T) {
 		t.Fatalf("15s 内未把 %s/app.conf 同步到本地: err=%v content=%q stats=%+v", syncRemote, err, b, c.Stats()[rule.ID])
 	}
 
-	// 远端内部临时文件不得以任何名字、任何内容落到本地（本地预置那一份除外，见下）。
+	// Minor-1：app.conf 落地 ≠ 引擎处理完本轮对账。去掉内置忽略后，远端 .part/.bak 排在
+	// app.conf 之后，applyOne 可能还没轮到它们，此刻读本地目录就会假绿（batch 迭代 5/5 能抓、
+	// gosftp 迭代只 1/5 抓得到）。改成等引擎确定性收敛：AlignTotal>0 且 Done>=AlignTotal，
+	// 即本轮快照里的每个条目都已处理过 —— 忽略一旦被移除，那两个 .part 必然已落盘。
+	waitSyncSettled(t, c, rule.ID)
+
+	// 远端内部临时文件不得以任何名字、任何内容落到本地。
 	entries, err := os.ReadDir(local)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.Name() == filepath.Base(localPart) {
-			continue // 本地预置的内部临时文件由下面的保留断言负责
-		}
 		if sftp.IsInternalTemp(e.Name()) {
 			t.Fatalf("远端内部临时文件绝不能被同步到本地: %s", e.Name())
 		}
@@ -124,9 +150,23 @@ func TestSyncE2E(t *testing.T) {
 			t.Fatalf("内部临时文件内容被当业务文件同步了: %s", e.Name())
 		}
 	}
-	// 本地预置的内部临时文件必须原样保留（内置忽略不等于误删本地文件）。
-	if b, err := os.ReadFile(localPart); err != nil || string(b) != internalContent {
-		t.Fatalf("本地内部临时文件必须原样保留: err=%v content=%q", err, b)
+	t.Logf("sync e2e 通过：app.conf=%q 已落地，远端内部临时文件被忽略", appConf)
+}
+
+// waitSyncSettled 等到本规则引擎把一轮对账处理完：AlignTotal>0 且 Done>=AlignTotal。
+// 这是「远端快照里的每个条目都过了 applyOne」的可观测判据；超时即失败（引擎卡死同样是失败），
+// 而不是像以前那样在 app.conf 刚落盘时就下结论。轮询 100ms、上限 20s。
+func waitSyncSettled(t *testing.T, c *Ctrl, id string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	var last SyncRuleStat
+	for time.Now().Before(deadline) {
+		last = c.Stats()[id]
+		if last.AlignTotal >= 1 && last.Done >= last.AlignTotal {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	t.Logf("sync e2e 通过：app.conf=%q 已落地，远端/本地内部临时文件均被忽略", appConf)
+	t.Fatalf("sync 引擎 20s 内未完成对账（AlignTotal=%d Done=%d Pending=%d Failed=%d）",
+		last.AlignTotal, last.Done, last.Pending, last.Failed)
 }
