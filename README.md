@@ -19,7 +19,8 @@
 
 - Go 1.26
 - Node.js 22+（LTS）
-- 系统 `PATH` 中需有 OpenSSH（`ssh`、`sftp`）
+- 系统 `PATH` 中需有 OpenSSH（`ssh`；默认的 `gosftp` 传输底座不再需要 `sftp` 二进制，
+  用 `sftp_transport = "batch"` 回退旧后端时才需要）
 - wails CLI（`go install github.com/wailsapp/wails/v2/cmd/wails@latest`）
 
 ## 下载安装
@@ -115,6 +116,7 @@ legacy_migrated = true           # 旧 recent_sftp 已迁移（不再写回；�
   font_scale = 1.0               # 0.9 | 1.0 | 1.15
   auto_start_on_launch = false   # 启动后自动连接转发通道
   auto_reconnect_default = true  # 新建同步规则的默认自动重连值
+  sftp_transport = ""            # ""/auto（= gosftp 内置默认）| "gosftp" | "batch"（旧后端回退）
 
 [[tunnels]]                      # 端口转发规则（-L / -R / -D）
 [[syncs]]                        # 远端 → 本地 的同步规则
@@ -159,13 +161,87 @@ path  = "~"            # 远端 home：连上主机后解析为 SftpHome
 - Windows 的「磁盘」组不在任何配置文件里：盘符每次实时枚举，插拔 U 盘后重开面板即可见。
 - 文件写坏时应用只提示、**不会覆盖你的文件**（日志面板会看到解析错误），预设组暂时为空。
 
+## SFTP 传输底座（`sftp_transport`）
+
+SFTP 有两条传输实现，可在设置页或配置里切换；连接与认证始终交给系统 `ssh`
+（密钥 / ssh-agent / `~/.ssh/config` / 跳板机），只是传输与列目录由谁驱动不同：
+
+- `gosftp`（**默认**）— 长连 `ssh -s <host> sftp` 起 SFTP 子系统，由 `pkg/sftp` 直接驱动
+  协议；一个会话长期复用，带真实字节级进度、整批取消、失败重试与 `.part` 续传。
+- `batch`（兼容，保留一个发布周期）— 每次操作一个 `sftp -b` 进程，解析 `ls -la` 文本输出；
+  无进度、无续传，是升级前的旧行为。
+
+**切换优先级：环境变量 `SSHORE_SFTP_TRANSPORT` > 配置项 `[app] sftp_transport` > 内置默认
+（`gosftp`）。** 非法值一律忽略并回落到内置默认，不阻断启动。
+
+```bash
+SSHORE_SFTP_TRANSPORT=batch sshore    # 临时回退旧后端（无需改配置）
+SSHORE_SFTP_TRANSPORT=gosftp sshore   # 显式选定新后端
+```
+
+- 设置页「传输 → SFTP 传输后端」的下拉等价于写配置项 `sftp_transport`
+  （`""`/`auto` = 内置默认，即 `gosftp`）。
+- 想**回退整轮默认**（例如真机验收在本机失败）：把 `internal/sftp/backend.go` 的
+  `const defaultTransport = KindGo` 改回 `KindBatch` 重新构建即可；这不影响上表两个显式覆盖。
+- `batch` 后端与开关计划在 **v0.8 删除**，届时只保留 `gosftp`。
+
+### 进度、取消与续传（仅 `gosftp`）
+
+- **进度**来自后端真实的已传字节数（节流上报 + 结尾强制补一帧末值）：单文件显示百分比、
+  速度与 ETA；目录传输先枚举再逐文件计数，枚举超预算时退化为「已完成 N 个文件」。
+- **取消**是**整批**语义：取消当前在传项（关会话让在飞 IO 立刻失败，目标名不会出现半截
+  文件），同批尚未派发的项直接标记为「已取消，停止后续项」。取消返回 `false` 表示这一项
+  其实已经提交完成或不在传输中——界面据此显示「取消过晚（已完成）」，绝不假装取消成功。
+- **重试**重新执行失败项；**续传**复用上次失败保留下来的 `.part`，从已落盘字节继续。
+  续传前会核对源文件的大小/修改时间指纹：源在两次传输之间被改写时不会拼接出坏文件，
+  而是整份重传（`.part` 大小等于源时直接提交，不重传）。
+- 每次传输在同一目标上互斥（host + 用户 + 方向 + 目标）：重复触发会立刻报错，不会静默排队
+  后互相覆盖。
+
+### 内部临时文件命名（面板隐藏 / sync 忽略）
+
+原子提交的临时名统一带中缀 `.sshore-sftppart-`（唯一来源 `internal/sftp.PartMarker`）：
+
+- 常规：`<原名>.sshore-sftppart-<id8>-<rand>`（与目标同目录）
+- 备份（无 `posix-rename` 时的 backup-swap）：`<原名>.sshore-sftppart-bak-<rand>`
+- 超长名退化（原名超过 200 字节时避免 `ENAMETOOLONG`）：
+  `.sshore-sftppart-<id8>-<rand>` / `.sshore-sftppart-bak-<rand>`
+
+这些名字**不会出现在文件面板里**（前端按中缀过滤），也**被同步 / 变更监控忽略**
+（`watch.IsInternalTemp` + `sync.inScope`），不会被当成新文件同步出去或下载下来。
+
+### 已知限制（不掩饰）
+
+- **必须在交互桌面会话里运行**：Session 0（Windows 服务 / 非交互会话）中由本应用 spawn 的
+  `ssh.exe` 会在 SFTP INIT 之后无响应（实测 ≥15–25s 且未观察到自行恢复）。这是本次真机
+  探测到的环境限制，所以**不要以服务方式启动**；用计划任务也要用 `/it` 投到交互会话。
+- **超预算的目录扫描只传已枚举前缀**：单次树扫描超过 **20000 个文件** 或 **5s** 预算时，
+  放弃继续枚举，只传输已经枚举到的那部分；调用返回**成功**，进度用 `-1` 分母
+  （`total`/`filesTotal` 为负）表示分母未知 —— 也就是「传输成功」不等于「整棵树都传完了」。
+- **`Atomic=false` 路径直写、无 `.part`、无 journal**：旧的四参 `Get/Put`（含 `internal/sync`
+  的用法）直接写目标文件，原子性由 sync 自己负责；这条路径不产生可续传的 `.part`。
+- **陈旧 `.part` 清理只扫配置里的 LocalRecent 目录**：启动时只清理最近使用过的本地目录
+  （超过 7 天的临时文件），不做全盘索引；其它目录里的孤儿 `.part` 需要手动清理。
+- **`RemoveRecursive` 有硬上限**：树深度 > 64 层或条目数 > 100000 时整体拒绝删除
+  （收集阶段就失败，不会删一半），**没有覆盖开关**。
+- **`Connected` 是粘性连接意图，不是探活**：一次成功握手后一直为真，直到显式
+  `Disconnect`/`CloseAll`；池内会话被逐出或关闭都不会翻转它。不要把它当存活探针用。
+- **多主机 journal 恢复只处理可达主机的条目**：按 `(host, user)` 分组，只探条目自己的主机；
+  主机不可达的那组原样保留到下次；**没有 host 的旧条目永远不动作、也不删除**。
+- **启动时不恢复**：journal（backup-swap）恢复发生在**优雅退出**路径；进程崩溃 / 断电后的
+  中断提交留到下一次优雅退出再收敛。
+- **退出宽限期 5s**：退出时最多等在飞传输 5s，超时即强制取消并关会话。卡在不可中断本地写
+  的传输仍可能在 `CloseAll` 返回后才收尾（它不会写 journal 意图，恢复时是无歧义状态）；
+  极端时序下还有一条逃过两次 `CloseAll` 池快照的窄窗口（低概率）。
+
 ## 架构
 
 - `internal/config` — 解析 `~/.ssh/config`（枚举用 kevinburke/ssh_config，
   权威字段用 `ssh -G`）并读写原子化的 TOML 配置存储
 - `internal/forward` — 生成/管理长驻 `ssh -N` 子进程、生命周期状态机、
   端口预检、错误分类、自动重连退避
-- `internal/sftp` — 每次操作一个 `sftp -b` 进程，`ls -la` 输出解析
+- `internal/sftp` — 门面 + 双后端（默认 `gosftp` = `pkg/sftp` 长驻会话池，
+  `batch` = 旧的 `sftp -b` 进程），`pkg/sftp` 驱动协议
 - `internal/sync` — 同步引擎：状态机、冲突队列、删除闸门、传输与路径映射
 - `internal/watch` — 远端变更探测：`inotifywait` 探测 + 轮询降级
 - `internal/sshconn` — ControlMaster socket 路径与 ssh/sftp 连接参数的唯一来源

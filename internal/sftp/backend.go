@@ -13,8 +13,10 @@ const (
 	KindGo                       // 新的 pkg/sftp 实现
 )
 
-// defaultTransport 是内置默认。Task 16 真机验收通过后改成 KindGo。
-const defaultTransport = KindBatch
+// defaultTransport 是内置默认：Task 16 起为 KindGo（pkg/sftp 底座）。
+// 环境变量 SSHORE_SFTP_TRANSPORT 与配置项 [app] sftp_transport 仍可双向覆盖
+// （batch 可回退旧后端）。回退一行改动就是把这里换回 KindBatch。
+const defaultTransport = KindGo
 
 // TransportSelector 由 app.go 注入，懒解析配置（避免依赖 Init/startup 的先后顺序）。
 type TransportSelector func() string

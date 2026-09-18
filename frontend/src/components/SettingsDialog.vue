@@ -87,7 +87,7 @@ watch(
           <label for="sftp-transport">SFTP 传输后端</label>
           <select id="sftp-transport" v-model="store.sftpTransport">
             <option value="">自动（默认）</option>
-            <option value="gosftp">新实现（实验）</option>
+            <option value="gosftp">新实现（默认）</option>
             <option value="batch">旧实现（兼容）</option>
           </select>
         </div>

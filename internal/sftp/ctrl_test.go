@@ -781,22 +781,37 @@ func TestFacadeAtomicCapableFollowsBackend(t *testing.T) {
 	}
 }
 
-// TestNewCtrlFacadeWiring 钉住两个构造：NewCtrl 只挂 batch（测试/兼容路径），
+// TestNewCtrlFacadeWiring 钉住两个构造：NewCtrl 不注入 selector（测试/兼容路径），
 // NewCtrlWith 额外注入懒解析选择器（生产路径）。
 // Task 5 评审 I1：这里必须**显式清掉 SSHORE_SFTP_TRANSPORT**，否则测试结果取
-// 决于外部环境；并且两条分支都要断言：默认/显式 batch 与显式 gosftp。
+// 决于外部环境；并且各条分支都要断言：内置默认（Task 16 起为 gosftp）、显式 batch、
+// 显式 gosftp，以及 env 覆盖 config。
+//
+// Task 16：内置默认已从 batch 切到 gosftp，因此「NewCtrl 默认拿到 batch」不再是事实 ——
+// 这里改成先显式钉住内置默认，再显式选 batch 验证兼容路径。
 func TestNewCtrlFacadeWiring(t *testing.T) {
 	t.Setenv("SSHORE_SFTP_TRANSPORT", "")
 	c := NewCtrl(nil, nil)
-	if _, ok := c.backend().(*BatchBackend); !ok {
-		t.Fatalf("NewCtrl 的 backend() 应默认返回 *BatchBackend, got %T", c.backend())
-	}
 	if c.sel != nil {
 		t.Fatal("NewCtrl 不得注入 selector（保持 spec D3 两参语义）")
 	}
-	if c.TransportKind() != KindBatch {
-		t.Fatalf("默认应解析为 KindBatch, got %v", c.TransportKind())
+	if c.TransportKind() != KindGo {
+		t.Fatalf("Task 16 内置默认应解析为 KindGo, got %v", c.TransportKind())
 	}
+	if _, ok := c.backend().(*GoBackend); !ok {
+		t.Fatalf("NewCtrl 的 backend() 应与内置默认一致（*GoBackend）, got %T", c.backend())
+	}
+
+	// 显式选 batch（回退路径）：env 覆盖内置默认。
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "batch")
+	cb := NewCtrl(nil, nil)
+	if _, ok := cb.backend().(*BatchBackend); !ok {
+		t.Fatalf("env=batch 应返回 *BatchBackend, got %T", cb.backend())
+	}
+	if cb.TransportKind() != KindBatch {
+		t.Fatalf("env=batch 应解析为 KindBatch, got %v", cb.TransportKind())
+	}
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "")
 
 	c2 := NewCtrlWith(nil, nil, func() string { return "gosftp" })
 	if c2.sel == nil || c2.sel() != "gosftp" {
