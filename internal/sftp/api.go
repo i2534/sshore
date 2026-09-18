@@ -65,16 +65,34 @@ type TransferError struct {
 	CommittedFiles int
 	CommittedBytes int64
 	RemainingFiles int
+	// TreeCounts 标记上面三个计数是否已由目录传输回填。单文件任务、成功路径的零值绝不能
+	// 被误读成「已传 0 个、还剩 0 个」—— Error() 只在本字段为真时才拼接计数文案。
+	TreeCounts bool
 }
 
 func (e *TransferError) Error() string {
-	if e.RemoteMsg != "" {
-		return fmt.Sprintf("%s %s: %s", e.Op, e.Path, e.RemoteMsg)
+	var base string
+	switch {
+	case e.RemoteMsg != "":
+		base = fmt.Sprintf("%s %s: %s", e.Op, e.Path, e.RemoteMsg)
+	case e.Err != nil:
+		base = fmt.Sprintf("%s %s: %v", e.Op, e.Path, e.Err)
+	default:
+		base = fmt.Sprintf("%s %s 失败", e.Op, e.Path)
 	}
-	if e.Err != nil {
-		return fmt.Sprintf("%s %s: %v", e.Op, e.Path, e.Err)
+	if e.TreeCounts {
+		// I4 生产消费点（Task 12 修复轮 2）：绑定层把 error 当纯字符串回传前端，Task 14
+		// 只能从文案里取「已传 N、剩 M」。若只把计数留在结构体字段里，它们永远到不了 UI。
+		// RemainingFiles<0 表示枚举已降级或扫描未完成（分母未知）。
+		remaining := ""
+		if e.RemainingFiles >= 0 {
+			remaining = fmt.Sprintf("剩余 %d 个文件", e.RemainingFiles)
+		} else {
+			remaining = "剩余文件数未知"
+		}
+		base += fmt.Sprintf("（已传输 %d 个文件/%d 字节，%s）", e.CommittedFiles, e.CommittedBytes, remaining)
 	}
-	return fmt.Sprintf("%s %s 失败", e.Op, e.Path)
+	return base
 }
 
 func (e *TransferError) Unwrap() error { return e.Err }

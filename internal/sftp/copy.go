@@ -454,19 +454,22 @@ func scanTree(ctx context.Context, s *Session, root string, start time.Time) (fi
 // 文件数；降级（枚举被放弃）时 total/files 为 -1，Done/FilesDone 仍真实累加 —— 这正是
 // D16 要求的字段闭环：UI 能区分「分母未知但确实在传」与「0 个文件」。
 type treeProgress struct {
-	id     string
-	host   string
-	dir    Direction
-	name   string
-	total  int64  // <0 表示未知（降级）
-	files  int    // <0 表示未知（降级）
-	base   int64  // 已提交文件的字节总数
-	infl   int64  // 当前文件已传字节（来自逐文件帧）
-	doneF  int    // 已提交文件数
-	part   string // 失败路径回填的重试锚点（失败末帧的 PartPath）；正常进度为空
-	report func(Progress)
-	now    func() time.Time
-	last   time.Time
+	id    string
+	host  string
+	dir   Direction
+	name  string
+	total int64  // <0 表示未知（降级）
+	files int    // <0 表示未知（降级）
+	base  int64  // 已提交文件的字节总数
+	infl  int64  // 当前文件已传字节（来自逐文件帧）
+	doneF int    // 已提交文件数
+	part  string // 失败路径回填的重试锚点（失败末帧的 PartPath）；正常进度为空
+	// overshot 在本文件出现「分子 > 分母」的分叉时置位，保证只强制上报**第一帧**分叉
+	// （否则大文件每次 Read 都会绕过节流，淹没事件总线）；提交对账后清零。
+	overshot bool
+	report   func(Progress)
+	now      func() time.Time
+	last     time.Time
 }
 
 func newTreeProgress(id, host string, d Direction, name string, total int64, files int, report func(Progress)) *treeProgress {
@@ -482,9 +485,11 @@ func (t *treeProgress) frame(force bool) {
 		return
 	}
 	t.last = t.now()
-	// M2：分母来自枚举、分子来自**已打开句柄**的 Stat，两者在「枚举与打开之间源被改写」
-	// 时可能不一致（分子会超过分母）。这里显式把两个分子夹到各自分母内，保证进度帧永不
-	// 出现 Done>Total / FilesDone>FilesTotal 的自相矛盾。
+	// M2/NEW-2：分母的权威来源是**已打开句柄**的 Stat（见 finishFile 的对账），枚举只是
+	// 估算；两者在「枚举与打开之间源被改写」时会出现短暂不一致（分子超过分母）。这里仍把
+	// 两个分子夹到各自分母内作为**安全网**：分叉帧（treeProgress.file 会强制上报）绝不
+	// 出现 Done>Total / FilesDone>FilesTotal 的自相矛盾，而末帧的分母已被对账成实际值，
+	// 不会再把多出来的字节静默藏掉。
 	done := t.base + t.infl
 	if t.total >= 0 && done > t.total {
 		done = t.total
@@ -515,16 +520,34 @@ func (t *treeProgress) begin() {
 }
 
 // file 接收某个文件内部的逐块进度：Done 折算成「已完成文件字节 + 本文件已传字节」。
+//
+// NEW-2：若分子（已打开句柄看到的实际字节）已经超过当前分母（枚举估算），说明源在枚举与
+// 打开之间变大了 —— 必须**立刻强制上报一帧**（而不是等节流窗口过去），否则分叉被静默吞掉。
+// 这一帧由 frame 的夹取兜底（Done 不会超过 Total），保证任何一帧都不自相矛盾。
 func (t *treeProgress) file(p Progress) {
 	t.infl = p.Done
+	if t.total >= 0 && t.base+t.infl > t.total && !t.overshot {
+		t.overshot = true
+		t.frame(true)
+		return
+	}
 	t.frame(false)
 }
 
-// finishFile 在一个文件**提交成功后**推进累计值。
-func (t *treeProgress) finishFile(size int64) {
-	t.base += size
+// finishFile 在一个文件**提交成功后**推进累计值。expected 是枚举时看到的大小，actual 是
+// **已打开句柄**看到的实际大小（权威来源）。
+//
+// M2/NEW-2：把分母按 (actual-expected) 对账到与分子同源 —— 枚举只是估算，实际大小才是真相。
+// 这样「文件在枚举与打开之间变大」时末帧的 Total 会跟随实际值（不再靠夹取把多出来的字节
+// 静默少报），整体上 Done 与 Total 都来自逐文件已打开句柄的 Stat。降级（分母 -1）时不动分母。
+func (t *treeProgress) finishFile(expected, actual int64) {
+	if t.total >= 0 {
+		t.total += actual - expected
+	}
+	t.base += actual
 	t.infl = 0
 	t.doneF++
+	t.overshot = false
 }
 
 // fail 在失败/取消路径上补发一帧末帧，并返回「已提交/剩余」计数（Task 12 修复轮 1 / I4）。
