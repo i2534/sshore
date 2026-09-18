@@ -1,10 +1,12 @@
 package sftp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"sync"
 	"time"
 )
@@ -145,9 +147,9 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 	}
 	total := fst.Size()
 	if resume {
-		if !g.resumeSourceUnchanged(downloadAnchorKey(part), remote, fst.Size(), fst.ModTime()) {
+		if !g.resumeSourceUnchanged(downloadAnchorKey(req.Host, req.User, part), remote, fst.Size(), fst.ModTime()) {
 			// 源在判定与打开之间被改写（或锚点不可验证/身份不符）：绝不追加 —— 退回整份重传。
-			g.forgetResumeAnchor(downloadAnchorKey(part))
+			g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, part))
 			resume, offset = false, 0
 		}
 	}
@@ -201,7 +203,7 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 	// 记录源指纹（Task 11）：这份 .part 的已落盘字节对应**已打开句柄**看到的远端源
 	// (身份, size, mtime)。续传请求带回同一个 PartPath 时用它验证「还是当初那份源吗」；
 	// 用句柄 Stat 而非判定时的 Stat，保证锚点与真正读到的字节出自同一份元数据（I3）。
-	g.recordResumeAnchor(downloadAnchorKey(part), remote, total, fst.ModTime())
+	g.recordResumeAnchor(downloadAnchorKey(req.Host, req.User, part), remote, total, fst.ModTime())
 	em := newProgressEmitter(req.ID, report)
 	// 首帧 Done 从续传起点起算，UI 不会在续传时先看到 0/total。
 	cw := &countingWriter{f: f, e: em, p: Progress{Host: req.Host, Direction: DirDownload, Name: remote, PartPath: part, Done: offset, Total: total, Phase: PhaseTransfer}, n: offset}
@@ -334,4 +336,170 @@ func isLocalError(err error) bool {
 // 本地文件系统错误绝不带 RemoteMsg：它不是远端的锅。
 func isRemoteError(err error) bool {
 	return err != nil && !isLocalError(err)
+}
+
+// —— Task 12：目录传输（枚举 + 阈值降级 + 聚合进度）——
+
+const (
+	// scanMaxFiles / scanMaxElapsed 是目录枚举的降级阈值（D16，本轮定值）：
+	// 已枚举文件数 > 20000 或枚举耗时 > 5s ⇒ 放弃继续枚举，转不定进度
+	// （Total=-1 && FilesTotal=-1 && Phase=transfer）。具名常量便于按实测调整。
+	scanMaxFiles   = 20000
+	scanMaxElapsed = 5 * time.Second
+)
+
+// scanLimitReached 是 D16 的纯判定：文件数超过 20000 或耗时超过 5s 就该降级。
+func scanLimitReached(files int, elapsed time.Duration) bool {
+	return files > scanMaxFiles || elapsed > scanMaxElapsed
+}
+
+// scanLimit 是 scanTree 实际使用的阈值判定（注入点，与 copyStream/posixRename 同思路）。
+// 生产实现就是 scanLimitReached；单测替换它就能在不造 2 万个文件的前提下真正跑通
+// 「枚举中途降级」这条路径 —— 否则降级只有纯函数测试，集成路径是假覆盖。
+var scanLimit = scanLimitReached
+
+// degradedProgress 返回降级后的进度载荷：Total=-1（不定进度条）且 FilesTotal=-1
+// （UI 显示「已完成 N 个文件」而不是假装有分母）。Phase 必须是 transfer —— 降级只放弃
+// 枚举，不放弃传输。
+func degradedProgress(id, host string, d Direction, name string) Progress {
+	return Progress{ID: id, Host: host, Direction: d, Name: name, Total: -1, FilesTotal: -1, Phase: PhaseTransfer}
+}
+
+// treeFile 是目录枚举出的一个待传文件。rel 是相对根目录的 **POSIX** 相对路径：
+// 远端分隔符永远是 /，拼远端路径必须用 path.Join；本地侧再由 filepath.FromSlash 转换。
+type treeFile struct {
+	rel  string
+	size int64
+}
+
+// scanTree 用 ReadDirContext（库唯一 ctx 感知 API）递归枚举远端目录树。
+// 返回 files（非目录项）与 subdirs（**子目录**的 POSIX 相对路径）——后者供调用方按 D11
+// 建出目录本身（含空目录，sftp get -r 同样会建出空目录）。
+//
+//   - 每处理完一个目录（一批）就检查 ctx：取消/超时 ⇒ 返回 ctx.Err()，只放弃枚举、不关会话（D16）；
+//   - 每批之后检查 scanLimit：命中 ⇒ 返回 degraded=true 与**已枚举到的**内容；
+//   - 单批用剩余预算的 deadline 调 ReadDirContext（D16「5s = 停止发起下一批」的落地）。
+//
+// 我方临时/备份文件（PartMarker 中缀）是内部产物，一律不进业务清单（D18）——否则上一次
+// 中断留下的 .part 会被当成真实文件再传一遍。
+func scanTree(ctx context.Context, s *Session, root string, start time.Time) (files []treeFile, subdirs []string, degraded bool, err error) {
+	queue := []string{""}
+	for len(queue) > 0 {
+		rel := queue[0]
+		queue = queue[1:]
+		remoteDir := root
+		if rel != "" {
+			remoteDir = path.Join(root, rel)
+		}
+		remaining := scanMaxElapsed - time.Since(start)
+		if remaining <= 0 {
+			return files, subdirs, true, nil
+		}
+		bctx, cancel := context.WithTimeout(ctx, remaining)
+		infos, rerr := s.Conn.ReadDirContext(bctx, remoteDir)
+		budgetHit := bctx.Err() != nil
+		cancel()
+		if rerr != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, nil, false, cerr
+			}
+			if budgetHit {
+				// 单批就吃光预算：与「超 5s」同一降级语义（D16）。
+				return files, subdirs, true, nil
+			}
+			return nil, nil, false, rerr
+		}
+		for _, fi := range infos {
+			name := fi.Name()
+			if IsInternalTemp(name) {
+				continue
+			}
+			childRel := name
+			if rel != "" {
+				childRel = rel + "/" + name
+			}
+			if fi.IsDir() {
+				subdirs = append(subdirs, childRel)
+				queue = append(queue, childRel)
+				continue
+			}
+			// 非目录项当文件处理：OpenSSH readdir 用 lstat，目录软链 IsDir()==false 因此不会
+			// 被递归（spec：目录软链不跟随）；文件软链交给 Open/Stat 跟随，与现状一致。
+			files = append(files, treeFile{rel: childRel, size: fi.Size()})
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, nil, false, cerr
+		}
+		if scanLimit(len(files), time.Since(start)) {
+			return files, subdirs, true, nil
+		}
+	}
+	return files, subdirs, false, nil
+}
+
+// treeProgress 聚合目录传输的进度帧（D7/D16）。
+//
+// Done 是跨文件累计的真实字节（已完成文件的字节 + 当前文件已传字节），FilesDone 是已提交
+// 文件数；降级（枚举被放弃）时 total/files 为 -1，Done/FilesDone 仍真实累加 —— 这正是
+// D16 要求的字段闭环：UI 能区分「分母未知但确实在传」与「0 个文件」。
+type treeProgress struct {
+	id     string
+	host   string
+	dir    Direction
+	name   string
+	total  int64 // <0 表示未知（降级）
+	files  int   // <0 表示未知（降级）
+	base   int64 // 已提交文件的字节总数
+	infl   int64 // 当前文件已传字节（来自逐文件帧）
+	doneF  int   // 已提交文件数
+	report func(Progress)
+	now    func() time.Time
+	last   time.Time
+}
+
+func newTreeProgress(id, host string, d Direction, name string, total int64, files int, report func(Progress)) *treeProgress {
+	return &treeProgress{id: id, host: host, dir: d, name: name, total: total, files: files, report: report, now: time.Now}
+}
+
+// frame 按节流窗口上报一帧聚合进度；force=true 绕过节流（首帧/末帧必达，D7）。
+func (t *treeProgress) frame(force bool) {
+	if t.report == nil {
+		return
+	}
+	if !force && t.now().Sub(t.last) < progressInterval {
+		return
+	}
+	t.last = t.now()
+	t.report(Progress{
+		ID: t.id, Host: t.host, Direction: t.dir, Name: t.name,
+		Done: t.base + t.infl, Total: t.total,
+		FilesDone: t.doneF, FilesTotal: t.files, Phase: PhaseTransfer,
+	})
+}
+
+// begin 发首帧：立刻让 UI 拿到分母（或降级的 -1/-1）与 Phase=transfer。
+// 降级帧形状由 degradedProgress 单一来源构造，避免两处各写一份 -1 字段而漂移。
+func (t *treeProgress) begin() {
+	if t.report == nil {
+		return
+	}
+	if t.total < 0 || t.files < 0 {
+		t.last = t.now()
+		t.report(degradedProgress(t.id, t.host, t.dir, t.name))
+		return
+	}
+	t.frame(true)
+}
+
+// file 接收某个文件内部的逐块进度：Done 折算成「已完成文件字节 + 本文件已传字节」。
+func (t *treeProgress) file(p Progress) {
+	t.infl = p.Done
+	t.frame(false)
+}
+
+// finishFile 在一个文件**提交成功后**推进累计值。
+func (t *treeProgress) finishFile(size int64) {
+	t.base += size
+	t.infl = 0
+	t.doneF++
 }

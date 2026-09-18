@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -267,7 +270,7 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 		switch kind {
 		case resumeFull:
 			// 源已变/不可验证：旧 .part 只会污染结果，删掉再走全新流程。
-			g.forgetResumeAnchor(downloadAnchorKey(req.PartPath))
+			g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, req.PartPath))
 			_ = os.Remove(req.PartPath)
 			req.Resume, req.ResumeOffset = false, 0
 		case resumeCommit:
@@ -275,7 +278,7 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 			if err := os.Rename(req.PartPath, req.Local); err != nil {
 				return &TransferError{Op: "sftp get", Path: req.Local, PartPath: req.PartPath, Err: err}
 			}
-			g.forgetResumeAnchor(downloadAnchorKey(req.PartPath))
+			g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, req.PartPath))
 			g.markCommitted(entry)
 			newProgressEmitter(req.ID, report).send(Progress{
 				Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: req.Local,
@@ -309,7 +312,7 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 		return &TransferError{Op: "sftp get", Path: req.Local, PartPath: part, Err: err}
 	}
 	// 提交成功后 .part 已不存在（被 rename 成目标），锚点随之失效。
-	g.forgetResumeAnchor(downloadAnchorKey(part))
+	g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, part))
 	// I2：提交已完成，先标记 committed 再发末帧 —— 末帧经 UI 同步回调，无论它多慢，
 	// Cancel 都只会看到 false（绝不出现「文件已落地却答应用户取消」）。
 	g.markCommitted(entry)
@@ -326,8 +329,113 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	reuse = true
 	return nil
 }
+
+// GetTree 下载远端目录树（D8/D11/D16）：先枚举（scanTree）、再逐文件走单文件的
+// .part + 本地 rename 提交（copyFileToLocal）。目录项**只重试、不续传**（P3.1）：
+// 树内多锚点无法用单值 PartPath 表达，因此 req.Resume/req.PartPath 一律忽略。
+//
+// 一个会话贯穿整棵树（不像「逐文件调 Get」那样每个文件重新握手 + 重新排队取额度）。
+// 取消仍由关会话完成（Task 10）：关会话会让当前 ReadDirContext/copyStream 立刻失败，
+// 循环随即带着错误退出 —— 已提交的文件保留，失败项的 .part 保留作续传/重试锚点。
 func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
-	return errors.New("未实现")
+	const op = "sftp get -r"
+	if req.Remote == "" || req.Local == "" {
+		return &TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: errors.New("目录传输缺少远端或本地路径")}
+	}
+	release, err := g.acquireInflight(req.Host, req.User, string(DirDownload), req.Local, req.ID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
+	if err != nil {
+		return &TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: err}
+	}
+	reuse := false
+	defer func() { g.pool.Release(s, reuse) }()
+	entry := g.register(req.ID, s)
+	defer g.unregister(req.ID, entry)
+
+	// 目录项不接受续传（P3.1）：清空单文件锚点参数。若照搬 req.PartPath，整棵树的所有文件
+	// 会共用同一个 .part 路径互相覆盖，最后各自 rename 出别人的内容 —— 静默损坏。
+	req.Resume, req.ResumeOffset, req.PartPath = false, 0, ""
+
+	files, subdirs, degraded, serr := scanTree(context.Background(), s, req.Remote, time.Now())
+	if serr != nil {
+		var remoteMsg string
+		if isRemoteError(serr) {
+			remoteMsg = s.Proc.StderrText()
+		}
+		return &TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: serr, RemoteMsg: remoteMsg}
+	}
+	// 目录本身（含空目录）按 D11 建出，与 sftp get -r 一致 —— 空目录也必须在本地出现。
+	if merr := os.MkdirAll(req.Local, 0o755); merr != nil {
+		return &TransferError{Op: op, Path: req.Local, Err: wrapLocalIO(merr)}
+	}
+	for _, d := range subdirs {
+		p := filepath.Join(req.Local, filepath.FromSlash(d))
+		if merr := os.MkdirAll(p, 0o755); merr != nil {
+			return &TransferError{Op: op, Path: p, Err: wrapLocalIO(merr)}
+		}
+	}
+	total, filesTotal := int64(0), len(files)
+	if degraded {
+		// D16：放弃枚举 ⇒ 分母未知（-1），但传输继续、Done/FilesDone 继续真实累加。
+		total, filesTotal = -1, -1
+	} else {
+		for _, f := range files {
+			total += f.size
+		}
+	}
+	tp := newTreeProgress(req.ID, req.Host, DirDownload, req.Remote, total, filesTotal, report)
+	tp.begin()
+
+	for _, f := range files {
+		localPath := filepath.Join(req.Local, filepath.FromSlash(f.rel))
+		if merr := os.MkdirAll(filepath.Dir(localPath), 0o755); merr != nil {
+			return &TransferError{Op: op, Path: filepath.Dir(localPath), Err: wrapLocalIO(merr)}
+		}
+		freq := req
+		freq.Remote = path.Join(req.Remote, f.rel) // 远端 POSIX 路径：path 而非 filepath
+		freq.Local = localPath
+
+		if req.Atomic {
+			part, _, ftotal, cerr := g.copyFileToLocal(s, freq, freq.Remote, freq.Local, tp.file)
+			if cerr != nil {
+				// 失败/取消：.part 保留（helper 契约），已提交的文件不回滚（目录项重试 = 整项重传）。
+				var remoteMsg string
+				if isRemoteError(cerr) {
+					remoteMsg = s.Proc.StderrText()
+				}
+				return &TransferError{Op: op, Host: req.Host, Path: freq.Remote, PartPath: part, Err: cerr, RemoteMsg: remoteMsg}
+			}
+			if rerr := os.Rename(part, localPath); rerr != nil {
+				return &TransferError{Op: op, Path: localPath, PartPath: part, Err: rerr}
+			}
+			g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, part))
+			tp.finishFile(ftotal)
+			continue
+		}
+		// legacy 面（Atomic=false）：直写目标，与 Get 的 legacy 分支同一语义与校验。
+		n, ftotal, cerr := g.getNonAtomic(s, freq.Remote, localPath)
+		if cerr != nil {
+			var remoteMsg string
+			if isRemoteError(cerr) {
+				remoteMsg = s.Proc.StderrText()
+			}
+			return &TransferError{Op: op, Host: req.Host, Path: freq.Remote, Err: cerr, RemoteMsg: remoteMsg}
+		}
+		if decideCommit(n, ftotal) != commitOK {
+			return &TransferError{Op: op, Path: freq.Remote, Err: shortReadError(n, ftotal, "")}
+		}
+		tp.finishFile(ftotal)
+	}
+	// 与 Get/Put 同一时序：先标 committed（此后 Cancel 只答 false），再发末帧。
+	g.markCommitted(entry)
+	tp.frame(true)
+	reuse = true
+	return nil
 }
 
 // Put 上传本地单个文件到远端（新面：.part + 原子提交）。
@@ -387,16 +495,17 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	if req.Resume && req.PartPath != "" {
 		kind, off, derr := g.decideUploadResume(s, req, total, srcMtime)
 		if derr != nil {
-			// M4：能走到这里说明远端 Stat 失败的原因**不是**「不存在」（ENOENT 会在
-			// decideUploadResume 内部直接判 full），因此 .part 很可能仍在远端保留着。
-			// 如实带上 req.PartPath，调用方不会因为一次 Stat 抖动就丢掉续传锚点。
+			// Task 12 加固（上传 M4）：与下载方向的 localPartIfExists 对齐 —— 只上报**已核实
+			// 存在**的锚点。原先乐观地直接回 req.PartPath，会把一次 Stat 抖动变成发布一个
+			// ENOENT 的假锚点（下次续传拿到 ENOENT 才降级为整份，但调用方已经先相信了它）。
+			// 注意：这里再 Stat 一次仍是远端操作，失败就如实返回空串（宁可丢锚点也不撒谎）。
 			return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath,
-				PartPath: req.PartPath, Err: derr, RemoteMsg: s.Proc.StderrText()}
+				PartPath: remotePartIfExists(s, req.PartPath), Err: derr, RemoteMsg: s.Proc.StderrText()}
 		}
 		switch kind {
 		case resumeFull:
 			// 源已变/不可验证：旧 .part 只会污染结果，删掉再走全新流程。
-			g.forgetResumeAnchor(uploadAnchorKey(req.PartPath))
+			g.forgetResumeAnchor(uploadAnchorKey(req.Host, req.User, req.Remote, req.PartPath))
 			if rerr := removeRemote(s.Conn, req.PartPath); rerr != nil && !os.IsNotExist(rerr) {
 				return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath, Err: rerr, RemoteMsg: s.Proc.StderrText()}
 			}
@@ -410,7 +519,7 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 				}
 				return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, PartPath: req.PartPath, Err: err, RemoteMsg: remoteMsg}
 			}
-			g.forgetResumeAnchor(uploadAnchorKey(req.PartPath))
+			g.forgetResumeAnchor(uploadAnchorKey(req.Host, req.User, req.Remote, req.PartPath))
 			g.markCommitted(entry)
 			newProgressEmitter(req.ID, report).send(Progress{
 				Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: req.Remote,
@@ -428,7 +537,7 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 				return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath, Err: aerr, RemoteMsg: s.Proc.StderrText()}
 			}
 			if !ok {
-				g.forgetResumeAnchor(uploadAnchorKey(req.PartPath))
+				g.forgetResumeAnchor(uploadAnchorKey(req.Host, req.User, req.Remote, req.PartPath))
 				if rerr := removeRemote(s.Conn, req.PartPath); rerr != nil && !os.IsNotExist(rerr) {
 					return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath, Err: rerr, RemoteMsg: s.Proc.StderrText()}
 				}
@@ -481,7 +590,7 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	// 记录本地源指纹（Task 11）：这份远端 .part 的已写字节对应**已打开句柄**看到的本地源
 	// (身份, size, mtime)；用句柄 Stat 记录，保证锚点与真正读到的字节出自同一份元数据（I3）。
 	// 记录必须晚于上面的复核：绝不给一份会被拼错的 .part 留下「合法」锚点。
-	g.recordResumeAnchor(uploadAnchorKey(part), req.Local, lst.Size(), lst.ModTime())
+	g.recordResumeAnchor(uploadAnchorKey(req.Host, req.User, req.Remote, part), req.Local, lst.Size(), lst.ModTime())
 	if req.Resume && offset > 0 {
 		// 上传续传：本地源与远端 .part 必须从同一 offset 续写（见上）。offset 的选择由
 		// Task 11 的 decideResume 负责；这里只保证两侧对称，避免拼出损坏文件。
@@ -513,7 +622,7 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, PartPath: part, Err: err, RemoteMsg: remoteMsg}
 	}
 	// 提交成功后 .part 已不存在（被 rename 成目标），锚点随之失效。
-	g.forgetResumeAnchor(uploadAnchorKey(part))
+	g.forgetResumeAnchor(uploadAnchorKey(req.Host, req.User, req.Remote, part))
 	// I2：提交已完成，先标记 committed 再发末帧（末帧经 UI 同步回调）—— Cancel 绝不
 	// 能在「远端文件已落地」时返回 true。
 	g.markCommitted(entry)
@@ -525,6 +634,19 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	}, true)
 	reuse = true
 	return nil
+}
+
+// remotePartIfExists 返回确实存在于远端的 .part 路径；不存在（或为空）返回空串。
+// 与下载方向的 localPartIfExists 对称（Task 12 加固 M4）：错误分支只上报**已核实存在**的
+// 锚点，绝不因为一次 Stat 抖动就发布一个 ENOENT 的假路径。Stat 本身失败同样返回空串。
+func remotePartIfExists(s *Session, part string) string {
+	if part == "" {
+		return ""
+	}
+	if st, err := s.Conn.Stat(part); err == nil && st.Mode().IsRegular() {
+		return part
+	}
+	return ""
 }
 
 // putCopyError 给搬运阶段（copyStream）的错误定性：本地源读失败不附远端 stderr（约束 6），
@@ -663,8 +785,213 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 	return nil
 }
 
+// PutTree 递归上传本地目录（D8/D11/D16）。
+//
+// 合并语义（D11，与 sftp put -r 实测一致，batch.go PutRecursive 的权威描述同源）：
+// 远端建 <remoteDir>/<base(local)>，同名目录已存在则**并入**（同名文件被覆盖），
+// 绝不嵌套出 <base>/<base>，也不清理远端独有的旧文件。
+//
+// 与 GetTree 对称：一个会话贯穿整棵树；每一项走远端 .part + commitRemote 原子提交；
+// 目录项只重试不续传（P3.1），req.Resume/req.PartPath 一律忽略。
 func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
-	return errors.New("未实现")
+	const op = "sftp put -r"
+	if req.Remote == "" || req.Local == "" {
+		return &TransferError{Op: op, Path: req.Local, Err: errors.New("目录传输缺少远端或本地路径")}
+	}
+	st, err := os.Stat(req.Local)
+	if err != nil {
+		return &TransferError{Op: op, Path: req.Local, Err: err}
+	}
+	if !st.IsDir() {
+		return &TransferError{Op: op, Path: req.Local, Err: errors.New("put -r 的本地源必须是目录")}
+	}
+	release, err := g.acquireInflight(req.Host, req.User, string(DirUpload), req.Remote, req.ID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	scanStart := time.Now()
+	files, subdirs, total, werr := scanLocalTree(req.Local)
+	if werr != nil {
+		return &TransferError{Op: op, Path: req.Local, Err: werr}
+	}
+	filesTotal := len(files)
+	if scanLimit(filesTotal, time.Since(scanStart)) {
+		// 与下载方向同一条 D16 规则：枚举超阈值 ⇒ 分母未知。
+		total, filesTotal = -1, -1
+	}
+	// 目录项不接受续传（P3.1）：清空单文件锚点参数，避免同一个 PartPath 被整棵树复用。
+	req.Resume, req.ResumeOffset, req.PartPath = false, 0, ""
+
+	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
+	if err != nil {
+		return &TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: err}
+	}
+	reuse := false
+	defer func() { g.pool.Release(s, reuse) }()
+	entry := g.register(req.ID, s)
+	defer g.unregister(req.ID, entry)
+
+	hasPosix := false
+	if req.Atomic {
+		_, hasPosix = s.Conn.HasExtension(posixRenameExt)
+	}
+	// 合并语义：目标根 = <remoteDir>/<base(local)>。用 path（POSIX）拼接，绝不碰 filepath
+	// 的远端语义（Windows 客户端会把 / 变成反斜杠）。
+	rootRemote := path.Join(req.Remote, filepath.Base(filepath.Clean(req.Local)))
+	// 远端目录（含空目录）按 D11 一次性建出：WalkDir 已给出完整子目录清单，绝不逐文件
+	// 重复 MkdirAll（那是每文件一次多余往返）。
+	if derr := s.Conn.MkdirAll(rootRemote); derr != nil {
+		return &TransferError{Op: op, Host: req.Host, Path: rootRemote, Err: derr, RemoteMsg: s.Proc.StderrText()}
+	}
+	for _, d := range subdirs {
+		p := path.Join(rootRemote, d)
+		if derr := s.Conn.MkdirAll(p); derr != nil {
+			return &TransferError{Op: op, Host: req.Host, Path: p, Err: derr, RemoteMsg: s.Proc.StderrText()}
+		}
+	}
+	tp := newTreeProgress(req.ID, req.Host, DirUpload, req.Remote, total, filesTotal, report)
+	tp.begin()
+
+	for _, f := range files {
+		localPath := filepath.Join(req.Local, filepath.FromSlash(f.rel))
+		remotePath := path.Join(rootRemote, f.rel)
+		// 累计值必须用**实际提交的字节数**（原子路径取已打开句柄的 Stat），不能拿枚举时的
+		// f.size —— 文件在枚举与打开之间被改写时，progress 的分母/分子会自相矛盾。
+		committed := f.size
+		if req.Atomic {
+			n, perr := g.putFileAtomic(s, req, localPath, remotePath, hasPosix, tp.file)
+			if perr != nil {
+				return perr
+			}
+			committed = n
+		} else {
+			freq := req
+			freq.Local, freq.Remote = localPath, remotePath
+			if perr := g.putNonAtomic(s, freq, f.size, tp.file, nil); perr != nil {
+				return perr
+			}
+		}
+		tp.finishFile(committed)
+	}
+	g.markCommitted(entry)
+	tp.frame(true)
+	reuse = true
+	return nil
+}
+
+// scanLocalTree 递归枚举本地目录：普通文件 + **子目录**（后者供 PutTree 建出空目录，
+// 与 sftp put -r 一致）。rel 统一转成 POSIX 相对路径，便于 path.Join 拼远端路径
+// （Windows 客户端的反斜杠绝不能进远端路径）。文件软链跟随（与远端枚举及现状一致），
+// 目录软链不递归；我方临时/备份文件（本地 .part）不进清单（D18）。
+func scanLocalTree(root string) (files []treeFile, subdirs []string, total int64, err error) {
+	// 源目录本身若是软链，WalkDir 不会跟随根（会把它当非目录项、一个文件都枚举不到）：
+	// 先解析成真实目录。用户从系统拖入的目录经常是软链。
+	if resolved, rerr := filepath.EvalSymlinks(root); rerr == nil {
+		root = resolved
+	}
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			if p == root {
+				return nil
+			}
+			rel, rerr := filepath.Rel(root, p)
+			if rerr != nil {
+				return rerr
+			}
+			if !IsInternalTemp(filepath.Base(rel)) {
+				subdirs = append(subdirs, filepath.ToSlash(rel))
+			}
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return ierr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			// 软链：跟随。解析成目录 ⇒ 不递归（与远端 readdir 用 lstat 的语义一致）。
+			st, serr := os.Stat(p)
+			if serr != nil {
+				return serr
+			}
+			info = st
+		}
+		if info.IsDir() || !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return rerr
+		}
+		if IsInternalTemp(filepath.Base(rel)) {
+			return nil
+		}
+		files = append(files, treeFile{rel: filepath.ToSlash(rel), size: info.Size()})
+		total += info.Size()
+		return nil
+	})
+	return files, subdirs, total, err
+}
+
+// putFileAtomic 把一个本地文件原子上传到远端目标：写远端同目录 .part → done==total →
+// commitRemote（posix-rename 或 backup-swap + journal）。
+//
+// 目录上传专用：调用方已持有一个会话、并保证远端父目录已建立；**不走单文件续传**
+// （目录项只重试，P3.1），每一项都新建 .part。提交仍复用唯一的 commitRemote —— 目录传输
+// 不新增第二条提交路径。total 取**已打开句柄**的 Stat，避免「枚举 size 与打开之间被改写」
+// 的窗口；done==total 仍是唯一提交前置（copyFileToLocal 的同款守卫）。
+func (g *GoBackend) putFileAtomic(s *Session, req TransferRequest, local, remote string, hasPosix bool, report func(Progress)) (int64, error) {
+	const op = "sftp put -r"
+	part := PartNameRemote(remote, req.ID) // 远端 POSIX 路径：必须用 Remote 家族（Task 2 评审 Important-2）
+	wf, err := s.Conn.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	if err != nil {
+		// .part 根本没建出来 ⇒ PartPath 必须为空（绝不发布假锚点）。
+		return 0, &TransferError{Op: op, Host: req.Host, Path: part, Err: err, RemoteMsg: s.Proc.StderrText()}
+	}
+	lf, err := os.Open(local)
+	if err != nil {
+		_ = wf.Close()
+		// 远端 .part 已建出：如实带上作重试锚点；本地错误不附远端 stderr。
+		return 0, &TransferError{Op: op, Path: local, PartPath: part, Err: wrapLocalIO(err)}
+	}
+	lst, lerr := lf.Stat()
+	if lerr != nil {
+		_ = wf.Close()
+		_ = lf.Close()
+		return 0, &TransferError{Op: op, Path: local, PartPath: part, Err: wrapLocalIO(lerr)}
+	}
+	total := lst.Size()
+	em := newProgressEmitter(req.ID, report)
+	cr := &countingReader{r: lf, e: em, p: Progress{Host: req.Host, Direction: DirUpload, Name: remote, PartPath: part, Total: total, Phase: PhaseTransfer}}
+	em.send(cr.p, true)
+	n, cerr := copyStream(wf, cr)
+	_ = wf.Close()
+	_ = lf.Close()
+	if cerr != nil {
+		var remoteMsg string
+		if isRemoteError(cerr) {
+			remoteMsg = s.Proc.StderrText()
+		}
+		return total, &TransferError{Op: op, Host: req.Host, Path: remote, PartPath: part, Err: cerr, RemoteMsg: remoteMsg}
+	}
+	if decideCommit(n, total) != commitOK {
+		// 唯一提交前置：少传/多传都保留 .part、绝不提交（R13/约束 4）。
+		return total, &TransferError{Op: op, Path: remote, PartPath: part, Err: shortReadError(n, total, part)}
+	}
+	if err := commitRemote(s, hasPosix, part, remote, g.journal, func(f string, a ...any) { g.warnf(s.Host, f, a...) }); err != nil {
+		var remoteMsg string
+		if isRemoteError(err) {
+			remoteMsg = s.Proc.StderrText()
+		}
+		return total, &TransferError{Op: op, Host: req.Host, Path: remote, PartPath: part, Err: err, RemoteMsg: remoteMsg}
+	}
+	// 末帧：提交成功后才发，PartPath 指向已提交的最终目标（与 Put 同一 PartPath 语义）。
+	em.send(Progress{Host: req.Host, Direction: DirUpload, Name: remote, PartPath: remote, Done: total, Total: total, Phase: PhaseTransfer}, true)
+	return total, nil
 }
 
 func (g *GoBackend) TransferGet(req TransferRequest, report func(Progress)) error {

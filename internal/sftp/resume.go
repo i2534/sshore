@@ -102,8 +102,18 @@ type resumeAnchor struct {
 
 // downloadAnchorKey / uploadAnchorKey 给两个方向分开命名空间：本地方向的 .part 路径与远端
 // 方向理论上可能字符串相同（如都在 /tmp 下），加前缀避免串号。
-func downloadAnchorKey(part string) string { return "d:" + part }
-func uploadAnchorKey(part string) string   { return "u:" + part }
+//
+// Task 12 加固（M1 同类残余）：键里必须含 host + user。同一个 GoBackend 会服务多个 host，
+// 而 .part 路径（尤其退化的短名或都用 /tmp 的场景）在不同 host 上完全可能相同；只按路径
+// 做键会让 A 主机留下的锚点被 B 主机的续传请求命中，从而把 B 的 .part 当成合法前缀续写。
+// 上传方向还含**目的远端路径**：同一 host 把同一个 PartPath 用于不同目标时，源相同也不能
+// 互认锚点。键里多算一个维度只会让查不到的锚点退化为整份重传（方向安全）。
+func downloadAnchorKey(host, user, part string) string {
+	return "d:" + host + "\x00" + user + "\x00" + part
+}
+func uploadAnchorKey(host, user, dest, part string) string {
+	return "u:" + host + "\x00" + user + "\x00" + dest + "\x00" + part
+}
 
 // recordResumeAnchor 记录（或覆盖）某个 .part 对应的源指纹（身份 + 期望长度 + mtime）。
 // key 为空（无锚点）时 no-op。表有上限：失败/取消留下的锚点会一直留着供续传，长时间运行
@@ -188,7 +198,7 @@ func (g *GoBackend) decideDownloadResume(s *Session, req TransferRequest) (resum
 	in := resumeInput{PartSize: pst.Size(), Total: st.Size(), SrcMtime: st.ModTime()}
 	// M1：锚点必须记的是**同一个远端源**。仅比 (size,mtime) 时，另一份同尺寸同 mtime 的
 	// 无关源会被误当成合法前缀；身份不符一律按「不可验证」处理。
-	if a, ok := g.lookupResumeAnchor(downloadAnchorKey(req.PartPath)); ok && a.src == req.Remote {
+	if a, ok := g.lookupResumeAnchor(downloadAnchorKey(req.Host, req.User, req.PartPath)); ok && a.src == req.Remote {
 		in.SrcSize, in.RecMtime = a.size, a.mtime
 	} else {
 		in.SrcChanged = true
@@ -209,7 +219,7 @@ func (g *GoBackend) decideUploadResume(s *Session, req TransferRequest, total in
 	}
 	in := resumeInput{PartSize: pst.Size(), Total: total, SrcMtime: srcMtime}
 	// M1：同下载方向，锚点必须记的是**同一个本地源**。
-	if a, ok := g.lookupResumeAnchor(uploadAnchorKey(req.PartPath)); ok && a.src == req.Local {
+	if a, ok := g.lookupResumeAnchor(uploadAnchorKey(req.Host, req.User, req.Remote, req.PartPath)); ok && a.src == req.Local {
 		in.SrcSize, in.RecMtime = a.size, a.mtime
 	} else {
 		in.SrcChanged = true

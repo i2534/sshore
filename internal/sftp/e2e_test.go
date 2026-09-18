@@ -501,3 +501,110 @@ func TestResumeE2E(t *testing.T) {
 		t.Log("batch 迭代：已断言 batch 诚实拒绝 Atomic（续传仅 gosftp 提供，绝不用 batch 跑绿冒充）")
 	}
 }
+
+// e2eEnv 读取 harness 注入的真实 sshd 环境；缺失时 skip 并返回 ok=false。
+func e2eEnv(t *testing.T) (host, remote string, ok bool) {
+	t.Helper()
+	host = os.Getenv("SSHORE_E2E_HOST")
+	remote = os.Getenv("SSHORE_E2E_REMOTE")
+	if host == "" || remote == "" {
+		t.Skip("未提供 SSHORE_E2E_HOST / SSHORE_E2E_REMOTE，跳过目录传输验证")
+		return "", "", false
+	}
+	return host, remote, true
+}
+
+// TestTreeE2E 是 Task 12 的目录往返 e2e（harness 的 batch/gosftp 双迭代都会真跑）：
+//   - PutTree 上传本地树 a/b/c（batch = sftp put -r；gosftp = 逐文件 .part + 提交）；
+//   - 第二次 PutTree 验证 D11 合并语义（并入而非嵌套出 a/a，远端独有文件保留）；
+//   - GetTree 下载回新目录，逐文件逐字节比对；
+//   - 成功后远端树内不得残留 .part/.bak。
+//
+// 走门面 Ctrl（按 SSHORE_SFTP_TRANSPORT 选中后端）而不是直连 GoBackend，这样双后端迭代
+// 各验一条真实实现，杜绝「两个迭代跑同一段代码」的假绿。
+func TestTreeE2E(t *testing.T) {
+	host, remote, ok := e2eEnv(t)
+	if !ok {
+		return
+	}
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("缺少 ssh 二进制")
+	}
+	be := resolveTransport(nil)
+	impl := map[BackendKind]string{KindBatch: "BatchBackend.TransferGetTree/PutTree", KindGo: "GoBackend.GetTree/PutTree"}[be]
+	ctrl := NewCtrl(osutil.NewRunner(), nil)
+	defer ctrl.CloseAll()
+	atomic := ctrl.AtomicCapable()
+	t.Logf("目录传输实现 = %s（backend=%v, Atomic=%v）", impl, be, atomic)
+
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "a", "b", "c"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 空目录：递归传输只搬文件时最容易漏掉，两个后端都必须建出目录本身（D11）。
+	if err := os.MkdirAll(filepath.Join(src, "a", "emptydir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"a/x.txt", "a/b/y.txt", "a/b/c/z.txt"} {
+		if err := os.WriteFile(filepath.Join(src, filepath.FromSlash(p)), []byte("payload:"+p), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := filepath.Join(remote, "tree")
+	// 目标父目录先建好：batch 的 sftp put -r 的合并语义要求 remoteDir 已存在（gosftp 会自行 MkdirAll）。
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(target) }()
+
+	localRoot := filepath.Join(src, "a")
+	put := func(id string) {
+		t.Helper()
+		if err := ctrl.TransferPutTree(TransferRequest{ID: id, Host: host, Remote: target, Local: localRoot, Atomic: atomic}, nil); err != nil {
+			t.Fatalf("PutTree(%s): %v", id, err)
+		}
+	}
+	put("t12-put1")
+	// 远端独有文件：第二次并入不得删掉它（D11 不做整树替换）。
+	stale := filepath.Join(target, "a", "keep.txt")
+	if err := os.WriteFile(stale, []byte("KEEP"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	put("t12-put2")
+	if _, err := os.Stat(filepath.Join(target, "a", "a")); !os.IsNotExist(err) {
+		t.Fatalf("put -r 必须并入而非嵌套（不应出现 target/a/a），stat err=%v", err)
+	}
+	if b, err := os.ReadFile(stale); err != nil || string(b) != "KEEP" {
+		t.Fatalf("并入不得清理远端独有文件: err=%v content=%q", err, string(b))
+	}
+	if st, err := os.Stat(filepath.Join(target, "a", "emptydir")); err != nil || !st.IsDir() {
+		t.Fatalf("递归上传必须建出空目录: err=%v st=%v", err, st)
+	}
+
+	dst := t.TempDir()
+	if err := ctrl.TransferGetTree(TransferRequest{ID: "t12-get", Host: host, Remote: target, Local: filepath.Join(dst, "tree"), Atomic: atomic}, nil); err != nil {
+		t.Fatalf("GetTree: %v", err)
+	}
+	for _, p := range []string{"a/x.txt", "a/b/y.txt", "a/b/c/z.txt"} {
+		want, _ := os.ReadFile(filepath.Join(src, filepath.FromSlash(p)))
+		got, err := os.ReadFile(filepath.Join(dst, "tree", filepath.FromSlash(p)))
+		if err != nil || !bytes.Equal(want, got) {
+			t.Fatalf("文件不一致: %s err=%v got=%d want=%d", p, err, len(got), len(want))
+		}
+	}
+	if st, err := os.Stat(filepath.Join(dst, "tree", "a", "emptydir")); err != nil || !st.IsDir() {
+		t.Fatalf("递归下载必须建出空目录: err=%v st=%v", err, st)
+	}
+	if err := filepath.WalkDir(target, func(p string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if !d.IsDir() && IsInternalTemp(d.Name()) {
+			return fmt.Errorf("远端残留内部临时文件: %s", p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("目录往返完成：3 个文件 + 空目录 + 合并语义（backend=%v, Atomic=%v）", be, atomic)
+}
