@@ -3,6 +3,7 @@ package sftp
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -23,13 +24,14 @@ func randHex(n int) string {
 }
 
 func shortID(id string) string {
-	if len(id) > 8 {
-		return id[:8]
-	}
 	if id == "" {
 		return "anon"
 	}
-	return id
+	r := []rune(id)
+	if len(r) > 8 {
+		r = r[:8]
+	}
+	return string(r)
 }
 
 // PartName 返回 <target> + 中缀 + <短id>-<随机>；过长时退化为同目录短名。
@@ -53,6 +55,25 @@ func BakName(target string) string {
 		return name
 	}
 	return filepath.Join(filepath.Dir(target), PartMarker+"bak-"+randHex(6))
+}
+
+// PartNameRemote / BakNameRemote 用于**远端 POSIX 路径**：远端分隔符永远是 /，
+// 而 Windows 客户端上的 filepath.Join/Clean 会把 / 变成 \（退化短名会落到别处，
+// 破坏「同目录 + rename 原子」）。本地路径继续用 PartName/BakName。
+func PartNameRemote(target, id string) string {
+	name := target + PartMarker + shortID(id) + "-" + randHex(6)
+	if len(name) <= partNameMax {
+		return name
+	}
+	return path.Join(path.Dir(target), ShortPartName(id))
+}
+
+func BakNameRemote(target string) string {
+	name := target + PartMarker + "bak-" + randHex(6)
+	if len(name) <= partNameMax {
+		return name
+	}
+	return path.Join(path.Dir(target), PartMarker+"bak-"+randHex(6))
 }
 
 // IsInternalTemp 用中缀判定：常规名（<name>.sshore-sftppart-…）与退化短名（.sshore-sftppart-…）都命中。

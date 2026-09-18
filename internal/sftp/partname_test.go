@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -87,5 +88,59 @@ func TestIsInternalTempRejectsNormalFiles(t *testing.T) {
 		if IsInternalTemp(n) {
 			t.Fatalf("普通文件 %q 不应被判为内部临时文件", n)
 		}
+	}
+}
+
+func TestMarkerLiteralIsPinned(t *testing.T) {
+	if PartMarker != ".sshore-sftppart-" {
+		t.Fatalf("marker 字面量漂移：%q（前端 Task 14 硬编码同一字面量，spec:271）", PartMarker)
+	}
+}
+
+func TestShortIDTruncationAndAnon(t *testing.T) {
+	if got := PartName("/d/a.txt", "abcdef123456"); !strings.Contains(got, "abcdef12-") {
+		t.Fatalf("id 超过 8 必须截前 8 并紧跟连字符，got %q", got)
+	}
+	if got := PartName("/d/a.txt", ""); !strings.Contains(got, "anon-") {
+		t.Fatalf("空 id 必须回落 anon，got %q", got)
+	}
+}
+
+func TestBakNameDegradesToSameDir(t *testing.T) {
+	long := "/data/" + strings.Repeat("y", 200) + ".bin"
+	bak := BakName(long)
+	if len(bak) > partNameMax {
+		t.Fatalf("bak 超长必须退化，got len=%d (%q)", len(bak), bak)
+	}
+	if filepath.Dir(bak) != filepath.Dir(long) {
+		t.Fatalf("bak 退化必须留在同目录，got %q", bak)
+	}
+	if !IsInternalTemp(bak) {
+		t.Fatalf("bak 必须被 IsInternalTemp 认出，got %q", bak)
+	}
+}
+
+func TestIsInternalTempUsesBaseOnly(t *testing.T) {
+	// marker 出现在父目录名里时，普通文件不得被判为内部临时文件
+	if IsInternalTemp("/data/.sshore-sftppart-x/notes.txt") {
+		t.Fatal("判定必须只看 basename：父目录含 marker 不应命中")
+	}
+}
+
+func TestRemoteFamilyUsesPosixSeparators(t *testing.T) {
+	long := "/data/" + strings.Repeat("y", 200) + ".bin"
+	got := PartNameRemote(long, "abcdef12")
+	if len(got) > partNameMax {
+		t.Fatalf("远端退化名超长：%q", got)
+	}
+	if path.Dir(got) != path.Dir(long) {
+		t.Fatalf("远端退化名必须留在同一 POSIX 目录：got %q", got)
+	}
+	if strings.Contains(got, "\\") {
+		t.Fatalf("远端路径不得出现反斜杠：%q", got)
+	}
+	bak := BakNameRemote(long)
+	if strings.Contains(bak, "\\") || path.Dir(bak) != path.Dir(long) {
+		t.Fatalf("BakNameRemote 必须 POSIX 同目录：%q", bak)
 	}
 }
