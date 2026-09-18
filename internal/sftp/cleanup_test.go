@@ -200,6 +200,10 @@ func TestGoBackendGetFailureEmitsFinalFrameWithHonestCounts(t *testing.T) {
 	if err == nil {
 		t.Fatal("短传必须报错")
 	}
+	var te *TransferError
+	if !errors.As(err, &te) {
+		t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+	}
 	frames := sink.all()
 	if len(frames) == 0 {
 		t.Fatal("失败路径必须有进度帧")
@@ -208,8 +212,20 @@ func TestGoBackendGetFailureEmitsFinalFrameWithHonestCounts(t *testing.T) {
 	if last.Phase != PhaseTransfer || last.Total != int64(len(data)) {
 		t.Fatalf("失败末帧必须是 transfer 相且带远端源大小 %d, got %+v", len(data), last)
 	}
-	if last.PartPath != local {
-		t.Fatalf("失败末帧的 PartPath 应与成功末帧同一语义（目标侧路径），got %q want %q", last.PartPath, local)
+	// 修复轮 2：失败末帧的 PartPath 是**保留下来的 .part**（与 te.PartPath 同一锚点），
+	// 绝不是已提交目标 local。前端会拿非空 partPath 覆盖 rec.partPath 并给出「清理」，
+	// 填最终目标会让清理删掉用户已有的目标文件。
+	if last.PartPath == "" || last.PartPath == local {
+		t.Fatalf("失败末帧 PartPath 必须是保留的 .part，不得是最终目标 %q，got %q", local, last.PartPath)
+	}
+	if !IsInternalTemp(filepath.Base(last.PartPath)) {
+		t.Fatalf("失败末帧 PartPath 应指向内部 .part，got %q", last.PartPath)
+	}
+	if te.PartPath != last.PartPath {
+		t.Fatalf("失败末帧 PartPath 必须与错误锚点一致: frame=%q err=%q", last.PartPath, te.PartPath)
+	}
+	if st, serr := os.Stat(last.PartPath); serr != nil || !st.Mode().IsRegular() {
+		t.Fatalf("失败末帧 PartPath 必须指向磁盘上仍存在的 .part: %q, stat err=%v", last.PartPath, serr)
 	}
 	if last.Done != 32<<10 {
 		t.Fatalf("失败末帧 Done 必须是 .part 真实落盘字节 %d，got %d", 32<<10, last.Done)
@@ -237,13 +253,31 @@ func TestGoBackendPutFailureEmitsFinalFrameWithHonestCounts(t *testing.T) {
 	if err == nil {
 		t.Fatal("短传必须报错")
 	}
+	var te *TransferError
+	if !errors.As(err, &te) {
+		t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+	}
 	frames := sink.all()
 	if len(frames) == 0 {
 		t.Fatal("失败路径必须有进度帧")
 	}
 	last := frames[len(frames)-1]
-	if last.Phase != PhaseTransfer || last.Total != int64(len(data)) || last.PartPath != "dst.bin" {
-		t.Fatalf("失败末帧形状不对（应为 transfer/目标侧 PartPath/源大小），got %+v", last)
+	if last.Phase != PhaseTransfer || last.Total != int64(len(data)) {
+		t.Fatalf("失败末帧形状不对（应为 transfer/源大小），got %+v", last)
+	}
+	// 修复轮 2：失败末帧 PartPath 必须是**保留的远端 .part**（与 te.PartPath 同一锚点），
+	// 不是已提交目标 dst.bin —— 否则前端「清理」会去删远端已有文件。
+	if last.PartPath == "" || last.PartPath == "dst.bin" {
+		t.Fatalf("失败末帧 PartPath 必须是保留的远端 .part，不得是最终目标 %q，got %q", "dst.bin", last.PartPath)
+	}
+	if !IsInternalTemp(filepath.Base(last.PartPath)) {
+		t.Fatalf("失败末帧 PartPath 应指向内部 .part，got %q", last.PartPath)
+	}
+	if te.PartPath != last.PartPath {
+		t.Fatalf("失败末帧 PartPath 必须与错误锚点一致: frame=%q err=%q", last.PartPath, te.PartPath)
+	}
+	if st, serr := os.Stat(filepath.Join(remoteRoot, last.PartPath)); serr != nil || !st.Mode().IsRegular() {
+		t.Fatalf("失败末帧 PartPath 必须指向远端仍存在的 .part: %q, stat err=%v", last.PartPath, serr)
 	}
 	if last.Done != 32<<10 {
 		t.Fatalf("失败末帧 Done 必须是远端 .part 真实落盘字节 %d，got %d", 32<<10, last.Done)
@@ -251,6 +285,128 @@ func TestGoBackendPutFailureEmitsFinalFrameWithHonestCounts(t *testing.T) {
 	if last.Direction != DirUpload || last.Name != "dst.bin" {
 		t.Fatalf("失败末帧字段不完整: %+v", last)
 	}
+}
+
+// TestGoBackendFailureFramePartPathRegression（Task 17 修复轮 2）：单文件失败末帧的 PartPath
+// 必须是**磁盘上仍存在的 .part**，且绝不等于最终目标；当 .part 根本建不出来时必须是空串，
+// 且 Done/Total 都是 0（绝不发表一个暗示可续传的非零 Total）。这是前端 failedActions /
+// cleanItem 的安全前提：clean 会拿 partPath 去 DeleteLocal / SftpRemove，指向最终目标 =
+// 删用户已有文件（下载）或删远端已有目标（上传）。
+func TestGoBackendFailureFramePartPathRegression(t *testing.T) {
+	t.Run("get", func(t *testing.T) {
+		remoteRoot, localDir := t.TempDir(), t.TempDir()
+		writeRemote(t, remoteRoot, "src.bin", bytes.Repeat([]byte("g"), 3*32<<10))
+		local := filepath.Join(localDir, "dst.bin")
+		g := backendForTestServer(t, remoteRoot)
+		swapCopyStream(t, func(dst io.Writer, srcR io.Reader) (int64, error) {
+			return io.Copy(dst, io.LimitReader(srcR, 32<<10))
+		})
+		sink := &progressSink{}
+		err := g.Get(TransferRequest{ID: "rw2-get", Host: "h", Remote: "src.bin", Local: local, Atomic: true}, sink.report)
+		if err == nil {
+			t.Fatal("短传必须报错")
+		}
+		var te *TransferError
+		if !errors.As(err, &te) {
+			t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+		}
+		frames := sink.all()
+		if len(frames) == 0 {
+			t.Fatal("失败路径必须有进度帧")
+		}
+		last := frames[len(frames)-1]
+		if last.PartPath == "" || last.PartPath != te.PartPath {
+			t.Fatalf("失败末帧 PartPath 必须等于错误锚点 .part: frame=%q err=%q", last.PartPath, te.PartPath)
+		}
+		if last.PartPath == local || filepath.Dir(last.PartPath) != localDir {
+			t.Fatalf("失败末帧 PartPath 不得是最终目标 %q，且必须与目标同目录: %q", local, last.PartPath)
+		}
+		if !IsInternalTemp(filepath.Base(last.PartPath)) {
+			t.Fatalf("失败末帧 PartPath 应指向内部 .part，got %q", last.PartPath)
+		}
+		if st, serr := os.Stat(last.PartPath); serr != nil || !st.Mode().IsRegular() {
+			t.Fatalf("失败末帧 PartPath 必须指向磁盘上仍存在的 .part: %q, stat err=%v", last.PartPath, serr)
+		}
+		if _, serr := os.Stat(local); !os.IsNotExist(serr) {
+			t.Fatalf("失败后最终目标不得出现，stat err=%v", serr)
+		}
+	})
+
+	t.Run("put", func(t *testing.T) {
+		remoteRoot, localDir := t.TempDir(), t.TempDir()
+		local := filepath.Join(localDir, "src.bin")
+		if err := os.WriteFile(local, bytes.Repeat([]byte("p"), 3*32<<10), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		g := backendForTestServer(t, remoteRoot)
+		swapCopyStream(t, func(dst io.Writer, srcR io.Reader) (int64, error) {
+			return io.Copy(dst, io.LimitReader(srcR, 32<<10))
+		})
+		sink := &progressSink{}
+		err := g.Put(TransferRequest{ID: "rw2-put", Host: "h", Remote: "dst.bin", Local: local, Atomic: true}, sink.report)
+		if err == nil {
+			t.Fatal("短传必须报错")
+		}
+		var te *TransferError
+		if !errors.As(err, &te) {
+			t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+		}
+		frames := sink.all()
+		if len(frames) == 0 {
+			t.Fatal("失败路径必须有进度帧")
+		}
+		last := frames[len(frames)-1]
+		if last.PartPath == "" || last.PartPath != te.PartPath {
+			t.Fatalf("失败末帧 PartPath 必须等于错误锚点 .part: frame=%q err=%q", last.PartPath, te.PartPath)
+		}
+		if last.PartPath == "dst.bin" || !IsInternalTemp(filepath.Base(last.PartPath)) {
+			t.Fatalf("失败末帧 PartPath 不得是最终目标，必须是 .part: %q", last.PartPath)
+		}
+		if st, serr := os.Stat(filepath.Join(remoteRoot, last.PartPath)); serr != nil || !st.Mode().IsRegular() {
+			t.Fatalf("失败末帧 PartPath 必须指向远端仍存在的 .part: %q, stat err=%v", last.PartPath, serr)
+		}
+		if _, serr := os.Stat(filepath.Join(remoteRoot, "dst.bin")); !os.IsNotExist(serr) {
+			t.Fatalf("失败后远端最终目标不得出现，stat err=%v", serr)
+		}
+	})
+
+	t.Run("no-part", func(t *testing.T) {
+		// .part 建不出来（只读父目录）⇒ 失败末帧 PartPath 必须为空，且 Done/Total 都是 0：
+		// 前端 failedActions 对空 partPath 只给「重试」，任何非零 Total 都会诱导出续传/清理。
+		skipUnlessUnixDirPerms(t)
+		remoteRoot := t.TempDir()
+		roParent := t.TempDir()
+		if err := os.Chmod(roParent, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(roParent, 0o700) })
+		writeRemote(t, remoteRoot, "src.bin", bytes.Repeat([]byte("n"), 64))
+		local := filepath.Join(roParent, "dst.bin")
+		g := backendForTestServer(t, remoteRoot)
+		sink := &progressSink{}
+		err := g.Get(TransferRequest{ID: "rw2-nopart", Host: "h", Remote: "src.bin", Local: local, Atomic: true}, sink.report)
+		if err == nil {
+			t.Fatal("只读目标必须报错")
+		}
+		var te *TransferError
+		if !errors.As(err, &te) {
+			t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+		}
+		if te.PartPath != "" {
+			t.Fatalf(".part 未创建时错误锚点必须为空，got %q", te.PartPath)
+		}
+		frames := sink.all()
+		if len(frames) == 0 {
+			t.Fatal("失败路径必须有进度帧（终态必达）")
+		}
+		last := frames[len(frames)-1]
+		if last.PartPath != "" {
+			t.Fatalf(".part 未创建时失败末帧 PartPath 必须为空（否则前端会给出续传/清理），got %q", last.PartPath)
+		}
+		if last.Done != 0 || last.Total != 0 {
+			t.Fatalf(".part 未创建时 Done/Total 必须归零（不得暗示可续传），got %d/%d", last.Done, last.Total)
+		}
+	})
 }
 
 // TestGoBackendPutCopyErrorKeepsErrorShape：补发末帧绝不能改变错误语义（PartPath 仍指向
