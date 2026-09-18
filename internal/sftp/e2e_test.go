@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -750,4 +752,136 @@ func hasLiveSftpChild(host string) bool {
 	}
 	out, _ := exec.Command("pgrep", "-fa", "--", host+" sftp").CombinedOutput()
 	return len(bytes.TrimSpace(out)) > 0
+}
+
+// TestCloseAllCleansRegisteredPartsE2E 覆盖 Task 13 复审 D5 指出的清理路径：CloseAll 第 4 步
+// 必须在 pool.CloseAll 之后**重新取会话**（AcquireList）删除登记表里的 .part。
+// TestNoLeftoverOnCloseE2E 覆盖不到这条路径 —— 它的 Put 已提交成功，.part 早被 forgetPart
+// 注销，CleanupParts 拿到的是空表，根本没碰远端（D5 的原话：.part had already been
+// committed/forgotten）。
+//
+// 这里用两次真实的「取消在飞传输」留下两份**登记在册**的 .part：
+//   - 上传（GoBackend.Put）留下远端 .part；
+//   - 下载（GoBackend.Get）留下本地 .part。
+//
+// 然后断言 CloseAll 必须：
+//  1. 因为登记表非空而重新 dial 一次（注入的 dial 计数器钉住，不靠日志推断）；
+//  2. 把远端与本地 .part 都删掉（远端删除只能靠这一步的重新 dial 完成）；
+//  3. 不留下任何 ssh 子进程。
+//
+// 顺序是硬约束（item 2）：pgrep 必须在任何可能重新 dial 的调用（例如 List）**之前**跑，
+// 否则看到的是新会话、断言恒真（Task 13 踩过）。本用例 CloseAll 后只用 pgrep + 本地 os.Stat
+// （远端目录在 harness 里就是本地 TMPD 路径），不做任何远端调用。
+func TestCloseAllCleansRegisteredPartsE2E(t *testing.T) {
+	host, remote, ok := e2eEnv(t)
+	if !ok {
+		return
+	}
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
+
+	// dial 计数：CleanupParts 的 AcquireList 必须真的重新起会话。
+	var dials atomic.Int32
+	origDial := g.pool.dial
+	g.pool.dial = func(h, u string) (*Session, error) {
+		dials.Add(1)
+		return origDial(h, u)
+	}
+
+	// —— 登记项 1：取消一次在飞上传，留下远端 .part ——
+	big := filepath.Join(t.TempDir(), "big.bin")
+	if err := os.WriteFile(big, bytes.Repeat([]byte("u"), 8<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+	putDst := remote + "/cleanup-put.bin"
+	putOK, putErr := runAndCancelInFlight(t, func(report func(Progress)) error {
+		return g.Put(TransferRequest{ID: "cleanup-put", Host: host, Local: big, Remote: putDst, Atomic: true}, report)
+	}, "cleanup-put", g.Cancel)
+	remotePart := transferPartPath(t, putOK, putErr, "上传")
+	if _, err := os.Stat(remotePart); err != nil {
+		t.Fatalf("取消后远端 .part 必须保留: %v", err)
+	}
+	if _, err := os.Stat(putDst); !os.IsNotExist(err) {
+		t.Fatalf("取消后最终目标不得存在, stat err=%v", err)
+	}
+
+	// —— 登记项 2：取消一次在飞下载，留下本地 .part ——
+	src := remote + "/cleanup-src.bin"
+	if err := os.WriteFile(src, bytes.Repeat([]byte("d"), 8<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+	getDst := filepath.Join(t.TempDir(), "cleanup-get.bin")
+	getOK, getErr := runAndCancelInFlight(t, func(report func(Progress)) error {
+		return g.Get(TransferRequest{ID: "cleanup-get", Host: host, Remote: src, Local: getDst, Atomic: true}, report)
+	}, "cleanup-get", g.Cancel)
+	localPart := transferPartPath(t, getOK, getErr, "下载")
+	if _, err := os.Stat(localPart); err != nil {
+		t.Fatalf("取消后本地 .part 必须保留: %v", err)
+	}
+	if _, err := os.Stat(getDst); !os.IsNotExist(err) {
+		t.Fatalf("取消后最终目标不得存在, stat err=%v", err)
+	}
+
+	// 用例自证：两份 .part 都必须在登记表里，否则这里根本没走到 D5 要补的清理分支。
+	g.partsMu.Lock()
+	_, putReg := g.knownParts[partKey("cleanup-put", remotePart)]
+	_, getReg := g.knownParts[partKey("cleanup-get", localPart)]
+	g.partsMu.Unlock()
+	if !putReg || !getReg {
+		t.Fatalf("取消后的 .part 必须在登记表里（put=%v get=%v）—— 否则 CleanupParts 走不到删除分支", putReg, getReg)
+	}
+	// 两次取消都应已关掉会话：清理前不应还有在飞 ssh 子进程。
+	if hasLiveSftpChild(host) {
+		t.Fatal("两次取消后不应还有 ssh 子进程（取消没有关干净会话）")
+	}
+
+	before := dials.Load()
+	g.CloseAll()
+	after := dials.Load()
+
+	// ① **先**查子进程：CleanupParts 的 AcquireList 会重新 dial，之后任何远端调用都会再起
+	//    会话，让这条断言失去意义（Task 13 已实测踩过）。
+	if hasLiveSftpChild(host) {
+		out, _ := exec.Command("pgrep", "-fa", "--", host+" sftp").CombinedOutput()
+		t.Fatalf("CloseAll 后仍有 ssh 子进程: %s", out)
+	}
+	// ② 清理确实重新取了会话（登记表非空 ⇒ AcquireList ⇒ dial）。
+	if after <= before {
+		t.Fatalf("CloseAll 必须为登记的远端 .part 重新取会话：dial %d → %d", before, after)
+	}
+	// ③ 远端与本地 .part 都被删掉。
+	if _, err := os.Stat(remotePart); !os.IsNotExist(err) {
+		t.Fatalf("CloseAll 必须重新 dial 删除登记的远端 .part, stat err=%v", err)
+	}
+	if _, err := os.Stat(localPart); !os.IsNotExist(err) {
+		t.Fatalf("CloseAll 必须删除登记的本地 .part, stat err=%v", err)
+	}
+	// ④ 登记表已清空。
+	g.partsMu.Lock()
+	left := len(g.knownParts)
+	g.partsMu.Unlock()
+	if left != 0 {
+		t.Fatalf("CloseAll 后登记表必须清空, 剩 %d 条", left)
+	}
+	t.Log("CloseAll 清理路径已验：远端+本地登记的 .part 均删除、重新 dial、无残留 ssh 子进程")
+}
+
+// transferPartPath 从取消传输返回的错误里取出保留的 .part 路径（TransferError.PartPath）：
+// 这是唯一不需要猜测随机短名后缀的来源。
+func transferPartPath(t *testing.T, ok bool, err error, dir string) string {
+	t.Helper()
+	if !ok {
+		t.Fatalf("取消在飞%s必须返回 true（会话被关）", dir)
+	}
+	if err == nil {
+		t.Fatalf("被取消的%s必须返回错误", dir)
+	}
+	var terr *TransferError
+	if !errors.As(err, &terr) {
+		t.Fatalf("被取消的%s错误必须是 *TransferError, got %T: %v", dir, err, err)
+	}
+	if terr.PartPath == "" {
+		t.Fatalf("%s被取消后必须带上保留的 .part 路径: %+v", dir, terr)
+	}
+	return terr.PartPath
 }

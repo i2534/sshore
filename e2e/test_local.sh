@@ -12,8 +12,10 @@ usage() {
            每个名字都必须在该后端的 go test 输出里出现 "--- PASS: <名字>"，
            少一个就判失败；防线 1/2（有 SKIP / 一个 PASS 都没有）同时生效。
            未设置时使用脚本内置的完整期望名单：
-             TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E,TestSyncE2E,TestCapabilitiesE2E,TestNoLeftoverOnCloseE2E
-           （TestSyncE2E 由 Task 13 追加：GoBackend.ListMany 落地后两个后端才都真绿）
+             TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E,TestSyncE2E,TestCapabilitiesE2E,TestNoLeftoverOnCloseE2E,TestCloseAllCleansRegisteredPartsE2E
+           （TestSyncE2E 由 Task 13 追加：GoBackend.ListMany 落地后两个后端才都真绿；
+             TestCloseAllCleansRegisteredPartsE2E 由 Task 15 追加：补 CloseAll 后 CleanupParts
+             重新 dial 删除「登记在册」的远端/本地 .part 这条清理路径）
            例：E2E_RUN='TestGoBackendE2E,TestSyncE2E,TestCapabilitiesE2E' bash e2e/test_local.sh
 USAGE
 }
@@ -62,7 +64,12 @@ trap cleanup EXIT
 # 原先因为 ListMany 是桩、gosftp 迭代必然 15s 超时而被排除）、TestCapabilitiesE2E
 # （Mkdir/Rename 覆盖/ListMany 缺失 key/RemoveRecursive 整体失败与整树删除）与
 # TestNoLeftoverOnCloseE2E（CloseAll 后远端无临时文件、无残留 ssh 子进程）。
-E2E_DEFAULT_LIST='TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E,TestSyncE2E,TestCapabilitiesE2E,TestNoLeftoverOnCloseE2E'
+# Task 15：追加 TestCloseAllCleansRegisteredPartsE2E —— TestNoLeftoverOnCloseE2E 的 Put 已提交，
+# .part 早被 forgetPart 注销，根本走不到 CleanupParts 的删除分支（Task 13 复审 D5）。新用例用
+# 两次真实取消留下**登记在册**的远端+本地 .part，断言 CloseAll 重新 dial 删除它们且无残留
+# ssh 子进程；同一 task 还把 sync 的内置忽略 (.part/.bak) 断言端到端化、把垫片的 -s 透传
+# 变成自检。
+E2E_DEFAULT_LIST='TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E,TestSyncE2E,TestCapabilitiesE2E,TestNoLeftoverOnCloseE2E,TestCloseAllCleansRegisteredPartsE2E'
 E2E_RUN="${E2E_RUN:-$E2E_DEFAULT_LIST}"
 
 # 首/尾逗号会被 read -a 折叠掉（"A," 拆成 [A]，不是 [A,""]），这里显式拒绝，
@@ -299,6 +306,32 @@ exec /usr/bin/sftp -F "$HOME/.ssh/config" -o IdentitiesOnly=yes "\$@"
 SHIMSF
 chmod +x "$SHIM/ssh" "$SHIM/sftp"
 
+# —— 垫片 `-s` 透传自检（Task 0 事实：GoBackend 用 `ssh -s <host> sftp`）——
+# 探针请求一个不存在的子系统：真 ssh 收到 `-s <host> <subsystem>` 会作为子系统请求发给
+# sshd，被拒后 client 在 stderr 打印 "subsystem request failed on channel 0"。
+# 若垫片改写/吞掉了 `-s`，<subsystem> 会被当成远端命令，stderr 是 command not found 之类。
+# 断言必须看到子系统拒绝 —— 这样「垫片坏了」是响亮的 FAIL，而不是一路 SKIP（假绿防线 1 兜底）。
+SHIM_PROBE_ERR="$TMPD/shim_s.log"
+SHIM_PROBE_RC=0
+"$SHIM/ssh" -o BatchMode=yes -o ConnectTimeout=5 -s sshore-e2e sshore-probe-nosuch \
+  </dev/null >/dev/null 2>"$SHIM_PROBE_ERR" || SHIM_PROBE_RC=$?
+if [ "$SHIM_PROBE_RC" -eq 0 ]; then
+  echo "FAIL: ssh 垫片：不存在的子系统请求不该成功" >&2
+  cat "$SHIM_PROBE_ERR" >&2
+  exit 1
+fi
+# 必须看到 ssh 客户端的子系统拒绝文案，且**不能**是 ssh 自己的 usage：
+#  - 真 ssh（透传 -s）：stderr = "subsystem request failed on channel 0"；
+#  - 吞掉 -s：子系统名变成远端命令 ⇒ "command not found"（探针名刻意不含 subsystem 字样）；
+#  - 吞掉全部参数：没有 destination ⇒ "usage: ssh ..."（含 -s subsystem 字样，只 grep subsystem 会误判）。
+if grep -qF "subsystem request failed" "$SHIM_PROBE_ERR" && ! grep -qF "usage:" "$SHIM_PROBE_ERR"; then
+  echo "PASS: ssh 垫片原样透传 -s（远端按子系统请求处理并拒绝，rc=$SHIM_PROBE_RC）"
+else
+  echo "FAIL: ssh 垫片疑似未透传 -s（stderr 不是子系统拒绝，rc=$SHIM_PROBE_RC）:" >&2
+  cat "$SHIM_PROBE_ERR" >&2
+  exit 1
+fi
+
 # 双后端循环：每次迭代显式导出 SSHORE_SFTP_TRANSPORT，并保留 SSHORE_E2E_*、PATH 垫片、
 # GOPATH/GOMODCACHE/GOCACHE。漏掉任一项都会「别名解析不到 → 测试全 skip → 假绿」。
 #
@@ -306,6 +339,9 @@ chmod +x "$SHIM/ssh" "$SHIM/sftp"
 # （名字里的 | 会被 go test 当正则，静默跑到名单外的用例上）。每次 go test 的 stdout 与
 # stderr 分文件收集，防线只读 stdout（--- PASS / SKIP 行），编译错误留在 stderr 里可读。
 E2E_FAIL=0
+# 用例 × 后端的实际执行矩阵：只记「该后端真的 PASS 了」的项（防线 3 判定后写入），
+# 供 Task 16 真机验收一眼读出每个用例落在哪个后端上，而不是只看脚本回显的 -run 意图。
+: > "$TMPD/backend_matrix"
 for backend in batch gosftp; do
   echo "--- backend=$backend run=$E2E_RUN ---"
   OUT=""
@@ -345,10 +381,16 @@ for backend in batch gosftp; do
     if [ -z "$PASSED_NAMES" ] || ! printf '%s\n' "$PASSED_NAMES" | grep -qxF -- "$_name"; then
       echo "FAIL: backend=$backend 没有名字**精确等于** E2E_RUN 名单项 '$_name' 的用例真正 PASS（目标用例被改名 / 被 -run 漏掉）" >&2
       E2E_FAIL=1
+    else
+      printf '%s %s\n' "$backend" "$_name" >> "$TMPD/backend_matrix"
     fi
   done
 done
 unset _name
 [ "$E2E_FAIL" -eq 0 ] || exit 1
+
+echo "== 用例 × 后端 实际执行矩阵（Task 16 真机验收一眼可读） =="
+awk '{ m[$2] = m[$2] " " $1 } END { for (c in m) printf "  %-40s %s\n", c, m[c] }' \
+  "$TMPD/backend_matrix" | sort
 
 echo "== ALL E2E TESTS PASSED (backend matrix: batch + gosftp; E2E_RUN=$E2E_RUN) =="
