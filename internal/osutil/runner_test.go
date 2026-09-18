@@ -234,3 +234,39 @@ func TestStartPipesDoesNotBlockWhenStderrUnread(t *testing.T) {
 		t.Fatal("stderr 应被后台 drain 到有界缓冲，供错误上报")
 	}
 }
+
+func TestPipedProcessCloseIsIdempotentAfterExit(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("缺少 sh")
+	}
+	p, err := StartPipes("sh", "-c", "echo done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := p.Wait(); out.ExitCode != 0 {
+		t.Fatalf("exit=%d", out.ExitCode)
+	}
+	// 子进程已退出：Close 必须成功（吞掉 os.ErrProcessDone），且可重复调用
+	if err := p.Close(); err != nil {
+		t.Fatalf("已退出后 Close 必须成功，got %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close 必须可重复调用，got %v", err)
+	}
+}
+
+func TestPipedProcessCloseKillsRunningChild(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("缺少 sh")
+	}
+	p, err := StartPipes("sh", "-c", "sleep 30")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("关闭运行中的子进程必须成功，got %v", err)
+	}
+	if out := p.Wait(); out.ExitCode == 0 {
+		t.Fatal("被 Kill 的子进程不应以 0 退出")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -297,6 +298,7 @@ func (p *PipedProcess) StderrText() string {
 	return strings.TrimSpace(string(p.errBuf))
 }
 
+// Wait 返回子进程的退出结果；按契约只应调用一次，重复调用返回零值 Outcome。
 func (p *PipedProcess) Wait() Outcome { return p.proc.Wait() }
 
 func (p *PipedProcess) Kill() error { return p.proc.Kill() }
@@ -305,8 +307,12 @@ func (p *PipedProcess) Kill() error { return p.proc.Kill() }
 func (p *PipedProcess) Signal() error { return p.proc.Signal() }
 
 // Close 关闭管道并终止子进程；调用方在传输结束后必须调用，避免长驻 ssh 泄漏。
+// 幂等：子进程已正常退出时 Kill 返回 os.ErrProcessDone，这不是错误。
 func (p *PipedProcess) Close() error {
 	_ = p.Stdin.Close()
 	_ = p.Stdout.Close()
-	return p.proc.Kill()
+	if err := p.proc.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
 }
