@@ -3341,7 +3341,9 @@ git commit -m "test(e2e): 临时 sshd 同时跑 sftp/sync 两包与双后端矩�
 make windows   # 见 Makefile 的 windows 目标；产物在 build/bin/
 ```
 
-再在 `win10` 客户机上安装本轮构建的 `sshore-windows-amd64.exe`。**必须在交互桌面会话（Session 1）里运行**（Task 0 的 Session 0 现象；用 schtasks /it 或直接桌面启动），且客户机免密键名非默认（`id_winlocal`），本机自连验证要带 `-i`。逐项打勾：
+再在 `win10` 客户机上安装本轮构建的 `sshore-windows-amd64.exe`。**Seek(partSize) 续传视为「待边界验证」**：Task 0 只验了文件内部回填（Seek(3) on 5B），未验 Seek(5)/Seek(7)（末尾与越过 EOF）→ 真机验收第一步先补这两个边界跑，再验续传（Task 0 评审 Minor-3）。
+
+**必须在交互桌面会话（Session 1）里运行**（Task 0 的 Session 0 现象；用 schtasks /it 或直接桌面启动），且客户机免密键名非默认（`id_winlocal`），本机自连验证要带 `-i`。逐项打勾：
 
 - 进度条在下载/上传都随字节推进；取消按钮在百毫秒级生效且目标名不出现半截文件；
 - 失败项「重试」「续传」可用；续传后 sha256 与一次性完整传输一致（在客户机上用 `certutil -hashfile` 比对）；
