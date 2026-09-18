@@ -11,10 +11,10 @@ usage() {
   E2E_RUN  逗号分隔的**用例全名**列表（不是正则，也不接受 | 等正则元字符）。
            每个名字都必须在该后端的 go test 输出里出现 "--- PASS: <名字>"，
            少一个就判失败；防线 1/2（有 SKIP / 一个 PASS 都没有）同时生效。
-           未设置时使用脚本内置的完整期望名单：TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E
-           （TestSyncE2E 仍未进默认名单：它的 gosftp 迭代走 GoBackend.ListMany，
-            该方法是 Task 13 的桩；Task 8 已补齐 Put，但 List 未落地前追加必红）
-           例：E2E_RUN='TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E' bash e2e/test_local.sh
+           未设置时使用脚本内置的完整期望名单：
+             TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E,TestSyncE2E,TestCapabilitiesE2E,TestNoLeftoverOnCloseE2E
+           （TestSyncE2E 由 Task 13 追加：GoBackend.ListMany 落地后两个后端才都真绿）
+           例：E2E_RUN='TestGoBackendE2E,TestSyncE2E,TestCapabilitiesE2E' bash e2e/test_local.sh
 USAGE
 }
 case "${1:-}" in
@@ -58,7 +58,11 @@ trap cleanup EXIT
 # sftp put -r/get -r，gosftp 迭代真跑逐文件 .part + 提交；两个迭代都验 D11 合并语义
 # （并入不嵌套、远端独有文件保留）与逐字节一致。未注册进名单的用例 harness 不会执行，
 # 等于假绿 —— 所以这里与 usage 的默认名单必须同步。
-E2E_DEFAULT_LIST='TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E'
+# Task 13：追加 TestSyncE2E（GoBackend.ListMany 落地后 sync → gosftp 真能扫完远端并同步，
+# 原先因为 ListMany 是桩、gosftp 迭代必然 15s 超时而被排除）、TestCapabilitiesE2E
+# （Mkdir/Rename 覆盖/ListMany 缺失 key/RemoveRecursive 整体失败与整树删除）与
+# TestNoLeftoverOnCloseE2E（CloseAll 后远端无临时文件、无残留 ssh 子进程）。
+E2E_DEFAULT_LIST='TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E,TestSyncE2E,TestCapabilitiesE2E,TestNoLeftoverOnCloseE2E'
 E2E_RUN="${E2E_RUN:-$E2E_DEFAULT_LIST}"
 
 # 首/尾逗号会被 read -a 折叠掉（"A," 拆成 [A]，不是 [A,""]），这里显式拒绝，

@@ -113,6 +113,22 @@ func (c *Ctrl) SetJournalDir(dir string) {
 
 func (c *Ctrl) CloseAll() { c.backend().CloseAll() }
 
+// RecoverSwaps 转发 backup-swap 崩溃恢复（Task 13）：按决策表恢复中断现场，返回处理条目数。
+// 只有 GoBackend 有 journal；batch 后端无 journal ⇒ 恒 (0, nil)（诚实 no-op，绝不报错）。
+func (c *Ctrl) RecoverSwaps() (int, error) {
+	if g, ok := c.backend().(*GoBackend); ok {
+		return g.RecoverSwaps()
+	}
+	return 0, nil
+}
+
+// CleanupParts 转发「删掉已知 .part」（Task 13）：只有 GoBackend 维护登记表。
+func (c *Ctrl) CleanupParts() {
+	if g, ok := c.backend().(*GoBackend); ok {
+		g.CleanupParts()
+	}
+}
+
 // —— 新传输面：一律走 c.backend()（Task 6 起按 resolveTransport 分派）——
 
 func (c *Ctrl) TransferGet(req TransferRequest, report func(Progress)) error {

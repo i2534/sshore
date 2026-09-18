@@ -142,8 +142,13 @@ func TestGoBackendCancelInflightDownloadClosesSessionAndRefundsOnce(t *testing.T
 	if !s.Closed() {
 		t.Fatal("取消后该传输的会话必须已关闭")
 	}
-	if g.Connected("h") {
-		t.Fatal("取消后 Connected 必须为 false（被取消的会话绝不塞回 idle）")
+	// Task 13（Task 6 重审 I3）：Connected 是粘性连接意图，取消只关掉这条会话，
+	// 不得把 UI 翻回未连接；从未连过的 host 仍是 false。
+	if !g.Connected("h") {
+		t.Fatal("取消会话不得清除粘性连接意图（Connected 必须仍为 true）")
+	}
+	if g.Connected("never-connected") {
+		t.Fatal("从未连接过的 host 必须 false")
 	}
 
 	// 额度恰好在取消后被归还：len(queue) 必须是 1。任何「关了会话但没 Release」的取消

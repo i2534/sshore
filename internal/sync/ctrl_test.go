@@ -1155,3 +1155,80 @@ func TestEngineFileRuleReportsPollEvenWhenInotifyPresent(t *testing.T) {
 		t.Fatalf("kind=file 在 inotify 主机上也必须报告 poll，得到 %q (Reason=%q)", got.Mode, got.Reason)
 	}
 }
+
+// TestInScopeRejectsInternalTemp 钉住 D18 的内置忽略：sshore 自己的传输临时文件
+// （中缀 .sshore-sftppart-）永远不在规则范围内，且与用户配置的 excludes 无关。
+func TestInScopeRejectsInternalTemp(t *testing.T) {
+	rule := config.SyncRule{Excludes: nil, MaxDepth: -1}
+	for _, rel := range []string{
+		"a.txt.sshore-sftppart-t1-ab",
+		"deep/x.sshore-sftppart-bak-9",
+		".sshore-sftppart-anon-abcdef",
+	} {
+		if inScope(rule, rel) {
+			t.Fatalf("内部临时文件 %q 必须被 inScope 拒绝（否则会被当业务文件同步/删除）", rel)
+		}
+	}
+	if !inScope(rule, "a.txt") {
+		t.Fatal("业务文件不得被内置忽略误伤")
+	}
+	// 用户显式把内部临时文件写进 excludes 之外也不能让它进来（内置规则优先）。
+	rule2 := config.SyncRule{Excludes: []string{"*.log"}, MaxDepth: -1}
+	if inScope(rule2, "a.txt.sshore-sftppart-t1-ab") {
+		t.Fatal("内置忽略不得被任何 excludes 配置绕过")
+	}
+}
+
+// TestEngineIgnoresInternalTempRemoteFiles 是 D18 的引擎级验证：远端目录里混入内部
+// 临时文件时，既不得把它下载到本地，也不得让它出现在任何统计/候选里。
+func TestEngineIgnoresInternalTempRemoteFiles(t *testing.T) {
+	local := t.TempDir()
+	lm := &scriptedListMany{tree: map[string][]sftp.Item{
+		"/r": {
+			{Name: "app.conf", Size: 2, ModTime: "t1"},
+			{Name: "app.conf.sshore-sftppart-up1-ab", Size: 99, ModTime: "t2"},
+		},
+	}}
+	xf := &fakeXfer{remote: map[string]string{
+		"/r/app.conf":                     "v1",
+		"/r/app.conf.sshore-sftppart-up1": "HALF-WRITTEN",
+	}}
+	rule := config.SyncRule{
+		ID: "d18", Host: "h", Kind: "dir", RemotePath: "/r", LocalPath: local,
+		MaxDepth: 0, PollIntervalS: 1, ForcePoll: true, Enabled: true,
+	}
+	rule.Normalize()
+	c := NewCtrl(Deps{
+		ListMany: lm.list, Transfer: xf, StateDir: t.TempDir(),
+		After: func(time.Duration) <-chan struct{} { return nil },
+	})
+	if err := c.Start(rule); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer c.Stop(rule.ID)
+
+	target := filepath.Join(local, "app.conf")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(target); err == nil && string(b) == "v1" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if b, err := os.ReadFile(target); err != nil || string(b) != "v1" {
+		t.Fatalf("业务文件必须被同步: err=%v content=%q stats=%+v", err, b, c.Stats()[rule.ID])
+	}
+	ents, _ := os.ReadDir(local)
+	for _, e := range ents {
+		if watch.IsInternalTemp(e.Name()) {
+			t.Fatalf("内部临时文件绝不能被同步到本地: %s", e.Name())
+		}
+	}
+	// 临时文件内容绝不能以任何名字落到本地（fakeXfer 里那份是 HALF-WRITTEN）。
+	for _, e := range ents {
+		b, _ := os.ReadFile(filepath.Join(local, e.Name()))
+		if string(b) == "HALF-WRITTEN" {
+			t.Fatalf("临时文件内容被当成业务文件同步了: %s", e.Name())
+		}
+	}
+}

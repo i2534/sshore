@@ -116,6 +116,26 @@ func (a *App) startup(ctx context.Context) {
 		// 坏文件：只记录、只降级，绝不覆盖用户文件
 		a.presetsErr = lerr
 	}
+	// Task 13（spec D14）：清理 >7 天且名字含 PartMarker 的本地传输临时文件。
+	// 进程崩溃后登记的 knownParts 随进程消失，这些 .part 只能靠陈旧清理兜底。
+	a.cleanupStaleParts()
+}
+
+// cleanupStaleParts 在启动时清理最近用过的本地目录下的陈旧临时文件（>7 天）。
+// 只扫配置里记录的本地目录（用户机器上没有可枚举「我们写过的所有目标目录」的全局索引）；
+// 不可读/不存在的目录静默跳过，绝不阻断启动。
+func (a *App) cleanupStaleParts() {
+	if a.cfg == nil {
+		return
+	}
+	seen := map[string]bool{}
+	for _, r := range a.cfg.LocalRecent {
+		if r.Path == "" || seen[r.Path] {
+			continue
+		}
+		seen[r.Path] = true
+		_, _ = sftp.CleanupStaleLocalParts(r.Path, time.Now())
+	}
 }
 
 // Init wires controllers. emit forwards subsystem events to the frontend.
@@ -1026,13 +1046,37 @@ func (a *App) OnShutdown() {
 	if a.forward != nil {
 		a.forward.OnShutdown()
 	}
-	// 2. 最后才关 SFTP 的 ControlMaster（它会 RemoveAll 整个 socket 目录）
+	// 2. SFTP 生命周期：**顺序是硬约束**（Task 13 / 技术审核 M5）——
+	//    先 CloseAll 停传输、关会话（此时才没有在途写入），再按 journal 恢复 backup-swap
+	//    的中断现场，最后清掉已知 .part。顺序颠倒会在有传输在飞时删掉正要提交的临时文件。
 	if a.sftp != nil {
 		a.sftp.CloseAll()
+		// journal 条目没有 host；GoBackend 用最近一次成功握手的凭据探测，拿不到就
+		// 不动作、不删条目（下次启动再试）。
+		if n, err := a.sftp.RecoverSwaps(); err != nil {
+			a.logf("恢复 swap journal 失败: %v", err)
+		} else if n > 0 {
+			a.logf("恢复了 %d 处中断提交", n)
+		}
+		a.sftp.CleanupParts()
 	}
 	if a.cfg != nil {
 		_ = a.saveConfig()
 	}
+}
+
+// logf 发一条 system 事件（emit 未接线时静默），供生命周期路径上报不阻断启动/退出的异常。
+func (a *App) logf(format string, args ...any) {
+	if a.emit == nil {
+		return
+	}
+	a.emit(forward.Event{
+		SourceType: "system",
+		SourceID:   "app",
+		TS:         time.Now().Format(time.RFC3339),
+		Level:      "warn",
+		Message:    fmt.Sprintf(format, args...),
+	})
 }
 
 // 适配器只有一处定义：internal/sync/adapters.go 的 NewSftpAdapter（见 Task 10）。

@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -607,4 +609,145 @@ func TestTreeE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("目录往返完成：3 个文件 + 空目录 + 合并语义（backend=%v, Atomic=%v）", be, atomic)
+}
+
+// writeTemp 在临时目录写一个内容确定的小文件（能力用例的本地源）。
+func writeTemp(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "f.txt")
+	if err := os.WriteFile(p, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestCapabilitiesE2E 是 Task 13 的能力迁移 e2e（ListMany/Mkdir/Rename 覆盖/RemoveRecursive）：
+//   - Mkdir 真的建出远端目录；
+//   - rename 覆盖已存在目标必须成功（保持旧 sftp rename 语义，GoBackend 走 PosixRename）；
+//   - ListMany 缺失 key = 未知（绝不当空目录）；
+//   - 不可读/不存在的目录 → RemoveRecursive 整体失败；
+//   - RemoveRecursive 真的删掉整棵树（含空目录）。
+func TestCapabilitiesE2E(t *testing.T) {
+	host, remote, ok := e2eEnv(t)
+	if !ok {
+		return
+	}
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
+	dir := remote + "/caps"
+	_ = g.RemoveRecursive(host, "", dir) // 上次运行残留：忽略失败
+	if err := g.Mkdir(host, "", dir); err != nil {
+		t.Fatal(err)
+	}
+	// rename 覆盖已存在目标必须成功（保持旧 sftp rename 语义）。
+	if err := g.Put(TransferRequest{ID: "caps-a", Host: host, Local: writeTemp(t, "a"), Remote: dir + "/a.txt", Atomic: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Put(TransferRequest{ID: "caps-b", Host: host, Local: writeTemp(t, "b"), Remote: dir + "/b.txt", Atomic: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Rename(host, "", dir+"/a.txt", dir+"/b.txt"); err != nil {
+		t.Fatalf("rename 覆盖已存在目标必须成功: %v", err)
+	}
+	items, err := g.List(host, "", dir)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	names := map[string]Item{}
+	for _, it := range items {
+		names[it.Name] = it
+	}
+	if _, present := names["a.txt"]; present {
+		t.Fatalf("rename 后源必须消失: %#v", items)
+	}
+	if it, present := names["b.txt"]; !present || it.Size != 1 {
+		t.Fatalf("rename 后目标必须是单字节新内容: %#v", items)
+	}
+	if it := names["b.txt"]; it.ModTime == "" || it.Mode == "" {
+		t.Fatalf("List 返回的 Item 必须带 Mode/ModTime: %#v", it)
+	}
+	// ListMany 缺失 key = 未知（绝不当空目录）。
+	res, err := g.ListMany(host, "", []string{dir, dir + "/does-not-exist"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := res[dir+"/does-not-exist"]; present {
+		t.Fatal("列不出来的目录必须缺席于返回值")
+	}
+	if _, present := res[dir]; !present {
+		t.Fatal("可列的目录必须在返回值里")
+	}
+	// 不可读目录 → RemoveRecursive 整体失败。
+	if err := g.RemoveRecursive(host, "", dir+"/does-not-exist"); err == nil {
+		t.Fatal("不存在的目录必须整体失败")
+	}
+	// 含空目录的整棵树：递归删除必须连空目录一起删干净。
+	if err := g.Mkdir(host, "", dir+"/empty"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.RemoveRecursive(host, "", dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(remote, "caps")); !os.IsNotExist(err) {
+		t.Fatalf("RemoveRecursive 后目录必须消失, stat err=%v", err)
+	}
+	t.Logf("能力验证完成：Mkdir/Rename 覆盖/ListMany 缺失 key/RemoveRecursive 整体失败与整树删除")
+}
+
+// TestNoLeftoverOnCloseE2E 是 Task 13 的退出清理 e2e：Put 成功后 CloseAll 必须
+//  1. 让远端不残留任何内部临时文件（.part/.bak）；
+//  2. 回收本次传输起出的 ssh 子进程（Unix 用 pgrep 反查命令行）。
+//
+// 进程检查只在有 pgrep 的 Unix 上做（Windows 见 Task 16 的 tasklist 断言）；parts 断言
+// 在所有平台都跑。注意：pgrep 的 -s 是「按 session id 过滤」而不是搜索字符串，所以这里用
+// -f 匹配完整命令行里的 "<host> sftp"，并用 -- 防止模式被当成选项。
+func TestNoLeftoverOnCloseE2E(t *testing.T) {
+	host, remote, ok := e2eEnv(t)
+	if !ok {
+		return
+	}
+	g := NewGoBackend(nil, nil)
+	src := filepath.Join(t.TempDir(), "small.bin")
+	if err := os.WriteFile(src, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Put(TransferRequest{ID: "p1", Host: host, Local: src, Remote: remote + "/small.bin", Atomic: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// 退出前先确认这条会话确实起出了 ssh 子进程（否则「无残留」的断言没有意义）。
+	if runtime.GOOS != "windows" {
+		if _, err := exec.LookPath("pgrep"); err == nil && !hasLiveSftpChild(host) {
+			t.Fatalf("CloseAll 之前必须能看到 ssh 子进程（否则用例无法证明清理生效）")
+		}
+	}
+	g.CloseAll()
+
+	// 1) 不得残留 ssh 子进程。**必须先查**：下面的 List 会重新 dial 出一条新会话，
+	//    那时 pgrep 看到的是新进程，断言就失去意义（实测踩过这个坑）。
+	if hasLiveSftpChild(host) {
+		out, _ := exec.Command("pgrep", "-fa", "--", host+" sftp").CombinedOutput()
+		t.Fatalf("CloseAll 后仍有 ssh 子进程: %s", out)
+	}
+	// 2) 远端不得残留内部临时文件。
+	if items, err := g.List(host, "", remote); err == nil {
+		for _, it := range items {
+			if strings.Contains(it.Name, PartMarker) {
+				t.Fatalf("CloseAll 后仍有临时文件: %s", it.Name)
+			}
+		}
+	}
+	t.Log("CloseAll 后无残留 ssh 子进程、无远端临时文件")
+}
+
+// hasLiveSftpChild 报告是否还有本次 sftp 会话起的 ssh 子进程（pgrep 不可用或 Windows 上
+// 返回 false，调用方据此只在能做有意义断言的平台上检查）。
+func hasLiveSftpChild(host string) bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		return false
+	}
+	out, _ := exec.Command("pgrep", "-fa", "--", host+" sftp").CombinedOutput()
+	return len(bytes.TrimSpace(out)) > 0
 }

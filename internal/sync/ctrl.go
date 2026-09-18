@@ -539,6 +539,12 @@ func (c *Ctrl) drainQueue(r *ruleRuntime) {
 // 过滤都必须调用它。两处一旦各写一份就会漂移，而漂移的代价是把被排除路径当成
 // "远端已删"并删掉本地文件（C2）。
 func inScope(rule config.SyncRule, rel string) bool {
+	// D18 内置忽略：sshore 自己的传输临时文件（中缀 .sshore-sftppart-）永远不属于本规则。
+	// 这是**唯一**判定点：consume 的事件入队过滤与 align 的删除候选过滤都走它，
+	// 一处生效即两处生效，绝不依赖用户配置的 excludes。
+	if watch.IsInternalTemp(rel) {
+		return false
+	}
 	if watch.MatchExclude(rel, rule.Excludes) {
 		return false
 	}
