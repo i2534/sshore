@@ -1642,7 +1642,7 @@ func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
 	return g
 }
 
-// 本文件在 Task 7 里还会补：var ioCopy = io.Copy（便于测试注入）、
+// 本文件在 Task 7 里还会补：var copyStream = io.Copy（便于测试注入）、
 // func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, local string, report func(Progress)) error
 // —— Task 12 的目录传输复用它，避免逐文件建会话。
 // dial 起 ssh -s sftp，把 stdin/stdout 交给 NewClientPipe。
@@ -1891,8 +1891,8 @@ func (e *progressEmitter) send(p Progress, force bool) {
 	e.report(p)
 }
 
-// ioCopy 是 io.Copy 的薄包装，便于测试注入。
-var ioCopy = io.Copy
+// copyStream 是 io.Copy 的薄包装，便于测试注入。
+var copyStream = io.Copy
 
 // countingReader 统计已发送字节（上传方向），base 是续传起点。
 type countingReader struct {
@@ -1995,7 +1995,7 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	em := newProgressEmitter(req.ID, report)
 	cw := &countingWriter{f: f, e: em, p: Progress{Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: part, Total: total, Phase: PhaseTransfer}}
 	em.send(cw.p, true) // 首帧
-	_, cerr := ioCopy(cw, rf)
+	_, cerr := copyStream(cw, rf)
 	_ = rf.Close()
 	_ = f.Close()
 	if cerr != nil {
@@ -2043,7 +2043,7 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 
 `Put` 同理：`!req.Atomic` 时直接 `OpenFile(req.Remote, O_WRONLY|O_CREATE|O_TRUNC)` 写完即返回，不做 `.part`、不做 `PosixRename`、不登记 journal。
 
-（`ioCopy` 是 `io.Copy` 的薄包装，便于测试注入。）
+（`copyStream` 是 `io.Copy` 的薄包装，便于测试注入。）
 
 - [ ] **Step 4: 跑测试 + e2e**
 
@@ -2166,7 +2166,7 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	em := newProgressEmitter(req.ID, report)
 	cr := &countingReader{r: lf, e: em, p: Progress{Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: part, Total: total, Phase: PhaseTransfer}, base: offset}
 	em.send(cr.p, true)
-	n, cerr := ioCopy(wf, cr)
+	n, cerr := copyStream(wf, cr)
 	_ = wf.Close()
 	_ = lf.Close()
 	if cerr != nil {
