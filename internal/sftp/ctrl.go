@@ -36,10 +36,14 @@ func NewCtrlWith(r osutil.Runner, emit forward.EmitFunc, sel TransportSelector) 
 // NewCtrlForcedBackend 返回一个**强制使用给定后端**的门面。forced 字段不可导出，包外
 // （package main）用例只能通过它注入测试后端。
 //
-// 用途仅限测试：Task 9 评审 I1 要求有一条 hermetic 用例钉住绑定层的 Atomic 决策 ——
+// ⚠️ 测试专用（test-only）：唯一的调用点是 app_test.go 的
+// TestSftpBindingsPassAtomicTrueWhenBackendCapable。生产装配一律走 NewCtrl（batch）或
+// NewCtrlWith（按选择器懒解析），**任何生产代码都不得调用本函数** —— 它绕过了
+// resolveTransport 的选择器语义。review 可据此核查：grep 调用点时只应命中 _test.go。
+//
+// 为什么必须导出：Task 9 评审 I1 要求有一条 hermetic 用例钉住绑定层的 Atomic 决策 ——
 // 需要一个 AtomicCapable=true 的记录型后端，才能证明完整能力链
 // Backend.AtomicCapable ⇒ Ctrl.AtomicCapable ⇒ App.sftpAtomic ⇒ 绑定的 TransferRequest.Atomic。
-// 生产装配一律走 NewCtrl（batch）或 NewCtrlWith（按选择器懒解析），绝不走这里。
 func NewCtrlForcedBackend(b Backend) *Ctrl { return &Ctrl{forced: b} }
 
 // —— legacy 四参面：签名逐字不变，但一律走 c.backend() 且 Atomic=false ——

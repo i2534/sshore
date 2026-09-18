@@ -50,6 +50,14 @@ var removeRemote = func(c *sftp.Client, path string) error {
 	return c.Remove(path)
 }
 
+// regEntry 是一次在飞传输在取消表里的条目。committed 在**提交成功之后、末帧进度上报
+// 之前**置位（Task 10 修复轮 1 / I2）：UI 的 emitProgress 是同步回调，若不标记，Cancel
+// 会在「文件其实已落地」的窗口里返回 true。一旦置位，Cancel 只答 false。
+type regEntry struct {
+	sess      *Session
+	committed bool
+}
+
 // GoBackend 是基于 pkg/sftp 的新传输后端（spec D1）。
 // 技术审核 S5：Go 没有 partial struct —— 后续 task 新增字段必须回来改**这一处**声明。
 // 这里一次性声明全部字段，后续 task 只实现方法，避免每个 task 都要改结构体。
@@ -61,8 +69,8 @@ type GoBackend struct {
 	journalDir string       // Task 8：journal 目录（app 用 stateDir() 注入）
 	journal    *swapJournal // Task 8：backup-swap 崩溃恢复
 
-	regMu sync.Mutex // Task 10：id → 会话（取消用）
-	reg   map[string]*Session
+	regMu sync.Mutex // Task 10：id → 在飞传输条目（取消用）
+	reg   map[string]*regEntry
 
 	inflightMu sync.Mutex // Task 11：同目标去重
 	inflight   map[string]string
@@ -76,8 +84,8 @@ func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
 		emit: emit,
 		sel:  sel,
 		// Task 6 评审 M2：这些 map 到 Task 10/11/13 才被写入。构造时就初始化，
-		// 后续 task 直接写字段（g.reg[id] = s 等）不会 panic: assignment to entry in nil map。
-		reg:        map[string]*Session{},
+		// 后续 task 直接写字段（g.reg[id] = e 等）不会 panic: assignment to entry in nil map。
+		reg:        map[string]*regEntry{},
 		inflight:   map[string]string{},
 		knownParts: map[string][2]string{},
 	}
@@ -203,7 +211,8 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	reuse := false
 	defer func() { g.pool.Release(s, reuse) }()
 	// Task 10：会话一取到就登记进取消表（defer 的注销先于 Release 执行 —— LIFO）。
-	defer g.register(req.ID, s)()
+	entry := g.register(req.ID, s)
+	defer g.unregister(req.ID, entry)
 
 	if !req.Atomic {
 		// legacy 面（internal/sync）：直写目标，原子性由 sync 自己的 .part+rename 保证。
@@ -221,6 +230,9 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 		if decideCommit(n, total) != commitOK {
 			return &TransferError{Op: "sftp get", Path: req.Local, Err: shortReadError(n, total, "")}
 		}
+		// legacy 面没有独立的提交步骤：字节全部落盘即视为已完成。先标记 committed 再置
+		// reuse，Cancel 不会在这个收尾窗口里假装取消成功（I2）。
+		g.markCommitted(entry)
 		reuse = true
 		return nil
 	}
@@ -245,6 +257,9 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	if err := os.Rename(part, req.Local); err != nil {
 		return &TransferError{Op: "sftp get", Path: req.Local, PartPath: part, Err: err}
 	}
+	// I2：提交已完成，先标记 committed 再发末帧 —— 末帧经 UI 同步回调，无论它多慢，
+	// Cancel 都只会看到 false（绝不出现「文件已落地却答应用户取消」）。
+	g.markCommitted(entry)
 	// 末帧强制：终值必须达（D7）。done==total 已成立，补发带完整计数的终态。
 	// 时序：**rename 成功之后**才发，保证「末帧 = 提交完成」而不是「字节到齐」——否则
 	// rename 失败时 UI 已经收下 done==total 的成功终态，随后却拿到错误。
@@ -286,11 +301,14 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	reuse := false
 	defer func() { g.pool.Release(s, reuse) }()
 	// Task 10：同 Get —— 会话一取到就登记，函数返回时注销。
-	defer g.register(req.ID, s)()
+	entry := g.register(req.ID, s)
+	defer g.unregister(req.ID, entry)
 
 	if !req.Atomic {
 		// legacy 面（internal/sync / app.SftpPut）：直写目标，不建我方 .part、不提交、不登记 journal。
-		if err := g.putNonAtomic(s, req, total, report); err != nil {
+		// I2：直写路径的末帧在 putNonAtomic 内部发出，这里把 committed 标记传进去，
+		// 保证末帧（同步回调）之前就已置位。
+		if err := g.putNonAtomic(s, req, total, report, func() { g.markCommitted(entry) }); err != nil {
 			return err
 		}
 		reuse = true
@@ -357,6 +375,9 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 		}
 		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, PartPath: part, Err: err, RemoteMsg: remoteMsg}
 	}
+	// I2：提交已完成，先标记 committed 再发末帧（末帧经 UI 同步回调）—— Cancel 绝不
+	// 能在「远端文件已落地」时返回 true。
+	g.markCommitted(entry)
 	// 末帧强制且只有在提交成功之后才发：末帧 = 提交完成（约束 6 的 PartPath 语义）。
 	// PartPath 必须指向**已提交的最终目标**，绝不能填那个已被 rename 掉、不再存在的旧 .part。
 	em.send(Progress{
@@ -380,7 +401,9 @@ func putCopyError(req TransferRequest, part string, err error, stderr string) *T
 // 不做 PosixRename/backup-swap、不登记 journal —— 原子性由调用方（internal/sync 自己的
 // .part+rename）保证。与 Get 的 legacy 分支对称，错误归属同样用 isRemoteError 判据。
 // 先开本地源再开远端目标：本地源打不开时绝不先把远端目标截断。
-func (g *GoBackend) putNonAtomic(s *Session, req TransferRequest, total int64, report func(Progress)) error {
+// markCommitted 由 Put 传入（I2）：必须在末帧（同步回调）之前调用，否则 Cancel 会在
+// 「目标已写完」的窗口里返回 true。可为 nil（测试直调时无注册表条目）。
+func (g *GoBackend) putNonAtomic(s *Session, req TransferRequest, total int64, report func(Progress), markCommitted func()) error {
 	lf, err := os.Open(req.Local)
 	if err != nil {
 		return &TransferError{Op: "sftp put", Path: req.Local, Err: wrapLocalIO(err)}
@@ -402,6 +425,10 @@ func (g *GoBackend) putNonAtomic(s *Session, req TransferRequest, total int64, r
 	}
 	if decideCommit(n, total) != commitOK {
 		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, Err: shortReadError(n, total, "")}
+	}
+	// I2：末帧（同步回调）之前先标记完成，Cancel 不能在收尾窗口里假装取消成功。
+	if markCommitted != nil {
+		markCommitted()
 	}
 	em.send(Progress{
 		Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: req.Remote,
@@ -542,46 +569,90 @@ func (g *GoBackend) CloseAll()                    { g.pool.CloseAll() }
 // 因此声明支持原子提交。绑定层据此把 TransferRequest.Atomic 置 true（Task 9）。
 func (g *GoBackend) AtomicCapable() bool { return true }
 
-// register 把一次在飞传输的会话登记进取消表（id → 会话），返回注销函数。
-// 注销必须在传输返回时执行（成功/失败/取消都一样），否则注册表会残留陈旧键。
+// cancelCloseSession 是 Cancel 关会话的唯一入口（注入点，与 copyStream/posixRename
+// 同思路）。单测用它把「Cancel 删除注册表条目」与「真正关闭会话」之间的窗口加宽成确定性，
+// 从而复现 I3 竞态：Release 已把会话放回 idle，Cancel 随后才关掉它。
+var cancelCloseSession = func(s *Session) { s.close() }
+
+// register 把一次在飞传输登记进取消表（id → 传输条目），返回条目供 markCommitted /
+// unregister 使用。
 //
+// 空 id（legacy 四参面不带 id）一律不登记，Cancel("") 永远 false —— 绝不把「没有身份标识」
+// 的传输暴露成可取消条目，也避免空键被并发无 id 传输互相覆盖（M1）。
+//
+// 注销必须在传输返回时执行（成功/失败/取消都一样），否则注册表会残留陈旧键。
 // 为什么 id 作键是安全的（Task 10 事实 4）：注册表是**进程内**的，进程重启即空，跨重启的
 // 陈旧 id 够不到新进程；又因池的传输并发上限为 1（AcquireTransfer 先取额度再登记），任一
-// 时刻至多一条在飞条目，注销时删掉的必是本次登记的那条，不存在「旧清理抹掉新登记」的 ABA。
-func (g *GoBackend) register(id string, s *Session) func() {
-	g.regMu.Lock()
-	g.reg[id] = s
-	g.regMu.Unlock()
-	return func() {
-		g.regMu.Lock()
-		delete(g.reg, id)
-		g.regMu.Unlock()
+// 时刻至多一条在飞条目。
+func (g *GoBackend) register(id string, s *Session) *regEntry {
+	if id == "" {
+		return nil
 	}
+	e := &regEntry{sess: s}
+	g.regMu.Lock()
+	g.reg[id] = e
+	g.regMu.Unlock()
+	return e
+}
+
+// markCommitted 标记本次传输已成功提交。必须在**末帧进度上报之前**、且在 regMu 下调用：
+// 与 Cancel 的「查表 + 判 committed + 删除」互斥，一旦置位，Cancel 只会看到 false（I2）。
+// 空条目（id==""）是 no-op。
+func (g *GoBackend) markCommitted(e *regEntry) {
+	if e == nil {
+		return
+	}
+	g.regMu.Lock()
+	e.committed = true
+	g.regMu.Unlock()
+}
+
+// unregister 幂等注销（由 Get/Put 的 defer 调用，先于 pool.Release 执行 —— LIFO）。
+// 只有表里仍是**本次**登记的那条时才删：防止迟到的清理抹掉同 id 的新登记（ABA 防御）。
+func (g *GoBackend) unregister(id string, e *regEntry) {
+	if e == nil {
+		return
+	}
+	g.regMu.Lock()
+	if g.reg[id] == e {
+		delete(g.reg, id)
+	}
+	g.regMu.Unlock()
 }
 
 // Cancel 关掉该传输独占的会话（库无逐请求取消，spec §2.3），返回是否真的取消到了一次
 // 在飞传输。整批语义（取消当前项 + 停止派发后续项）由前端编排层落实（spec §6.1）。
 //
 // 诚实契约（Task 14 依赖，绝不为了取悦 UI 返回 true）：
-//   - true 仅当注册表里确实有该 id 的在飞会话（关会话 ⇒ 在飞 read/write 立刻失败 ⇒
-//     done!=total ⇒ 绝不提交；.part 按约定保留作续传锚点）；
-//   - 未知 id / 从未开始 / 已完成（已注销）⇒ false；
+//   - true 仅当注册表里确实有该 id 的**未提交**在飞会话（关会话 ⇒ 在飞 read/write 立刻
+//     失败 ⇒ done!=total ⇒ 绝不提交；.part 按约定保留作续传锚点）；
+//   - 已提交的传输（committed=true）⇒ false：文件已经落地，绝不能说取消了（I2）；
+//   - 未知 id / 空 id / 从未开始 / 已完成（已注销）⇒ false；
 //   - 同一 id 第二次取消 ⇒ false（取消时即从注册表移除，天然幂等，不报错）；
 //   - batch 后端没有长驻会话 ⇒ 恒 false（见 BatchBackend.Cancel）。
 //
-// 并发：取条目、删除都在 regMu 下完成 —— 并发取消同一 id 恰好一个拿到会话返回 true，
-// 其余看到空条目返回 false（-race 干净）。
+// 并发：查表、判 committed、删除都在 regMu 下完成 —— 并发取消同一 id 恰好一个拿到会话返回
+// true，其余返回 false（-race 干净）。close 绝不在锁内：Session.close 要关管道并有界等待
+// 子进程退出（≤5s），持锁会把清理路径一起堵住。
 func (g *GoBackend) Cancel(id string) bool {
+	if id == "" {
+		return false
+	}
 	g.regMu.Lock()
-	s, ok := g.reg[id]
-	if ok {
+	e, ok := g.reg[id]
+	if ok && e != nil && !e.committed {
 		delete(g.reg, id)
+	} else {
+		ok = false
 	}
 	g.regMu.Unlock()
 	if !ok {
 		return false
 	}
-	// 绝不持锁关会话：Session.close 要关管道并有界等待子进程退出，持锁会把清理路径一起堵住。
-	s.close()
+	// I3(b)：关闭前先把会话从 idle 摘掉 —— 竞态里 Release 可能已把它放回 idle。
+	// 注意仍留一条尾巴：RemoveIdle 之后 Release 才追加的话，会话会以 Closed 状态留在
+	// idle；由 AcquireList 出池时的 Closed 兜底拦住（I3(a)），两处缺一不可。
+	g.pool.RemoveIdle(e.sess)
+	cancelCloseSession(e.sess)
 	return true
 }

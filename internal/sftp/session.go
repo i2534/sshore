@@ -150,24 +150,68 @@ func (p *Pool) AcquireTransfer(ctx context.Context, host, user string) (*Session
 
 // AcquireList：优先复用 idle；池空则新建；超出 idle 上限关最久未用者。
 // 绝不排队、绝不因池满失败（spec D2）。
+//
+// I3（修复轮 1）：绝不交出 Closed 会话。Cancel 的「删注册表条目 → close」与 Release 的
+// 「Closed 检查 → 入 idle」之间没有公共锁，竞态可能把一条已关闭会话留在 idle；出池时
+// 必须跳过（从 all 剔除 + 幂等 close）并改新建，否则后续 Capabilities/Probe/List/ListMany
+// 会拿到死会话、报与用户操作无关的伪失败。
 // 注意：调用方一律传 context.Background()，不要传 nil（Probe 会对 ctx 做 WithTimeout）。
 func (p *Pool) AcquireList(ctx context.Context, host, user string) (*Session, error) {
 	key := host + "\x00" + user
-	p.mu.Lock()
-	if lst := p.idle[key]; len(lst) > 0 {
+	for {
+		p.mu.Lock()
+		lst := p.idle[key]
+		if len(lst) == 0 {
+			p.mu.Unlock()
+			break
+		}
 		s := lst[len(lst)-1]
 		p.idle[key] = lst[:len(lst)-1]
+		if len(p.idle[key]) == 0 {
+			delete(p.idle, key)
+		}
+		if s.Closed() {
+			// 已关闭（典型成因：Cancel 在 Release 入 idle 之后才 close）：绝不交出。
+			// close 有界等待子进程退出，必须在放锁之后调用（与 Cancel/Release 同一规约）。
+			delete(p.all, s)
+			p.mu.Unlock()
+			s.close()
+			continue
+		}
 		s.setState(sessBusy)
 		p.mu.Unlock()
 		return s, nil
 	}
-	p.mu.Unlock()
 	s, err := p.dial(host, user)
 	if err != nil {
 		return nil, err
 	}
 	s.setState(sessBusy)
 	return p.track(s), nil
+}
+
+// RemoveIdle 把 s 从 idle 列表里摘掉（若在）。I3(b)：Cancel 在关闭会话之前调用 ——
+// 若竞态里 Release 已把它放回 idle，先撤出可复用队列，绝不留一条即将关闭的会话给
+// 后续 AcquireList。只动 idle，不 close（close 由调用方在锁外执行）。
+// 注意：RemoveIdle 之后再发生的 Release 追加仍有窗口，由 AcquireList 的 Closed 兜底
+// （I3(a)）拦住 —— 两处缺一不可。
+func (p *Pool) RemoveIdle(s *Session) {
+	if s == nil {
+		return
+	}
+	key := s.Host + "\x00" + s.User
+	p.mu.Lock()
+	lst := p.idle[key]
+	for i, e := range lst {
+		if e == s {
+			p.idle[key] = append(lst[:i], lst[i+1:]...)
+			break
+		}
+	}
+	if len(p.idle[key]) == 0 {
+		delete(p.idle, key)
+	}
+	p.mu.Unlock()
 }
 
 // Release：reusable=true 时把会话放回 idle（并按上限 LRU 关闭多余），否则直接关。
