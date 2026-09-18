@@ -3,6 +3,24 @@
 # Uses a throwaway local sshd in a temp dir. Run from repo root.
 set -euo pipefail
 
+usage() {
+  cat <<'USAGE'
+用法: bash e2e/test_local.sh [-h|--help]
+
+环境变量:
+  E2E_RUN  逗号分隔的**用例全名**列表（不是正则，也不接受 | 等正则元字符）。
+           每个名字都必须在该后端的 go test 输出里出现 "--- PASS: <名字>"，
+           少一个就判失败；防线 1/2（有 SKIP / 一个 PASS 都没有）同时生效。
+           未设置时使用脚本内置的完整期望名单：TestGoBackendE2E
+           （TestSyncE2E 要等 GoBackend 的列表/上传补齐、两个后端都能绿之后再追加，
+            否则 gosftp 迭代必然失败）
+           例：E2E_RUN='TestGoBackendE2E,TestCancelWholeBatchE2E' bash e2e/test_local.sh
+USAGE
+}
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMPD="$(mktemp -d)"
 PORT=22901
@@ -23,18 +41,46 @@ cleanup() {
 trap cleanup EXIT
 
 # --- E2E_RUN 校验（必须在起 sshd/生成密钥之前，失败要快速且无残留）---
-# E2E_RUN 是**用例全名**（不是正则）：防线 3 按名字精确比对。若允许 ERE，用户传 "." 会把
-# 「任一用例 PASS」悄悄变成「目标用例 PASS」（Task 6 重审 I2）。故逐字拒绝正则元字符与 /。
-# 不用 case 的括号类：bash 对括号类里的 ( ) 有配对歧义，实测 *[][.\*?+^$(){}|/]* 会把 "." 判成合法。
+# E2E_RUN：逗号分隔的**用例全名**列表（不是正则）。未设置时用内置完整期望名单 ——
+# 之前这里直接引用 $E2E_RUN，在 set -u 下 make e2e 会 "unbound variable" 直接死掉（I1）。
+# 每个名字都走防线 3 逐字比对，少一个就判失败（I3：名单里任何一个缺失都算失败）。
+# 默认名单 = 当前**两个后端都真能跑绿**的完整期望集合。
+# 为什么不直接照抄 plan 的 TestGoBackendE2E,TestSyncE2E：TestSyncE2E 走 sync → Ctrl → backend()
+# → 当前选中的后端，而 gosftp 后端此刻（Task 7）只实现了 Get，ListMany/Put 仍是「未实现」
+# 桩；把它放进默认名单会让 gosftp 迭代必然失败、make e2e 永远不会 0。等 GoBackend 的
+# 列表/上传补齐（Task 8/9/13）后，再把 TestSyncE2E 追加进这一行。
+E2E_DEFAULT_LIST='TestGoBackendE2E'
+E2E_RUN="${E2E_RUN:-$E2E_DEFAULT_LIST}"
+
+# 首/尾逗号会被 read -a 折叠掉（"A," 拆成 [A]，不是 [A,""]），这里显式拒绝，
+# 免得「名单少写一个名字却看不出来」；中间的空项（",,"）仍由下面的遍历兜住。
+if [[ "$E2E_RUN" == ,* || "$E2E_RUN" == *, ]]; then
+  echo "FAIL: E2E_RUN 名单不得以逗号开头或结尾：'$E2E_RUN'" >&2
+  exit 2
+fi
+IFS=',' read -r -a E2E_NAMES <<< "$E2E_RUN"
+if [ "${#E2E_NAMES[@]}" -eq 0 ]; then
+  echo "FAIL: E2E_RUN 为空：需要至少一个用例全名" >&2
+  exit 2
+fi
+# 若允许 ERE，用户传 "." 会把「任一用例 PASS」悄悄变成「目标用例 PASS」（Task 6 重审 I2）。
+# 故逐字拒绝正则元字符与 /。不用 case 的括号类：bash 对括号类里的 ( ) 有配对歧义，
+# 实测 *[][.\*?+^$(){}|/]* 会把 "." 判成合法。
 E2E_BAD_CHARS='][.*?+^$(){}|/\\'
-for (( _i=0; _i<${#E2E_BAD_CHARS}; _i++ )); do
-  _c="${E2E_BAD_CHARS:_i:1}"
-  if [[ "$E2E_RUN" == *"$_c"* ]]; then
-    echo "FAIL: E2E_RUN 只接受用例全名（不得含正则元字符或 /）：'$E2E_RUN'" >&2
+for _name in "${E2E_NAMES[@]}"; do
+  if [ -z "$_name" ]; then
+    echo "FAIL: E2E_RUN 名单里含空项：'$E2E_RUN'" >&2
     exit 2
   fi
+  for (( _i=0; _i<${#E2E_BAD_CHARS}; _i++ )); do
+    _c="${E2E_BAD_CHARS:_i:1}"
+    if [[ "$_name" == *"$_c"* ]]; then
+      echo "FAIL: E2E_RUN 只接受用例全名（不得含正则元字符或 /）：'$_name'" >&2
+      exit 2
+    fi
+  done
 done
-unset _i _c
+unset _i _c _name
 
 echo "== generating test keys =="
 ssh-keygen -t ed25519 -N "" -f "$TMPD/hostkey" -q
@@ -243,15 +289,30 @@ chmod +x "$SHIM/ssh" "$SHIM/sftp"
 # 双后端循环：每次迭代显式导出 SSHORE_SFTP_TRANSPORT，并保留 SSHORE_E2E_*、PATH 垫片、
 # GOPATH/GOMODCACHE/GOCACHE。漏掉任一项都会「别名解析不到 → 测试全 skip → 假绿」。
 #
+# E2E_RUN 名单里的每个用例**逐个**用 -run '^NAME$' 精确跑：绝不把名单拼进 -run 正则
+# （名字里的 | 会被 go test 当正则，静默跑到名单外的用例上）。每次 go test 的 stdout 与
+# stderr 分文件收集，防线只读 stdout（--- PASS / SKIP 行），编译错误留在 stderr 里可读。
 E2E_FAIL=0
 for backend in batch gosftp; do
   echo "--- backend=$backend run=$E2E_RUN ---"
-  OUT="$(PATH="$SHIM:$PATH" \
-     GOPATH="$REAL_GOPATH" GOMODCACHE="$REAL_GOMODCACHE" GOCACHE="$REAL_GOCACHE" \
-     SSHORE_E2E_HOST=sshore-e2e SSHORE_E2E_REMOTE="$REMOTE_DIR" \
-     SSHORE_SFTP_TRANSPORT="$backend" \
-     HOME="$HOME" go test ./internal/sftp/ ./internal/sync/ -run "^${E2E_RUN}\$" -count=1 -v 2>&1)" || E2E_FAIL=1
-  printf '%s\n' "$OUT"
+  OUT=""
+  for _name in "${E2E_NAMES[@]}"; do
+    printf '>>> -run ^%s$ (backend=%s)\n' "$_name" "$backend"
+    _iter_out="$(mktemp)"; _iter_err="$(mktemp)"
+    if PATH="$SHIM:$PATH" \
+         GOPATH="$REAL_GOPATH" GOMODCACHE="$REAL_GOMODCACHE" GOCACHE="$REAL_GOCACHE" \
+         SSHORE_E2E_HOST=sshore-e2e SSHORE_E2E_REMOTE="$REMOTE_DIR" \
+         SSHORE_SFTP_TRANSPORT="$backend" \
+         HOME="$HOME" go test ./internal/sftp/ ./internal/sync/ -run "^$_name\$" -count=1 -v >"$_iter_out" 2>"$_iter_err"; then
+      :
+    else
+      E2E_FAIL=1
+    fi
+    cat "$_iter_out"
+    if [ -s "$_iter_err" ]; then cat "$_iter_err" >&2; fi
+    OUT="$OUT$(cat "$_iter_out")"$'\n'
+    rm -f "$_iter_out" "$_iter_err"
+  done
   # 假绿防线 1：任何用例 SKIP 都说明环境没送达（缺 env / 垫片失效），必须失败。
   if printf '%s\n' "$OUT" | grep -q '^--- SKIP'; then
     echo "FAIL: backend=$backend 有用例被 SKIP（SSHORE_E2E_* 或 PATH 垫片没生效）—— 假绿，不接受" >&2
@@ -262,17 +323,19 @@ for backend in batch gosftp; do
     echo "FAIL: backend=$backend 没有任何用例真正通过（-run 未匹配 / 编译失败）" >&2
     E2E_FAIL=1
   fi
-  # 假绿防线 3（I2，Task 6 重审）：PASS 必须来自**目标用例本身**，而不是同一批 -run 里
-  # 任意一个无关用例。防线 2 只看「有无 PASS」：目标用例一旦改名/被 -run 漏掉，无关用例
-  # 仍能撑过防线 —— 双后端迭代会退化成「随便跑点什么都算数」。
-  # 这里用 grep -qxF **逐字精确**比对（-x 整行、-F 字面量、无 -E）：Task 6 原版是 -qE
-  # 非锚定 ERE，重审已证明「目标用例改名 + 一个名字含同正则的空用例」能让 harness 假绿。
+  # 假绿防线 3（I2/I3，Task 6 重审 + Task 7 评审）：**名单里的每一个**名字都必须出现
+  # "--- PASS: <name>"。用 grep -qxF **逐字精确**比对（-x 整行、-F 字面量、无 -E）：
+  # Task 6 原版是 -qE 非锚定 ERE，重审已证明「目标用例改名 + 一个名字含同正则的空用例」
+  # 能让 harness 假绿；只比对名单第一项则会让「名单里有名字缺失」蒙混过关。
   PASSED_NAMES="$(printf '%s\n' "$OUT" | sed -n 's/^--- PASS: \([^ ]*\).*/\1/p')"
-  if [ -z "$PASSED_NAMES" ] || ! printf '%s\n' "$PASSED_NAMES" | grep -qxF -- "$E2E_RUN"; then
-    echo "FAIL: backend=$backend 没有名字**精确等于** E2E_RUN='$E2E_RUN' 的用例真正 PASS（目标用例被改名 / 被 -run 漏掉）" >&2
-    E2E_FAIL=1
-  fi
+  for _name in "${E2E_NAMES[@]}"; do
+    if [ -z "$PASSED_NAMES" ] || ! printf '%s\n' "$PASSED_NAMES" | grep -qxF -- "$_name"; then
+      echo "FAIL: backend=$backend 没有名字**精确等于** E2E_RUN 名单项 '$_name' 的用例真正 PASS（目标用例被改名 / 被 -run 漏掉）" >&2
+      E2E_FAIL=1
+    fi
+  done
 done
+unset _name
 [ "$E2E_FAIL" -eq 0 ] || exit 1
 
-echo "== ALL E2E TESTS PASSED (backend matrix: batch + gosftp) =="
+echo "== ALL E2E TESTS PASSED (backend matrix: batch + gosftp; E2E_RUN=$E2E_RUN) =="
