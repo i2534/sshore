@@ -29,6 +29,12 @@ func TestGoBackendE2E(t *testing.T) {
 		t.Fatalf("能力探测失败（会话没起来）: %v", err)
 	}
 	t.Logf("posix-rename 能力: %v", ok)
+	// I1：能力探测结果必须断言，不能只 Log。plan 的 Expected 是 true（本地 sshd 与
+	// Win32-OpenSSH 9.5p1 都由 internal-sftp 提供该扩展）；只 Log 的话，将来探测
+	// 静默变 false（按裁决 1 会让 atomic 提交不可用）harness 仍然全绿。
+	if !ok {
+		t.Fatalf("远端未提供 posix-rename@openssh.com（预期 true）：能力探测静默降级会让 atomic 提交不可用")
+	}
 	if _, err := g.List(host, "", remote); err == nil {
 		t.Log("提示：List 已实现（若已执行到 Task 13 则正常）")
 	}

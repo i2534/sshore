@@ -248,6 +248,14 @@ for backend in batch gosftp; do
     echo "FAIL: backend=$backend 没有任何用例真正通过（-run 未匹配 / 编译失败）" >&2
     E2E_FAIL=1
   fi
+  # 假绿防线 3（I2）：PASS 必须来自**目标用例**（名字匹配 E2E_RUN 的用例），而不是同一批
+  # -run 里任意一个无关用例。防线 2 只看「有无 PASS」：目标用例一旦改名/被 -run 漏掉，
+  # 无关用例仍能撑过防线 —— 双后端迭代会退化成「随便跑点什么都算数」。
+  PASSED_NAMES="$(printf '%s\n' "$OUT" | sed -n 's/^--- PASS: \([^ ]*\).*/\1/p')"
+  if [ -z "$PASSED_NAMES" ] || ! printf '%s\n' "$PASSED_NAMES" | grep -qE "$E2E_RUN"; then
+    echo "FAIL: backend=$backend 没有名字匹配 E2E_RUN='$E2E_RUN' 的用例真正 PASS（目标用例被改名 / 被 -run 漏掉）" >&2
+    E2E_FAIL=1
+  fi
 done
 [ "$E2E_FAIL" -eq 0 ] || exit 1
 

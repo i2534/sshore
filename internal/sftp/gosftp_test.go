@@ -137,21 +137,79 @@ func TestNewGoBackendWiresPoolAndDeclaredFields(t *testing.T) {
 		t.Fatalf("池没有走 GoBackend.dial: %v", err)
 	}
 
-	// 后续 task 的容器字段必须已声明（编译期即证）；这里钉住可用性。
-	g.regMu.Lock()
-	if g.reg == nil {
-		g.reg = map[string]*Session{}
+	// 后续 task 的容器字段必须已声明且已初始化（M2）；写入路径见
+	// TestGoBackendMapsWritableAfterConstruction，这里只钉住非 nil。
+	if g.reg == nil || g.inflight == nil || g.knownParts == nil {
+		t.Fatalf("构造后 map 字段不得为 nil: reg=%v inflight=%v knownParts=%v", g.reg, g.inflight, g.knownParts)
 	}
-	g.reg["id"] = nil
-	g.regMu.Unlock()
-	g.inflightMu.Lock()
-	g.inflight = map[string]string{"id": "key"}
-	g.inflightMu.Unlock()
-	g.partsMu.Lock()
-	g.knownParts = map[string][2]string{"id": {"/l", "/r"}}
-	g.partsMu.Unlock()
-	if got := g.knownParts["id"]; got != [2]string{"/l", "/r"} {
-		t.Fatalf("knownParts 字段不可用: %v", got)
+}
+
+// TestGoBackendMapsWritableAfterConstruction 是 Task 6 评审 M2 的回归测试：
+// Task 10/11/13 会直接写 reg/inflight/knownParts，构造后这些 map 必须已可用，
+// 不能再由调用方手工兜底 —— 否则迟到的 task 一写就 panic: assignment to entry in nil map。
+func TestGoBackendMapsWritableAfterConstruction(t *testing.T) {
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("直接写 map 字段触发 panic（M2 未修）: %v", r)
+			}
+		}()
+		g.regMu.Lock()
+		g.reg["id"] = nil
+		g.regMu.Unlock()
+		g.inflightMu.Lock()
+		g.inflight["id"] = "key"
+		g.inflightMu.Unlock()
+		g.partsMu.Lock()
+		g.knownParts["id"] = [2]string{"/l", "/r"}
+		g.partsMu.Unlock()
+	}()
+	if len(g.reg) != 1 || g.inflight["id"] != "key" || g.knownParts["id"] != [2]string{"/l", "/r"} {
+		t.Fatalf("写入后读数不对: reg=%v inflight=%v knownParts=%v", g.reg, g.inflight, g.knownParts)
+	}
+}
+
+// TestGoBackendConnectedTruthful 是 Task 6 评审 I3 的回归测试：Connected 必须真实反映
+// 「本 host 是否成功建立过会话」。会话惰性建立 —— 未连过 false；成功 dial 入池（Connect 的
+// 握手探测同样走池）后 true（含会话停在 idle 的情况，正是 UI 误显示未连接的场景）；
+// 未连过的其他 host 仍 false；Disconnect 关掉后回到 false。
+func TestGoBackendConnectedTruthful(t *testing.T) {
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
+	const host = "prod-01"
+	if g.Connected(host) {
+		t.Fatal("从未连接过就必须 false（会话惰性建立）")
+	}
+	if g.Connected("unrelated") {
+		t.Fatal("从未连接过的其他 host 必须 false")
+	}
+
+	// 用必定成功的 dial 替换池接线，模拟成功握手（不联网、不起真实 ssh）。
+	orig := g.pool.dial
+	g.pool.dial = func(h, u string) (*Session, error) { return &Session{Host: h, User: u}, nil }
+	t.Cleanup(func() { g.pool.dial = orig })
+
+	s, err := g.pool.AcquireList(context.Background(), host, "")
+	if err != nil {
+		t.Fatalf("AcquireList: %v", err)
+	}
+	if !g.Connected(host) {
+		t.Fatal("成功 dial 入池后必须 true —— 否则 UI 显示未连接（I3 回归）")
+	}
+	if g.Connected("unrelated") {
+		t.Fatal("未连接过的 host 不得被顺带点亮（不得对未连接 host 造 true）")
+	}
+	g.pool.Release(s, true) // 会话停在 idle：I3 现象正是「池中有 idle 仍显示未连接」
+	if !g.Connected(host) {
+		t.Fatal("会话在池中 idle 时必须 true")
+	}
+	if err := g.Disconnect(host); err != nil {
+		t.Fatalf("Disconnect: %v", err)
+	}
+	if g.Connected(host) {
+		t.Fatal("Disconnect 关掉会话后必须回到 false")
 	}
 }
 
