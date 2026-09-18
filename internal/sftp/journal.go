@@ -12,13 +12,23 @@ import (
 // swapJournal 是 backup-swap 崩溃恢复日志（spec D8 / 决策 backup-swap）。
 //
 // 背景：远端的「.part → target」提交在 OpenSSH 上没有可覆盖的普通 rename，
-// 只能用 backup-swap（target → bak，part → target）。两条 rename 之间进程崩溃会留下
-// 「target 已改名成 bak、新内容还没落位」的窗口；journal 在第一条 rename 成功之后、
-// 第二条之前落盘，供下次启动（Task 13）恢复。
+// 只能用 backup-swap（target → bak，part → target）。journal 的 intent（target/bak/part
+// 三元组）在**任何破坏性 rename 之前**落盘（C1 修复轮 1），覆盖两个崩溃窗口：
+//   - intent 已写、target→bak 尚未执行：target 旧内容仍在其原名下，恢复只需清掉陈条条目；
+//   - target→bak 已执行、part→target 尚未执行：target 名暂缺而旧内容在随机 bak 名里，
+//     恢复侧必须从 journal 拿到 bak，才能回滚或补完（bak 名无法从 target 反推，
+//     长路径退化名更是只保留目录）。
+//
+// 因此「先改名再登记」是不允许的：那会留下「target 名已消失、journal 仍空」的不可恢复窗口。
 //
 // 真相在磁盘（$dir/swap-entries.json），不是内存缓存：Begin/Done/Recover 每次都读改写，
 // 因此「重启后新实例」能读到上一个进程留下的未完成项。写入用 tmp+rename 保证原子
 // （半截 JSON 比没有 journal 更危险：会让恢复误判）。
+//
+// 并发（多实例注意）：mu 是**实例级**互斥，只序列化同一个 swapJournal 的读改写。
+// 若两个进程/两个 swapJournal 实例共享同一状态目录，会互相丢更新（lost update）。
+// 当前设计只有 app 装配出的**唯一** GoBackend 一个写者；Task 13 必须保持「单写者」，
+// 否则要换成文件锁（flock/LockFileEx）。
 type swapJournal struct {
 	dir string
 	mu  sync.Mutex
@@ -98,8 +108,9 @@ func (j *swapJournal) store(entries []swapEntry) error {
 	return nil
 }
 
-// Begin 在 target → bak 已成功、part → target 尚未执行时登记一条未完成项。
-// 同一 target 重复 Begin（上次已回滚/本次重试）替换旧条目，绝不累积重复 target。
+// Begin 在**任何破坏性改名之前**登记一条 intent（target,bak,part）（C1 修复轮 1）。
+// 调用方契约：Begin 返回错误时不得再执行 target→bak —— 否则会进入无 journal 保护的窗口。
+// 同一 target 重复 Begin（上次失败/本次重试）替换旧条目，绝不累积重复 target。
 func (j *swapJournal) Begin(target, bak, part string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -134,18 +145,16 @@ func (j *swapJournal) Done(target string) error {
 	return j.store(out)
 }
 
-// Recover 返回所有未完成的目标路径（供启动时恢复）。只读，不改动 journal 文件；
-// 读取失败或文件损坏时返回 nil —— 恢复是尽力而为，绝不让坏文件阻断启动。
-func (j *swapJournal) Recover() []string {
+// Recover 返回所有未完成的 swap 条目（target+bak+part），供启动时恢复。
+// 必须给出完整三元组：bak 是随机名，恢复侧无法从 target 反推，长路径退化名更只保留目录。
+// 只读，不改动 journal 文件；读取失败或文件损坏时返回 nil —— 恢复是尽力而为，
+// 绝不让坏文件阻断启动（损坏的 journal 会让这一条 swap 无法自动恢复，但不阻止其它操作）。
+func (j *swapJournal) Recover() []swapEntry {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	entries, err := j.load()
 	if err != nil {
 		return nil
 	}
-	out := make([]string, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, e.Target)
-	}
-	return out
+	return entries
 }

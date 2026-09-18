@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pkg/sftp"
 
@@ -34,6 +35,19 @@ const posixRenameExt = "posix-rename@openssh.com"
 // 「返回非 nil → 必须回退 backup-swap」两条分支（约束 3），故做成变量。
 var posixRename = func(c *sftp.Client, oldname, newname string) error {
 	return c.PosixRename(oldname, newname)
+}
+
+// renameRemote / removeRemote 是 backup-swap 两条普通 rename 与 bak 清理的注入点
+// （与 posixRename 同思路）。做成变量有两个必要用途：
+//  1. 单测能在「破坏性改名动手之前」观测 journal 是否已落盘（C1 顺序不变量）；
+//  2. 单测能稳定构造非 ENOENT 的 rename 失败与回滚失败，不必依赖服务端对 rename 的
+//     具体 errno（I4/I3）。
+var renameRemote = func(c *sftp.Client, oldname, newname string) error {
+	return c.Rename(oldname, newname)
+}
+
+var removeRemote = func(c *sftp.Client, path string) error {
+	return c.Remove(path)
 }
 
 // GoBackend 是基于 pkg/sftp 的新传输后端（spec D1）。
@@ -125,7 +139,7 @@ func (g *GoBackend) Capabilities(host, user string) (bool, error) {
 		g.pool.Release(s, false)
 		return false, errors.New("会话没有 SFTP 连接")
 	}
-	_, ok := s.Conn.HasExtension("posix-rename@openssh.com")
+	_, ok := s.Conn.HasExtension(posixRenameExt)
 	g.pool.Release(s, true)
 	return ok, nil
 }
@@ -140,6 +154,22 @@ func (g *GoBackend) SetJournalDir(dir string) {
 		return
 	}
 	g.journal = newSwapJournal(dir)
+}
+
+// warnf 发一条 warn 级 SFTP 日志（SourceType=sftp, SourceID=host）。emit 为 nil（测试/
+// 未接线）时静默，与 BatchBackend.logEvent 一致。commitRemote 用它上报「已提交但清理
+// 失败」这类不改变成功结论、却必须可观测的异常（I3 修复轮 1）。
+func (g *GoBackend) warnf(host, format string, args ...any) {
+	if g.emit == nil {
+		return
+	}
+	g.emit(forward.Event{
+		SourceType: "sftp",
+		SourceID:   host,
+		TS:         time.Now().Format(time.RFC3339),
+		Level:      "warn",
+		Message:    fmt.Sprintf(format, args...),
+	})
 }
 
 // —— Task 7-13 才实现的正文；本 task 只落引导与能力探测（自审 S7）——
@@ -236,7 +266,9 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 // Remote 家族（path.Dir）—— Windows 客户端的 filepath 会把远端 / 变成 \，临时文件会落到
 // 别的目录（Task 2 评审 Important-2）。失败/取消保留远端 .part 作为 Task 11 续传锚点。
 //
-// 续传（Task 11）预接线：req.Resume 时用 O_WRONLY（**严禁 O_TRUNC**）并 Seek(offset)。
+// 续传（Task 11 负责 offset 判定与去重）：req.Resume 时远端 .part 用 O_WRONLY
+// （**严禁 O_TRUNC**）并 Seek(offset)，**本地源也必须 Seek 到同一 offset** ——
+// 只 Seek 远端而本地从 0 读，会把源的第 0 字节写到远端 offset 处，拼出损坏文件。
 func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	st, err := os.Stat(req.Local)
 	if err != nil {
@@ -291,6 +323,15 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 		// 本地源打不开：远端 .part 已建出、按约束 4 保留可续传，但不附远端 stderr（本地错误）。
 		return &TransferError{Op: "sftp put", Path: req.Local, PartPath: part, Err: wrapLocalIO(err)}
 	}
+	if req.Resume && offset > 0 {
+		// 上传续传：本地源与远端 .part 必须从同一 offset 续写（见上）。offset 的选择由
+		// Task 11 的 decideResume 负责；这里只保证两侧对称，避免拼出损坏文件。
+		if _, err := lf.Seek(offset, io.SeekStart); err != nil {
+			_ = wf.Close()
+			_ = lf.Close()
+			return &TransferError{Op: "sftp put", Path: req.Local, PartPath: part, Err: wrapLocalIO(err)}
+		}
+	}
 	em := newProgressEmitter(req.ID, report)
 	// 首帧 Done 从续传起点起算，UI 不会在续传时先看到 0。
 	cr := &countingReader{r: lf, e: em, p: Progress{Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: part, Done: offset, Total: total, Phase: PhaseTransfer}, base: offset}
@@ -304,7 +345,7 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	if decideCommit(n+offset, total) != commitOK {
 		return &TransferError{Op: "sftp put", Path: req.Remote, PartPath: part, Err: shortReadError(n+offset, total, part)}
 	}
-	if err := commitRemote(s, hasPosix, part, req.Remote, g.journal); err != nil {
+	if err := commitRemote(s, hasPosix, part, req.Remote, g.journal, func(f string, a ...any) { g.warnf(s.Host, f, a...) }); err != nil {
 		// 提交失败：只有真正的远端失败才附 stderr；.part 仍在（提交没成功）⇒ 如实给出锚点。
 		var remoteMsg string
 		if isRemoteError(err) {
@@ -371,34 +412,84 @@ func (g *GoBackend) putNonAtomic(s *Session, req TransferRequest, total int64, r
 // 一律回退 backup-swap（约束 3：Task 0 只在 6 次运行、零次独立失败上观测到覆盖成功，
 // 绝不把「扩展可用」当「覆盖必成」）。
 //
-// backup-swap 的顺序是 target → bak，part → target：**绝不先删目标**，替换物没落位前
-// 目标内容始终存在（要么原名、要么 bak 名）。第一条 rename 成功后登记 journal，
-// 第二条失败则回滚 bak → target 并原样上报。只有「目标本来就不存在」的 ENOENT 才走
-// 直接提交；其它错误（权限/被占用）必须上报，否则会把失败当成功还绕过 journal。
-func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal) error {
+// backup-swap 的顺序（C1 修复轮 1 重排）：
+//  1. 先把 (target,bak,part) 三元组写进 journal —— **intent 必须先于任何破坏性改名落盘**。
+//     旧顺序（先 target→bak 再 Begin）中间的崩溃会留下「target 名已消失、journal 仍空」，
+//     旧内容只剩在随机 bak 名里，恢复侧无法从 bak 反推 target（长路径退化名更只剩目录）。
+//  2. Rename(target,bak)；3. Rename(part,target)；4. Done 并删 bak。
+//
+// 只有「目标本来就不存在」的 ENOENT 才走直接提交；其它错误（权限/被占用）必须上报。
+//
+// 错误策略（I3 修复轮 1，逐条明确）：
+//   - journal.Begin 失败 → 立刻返回，**绝不动 target**（否则进入无 journal 保护的破坏窗口）。
+//   - Rename(target,bak) 非 ENOENT 失败 → 原样返回该错误；顺手尽力清掉刚写的 intent，
+//     清不掉只 warn（主错误照报）。
+//   - Rename(part,target) 失败 → 回滚 bak→target：回滚成功则**清条目**（I2）并返回原错误；
+//     回滚失败则**保留条目**并把回滚错误一并返回（供下次启动按 journal 恢复）。
+//   - 提交已成功后的清理失败（Done / Remove(bak)）**不改变「提交成功」这一事实**，
+//     只发 warn 日志：这里返回错误会让 Put 报失败，并发布一个已被 rename 掉、不存在的
+//     PartPath（假锚点）。warn 不是静默 —— logf 为 nil（纯单测）时才丢弃，与 emit=nil 一致。
+func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal, logf func(string, ...any)) error {
+	warn := func(format string, args ...any) {
+		if logf != nil {
+			logf(format, args...)
+		}
+	}
 	if hasPosix {
 		if err := posixRename(s.Conn, part, target); err == nil {
 			return nil
 		}
 	}
 	bak := BakNameRemote(target) // 远端 POSIX 路径：必须用 Remote 家族
-	if err := s.Conn.Rename(target, bak); err != nil {
+	// 1) intent 先落盘；Begin 失败绝不进入破坏性改名。
+	if j != nil {
+		if err := j.Begin(target, bak, part); err != nil {
+			return fmt.Errorf("登记 swap journal 失败，未改动目标: %w", err)
+		}
+	}
+	// 2) target → bak。绝不先删目标：替换物没落位前目标内容始终存在（原名或 bak 名）。
+	if err := renameRemote(s.Conn, target, bak); err != nil {
 		if !os.IsNotExist(err) {
+			// I4：非 ENOENT（权限/被占用）必须上报，绝不当作「目标不存在」直接提交 ——
+			// 那会把失败当成功，还会绕过 journal。target 没被动，清掉已无意义的 intent。
+			if j != nil {
+				if derr := j.Done(target); derr != nil {
+					warn("清理 swap journal 条目失败（目标改名失败时）: %v", derr)
+				}
+			}
 			return err
 		}
-		return s.Conn.Rename(part, target)
+		// 目标原本不存在：无旧内容可丢，直接提交；intent 已无意义，先清（清不掉只 warn）。
+		if j != nil {
+			if derr := j.Done(target); derr != nil {
+				warn("清理 swap journal 条目失败（目标本不存在时）: %v", derr)
+			}
+		}
+		return renameRemote(s.Conn, part, target)
 	}
-	if j != nil {
-		_ = j.Begin(target, bak, part)
-	}
-	if err := s.Conn.Rename(part, target); err != nil {
-		_ = s.Conn.Rename(bak, target) // 回滚：替换物没落位，绝不丢目标
+	// 3) part → target。
+	if err := renameRemote(s.Conn, part, target); err != nil {
+		// 回滚：替换物没落位，绝不丢目标。回滚成功才清条目；失败必须保留条目并上报。
+		if rbErr := renameRemote(s.Conn, bak, target); rbErr != nil {
+			return fmt.Errorf("提交失败: %w; 回滚 %s → %s 亦失败（journal 条目已保留，待恢复）: %v",
+				err, bak, target, rbErr)
+		}
+		if j != nil {
+			if derr := j.Done(target); derr != nil {
+				return fmt.Errorf("%w（回滚成功但清理 journal 失败，条目保留）: %v", err, derr)
+			}
+		}
 		return err
 	}
+	// 4) 提交成功：清理失败只 warn（见函数头错误策略）。
 	if j != nil {
-		_ = j.Done(target)
+		if err := j.Done(target); err != nil {
+			warn("提交成功但清理 swap journal 条目失败: %v", err)
+		}
 	}
-	_ = s.Conn.Remove(bak)
+	if err := removeRemote(s.Conn, bak); err != nil && !os.IsNotExist(err) {
+		warn("提交成功但删除备份 %s 失败（残留孤儿 bak，由临时文件清理兜底）: %v", bak, err)
+	}
 	return nil
 }
 

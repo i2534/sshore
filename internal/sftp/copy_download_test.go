@@ -492,6 +492,9 @@ func TestCopyFileToLocalReturnsPartWithoutCommitting(t *testing.T) {
 // TestCopyFileToLocalLocalOpenErrorIsPathError：本地 .part 建不出来时（只读父目录）
 // 必须原样返回 *os.PathError（Get 据此把错误归到本地路径而不是远端）。
 func TestCopyFileToLocalLocalOpenErrorIsPathError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 下 CAP_DAC_OVERRIDE 会绕过目录权限，0500 不构成只读")
+	}
 	remoteRoot := t.TempDir()
 	roParent := t.TempDir() // 只读父目录 ⇒ 连 .part 也建不出来（父目录不可写）
 	if err := os.Chmod(roParent, 0500); err != nil {
@@ -588,6 +591,9 @@ func TestGoBackendGetShortReadPartPathOnError(t *testing.T) {
 // TestGoBackendGetReadOnlyDestPartPathIsEmpty（Task 7 评审 I2）：本地 .part 建不出来时
 // TransferError.PartPath 必须为空。假锚点会让 Task 11 拿到一条 ENOENT 的「可续传」路径。
 func TestGoBackendGetReadOnlyDestPartPathIsEmpty(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 下 CAP_DAC_OVERRIDE 会绕过目录权限，0500 不构成只读")
+	}
 	remoteRoot := t.TempDir()
 	roParent := t.TempDir()
 	if err := os.Chmod(roParent, 0500); err != nil { // 父目录不可写 ⇒ .part 建不出来
@@ -622,6 +628,9 @@ func TestGoBackendGetReadOnlyDestPartPathIsEmpty(t *testing.T) {
 // 绝不能被非空的远端 stderr 盖掉。api.go 的 Error() 优先打印 RemoteMsg；若本地错误也被
 // 套上 stderr，生产上就会看到远端噪音而看不到「本地磁盘/权限」这个真正原因。
 func TestGoBackendGetLocalErrorNotMaskedByStderr(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 下 CAP_DAC_OVERRIDE 会绕过目录权限，0500 不构成只读")
+	}
 	remoteRoot := t.TempDir()
 	roParent := t.TempDir()
 	if err := os.Chmod(roParent, 0500); err != nil {
@@ -718,6 +727,9 @@ func noisyProcForDial(t *testing.T, g *GoBackend, name string, args ...string) *
 // 不能被非空远端 stderr 盖掉。该分支经 ctrl.go 的 legacy 四参面被 internal/sync 实际调用，
 // 与原子路径共用 isRemoteError(err) 判据。
 func TestGoBackendGetLegacyLocalErrorNotMaskedByStderr(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 下 CAP_DAC_OVERRIDE 会绕过目录权限，0500 不构成只读")
+	}
 	remoteRoot := t.TempDir()
 	roParent := t.TempDir()
 	if err := os.Chmod(roParent, 0500); err != nil { // 父目录不可写 ⇒ 目标文件建不出来
