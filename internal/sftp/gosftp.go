@@ -451,14 +451,25 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 			remoteMsg = s.Proc.StderrText()
 		}
 		// I4（Task 17 修复波）：单文件失败/取消路径也必须补发一发强制末帧，带**诚实计数**
-		// （Done=已落盘字节、Total=远端源大小），与目录失败路径 tp.fail 对称。part 为空表示
-		// .part 根本没建出来（远端 Stat/Open 失败或本地 OpenFile 失败），此时 Done/Total 都还
-		// 没有意义（helper 契约即 0/0）—— 帧仍要发（终态必达，D7），只是计数保持 0。
-		// PartPath 与成功末帧同一语义：指向目标侧路径（req.Local），失败时 .part 由 *_PartPath
-		// 契约单独上报，不在这里重复。
+		// （Done=已落盘字节、Total=远端源大小），与目录失败路径 tp.fail 对称。
+		//
+		// PartPath 契约（Task 7 M1 + Task 17 修复轮 2）：**只有成功末帧**才填已提交的目标
+		// req.Local；失败帧必须填**保留下来、可续传的 .part**（与 te.PartPath、目录路径
+		// tp.fail(te.PartPath) 同一语义）。原因不是外观：前端 applyProgress 会用非空
+		// partPath 覆盖 rec.partPath，失败行随即提供 clean —— 填最终目标会让「清理」去删
+		// 用户已有的目标文件（下载）或远端已有文件（上传）。
+		//
+		// part 为空表示 .part 根本没建出来（远端 Stat/Open 失败或本地 OpenFile 失败）：
+		// PartPath 必须为空（前端据此只给重试，不给续传/清理），同时 Done/Total 归零 ——
+		// 绝不用一个非零 Total 暗示存在可续传的 .part（helper 对本地 OpenFile 失败返回的
+		// total 只对错误诊断有意义）。帧仍要发（终态必达，D7）。
+		lastPart, lastDone, lastTotal := part, done, total
+		if part == "" {
+			lastDone, lastTotal = 0, 0
+		}
 		newProgressEmitter(req.ID, report).send(Progress{
-			Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: req.Local,
-			Done: done, Total: total, Phase: PhaseTransfer,
+			Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: lastPart,
+			Done: lastDone, Total: lastTotal, Phase: PhaseTransfer,
 		}, true)
 		// part 非空 ⇔ .part 已真实存在（helper 契约）：失败/取消保留它作 Task 11 续传锚点。
 		// part 为空且错误是远端 Stat/Open → 没建任何本地文件；错误是本地 OpenFile 失败 →
@@ -803,9 +814,13 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	}
 	_ = wf.Close()
 	_ = lf.Close()
+	// PartPath 契约（Task 17 修复轮 2）：失败帧必须填**保留下来、可续传的远端 .part**
+	// （与返回的 te.PartPath 同一语义），绝不填已提交目标 req.Remote —— 那是成功帧的语义。
+	// 前端会拿失败帧的 partPath 覆盖 rec.partPath 并据此提供「清理」，填目标会让清理删掉
+	// 远端已有的同名文件。此处 part 必非空（上面 OpenFile(part) 已成功）。
 	failFrame := func() {
 		em.send(Progress{
-			Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: req.Remote,
+			Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: part,
 			Done: written, Total: total, Phase: PhaseTransfer,
 		}, true)
 	}
