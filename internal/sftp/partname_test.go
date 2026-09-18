@@ -1,8 +1,10 @@
 package sftp
 
 import (
+	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -95,6 +97,24 @@ func TestIsInternalTempRejectsNormalFiles(t *testing.T) {
 func TestMarkerLiteralIsPinned(t *testing.T) {
 	if PartMarker != ".sshore-sftppart-" {
 		t.Fatalf("marker 字面量漂移：%q（前端 Task 14 硬编码同一字面量，spec:271）", PartMarker)
+	}
+}
+
+// TestPartMarkerPinnedWithFrontend（Task 14 修复轮 1 / 评审 M2）：marker 是前后端唯一共享的
+// 字面量。两边各自钉自己的字面量仍不够 —— 只改一侧、连它自己那侧的字面量用例一起改，整个仓库
+// 依然全绿。这里直接读前端 frontend/src/utils/queue.js 的 PART_MARKER 与 sftp.PartMarker 逐字
+// 比对：任一侧单独漂移都会在这里变红。反向（前端读本文件比对）见 queue.test.js。
+func TestPartMarkerPinnedWithFrontend(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "frontend", "src", "utils", "queue.js"))
+	if err != nil {
+		t.Fatalf("读前端 PART_MARKER 失败: %v", err)
+	}
+	m := regexp.MustCompile(`export const PART_MARKER\s*=\s*'([^']+)'`).FindSubmatch(b)
+	if m == nil {
+		t.Fatal("frontend/src/utils/queue.js 里找不到 export const PART_MARKER = '…'")
+	}
+	if string(m[1]) != PartMarker {
+		t.Fatalf("前后端临时文件中缀不一致：Go %q，前端 %q", PartMarker, string(m[1]))
 	}
 }
 

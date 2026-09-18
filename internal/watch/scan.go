@@ -31,11 +31,12 @@ type ListManyFunc func(host, user string, paths []string) (map[string][]sftp.Ite
 const scanBatch = 64
 
 // IsInternalTemp 判定 sshore 自己的临时文件；sync 的 align/ScanTree 与面板都不该把它
-// 当业务文件。与 internal/sftp.PartMarker 同字面量；两边各自单测钉住（D18）。
+// 当业务文件。**直接引用 internal/sftp.PartMarker**，不再抄第三份字面量（Task 14 评审 M2）：
+// 改 sftp.PartMarker 时这里跟着变，而前后端互钉用例（partname_test.go）会拦住只改一侧。
 // 用中缀（Contains）而不是前缀：常规名是 <name>.sshore-sftppart-…，退化短名才是
 // .sshore-sftppart-… 开头；两种都要命中，且备份名复用同一中缀 ⇒ 一条规则全覆盖。
 func IsInternalTemp(rel string) bool {
-	return strings.Contains(path.Base(rel), ".sshore-sftppart-")
+	return strings.Contains(path.Base(rel), sftp.PartMarker)
 }
 
 // MatchExclude 判定相对路径是否命中忽略规则。
