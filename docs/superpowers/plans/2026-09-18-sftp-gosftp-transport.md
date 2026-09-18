@@ -1466,13 +1466,15 @@ type fakeBackend struct {
 func (f *fakeBackend) List(string, string, string) ([]Item, error) { f.called = "List"; return nil, nil }
 func (f *fakeBackend) ListMany(string, string, []string) (map[string][]Item, error) { return nil, nil }
 func (f *fakeBackend) Home(string, string) (string, error) { return "", nil }
-func (f *fakeBackend) Get(req TransferRequest, _ func(Progress)) error {
-	f.called, f.lastReq = "Get", req
+// 方法名必须是接口定稿的 Transfer* 名字（Go 无重载；legacy 四参 Get/Put 只在 BatchBackend 上）。
+// 原计划此处照抄了旧名 Get/GetTree/Put/PutTree，逐字写不编译（Task 5 实测）。
+func (f *fakeBackend) TransferGet(req TransferRequest, _ func(Progress)) error {
+	f.called, f.lastReq = "TransferGet", req
 	return nil
 }
-func (f *fakeBackend) GetTree(TransferRequest, func(Progress)) error  { f.called = "GetTree"; return nil }
-func (f *fakeBackend) Put(TransferRequest, func(Progress)) error      { f.called = "Put"; return nil }
-func (f *fakeBackend) PutTree(TransferRequest, func(Progress)) error  { f.called = "PutTree"; return nil }
+func (f *fakeBackend) TransferGetTree(TransferRequest, func(Progress)) error { f.called = "TransferGetTree"; return nil }
+func (f *fakeBackend) TransferPut(TransferRequest, func(Progress)) error     { f.called = "TransferPut"; return nil }
+func (f *fakeBackend) TransferPutTree(TransferRequest, func(Progress)) error { f.called = "TransferPutTree"; return nil }
 func (f *fakeBackend) Remove(string, string, string) error            { return nil }
 func (f *fakeBackend) RemoveRecursive(string, string, string) error   { return nil }
 func (f *fakeBackend) Mkdir(string, string, string) error             { return nil }
