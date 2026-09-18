@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -1255,6 +1256,28 @@ func TestSftpTransferProgressEventShape(t *testing.T) {
 		if full[k] != v {
 			t.Fatalf("字段 %s = %#v, want %#v", k, full[k], v)
 		}
+	}
+}
+
+// TestTransferProgressEventNamePinnedWithFrontend（Task 14 / Task 9 M1）：事件名是前后端唯一的
+// 关联点，改名不会让任何一侧编译失败，只会让前端订阅静默失效（永远没有进度帧）。前端把名字
+// 放在 frontend/src/utils/queue.js 的 TRANSFER_PROGRESS_EVENT 常量里并由 vitest 钉死，
+// 这里再断言 Go 侧 emit 的名字与前端常量**逐字相等**——两边分开改名就会在这里变红。
+func TestTransferProgressEventNamePinnedWithFrontend(t *testing.T) {
+	const want = "sftp:transfer-progress"
+	if progressEventName != want {
+		t.Fatalf("事件名 = %q, want %q", progressEventName, want)
+	}
+	b, err := os.ReadFile(filepath.Join("frontend", "src", "utils", "queue.js"))
+	if err != nil {
+		t.Fatalf("读前端事件名常量失败: %v", err)
+	}
+	m := regexp.MustCompile(`export const TRANSFER_PROGRESS_EVENT\s*=\s*'([^']+)'`).FindSubmatch(b)
+	if m == nil {
+		t.Fatal("frontend/src/utils/queue.js 里找不到 TRANSFER_PROGRESS_EVENT = '…'")
+	}
+	if string(m[1]) != want {
+		t.Fatalf("前后端事件名不一致：Go %q，前端 %q", want, string(m[1]))
 	}
 }
 
