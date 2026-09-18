@@ -228,6 +228,47 @@ describe('取消结果 applyCancelResult（SftpTransferCancel 返回值唯一落
     expect(rec.partPath).toBe('')
     expect(rowNote(rec)).toBe(CANCELLED_LATE_TEXT)
   })
+
+  // —— 修复轮 3：真取消锁存（cancelOk）。GoBackend.Cancel 首次成功后删除注册表条目，
+  // 重复/并发第二发必返回 false；若后面的 false 能把真取消翻成「失败」就是新缺陷。 ——
+  it('重复取消 C(true) C(false) 然后 M(error)：真取消锁存，false 不得翻盘 ⇒ 收敛「取消」', () => {
+    const rec = { id: 't1-0', status: '处理中', pending: false }
+    applyBatchCancel([rec], rec)
+    expect(applyCancelResult(rec, true)).toBe('cancelling') // 第一发真取消：锁存
+    expect(applyCancelResult(rec, false)).toBe('done')      // 第二发假 false：必须被锁存丢弃
+    expect(rec.cancelOk).toBe(true)
+    expect(rec.cancelFailed).toBe(false)                    // 绝不写 cancelFailed
+    expect(rec.pendingCancel).toBe(false)
+    expect(rec.status).toBe('处理中')                        // 终态仍等操作返回
+    expect(applyOutcome(rec, { ok: false, error: new Error('context canceled') })).toBe('取消')
+    expect(rec.status).toBe('取消')
+    expect(rec.cancelFailed).toBe(false)
+    expect(rec.reason).toBe('context canceled')
+    expect(failedActions(rec)).toContain('retry')
+  })
+  it('重复取消 M(error) C(true) C(false)：终态本已「取消」，后到的 false 不得翻成「失败」', () => {
+    const rec = { id: 't1-0', status: '处理中', pending: false }
+    applyBatchCancel([rec], rec)
+    // 无关失败先落，此时 cancelFailed 仍为 false ⇒ 按「取消」落终态（与顺序 B 相同的起点）
+    expect(applyOutcome(rec, { ok: false, error: new Error('disk full') })).toBe('取消')
+    expect(applyCancelResult(rec, true)).toBe('done')  // 真取消到达：锁存，终态保持「取消」
+    expect(applyCancelResult(rec, false)).toBe('done') // 第二发假 false：被锁存丢弃
+    expect(rec.cancelOk).toBe(true)
+    expect(rec.cancelFailed).toBe(false)
+    expect(rec.status).toBe('取消')                     // 绝不因 false 变成「失败」
+    expect(rec.pendingCancel).toBe(false)
+  })
+  it('未锁存前先到 false、后到 true（顺序 false→true）：true 纠正 cancelFailed 并收敛「取消」', () => {
+    const rec = { id: 't1-0', status: '处理中', pending: false }
+    applyBatchCancel([rec], rec)
+    expect(applyCancelResult(rec, false)).toBe('failed')
+    expect(rec.cancelFailed).toBe(true)
+    expect(applyCancelResult(rec, true)).toBe('cancelling') // 真取消锁存并清掉 false 的污染
+    expect(rec.cancelOk).toBe(true)
+    expect(rec.cancelFailed).toBe(false)
+    expect(applyOutcome(rec, { ok: false, error: new Error('context canceled') })).toBe('取消')
+    expect(rec.status).toBe('取消')
+  })
   it('返回 false：转「未能取消」，不再显示「取消中…」', () => {
     const rec = { id: 't1-0', status: '处理中', cancelRequested: true, pendingCancel: true }
     expect(applyCancelResult(rec, false)).toBe('failed')
@@ -404,29 +445,36 @@ describe('生产路径互钉：SFC 必须消费 queue.js 的纯函数（评审 I
   })
 })
 
-// —— e-weak 结构性收紧（I3 修复轮 2）：终态赋值只允许发生在 queue.js ——
+// —— e-weak 结构性收紧（I3 修复轮 2，修复轮 3 收紧白名单）：终态赋值只允许发生在 queue.js ——
 //
 // 旧的互钉只是字面量 pin（断言 SftpView 里有 applyOutcome(rec…），把**成功分支**
 // rec.status = '完成' 内联回 SftpView 后仍然命中，变异存活（评审 e-weak）。这里改成
 // 结构性断言：扫描两个 SFC 的“写入赋值”，任何没被显式白名单批准的 status/partPath
-// 赋值都失败。白名单里的每一行都是**没有 id 的 legacy 路径**（removeSelected /
-// onMoveDrop / 系统拖入 copy / uploadPicked），它们根本不走 id 身份状态机，
-// 只能就地写终态；除此之外的所有终态写入都必须经由 queue.js 的 applyOutcome/
-// finalizeOutcome（脚本里 rec.status='处理中' 是重置为运行态，不是终态决策）。
-// 键 = 该行 trim 后的原文；重复项用重复条目表达（同一行两个赋值也各自一条）。
+// 赋值都失败。白名单里的每一条都必须**逐条经得起追问**（修复轮 3 评审：有一条注释
+// 把 uploadPicked 的外层兜底错说成无 id 状态机，实际那个 t 有 transferID）：
+//   · 非终态写点：dispatchTransfer 重置运行态、retryItem/cleanItem 维护 partPath 锚点；
+//   · 终态写点：只剩**就地构造的无 id legacy 记录**（removeSelected / onMoveDrop /
+//     系统拖入 copy），它们根本不走 id 身份状态机，只能就地写终态。
+// uploadPicked 的有 id 兜底已改走 applyOutcome（共享终态落点），不再需要白名单条目。
+// 除此之外的所有终态写入都必须经由 queue.js 的 applyOutcome/finalizeOutcome。
+// 键 = 该行 trim 后的原文；重复项用重复条目表达（同一行两个赋值也各自一条）；不引用行号。
 const SFC_ASSIGN_ALLOWLIST = {
-  // SftpView.vue 的 legacy 无 id 终态写点（行号见注释，仅方便定位；断言按原文多重集）
+  // SftpView.vue 的允许写点。**不写行号**（会随改动漂移），改成引用所在函数名 + 语句原文；
+  // 断言本身按「trim 后的整行原文」多重集精确相等，行号只是噪音。
+  //
+  // 除前三条非终态写点外，其余每一条都在**就地构造的无 id legacy 记录**上：
+  // 这些记录不走 id 身份状态机（无绑定 id、无进度订阅、无取消/续传/重试锚点），
+  // 只能就地写终态，是评审显式允许的白名单；任何**有 id** 的终态写入都必须经 queue.js。
   'SftpView.vue': [
-    { text: "rec.status = '处理中'", why: ':81 dispatchTransfer 重置为运行态（终态决策仍交给 applyOutcome）' },
-    { text: "rec.partPath = keep", why: ':142 retryItem 保留锚点（不是终态写入）' },
-    { text: "rec.partPath = ''", why: ':161 cleanItem 清掉已删除的锚点（不是终态写入）' },
-    { text: "rec.status = '完成'", why: ':519 legacy removeSelected 无 id 记录，不走绑定（I4 白名单）' },
-    { text: "rec.status = '失败'", why: ':521 legacy removeSelected 无 id 记录，不走绑定（I4 白名单）' },
-    { text: "t.status = '失败'", why: ':587 legacy uploadPicked 的外层兜底，无 id 状态机（I4 白名单）' },
-    { text: "rec.status = '完成'", why: ':696 legacy onMoveDrop 无 id 记录，不走绑定（I4 白名单）' },
-    { text: "rec.status = '失败'", why: ':699 legacy onMoveDrop 无 id 记录，不走绑定（I4 白名单）' },
-    { text: "try { await CopyLocal(i.path, dst); rec.status = '完成' } catch (e) { rec.status = '失败'; rec.reason = String((e && e.message) || e); err(e) }", why: ':759 legacy 系统拖入 copy 无 id 记录，不走绑定（I4 白名单），两个赋值同一行' },
-    { text: "try { await CopyLocal(i.path, dst); rec.status = '完成' } catch (e) { rec.status = '失败'; rec.reason = String((e && e.message) || e); err(e) }", why: ':759 同上（同一行的第二个赋值，重复条目表达多重集）' },
+    { text: "rec.status = '处理中'", why: "dispatchTransfer 开头：重置为运行态（终态决策仍交给 applyOutcome/finalizeOutcome）" },
+    { text: "rec.partPath = keep", why: "retryItem：保留续传锚点，不是终态写入" },
+    { text: "rec.partPath = ''", why: "cleanItem：清掉已删除的锚点，不是终态写入" },
+    { text: "rec.status = '完成'", why: "removeSelected：就地构造的无 id 删除记录（只有 direction/name/src/dst/size/status/startedAt）" },
+    { text: "rec.status = '失败'", why: "removeSelected：同一条无 id 删除记录的失败分支" },
+    { text: "rec.status = '完成'", why: "onMoveDrop：就地构造的无 id move 记录" },
+    { text: "rec.status = '失败'", why: "onMoveDrop：同一条无 id move 记录的失败分支" },
+    { text: "try { await CopyLocal(i.path, dst); rec.status = '完成' } catch (e) { rec.status = '失败'; rec.reason = String((e && e.message) || e); err(e) }", why: "handleSystemDrop：就地构造的无 id 系统拖入 copy 记录；成功/失败两个赋值同一行，故列两条" },
+    { text: "try { await CopyLocal(i.path, dst); rec.status = '完成' } catch (e) { rec.status = '失败'; rec.reason = String((e && e.message) || e); err(e) }", why: "handleSystemDrop：同上，同一行第二个赋值（重复条目表达多重集）" },
   ],
   // TransferQueue.vue：只读渲染，任何赋值都不允许
   'TransferQueue.vue': [],
