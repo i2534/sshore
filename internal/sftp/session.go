@@ -260,6 +260,20 @@ func (p *Pool) Disconnect(host string) error {
 	return nil
 }
 
+// Connected 报告 host 是否仍有已成功建立的会话（idle 或传输中，跨 user）。
+// 会话是惰性建立的：池里没有该 host 的会话 ⇒ 从未建过（或已关/被逐出）⇒ false。
+// 这是 GoBackend.Connected 的依据，避免对 UI 硬编码 false（Task 6 评审 I3）。
+func (p *Pool) Connected(host string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for s := range p.all {
+		if s.Host == host {
+			return true
+		}
+	}
+	return false
+}
+
 // CloseAll 关闭所有已知会话（含进行中的传输），供 OnShutdown 调用。
 func (p *Pool) CloseAll() {
 	p.mu.Lock()

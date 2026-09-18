@@ -47,7 +47,15 @@ type GoBackend struct {
 }
 
 func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
-	g := &GoBackend{emit: emit, sel: sel}
+	g := &GoBackend{
+		emit: emit,
+		sel:  sel,
+		// Task 6 评审 M2：这些 map 到 Task 10/11/13 才被写入。构造时就初始化，
+		// 后续 task 直接写字段（g.reg[id] = s 等）不会 panic: assignment to entry in nil map。
+		reg:        map[string]*Session{},
+		inflight:   map[string]string{},
+		knownParts: map[string][2]string{},
+	}
 	g.pool = NewPool(g.dial)
 	return g
 }
@@ -171,6 +179,9 @@ func (g *GoBackend) Search(ctx context.Context, host, user, root, pattern string
 	return SearchOutcome{}, errors.New("未实现")
 }
 
-func (g *GoBackend) Connected(host string) bool   { return false }
+// Connected 报告 host 是否有已成功建立的会话（池内 idle 或传输中，跨 user）。
+// 会话惰性建立：从未连过 ⇒ false 正确；Connect/Capabilities 真握手入池后 ⇒ true；
+// Disconnect/CloseAll 关掉后回到 false。绝不能对未连接过的 host 硬造 true（Task 6 评审 I3）。
+func (g *GoBackend) Connected(host string) bool   { return g.pool.Connected(host) }
 func (g *GoBackend) Disconnect(host string) error { return g.pool.Disconnect(host) }
 func (g *GoBackend) CloseAll()                    { g.pool.CloseAll() }
