@@ -2045,7 +2045,7 @@ git commit -m "feat(sftp): 单文件下载（字节进度 + .part 原子提交 +
 - Test: `internal/sftp/journal_test.go`、`internal/sftp/e2e_test.go`（追加覆盖写用例）
 
 **Interfaces:**
-- Consumes: `PartName/BakName`（Task 2）、`Capabilities`（Task 6）
+- Consumes: `PartNameRemote/BakNameRemote`（**远端路径必须用 Remote 家族**；本地路径才用 `PartName/BakName`）—— Task 2 评审 Important-2 / 重审 N3、`Capabilities`（Task 6）
 - Produces: `type swapJournal struct{...}`；`func newSwapJournal(dir string) *swapJournal`；`(j *swapJournal) Begin(target, bak, part string) error`；`(j *swapJournal) Done(target string) error`；`(j *swapJournal) Recover() []string`
 
 - [ ] **Step 1: 写失败测试（journal 幂等 + 恢复）**
