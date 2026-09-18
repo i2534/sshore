@@ -2,8 +2,10 @@ package sftp
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -440,7 +442,7 @@ func TestGoBackendConnectedStickyAfterSessionEviction(t *testing.T) {
 func writeSwapEntry(t *testing.T, dir string, e swapEntry) {
 	t.Helper()
 	j := newSwapJournal(dir)
-	if err := j.Begin(e.Target, e.Bak, e.Part); err != nil {
+	if err := j.Begin(e.Host, e.User, e.Target, e.Bak, e.Part); err != nil {
 		t.Fatalf("写 journal 条目: %v", err)
 	}
 }
@@ -514,11 +516,11 @@ func TestRecoverSwapsDecisionTable(t *testing.T) {
 	jdir := t.TempDir()
 
 	// W0：bak 尚未产生（target 旧内容仍在原名下）。
-	writeSwapEntry(t, jdir, swapEntry{Target: "w0.txt", Bak: "w0.bak", Part: "w0.part"})
+	writeSwapEntry(t, jdir, swapEntry{Host: "h", Target: "w0.txt", Bak: "w0.bak", Part: "w0.part"})
 	// W1：target→bak 已发生，part→target 未发生 ⇒ 必须回滚。
-	writeSwapEntry(t, jdir, swapEntry{Target: "w1.txt", Bak: "w1.bak", Part: "w1.part"})
+	writeSwapEntry(t, jdir, swapEntry{Host: "h", Target: "w1.txt", Bak: "w1.bak", Part: "w1.part"})
 	// W2：提交已完成（两处都在）⇒ 必须保留新内容、只删 bak。
-	writeSwapEntry(t, jdir, swapEntry{Target: "w2.txt", Bak: "w2.bak", Part: "w2.part"})
+	writeSwapEntry(t, jdir, swapEntry{Host: "h", Target: "w2.txt", Bak: "w2.bak", Part: "w2.part"})
 
 	fake := &fakeReopenSession{files: map[string]string{
 		"w0.txt":    "OLD0", // W0：只有 target
@@ -570,7 +572,7 @@ func TestRecoverSwapsDecisionTable(t *testing.T) {
 // TestRecoverSwapsProbeFailureKeepsEntry：探测失败（Stat 非 ENOENT）⇒ 不动作、不删条目。
 func TestRecoverSwapsProbeFailureKeepsEntry(t *testing.T) {
 	jdir := t.TempDir()
-	writeSwapEntry(t, jdir, swapEntry{Target: "x.txt", Bak: "x.bak", Part: "x.part"})
+	writeSwapEntry(t, jdir, swapEntry{Host: "h", Target: "x.txt", Bak: "x.bak", Part: "x.part"})
 	fake := &fakeReopenSession{files: map[string]string{"x.bak": "OLD"}, err: errors.New("permission denied")}
 	useFakeRecoverSession(t, fake)
 	g := NewGoBackend(nil, nil)
@@ -600,7 +602,7 @@ func TestRecoverSwapsProbeFailureKeepsEntry(t *testing.T) {
 // 不动作、不删条目 —— 恢复是尽力而为，绝不能因为一次 dial 失败就把未完成现场抹掉。
 func TestRecoverSwapsSessionUnavailableKeepsEntry(t *testing.T) {
 	jdir := t.TempDir()
-	writeSwapEntry(t, jdir, swapEntry{Target: "x.txt", Bak: "x.bak", Part: "x.part"})
+	writeSwapEntry(t, jdir, swapEntry{Host: "h", Target: "x.txt", Bak: "x.bak", Part: "x.part"})
 
 	orig := probeRecoverSession
 	probeRecoverSession = func(*GoBackend, string, string) (reopenSession, error) {
@@ -633,11 +635,11 @@ func TestRecoverSwapsRealSessionPath(t *testing.T) {
 
 	// W1：只有 bak ⇒ 真回滚（真 rename）。
 	writeRemote(t, root, "real.bak", []byte("OLD"))
-	writeSwapEntry(t, jdir, swapEntry{Target: "real.txt", Bak: "real.bak", Part: "real.part"})
+	writeSwapEntry(t, jdir, swapEntry{Host: "h", Target: "real.txt", Bak: "real.bak", Part: "real.part"})
 	// W2：新内容已提交 ⇒ 保留 target、真删 bak。
 	writeRemote(t, root, "committed.txt", []byte("NEW"))
 	writeRemote(t, root, "committed.bak", []byte("OLD"))
-	writeSwapEntry(t, jdir, swapEntry{Target: "committed.txt", Bak: "committed.bak", Part: "committed.part"})
+	writeSwapEntry(t, jdir, swapEntry{Host: "h", Target: "committed.txt", Bak: "committed.bak", Part: "committed.part"})
 	g.SetJournalDir(jdir)
 	// 默认 probe 需要一条真实会话：先握手一次（测试服务端），它会记下 host 凭据。
 	if err := g.Connect("h", ""); err != nil {
@@ -665,37 +667,122 @@ func TestRecoverSwapsRealSessionPath(t *testing.T) {
 	}
 }
 
-// TestCloseAllKeepsRecoveryHostAfterPartCleanup 钉住一个易漏的顺序细节：CloseAll 内部
-// 的 CleanupParts 会为远端 .part 新建会话（并因此更新「最近握手」），但紧接着 app.go 调用的
-// RecoverSwaps 必须仍用**关闭前**那次真实握手的 host —— 否则恢复可能探测到错误的 host，
-// 走到「bak 不存在 ⇒ 清条目」，把中断现场静默丢掉。
-func TestCloseAllKeepsRecoveryHostAfterPartCleanup(t *testing.T) {
-	root, jdir := t.TempDir(), t.TempDir()
-	g := backendForTestServer(t, root)
-	// 此前用户在 h 上成功握过手；随后有一条 h2 的远端 .part 待清理。
-	g.markConnected("h", "u")
-	left := filepath.Join(root, "left"+PartMarker+"t13")
-	writeRemote(t, root, "left"+PartMarker+"t13", []byte("half"))
-	g.recordPart("h2", "u2", "t13-cleanup", "", left)
+// TestRecoverSwapsProbesEntryHostNotLastHandshake 是 reviewer 只读 overlay 复现的仓库用例
+// （修复轮 1 / F1）：journal 里有一条属于 hostB 的条目，而进程最近一次握手是 hostA。
+// 旧实现拿 hostA 的会话探所有条目；hostA 的视图里没有 b.bak ⇒ 误判 W0 清掉条目，
+// 于是 hostB 的 target 名永久缺失、旧内容只剩随机 bak（本地 7 天清理也够不到）。
+// 现在恢复只探条目自己的 host：hostB 不可达时条目原样保留（不动作、不删除），
+// hostA 根本不会被探 —— 哪怕它能看到一个「没有 bak」的视图。
+func TestRecoverSwapsProbesEntryHostNotLastHandshake(t *testing.T) {
+	jdir := t.TempDir()
+	writeSwapEntry(t, jdir, swapEntry{Host: "hostB", User: "ub", Target: "b.txt", Bak: "b.bak", Part: "b.part"})
 
-	var gotHost, gotUser string
-	fake := &fakeReopenSession{files: map[string]string{"z.bak": "OLD"}}
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
+	g.SetJournalDir(jdir)
+	// overlay 场景：最近一次握手是 hostA（旧实现的探测凭据来源）。
+	g.markConnected("hostA", "ua")
+
+	var probed []string
 	orig := probeRecoverSession
 	probeRecoverSession = func(_ *GoBackend, host, user string) (reopenSession, error) {
-		gotHost, gotUser = host, user
-		return fake, nil
+		probed = append(probed, host+"/"+user)
+		if host == "hostB" {
+			return nil, errors.New("hostB 不可达")
+		}
+		// hostA 的视图里只有 a-only.txt：若实现仍用 hostA 探 B 的条目，b.bak 会被判成
+		// 「不存在」而清掉条目 —— 正是要防的数据丢失。
+		return &fakeReopenSession{files: map[string]string{"a-only.txt": "A"}}, nil
 	}
 	t.Cleanup(func() { probeRecoverSession = orig })
 
-	writeSwapEntry(t, jdir, swapEntry{Target: "z.txt", Bak: "z.bak", Part: "z.part"})
+	n, err := g.RecoverSwaps()
+	if err != nil {
+		t.Fatalf("RecoverSwaps: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("hostB 不可达时不得处理任何条目: got %d", n)
+	}
+	if len(probed) != 1 || probed[0] != "hostB/ub" {
+		t.Fatalf("恢复必须只探条目自己的 hostB/ub，got %v", probed)
+	}
+	entries := journalEntries(t, jdir)
+	if len(entries) != 1 || entries[0].Host != "hostB" || entries[0].Target != "b.txt" {
+		t.Fatalf("归属 hostB 的条目必须原样保留，got %+v", entries)
+	}
+}
+
+// TestRecoverSwapsRecoversPerHostAndKeepsUnreachable 钉住分组的完整语义：hostA 可达 →
+// 按决策表恢复并清掉它的条目；hostB 不可达 → 它的条目原样保留。两次探测必须各用自己的
+// (host,user)，绝不交叉。
+func TestRecoverSwapsRecoversPerHostAndKeepsUnreachable(t *testing.T) {
+	jdir := t.TempDir()
+	writeSwapEntry(t, jdir, swapEntry{Host: "hostA", User: "ua", Target: "a.txt", Bak: "a.bak", Part: "a.part"})
+	writeSwapEntry(t, jdir, swapEntry{Host: "hostB", User: "ub", Target: "b.txt", Bak: "b.bak", Part: "b.part"})
+
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
 	g.SetJournalDir(jdir)
 
-	g.CloseAll() // 内部先 CleanupParts（会给 h2 建会话），再 pool.CloseAll
-	if n, err := g.RecoverSwaps(); err != nil || n != 1 {
-		t.Fatalf("RecoverSwaps: n=%d err=%v", n, err)
+	probed := map[string]bool{}
+	fakeA := &fakeReopenSession{files: map[string]string{"a.bak": "OLD-A"}}
+	orig := probeRecoverSession
+	probeRecoverSession = func(_ *GoBackend, host, user string) (reopenSession, error) {
+		probed[host+"/"+user] = true
+		if host == "hostA" {
+			return fakeA, nil
+		}
+		return nil, errors.New("hostB 不可达")
 	}
-	if gotHost != "h" || gotUser != "u" {
-		t.Fatalf("恢复必须用关闭前最近一次真实握手的 host（h/u），got %q/%q —— CleanupParts 的会话不得把它顶掉", gotHost, gotUser)
+	t.Cleanup(func() { probeRecoverSession = orig })
+
+	n, err := g.RecoverSwaps()
+	if err != nil || n != 1 {
+		t.Fatalf("只应恢复 hostA 的 1 条: n=%d err=%v", n, err)
+	}
+	if !probed["hostA/ua"] || !probed["hostB/ub"] || len(probed) != 2 {
+		t.Fatalf("每个分组必须用自己的凭据探测: got %v", probed)
+	}
+	fakeA.mu.Lock()
+	_, bakKept := fakeA.files["a.bak"]
+	gotA := fakeA.files["a.txt"]
+	fakeA.mu.Unlock()
+	if bakKept || gotA != "OLD-A" {
+		t.Fatalf("hostA 的 W1 必须被回滚: %+v", fakeA.files)
+	}
+	entries := journalEntries(t, jdir)
+	if len(entries) != 1 || entries[0].Host != "hostB" {
+		t.Fatalf("hostB 的条目必须保留、hostA 的必须清掉，got %+v", entries)
+	}
+}
+
+// TestRecoverSwapsSkipsLegacyEntriesWithoutHost（F1 向后兼容）：归属为空的旧条目
+// 绝不动作、绝不删除；即使有可用会话也不去探它（避免误判 W0 清掉无法重建的现场）。
+func TestRecoverSwapsSkipsLegacyEntriesWithoutHost(t *testing.T) {
+	jdir := t.TempDir()
+	writeSwapEntry(t, jdir, swapEntry{Target: "old.txt", Bak: "old.bak", Part: "old.part"}) // host 为空
+
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
+	g.SetJournalDir(jdir)
+
+	probed := 0
+	orig := probeRecoverSession
+	probeRecoverSession = func(_ *GoBackend, host, user string) (reopenSession, error) {
+		probed++
+		return &fakeReopenSession{files: map[string]string{}}, nil
+	}
+	t.Cleanup(func() { probeRecoverSession = orig })
+
+	n, err := g.RecoverSwaps()
+	if err != nil || n != 0 {
+		t.Fatalf("归属未知的旧条目不得被处理: n=%d err=%v", n, err)
+	}
+	if probed != 0 {
+		t.Fatalf("归属未知的旧条目不得触发任何探测，got %d 次", probed)
+	}
+	if entries := journalEntries(t, jdir); len(entries) != 1 || entries[0].Target != "old.txt" {
+		t.Fatalf("归属未知的旧条目必须原样保留: %+v", entries)
 	}
 }
 
@@ -807,7 +894,7 @@ func TestCtrlDelegatesLifecycleToGoBackend(t *testing.T) {
 	root, jdir := t.TempDir(), t.TempDir()
 	g := backendForTestServer(t, root)
 	writeRemote(t, root, "d.bak", []byte("OLD"))
-	writeSwapEntry(t, jdir, swapEntry{Target: "d.txt", Bak: "d.bak", Part: "d.part"})
+	writeSwapEntry(t, jdir, swapEntry{Host: "h", Target: "d.txt", Bak: "d.bak", Part: "d.part"})
 	g.SetJournalDir(jdir)
 	g.markConnected("h", "") // 模拟此前已成功握手（恢复凭据来自最近握手）
 	c := NewCtrlForcedBackend(g)
@@ -823,6 +910,396 @@ func TestCtrlDelegatesLifecycleToGoBackend(t *testing.T) {
 	c.CleanupParts()
 	if _, err := os.Stat(localPart); !os.IsNotExist(err) {
 		t.Fatalf("门面 CleanupParts 必须转发到 GoBackend: stat err=%v", err)
+	}
+}
+
+// —— Task 13 修复轮 1：F2 退出静默 ——
+
+// TestCloseAllQuiescesInflightTransferKeepsPart（F2）：Put 建出远端 .part 并登记之后、
+// 提交之前停在注入点；此时 CloseAll 不能删掉这条仍在飞的 .part，也不能在传输结束前返回。
+// 旧顺序（先 CleanupParts 再 pool.CloseAll、不等静默）会立刻删 .part 并关会话，
+// 让这次提交彻底失败（target 缺席、内容丢在随机 bak/被删的 .part 里）。
+func TestCloseAllQuiescesInflightTransferKeepsPart(t *testing.T) {
+	root := t.TempDir()
+	g := backendForTestServer(t, root)
+	local := filepath.Join(t.TempDir(), "src.bin")
+	if err := os.WriteFile(local, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(unblock) }) }
+	t.Cleanup(release)
+	origHook := beforeOpenLocalSource
+	beforeOpenLocalSource = func(p string) {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-unblock
+	}
+	t.Cleanup(func() { beforeOpenLocalSource = origHook })
+
+	putDone := make(chan error, 1)
+	go func() {
+		putDone <- g.Put(TransferRequest{ID: "f2a", Host: "h", Local: local, Remote: "dst.bin", Atomic: true}, nil)
+	}()
+	<-entered // .part 已建出并 recordPart，传输停在注入点
+
+	// 找到磁盘上的远端 .part。
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var part string
+	for _, e := range ents {
+		if IsInternalTemp(e.Name()) {
+			part = filepath.Join(root, e.Name())
+		}
+	}
+	if part == "" {
+		t.Fatal("传输停在注入点时远端必须已有 .part")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		g.CloseAll()
+		close(closeDone)
+	}()
+	// CloseAll 必须等待在飞传输：不能返回、更不能删掉 .part。
+	select {
+	case <-closeDone:
+		t.Fatal("CloseAll 不得在传输仍在飞时返回（必须先静默）")
+	case <-time.After(250 * time.Millisecond):
+	}
+	if _, err := os.Stat(part); err != nil {
+		t.Fatalf("在飞传输的 .part 不得被退出清理删掉: %v", err)
+	}
+
+	release() // 让传输完成提交
+	if err := <-putDone; err != nil {
+		t.Fatalf("放行后传输应成功提交: %v", err)
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("静默后 CloseAll 必须返回")
+	}
+	if b, err := os.ReadFile(filepath.Join(root, "dst.bin")); err != nil || string(b) != "payload" {
+		t.Fatalf("目标必须被提交: err=%v content=%q", err, b)
+	}
+}
+
+// TestShutdownDoesNotClearJournalEntryDuringInflightCommit（F2）：提交停在
+// rename(target→bak) 之前（journal intent 已落盘、破坏性改名尚未发生）时发起 CloseAll。
+// 修复后的顺序是先静默再返回，因此 app.go 随后的 RecoverSwaps 绝不会把这条在飞 intent
+// 当成 W0 清掉（旧顺序下 CloseAll 立即返回，恢复看到 bak 不存在 ⇒ 清条目，target 与
+// 条目双失）。
+func TestShutdownDoesNotClearJournalEntryDuringInflightCommit(t *testing.T) {
+	root, jdir := t.TempDir(), t.TempDir()
+	g := backendForTestServer(t, root)
+	g.SetJournalDir(jdir)
+	local := filepath.Join(t.TempDir(), "src.bin")
+	if err := os.WriteFile(local, []byte("NEW"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 强制走 backup-swap：posix 提交一律失败，落到 journal.Begin + rename(target→bak)。
+	swapPosixRename(t, func(*sftp.Client, string, string) error { return errors.New("no posix") })
+
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(unblock) }) }
+	t.Cleanup(release)
+	var origRename func(*sftp.Client, string, string) error
+	origRename = swapRenameRemote(t, func(c *sftp.Client, oldname, newname string) error {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-unblock
+		return origRename(c, oldname, newname)
+	})
+
+	putDone := make(chan error, 1)
+	go func() {
+		putDone <- g.Put(TransferRequest{ID: "f2b", Host: "h", Local: local, Remote: "dst.bin", Atomic: true}, nil)
+	}()
+	<-entered
+	if entries := journalEntries(t, jdir); len(entries) != 1 {
+		t.Fatalf("提交在飞时 journal 必须已落盘 1 条 intent，got %+v", entries)
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		g.CloseAll()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+		t.Fatal("CloseAll 不得在提交仍在飞时返回（必须先静默）")
+	case <-time.After(250 * time.Millisecond):
+	}
+	if entries := journalEntries(t, jdir); len(entries) != 1 {
+		t.Fatalf("在飞提交期间 journal 条目不得被清掉，got %+v", entries)
+	}
+
+	release()
+	if err := <-putDone; err != nil {
+		t.Fatalf("放行后提交应成功: %v", err)
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("静默后 CloseAll 必须返回")
+	}
+	if entries := journalEntries(t, jdir); len(entries) != 0 {
+		t.Fatalf("提交成功后 journal 条目必须清空，got %+v", entries)
+	}
+	if b, err := os.ReadFile(filepath.Join(root, "dst.bin")); err != nil || string(b) != "NEW" {
+		t.Fatalf("目标必须被提交: err=%v content=%q", err, b)
+	}
+}
+
+// —— Task 13 修复轮 1：F5 符号链接语义 ——
+
+// sftpOpStat / sftpOpLstat 是 SSH_FXP_STAT / SSH_FXP_LSTAT 的包类型号（draft-02 §3 编码）。
+const (
+	sftpOpStat  = 17
+	sftpOpLstat = 7
+)
+
+// sftpReqCounter 按 SSH_FXP 帧解析并统计客户端发出的请求类型。
+//
+// 为什么需要它：pkg/sftp 自带的测试服务端把 RMDIR 实现成 os.Remove（server.go 的
+// sshFxpRmdir 分支），对符号链接也会成功 unlink —— 因此「Stat 跟随符号链接」与
+// 「Lstat 不跟随」在行为上无法区分（真 OpenSSH 的 RMDIR 才会 ENOTDIR）。
+// 计数器提供结构性断言：不跟随符号链接的实现不能对条目发出 SSH_FXP_STAT。
+type sftpReqCounter struct {
+	mu     sync.Mutex
+	buf    []byte
+	counts map[byte]int
+}
+
+func newSFTPReqCounter() *sftpReqCounter { return &sftpReqCounter{counts: map[byte]int{}} }
+
+// observe 把写入字节追加进缓冲，尽量切出完整帧（uint32 长度 + 1 字节类型 + 负载），
+// 只统计类型。解析不出来时只丢弃缓冲，绝不影响字节透传。
+func (c *sftpReqCounter) observe(p []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf = append(c.buf, p...)
+	for len(c.buf) >= 5 {
+		n := int(binary.BigEndian.Uint32(c.buf[:4]))
+		if n < 1 || n > 1<<24 {
+			c.buf = nil
+			return
+		}
+		if len(c.buf) < 4+n {
+			return
+		}
+		c.counts[c.buf[4]]++
+		c.buf = c.buf[4+n:]
+	}
+}
+
+func (c *sftpReqCounter) count(op byte) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.counts[op]
+}
+
+func (c *sftpReqCounter) reset() {
+	c.mu.Lock()
+	c.counts = map[byte]int{}
+	c.buf = nil
+	c.mu.Unlock()
+}
+
+// sftpReqSniffer 夹在 sftp 客户端与 net.Pipe 之间：写方向计数后原样透传，读方向透传。
+type sftpReqSniffer struct {
+	inner net.Conn
+	cnt   *sftpReqCounter
+}
+
+func (s *sftpReqSniffer) Read(p []byte) (int, error) { return s.inner.Read(p) }
+func (s *sftpReqSniffer) Close() error               { return s.inner.Close() }
+func (s *sftpReqSniffer) Write(p []byte) (int, error) {
+	s.cnt.observe(p)
+	return s.inner.Write(p)
+}
+
+// backendForTestServerSniffed 与 backendForTestServer 相同，但每次 dial 都把客户端侧包一层
+// 请求计数器（共享同一个 counter，跨会话累计）。
+func backendForTestServerSniffed(t *testing.T, root string) (*GoBackend, *sftpReqCounter) {
+	t.Helper()
+	g := NewGoBackend(nil, nil)
+	cnt := newSFTPReqCounter()
+	var mu sync.Mutex
+	var servers []*sftp.Server
+	var conns []net.Conn
+	g.pool.dial = func(host, user string) (*Session, error) {
+		c1, c2 := net.Pipe()
+		srv, err := sftp.NewServer(c1, sftp.WithServerWorkingDirectory(root))
+		if err != nil {
+			return nil, err
+		}
+		go func() { _ = srv.Serve() }()
+		sn := &sftpReqSniffer{inner: c2, cnt: cnt}
+		cl, err := sftp.NewClientPipe(sn, sn)
+		if err != nil {
+			_ = srv.Close()
+			return nil, err
+		}
+		p, perr := osutil.StartPipes("cat")
+		if perr != nil {
+			return nil, perr
+		}
+		mu.Lock()
+		servers = append(servers, srv)
+		conns = append(conns, c1, c2)
+		mu.Unlock()
+		return &Session{Host: host, User: user, Conn: cl, Proc: p, state: sessBusy}, nil
+	}
+	t.Cleanup(func() {
+		g.CloseAll()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, s := range servers {
+			_ = s.Close()
+		}
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	return g, cnt
+}
+
+// TestGoBackendRemoveRecursiveSymlink（F5）：Walker 用 Lstat/ReadDir 语义（不跟随符号
+// 链接），条目分类也必须一致 —— 指向目录的符号链接必须当普通条目 unlink，
+// 绝不能用 Conn.Stat 跟随它、再对它 RemoveDirectory（真 OpenSSH 会 ENOTDIR，让整次递归失败）。
+//
+// 自带测试服务端的 RMDIR 是 os.Remove，行为上区分不出 Stat/Lstat，所以这里额外用请求计数器
+// 做结构性断言：整个递归期间不得出现任何 SSH_FXP_STAT（跟随符号链接的 stat）。
+func TestGoBackendRemoveRecursiveSymlink(t *testing.T) {
+	root := t.TempDir()
+	g, cnt := backendForTestServerSniffed(t, root)
+	if err := os.MkdirAll(filepath.Join(root, "outside"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRemote(t, root, "outside/keep.txt", []byte("KEEP"))
+	if err := os.MkdirAll(filepath.Join(root, "tree", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRemote(t, root, "tree/sub/real.txt", []byte("R"))
+	if err := os.Symlink(filepath.Join(root, "outside"), filepath.Join(root, "tree", "sub", "linkdir")); err != nil {
+		t.Skipf("本机不支持创建符号链接，无法在本用例中覆盖 F5: %v", err)
+	}
+
+	cnt.reset() // 只统计本次 RemoveRecursive 期间的请求
+	if err := g.RemoveRecursive("h", "", "tree"); err != nil {
+		t.Fatalf("含指向目录的符号链接的树必须被完整删除: %v", err)
+	}
+	if n := cnt.count(sftpOpStat); n != 0 {
+		t.Fatalf("递归删除不得对条目发跟随符号链接的 SSH_FXP_STAT（应用 w.Stat/Lstat），got %d 次", n)
+	}
+	if n := cnt.count(sftpOpLstat); n == 0 {
+		t.Fatal("必须至少用一次 SSH_FXP_LSTAT（Walker 的根 Lstat + 目标自身的 Lstat）")
+	}
+	if _, err := os.Stat(filepath.Join(root, "tree")); !os.IsNotExist(err) {
+		t.Fatalf("tree 必须被删除, stat err=%v", err)
+	}
+	// 符号链接的目标绝不能被递归删除（语义与 Walker 一致：不跟随）。
+	if b, err := os.ReadFile(filepath.Join(root, "outside", "keep.txt")); err != nil || string(b) != "KEEP" {
+		t.Fatalf("符号链接的目标不得被删除: err=%v content=%q", err, b)
+	}
+}
+
+// —— Task 13 修复轮 1：F6 边界 ——
+
+// TestGoBackendRemoveRecursiveRejectsRelativeRoots（F6）："."/".." 也必须拒绝，
+// 不能把「当前目录」当成可递归删除的目标。
+func TestGoBackendRemoveRecursiveRejectsRelativeRoots(t *testing.T) {
+	root := t.TempDir()
+	g := backendForTestServer(t, root)
+	writeRemote(t, root, "keep.txt", []byte("K"))
+	for _, p := range []string{"", "/", ".", "..", "./", "../"} {
+		if err := g.RemoveRecursive("h", "", p); err == nil {
+			t.Fatalf("必须拒绝递归删除根/相对根路径 %q", p)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "keep.txt")); err != nil {
+		t.Fatalf("拒绝后不得删除任何东西: %v", err)
+	}
+}
+
+// TestGoBackendRemoveRecursiveBounds（F6）：条目数与深度上限必须在**收集阶段**触发，
+// 此时还没删任何文件 —— 绝不留下删一半的树。
+func TestGoBackendRemoveRecursiveBounds(t *testing.T) {
+	root := t.TempDir()
+	g := backendForTestServer(t, root)
+	if err := os.MkdirAll(filepath.Join(root, "tree", "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRemote(t, root, "tree/top.txt", []byte("T"))
+	writeRemote(t, root, "tree/a/mid.txt", []byte("M"))
+	writeRemote(t, root, "tree/a/b/deep.txt", []byte("D"))
+
+	origE, origD := removeMaxEntries, removeMaxDepth
+	t.Cleanup(func() { removeMaxEntries, removeMaxDepth = origE, origD })
+
+	// 深度上限：tree/a/b/deep.txt 深度 3 ⇒ 上限 2 必失败。
+	removeMaxEntries, removeMaxDepth = 100000, 2
+	if err := g.RemoveRecursive("h", "", "tree"); err == nil {
+		t.Fatal("超过深度上限必须整体失败")
+	}
+	if _, err := os.Stat(filepath.Join(root, "tree", "a", "b", "deep.txt")); err != nil {
+		t.Fatalf("撞深度上限时不得删除任何文件: %v", err)
+	}
+
+	// 条目上限：树里共 5 个条目（top.txt, a, a/mid.txt, a/b, a/b/deep.txt）⇒ 上限 2 必失败。
+	removeMaxEntries, removeMaxDepth = 2, 64
+	if err := g.RemoveRecursive("h", "", "tree"); err == nil {
+		t.Fatal("超过条目上限必须整体失败")
+	}
+	if _, err := os.Stat(filepath.Join(root, "tree", "top.txt")); err != nil {
+		t.Fatalf("撞条目上限时不得删除任何文件: %v", err)
+	}
+
+	// 还原后必须成功删掉整棵树。
+	removeMaxEntries, removeMaxDepth = origE, origD
+	if err := g.RemoveRecursive("h", "", "tree"); err != nil {
+		t.Fatalf("还原上限后必须成功: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "tree")); !os.IsNotExist(err) {
+		t.Fatalf("tree 必须被删除, stat err=%v", err)
+	}
+}
+
+// TestCleanupPartsNilConnDoesNotPanic（F7）：CleanupParts 与其它能力方法一样必须先判
+// s.Conn。异常/测试替身会话可能没有 SFTP 连接，直接解引用会 panic 并让退出清理崩掉。
+func TestCleanupPartsNilConnDoesNotPanic(t *testing.T) {
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
+	g.pool.dial = func(host, user string) (*Session, error) {
+		p, err := osutil.StartPipes("cat")
+		if err != nil {
+			return nil, err
+		}
+		return &Session{Host: host, User: user, Conn: nil, Proc: p, state: sessBusy}, nil
+	}
+	g.recordPart("h", "u", "f7", "", "remote.part")
+	g.CleanupParts() // 不得 panic
+	g.partsMu.Lock()
+	n := len(g.knownParts)
+	g.partsMu.Unlock()
+	if n != 0 {
+		t.Fatalf("清理后登记表必须清空, got %d", n)
 	}
 }
 
