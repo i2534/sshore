@@ -82,6 +82,7 @@ async function dispatchTransfer(rec) {
   rec.elapsed = 0
   rec.cancelRequested = false
   rec.pendingCancel = false
+  rec.pending = false
   rec.hasProgress = false
   rec.done = undefined
   rec.total = undefined
@@ -114,22 +115,22 @@ async function cancelTransfer(rec) {
   if (!rec || !rec.id) return
   rec.cancelRequested = true // 用户意图；**不是**终态
   rec.pendingCancel = true
-  // 本批中"还没开始派发"的项（pending）不会再有结果，可以立刻定终态；当前在飞的项等它自己的返回。
-  // pending 与 status 一起写：派发循环用 rec.pending 判定"还没开始"，单独改 status 会被
-  // dispatchTransfer 重置成「处理中」而重新派发。
+  // 整批语义：本批"还没开始派发"的项（pending）不会再有结果，立刻定终态。
+  // 用独立的 batchAborted 标记而不是改 rec.status —— 派发循环若只看 status，会把
+  // 已经被取消、尚未真正在飞的项当成"跳过"（status 是我们自己刚写的，不是操作结果）。
+  // 只按同批前缀处理：别的批次可能在等冲突确认/排队，不能被这次取消连坐。
+  const prefix = String(rec.id).split('-')[0] + '-'
   for (const o of transfers.value) {
     if (o.id === rec.id) continue
-    if (o.pending || o.status !== '处理中') continue
+    if (o.status !== '处理中' || !o.pending) continue
+    if (!String(o.id || '').startsWith(prefix)) continue
+    o.batchAborted = true
     o.status = '取消'
     o.reason = '已取消，停止后续项'
   }
-  try {
-    await SftpTransferCancel(rec.id)
-  } catch (e) {
-    err(e)
-    if (rec.status === '处理中') rec.pendingCancel = false
-  }
-  if (rec.status === '处理中') rec.pendingCancel = false
+  // 不 await：取消绑定可能要等后端注册表/关会话，但它不影响这里的终态判定
+  // （终态只看那次传输方法的返回）。pendingCancel 保留到该次调用结束，UI 显示「取消中…」。
+  SftpTransferCancel(rec.id).catch((e) => err(e))
 }
 
 // 重试：整项重跑，resume=false。旧 partPath 仍传给后端，让后端先删同名 .part 再重来。
@@ -466,8 +467,8 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   }))
   for (const rec of batch) transfers.value.push(rec)
   for (const rec of batch) {
-    // 取消已经落在这批的某项上：不再派发（已完成项保留，未开始的项直接记取消）。
-    if (rec.status !== '处理中') continue
+    // 这一批已被取消：不再派发（已完成项保留，未开始的项在 cancelTransfer 里已定「取消」）。
+    if (rec.batchAborted) break
     rec.pending = false
     rec.pendingCancel = false
     await dispatchTransfer(rec)
