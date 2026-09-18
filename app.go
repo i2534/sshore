@@ -471,11 +471,17 @@ func progressToEvent(p sftp.Progress) map[string]any {
 	}
 }
 
+// progressEventName 是进度事件名的唯一来源：前端把同一个字面量放在
+// frontend/src/utils/queue.js 的 TRANSFER_PROGRESS_EVENT（vitest 钉死），本包测试
+// TestTransferProgressEventNamePinnedWithFrontend 断言两边逐字相等 —— 只在一侧改名
+// 不会让任何东西编译失败，只会让订阅静默失效。
+const progressEventName = "sftp:transfer-progress"
+
 // emitProgress 转发一帧进度到前端。a.ctx 为空（startup 之前）时静默：绝不对 nil context
 // 调 runtime.EventsEmit。
 func (a *App) emitProgress(p sftp.Progress) {
 	if a.ctx != nil {
-		runtime.EventsEmit(a.ctx, "sftp:transfer-progress", progressToEvent(p))
+		runtime.EventsEmit(a.ctx, progressEventName, progressToEvent(p))
 	}
 }
 
