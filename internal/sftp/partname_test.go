@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestPartNameKeepsTargetPrefixAndMarker(t *testing.T) {
@@ -142,5 +143,82 @@ func TestRemoteFamilyUsesPosixSeparators(t *testing.T) {
 	bak := BakNameRemote(long)
 	if strings.Contains(bak, "\\") || path.Dir(bak) != path.Dir(long) {
 		t.Fatalf("BakNameRemote 必须 POSIX 同目录：%q", bak)
+	}
+}
+
+// TestRemoteFamilyBoundaryIsPinned 钉住远端 POSIX 家族的两个非退化分支与 200 字节阈值本身。
+// 旧 TestRemoteFamilyUsesPosixSeparators 只走退化分支且只断言 len>partNameMax 的弱口径，
+// 无法杀死「PartNameRemote/BakNameRemote 恒退化」与「阈值漂移」三类变异（重审 N1）。
+func TestRemoteFamilyBoundaryIsPinned(t *testing.T) {
+	id8 := "abcdef12"
+	// PartNameRemote 与本地家族同口径：
+	// len(target) = 200 - 17(marker) - 8(id) - 1('-') - 6(rand) = 168
+	target := "/data/" + strings.Repeat("y", partNameMax-len("/data/")-len(PartMarker)-len(id8)-1-6)
+	if len(target) != 168 {
+		t.Fatalf("测试自身前提错误：target len=%d，应为 168", len(target))
+	}
+	got := PartNameRemote(target, id8)
+	if len(got) != partNameMax {
+		t.Fatalf("远端恰好 200 字节不得退化：want len=%d, got %d (%q)", partNameMax, len(got), got)
+	}
+	if !strings.HasPrefix(got, target+PartMarker) {
+		t.Fatalf("远端未退化时必须保留 <target><marker> 形态，got %q", got)
+	}
+
+	// BakNameRemote 的后缀是 "bak-"(4) 而非 id(8)+"-"(1)，故边界 target 长度为 200-17-4-6=173；
+	// 用 PartName 的 target 会得到 195 字节，钉不住 bak 的阈值。
+	bakTarget := "/data/" + strings.Repeat("z", partNameMax-len("/data/")-len(PartMarker)-len("bak-")-6)
+	if len(bakTarget) != 173 {
+		t.Fatalf("测试自身前提错误：bakTarget len=%d，应为 173", len(bakTarget))
+	}
+	bak := BakNameRemote(bakTarget)
+	if len(bak) != partNameMax {
+		t.Fatalf("远端 bak 恰好 200 字节不得退化：want len=%d, got %d (%q)", partNameMax, len(bak), bak)
+	}
+	if !strings.HasPrefix(bak, bakTarget+PartMarker) {
+		t.Fatalf("远端 bak 未退化时必须保留 <target><marker> 形态，got %q", bak)
+	}
+
+	// 超一字节：两个函数都必须退化，且留在同一 POSIX 目录、被 IsInternalTemp 认出
+	got2 := PartNameRemote(target+"y", id8)
+	if len(got2) >= partNameMax {
+		t.Fatalf("远端超限必须退化为短名（<阈值），got len=%d (%q)", len(got2), got2)
+	}
+	if path.Dir(got2) != "/data" {
+		t.Fatalf("远端超限退化必须留在同一 POSIX 目录，got %q", got2)
+	}
+	if !IsInternalTemp(got2) {
+		t.Fatalf("远端退化短名必须被 IsInternalTemp 认出，got %q", got2)
+	}
+	bak2 := BakNameRemote(bakTarget + "z")
+	if len(bak2) >= partNameMax {
+		t.Fatalf("远端 bak 超限必须退化为短名（<阈值），got len=%d (%q)", len(bak2), bak2)
+	}
+	if path.Dir(bak2) != "/data" {
+		t.Fatalf("远端 bak 超限退化必须留在同一 POSIX 目录，got %q", bak2)
+	}
+	if !IsInternalTemp(bak2) {
+		t.Fatalf("远端 bak 退化短名必须被 IsInternalTemp 认出，got %q", bak2)
+	}
+}
+
+// TestShortIDBoundaryAndNonASCII 钉住 shortID 的 rune 语义与 8 字符边界本身（Minor-4）：
+// 把 []rune 改成 []byte、或把 8 改成 9，本测试都必须失败。
+func TestShortIDBoundaryAndNonASCII(t *testing.T) {
+	// 恰好 9 个字符：必须只剩前 8 个（钉住 8 这个边界，不只是「截断」）
+	if got := PartName("/d/a.txt", "123456789"); !strings.Contains(got, "12345678-") {
+		t.Fatalf("恰好 9 字符 id 必须截为前 8，got %q", got)
+	}
+	// 恰好 8 个字符：原样保留
+	if got := PartName("/d/a.txt", "12345678"); !strings.Contains(got, "12345678-") {
+		t.Fatalf("恰好 8 字符 id 必须原样，got %q", got)
+	}
+	// 非 ASCII：按 rune 截断，不得切断 UTF-8（9 个汉字截为前 8 个，结果必须是合法 UTF-8）
+	got := PartName("/d/a.txt", "一二三四五六七八九")
+	if !strings.Contains(got, "一二三四五六七八-") {
+		t.Fatalf("多字节 id 必须按 rune 截断，got %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("截断后必须仍是合法 UTF-8，got %q", got)
 	}
 }
