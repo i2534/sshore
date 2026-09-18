@@ -134,31 +134,60 @@ export function outcomeStatus({ ok, cancelRequested, cancelFailed } = {}) {
   return FAILED_TEXT
 }
 
-// applyOutcome：把一次派发的结果写回队列项的**唯一落点**，返回终态。
-// SftpView.dispatchTransfer 调用它；单测调用同一个函数，不再是两条路径。
-export function applyOutcome(rec, { ok, error } = {}) {
-  if (!rec) return ''
-  const status = outcomeStatus({ ok, cancelRequested: rec.cancelRequested, cancelFailed: rec.cancelFailed })
+// finalizeOutcome：终态的**唯一写入口**。只读 rec.outcome（操作结果原文）与 rec.cancelFailed
+// （Cancel 的返回值）推导终态。不变式：终态赋值只发生在 queue.js，组件不得自己写 status。
+//
+// 为什么不是一次性算完（I3 修复轮 2）：操作结果与 Cancel 返回值是两个彼此独立的 promise，
+// 谁先到不确定。若操作结果（无关失败，例如 disk full）先于 Cancel 返回 false 到达，
+// 当时 cancelFailed 还是 false，只能按「取消」落终态；等 Cancel 的 false 到了必须能**回头修正**
+// 成「失败」。所以终态推导是可重入的：Cancel 结果一到就带着新的 cancelFailed 重推一次。
+//  - ok=true（绑定返回 nil = 已提交）⇒ 恒「完成」，Cancel 的返回值一律不参与（提交已完成的窄窗口）；
+//  - ok=false：cancelRequested && !cancelFailed ⇒「取消」；否则「失败」（含未能取消后的无关失败）。
+// 返回「完成」/「失败」/「取消」，调用方据此决定是否清 partPath。
+function finalizeOutcome(rec) {
+  const status = outcomeStatus({ ok: rec.outcome.ok, cancelRequested: rec.cancelRequested, cancelFailed: rec.cancelFailed })
   rec.status = status
   rec.pendingCancel = false
   if (status === DONE_TEXT) {
     rec.cancelFailed = false
     rec.partPath = '' // 提交后锚点已不存在，不留一个会误导「清理/续传」的路径
   } else {
+    // 用 outcome 里保存的**原始**结果重新归一化，绝不能把归一化后的字符串二次归一化
+    // （二次 norm 会把 String(err) 多包一层）。
+    const error = rec.outcome.error
     rec.reason = String((error && error.message) || error || '')
   }
   return status
 }
 
+// applyOutcome：把一次派发的结果写回队列项的**唯一落点**，返回终态。
+// SftpView.dispatchTransfer 调用它；单测调用同一个函数，不再是两条路径。
+// 先把原始结果存进 rec.outcome，再把终态决策交给 finalizeOutcome（唯一写入口）。
+export function applyOutcome(rec, { ok, error } = {}) {
+  if (!rec) return ''
+  rec.outcome = { ok, error }
+  return finalizeOutcome(rec)
+}
+
 // applyCancelResult：把 SftpTransferCancel 的返回值落到队列项上的**唯一落点**（I3）。
-//  - true：确实取消到在飞的未提交传输 ⇒ 保持 pendingCancel，等那次传输自己返回终态；
-//  - false：已提交/未知/从未开始/batch 后端恒 false ⇒ 立刻转成 cancelFailed，
-//    UI 如实显示「未能取消」，绝不停在「取消中…」；这次传输后续若失败也不算取消；
-//  - 项已是终态：不覆盖终态，只清掉 in-flight 标记（取消过晚的事实由 cancelRequested 表达）。
+//  - 项仍在飞：
+//    · true：确实取消到 ⇒ 保持 pendingCancel，等那次传输自己返回终态；
+//    · false：已提交/未知/从未开始/batch 后端恒 false ⇒ 立刻转成 cancelFailed，
+//      UI 如实显示「未能取消」，绝不停在「取消中…」；这次传输后续若失败也不算取消。
+//  - 项已是终态（I3 修复轮 2，顺序 B）：若这次 false 发生在操作结果之后，当时终态是按
+//    「cancelRequested 且尚未 cancelFailed」推出来的「取消」——那是错的，必须用保存的操作结果
+//    + 新的 cancelFailed 重推一次，把「取消」修正成「失败」并配上原始失败原因。
+//    反过来：操作已「完成」（ok=true）时 Cancel 的返回值一律无关，绝不改正结果；
+//    Cancel 返回 true 时没有任何可修正的终态（只会保持/已是取消），也不动。
 // 返回 'cancelling' | 'failed' | 'done'。
 export function applyCancelResult(rec, ok) {
   if (!rec) return 'done'
   if (rec.status !== RUNNING_TEXT) {
+    // 终态只有在「记录过操作结果、且结果不是成功、且这次明确没能取消」时才可能被修正。
+    if (!ok && rec.outcome && !rec.outcome.ok) {
+      rec.cancelFailed = true
+      return finalizeOutcome(rec) === FAILED_TEXT ? 'failed' : 'done'
+    }
     rec.pendingCancel = false
     return 'done'
   }
