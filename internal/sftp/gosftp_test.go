@@ -1066,6 +1066,126 @@ func TestShutdownDoesNotClearJournalEntryDuringInflightCommit(t *testing.T) {
 	}
 }
 
+// —— Task 13 修复轮 2：D1 退出宽限期 ——
+
+// TestCloseAllGraceBoundsStuckTransfer（D1）钉住「有界退出」：一个故意卡死、且**既不响应
+// ctx 也不经过会话 IO** 的传输（注入点直接阻塞在通道上）不得让 CloseAll 永久等待 ——
+// 修复轮 1 的无界 transfersWG.Wait() 会在这里永远挂住。
+// 修复后 CloseAll 等满 closeGrace 即取消后端级 transferCtx、关闭全部会话并返回（发 warn）。
+func TestCloseAllGraceBoundsStuckTransfer(t *testing.T) {
+	root := t.TempDir()
+	g := backendForTestServer(t, root)
+	// 单测不真等 5 秒：宽限期可注入，生产默认仍是 shutdownGrace。
+	g.closeGrace = 200 * time.Millisecond
+
+	local := filepath.Join(t.TempDir(), "src.bin")
+	if err := os.WriteFile(local, []byte("payload"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(unblock) }) }
+	t.Cleanup(release)
+	origHook := beforeOpenLocalSource
+	beforeOpenLocalSource = func(string) {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-unblock // 刻意无视 ctx 与会话关闭：最“赖”的卡死形态
+	}
+	t.Cleanup(func() { beforeOpenLocalSource = origHook })
+
+	stuckDone := make(chan error, 1)
+	go func() {
+		stuckDone <- g.Put(TransferRequest{ID: "d1-stuck", Host: "h", Local: local, Remote: "stuck.bin", Atomic: true}, nil)
+	}()
+	<-entered
+
+	closeDone := make(chan struct{})
+	start := time.Now()
+	go func() {
+		g.CloseAll()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseAll 必须在宽限期内返回，绝不能无界等待卡死的传输（D1 回归）")
+	}
+	elapsed := time.Since(start)
+	if elapsed < g.closeGrace {
+		t.Fatalf("CloseAll 必须先等满宽限期（先静默、后强停），elapsed=%v grace=%v", elapsed, g.closeGrace)
+	}
+	if elapsed > g.closeGrace+2*time.Second {
+		t.Fatalf("CloseAll 必须在宽限期附近返回，elapsed=%v grace=%v", elapsed, g.closeGrace)
+	}
+	if g.transferCtx.Err() == nil {
+		t.Fatal("宽限期耗尽后必须取消后端级传输上下文（强停入口）")
+	}
+
+	// 放行卡死传输：它会因为会话已被关闭而失败返回（绝不报成功），且不得泄漏 goroutine。
+	release()
+	select {
+	case err := <-stuckDone:
+		if err == nil {
+			t.Fatal("被强停的传输不得报成功")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("放行后卡死传输必须结束")
+	}
+}
+
+// TestCloseAllGraceInterruptsQueuedTransfer（D1）：取额度排队是**无界**的（池容量 1），
+// 若在飞传输卡死，第二个传输会永远卡在 <-p.queue 上。这条用例占住唯一额度，证明
+// CloseAll 的宽限期取消后端级 ctx 后，排队的 select 会走 ctx.Done() 分支返回，
+// 而不是继续阻塞（这正是修复轮 1 的第二条 liveness 漏洞）。
+func TestCloseAllGraceInterruptsQueuedTransfer(t *testing.T) {
+	root := t.TempDir()
+	writeRemote(t, root, "a.bin", []byte("x"))
+	g := backendForTestServer(t, root)
+	g.closeGrace = 150 * time.Millisecond
+	// 占住唯一传输额度：第二个传输必然在 AcquireTransfer 里无界排队。
+	<-g.pool.queue
+
+	local := filepath.Join(t.TempDir(), "a.bin")
+	queuedDone := make(chan error, 1)
+	go func() {
+		queuedDone <- g.Get(TransferRequest{ID: "d1-queued", Host: "h", Remote: "a.bin", Local: local}, nil)
+	}()
+	// 等到它确实已登记为在飞（acquireInflight 之后、AcquireTransfer 排队中）。
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		g.inflightMu.Lock()
+		n := len(g.inflight)
+		g.inflightMu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("排队传输未在预期时间内登记为在飞")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	start := time.Now()
+	g.CloseAll()
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("CloseAll 不得无界等待排队中的传输: %v", elapsed)
+	}
+	select {
+	case err := <-queuedDone:
+		if err == nil {
+			t.Fatal("排队等待被取消的传输必须报错")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("CloseAll 取消后端级 ctx 必须中断无界的排队等待")
+	}
+}
+
 // —— Task 13 修复轮 1：F5 符号链接语义 ——
 
 // sftpOpStat / sftpOpLstat 是 SSH_FXP_STAT / SSH_FXP_LSTAT 的包类型号（draft-02 §3 编码）。
