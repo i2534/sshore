@@ -49,10 +49,13 @@ type TransferRequest struct {
 }
 
 // TransferError 统一错误形状，RemoteMsg 保留远端/ssh 原文（spec D12）。
+// PartPath 是本次传输实际使用的 .part 路径（未用到时为空）：失败/取消后调用方
+// 凭它定位「保留下来、可续传」的临时文件，不需要解析错误文案（Task 7 起填充）。
 type TransferError struct {
 	Op        string
 	Host      string
 	Path      string
+	PartPath  string
 	RemoteMsg string
 	Err       error
 }

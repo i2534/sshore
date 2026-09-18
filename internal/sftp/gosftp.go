@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 
@@ -59,10 +60,6 @@ func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
 	g.pool = NewPool(g.dial)
 	return g
 }
-
-// 本文件在后续 task 里还会补：var ioCopy = io.Copy（便于测试注入）、
-// func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, local string, report func(Progress)) error
-// —— Task 12 的目录传输复用它，避免逐文件建会话。
 
 // sftpDialArgs 构造 ssh 的参数（纯函数，便于单测逐字钉顺序）。
 func sftpDialArgs(host, user string) []string {
@@ -136,8 +133,58 @@ func (g *GoBackend) ListMany(host, user string, paths []string) (map[string][]It
 // Get/GetTree/Put/PutTree 是 GoBackend 的正文方法（后续 task 填充）。
 // 接口方法 Transfer* 是薄适配层 —— 门面通过 Backend 接口只看到 Transfer*，
 // 与 BatchBackend（legacy 四参 Get/Put 保留、Transfer* 包一层）方向相反。
+// Get 下载远端单个文件（spec D15：.part 原子提交）。
+//
+// 提交前置只有一个：done == total。pkg/sftp 的 WriteTo/ReadFrom 对 EOF 返回 (n, nil)，
+// 「源被截断」不会报错 —— 必须靠字节数兜住（技术审核 R13），否则半截文件会被改名成最终名。
+//
+// 失败与取消一律保留 .part（Task 11 的续传锚点），只有 done==total 才 os.Rename 提交；
+// os.Rename 在 Linux 与 Windows 上都覆盖已存在目标。
+//
+// 取消由调用方关会话完成（库无逐请求 ctx，spec §2.3）：关会话会让 copyStream 立刻返回错误，
+// 此时 .part 及其已落盘字节保留，reuse=false 走会话关闭路径。
 func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
-	return errors.New("未实现")
+	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
+	if err != nil {
+		return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: err}
+	}
+	reuse := false
+	defer func() { g.pool.Release(s, reuse) }()
+
+	if !req.Atomic {
+		// legacy 面（internal/sync）：直写目标，原子性由 sync 自己的 .part+rename 保证。
+		n, total, err := g.getNonAtomic(s, req.Remote, req.Local)
+		if err != nil {
+			return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: err, RemoteMsg: s.Proc.StderrText()}
+		}
+		if decideCommit(n, total) != commitOK {
+			return &TransferError{Op: "sftp get", Path: req.Local, Err: shortReadError(n, total, "")}
+		}
+		reuse = true
+		return nil
+	}
+
+	// 远端 → 本地 .part（Task 12 的目录传输复用同一个 helper，避免逐文件重建会话）。
+	// helper 内部已执行唯一提交前置 done==total：远端被截断（库对 EOF 返回 nil）时
+	// 返回 shortReadError，绝不能把半截文件改名成最终名（R13）。
+	part, _, total, err := g.copyFileToLocal(s, req, req.Remote, req.Local, report)
+	if err != nil {
+		if part == "" { // 远端 Stat/Open 失败：不创建本地文件，错误带远端原文（spec D12）
+			return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: err, RemoteMsg: s.Proc.StderrText()}
+		}
+		// 失败/取消：.part 保留（Task 11 续传锚点），reuse=false 关掉会话。
+		return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, PartPath: part, Err: err, RemoteMsg: s.Proc.StderrText()}
+	}
+	if err := os.Rename(part, req.Local); err != nil {
+		return &TransferError{Op: "sftp get", Path: req.Local, PartPath: part, Err: err}
+	}
+	// 末帧强制：终值必须达（D7）。done==total 已成立，补发带完整计数的终态。
+	newProgressEmitter(req.ID, report).send(Progress{
+		Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: part,
+		Done: total, Total: total, Phase: PhaseTransfer,
+	}, true)
+	reuse = true
+	return nil
 }
 func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 	return errors.New("未实现")
