@@ -64,10 +64,15 @@ func (s *Session) markTransfer() {
 	s.mu.Unlock()
 }
 
-func (s *Session) isTransfer() bool {
+// takeTransfer 是唯一的消费入口：返回旧值并清零，保证同一会话只归还一次额度。
+// Task 4 评审 Critical C1：只读不清会让「传输会话停 idle → 被 AcquireList 复用 →
+// 再按 list 语义 Release」二次归还 token，容量 1 的 queue 拦不住已在飞行的传输。
+func (s *Session) takeTransfer() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.transfer
+	was := s.transfer
+	s.transfer = false
+	return was
 }
 
 // close 走有界退出流程：关 client → 关管道 → 有界等待 → 必要时 Kill。
@@ -171,8 +176,10 @@ func (p *Pool) Release(s *Session, reusable bool) {
 		return
 	}
 	// 只有传输会话才归还并发额度；列表会话从不占用额度（技术审核 S8）。
+	// C1 修正：标记必须一次性消费（takeTransfer 清零），保证同一会话只归还一次。
+	wasTransfer := s.takeTransfer()
 	defer func() {
-		if s.isTransfer() {
+		if wasTransfer {
 			p.refill()
 		}
 	}()
