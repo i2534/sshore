@@ -1046,12 +1046,21 @@ func (a *App) OnShutdown() {
 	if a.forward != nil {
 		a.forward.OnShutdown()
 	}
-	// 2. SFTP 生命周期：**顺序是硬约束**（Task 13 / 技术审核 M5，修复轮 1 / F2）——
-	//    GoBackend.CloseAll 内部按固定顺序收尾：先静默（拒绝新传输 + 等待所有在飞传输
-	//    结束），再关会话，最后清掉已知 .part（CleanupParts 在关会话之后自己取新会话）。
-	//    CloseAll 返回后已无在飞提交，才做 journal 恢复：恢复探测因此不可能与一次正在
-	//    进行的 rename(target→bak)/rename(part→target) 竞争。顺序颠倒（有传输在飞时删
-	//    .part，或不等静默就恢复）会留下 target 缺失、bak 残存、journal 条目被清的现场。
+	// 2. SFTP 生命周期：**顺序是硬约束**（Task 13 / 技术审核 M5，修复轮 1 / F2），
+	//    但静默是**有界**的（修复轮 2 / D1）——GoBackend.CloseAll 内部按固定顺序收尾：
+	//    先置 closing 拒绝新传输、并在 closeGrace（默认 5s）内等在飞传输自然结束；
+	//    宽限期内未结束就强停：取消后端级 transferCtx（中断无界的取额度排队/扫描相）
+	//    并关闭全部会话（中断阻塞中的网络 IO）；最后清掉已知 .part（CleanupParts 在关
+	//    会话之后自己取新会话）。有界等待是退出 liveness 的硬要求：对端活着但卡死时
+	//    传输可能永不返回，无界 Wait 会把退出押在 ssh 的 ServerAlive 超时上。
+	//
+	//    CloseAll 返回后做 journal 恢复，但**只在正常路径上**才保证没有在飞提交了：
+	//    强停路径下某次提交可能恰好停在 rename(target→bak) 与 rename(part→target)
+	//    之间，于是恢复探测仍可能撞上这次被强停的提交 —— 这正是有界退出换来的取舍。
+	//    RecoverSwaps 因此只按 journal 条目与两端实际存在情况收敛（W0 只删"两端都不
+	//    存在/都回滚干净"的条目，能回滚就回滚），绝不把这种条目当成"从未发生"清掉。
+	//    顺序颠倒（有传输在飞时先删 .part，或不等静默就恢复）会留下 target 缺失、
+	//    bak 残存、journal 条目被清的现场。
 	if a.sftp != nil {
 		a.sftp.CloseAll()
 		// journal 条目自带 host/user；恢复按 (host,user) 分组、只探条目自己的主机。
