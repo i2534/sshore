@@ -808,10 +808,15 @@ func (p *PipedProcess) Kill() error { return p.proc.Kill() }
 func (p *PipedProcess) Signal() error { return p.proc.Signal() }
 
 // Close 关闭管道并终止子进程；调用方在传输结束后必须调用，避免长驻 ssh 泄漏。
+// 幂等（Task 3 实测）：子进程已正常退出时 Kill 返回 os.ErrProcessDone，这不是错误 ——
+// 否则 Task 6 每次正常收尾都会拿到假错误。调用点不需要 whitelist。
 func (p *PipedProcess) Close() error {
 	_ = p.Stdin.Close()
 	_ = p.Stdout.Close()
-	return p.proc.Kill()
+	if err := p.proc.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
 }
 ```
 
