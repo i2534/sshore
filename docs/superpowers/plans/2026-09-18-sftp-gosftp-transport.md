@@ -84,7 +84,7 @@ ssh -p 2222 lan@127.0.0.1 "where ssh & where sftp & ssh -V"
 
 - [ ] **Step 2: 在客户机投放探测程序**
 
-`main.go`（约 60 行，验证四件事）：
+`main.go`（约 60 行，验证四件事）。**实跑修正**：v1.13.11 的 `*sftp.Client` **没有** `ReadFile`/`WriteFile`（Task 0 实测编译不过）—— 下方对应的两处调用用等价 helper 替换即可（WriteFile = Create+Write+Close；ReadFile = Open+io.ReadAll+Close），探测顺序/参数/打印不变：
 
 ```go
 package main
@@ -1624,8 +1624,10 @@ func (g *GoBackend) dial(host, user string) (*Session, error) {
 	if user != "" {
 		args = append(args, "-o", "User="+user)
 	}
-	// Task 0 的结论决定 -s 的位置；默认用后置写法（Linux 已验证有效）
-	args = append(args, host, "-s", "sftp")
+	// Task 0 实测：-s 前置/后置在 Win32-OpenSSH 9.5p1 都可用；采用前置（不依赖 getopt 置换）。
+	// 另注（Task 0 的 Session 0 现象）：本函数必须在交互桌面会话里运行 ——
+	// Session 0 中 spawn 的 ssh.exe 会卡在 SFTP INIT 之后（裸 ssh 命令同样卡），属环境限制。
+	args = append(args, "-s", host, "sftp")
 	pp, err := osutil.StartPipes("ssh", args...)
 	if err != nil {
 		return nil, err
@@ -3339,7 +3341,7 @@ git commit -m "test(e2e): 临时 sshd 同时跑 sftp/sync 两包与双后端矩�
 make windows   # 见 Makefile 的 windows 目标；产物在 build/bin/
 ```
 
-再在 `win10` 客户机上安装本轮构建的 `sshore-windows-amd64.exe`，逐项打勾：
+再在 `win10` 客户机上安装本轮构建的 `sshore-windows-amd64.exe`。**必须在交互桌面会话（Session 1）里运行**（Task 0 的 Session 0 现象；用 schtasks /it 或直接桌面启动），且客户机免密键名非默认（`id_winlocal`），本机自连验证要带 `-i`。逐项打勾：
 
 - 进度条在下载/上传都随字节推进；取消按钮在百毫秒级生效且目标名不出现半截文件；
 - 失败项「重试」「续传」可用；续传后 sha256 与一次性完整传输一致（在客户机上用 `certutil -hashfile` 比对）；
