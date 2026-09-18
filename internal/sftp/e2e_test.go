@@ -19,6 +19,57 @@ import (
 	"sshore/internal/osutil"
 )
 
+// e2eBackendName 把 BackendKind 翻译成 harness 认识的稳定字符串（batch/gosftp/unknown）。
+func e2eBackendName(k BackendKind) string {
+	switch k {
+	case KindBatch:
+		return "batch"
+	case KindGo:
+		return "gosftp"
+	default:
+		return "unknown"
+	}
+}
+
+// observedBackendName 返回门面**实际选中的后端**名。读的是 backend() 的运行时类型，
+// 不是循环变量、也不是「意图」：选择器一旦忽略 SSHORE_SFTP_TRANSPORT，这里打印的
+// 就与 harness 本轮迭代不符，矩阵与断言会一起报出来（Important-1）。
+func observedBackendName(c *Ctrl) string {
+	switch c.backend().(type) {
+	case *BatchBackend:
+		return "batch"
+	case *GoBackend:
+		return "gosftp"
+	default:
+		return "unknown"
+	}
+}
+
+// assertTransportMatchesEnv 钉住「选择器真的读了环境变量」这半条后端身份断言。
+// harness 的两轮迭代分别导出 SSHORE_SFTP_TRANSPORT=batch|gosftp：
+//   - 把 resolveTransport 改成忽略 env（恒返回 batch）⇒ 这里 got≠want，立即失败；
+//   - 把 harness 里的变量名拼错/漏导出（env 为空 ⇒ 回落内置默认 batch）⇒ 这里也失败，
+//     而不是让两轮迭代都悄悄跑 batch 还打印 batch/gosftp 的假矩阵。
+func assertTransportMatchesEnv(t *testing.T) {
+	t.Helper()
+	raw := strings.TrimSpace(os.Getenv("SSHORE_SFTP_TRANSPORT"))
+	var want BackendKind
+	switch strings.ToLower(raw) {
+	case "batch":
+		want = KindBatch
+	case "gosftp":
+		want = KindGo
+	case "":
+		t.Fatalf("SSHORE_SFTP_TRANSPORT 未送达（空值 = harness 变量名拼错/漏导出）：后端身份无法证明")
+	default:
+		t.Fatalf("SSHORE_SFTP_TRANSPORT 非法值 %q", raw)
+	}
+	if got := resolveTransport(nil); got != want {
+		t.Fatalf("resolveTransport(nil) 未按 SSHORE_SFTP_TRANSPORT=%q 选择后端：got %s want %s",
+			raw, e2eBackendName(got), e2eBackendName(want))
+	}
+}
+
 // TestGoBackendE2E 需要 e2e/test_local.sh 先起好临时 sshd 并导出 SSHORE_E2E_HOST / SSHORE_E2E_REMOTE。
 // 缺环境即 skip（保证 go test ./... 在无网络/无 sshd 时无声通过），
 // 而 harness 会显式设置这些变量并把任何 SKIP 当作失败（防假绿）。
@@ -31,8 +82,14 @@ func TestGoBackendE2E(t *testing.T) {
 	if _, err := exec.LookPath("ssh"); err != nil {
 		t.Skip("缺少 ssh 二进制")
 	}
+	// Important-1(a)：先证明选择器真的读了 SSHORE_SFTP_TRANSPORT，再谈后面跑的是哪个后端。
+	assertTransportMatchesEnv(t)
 	g := NewGoBackend(nil, nil)
 	defer g.CloseAll()
+	ctrl := NewCtrl(osutil.NewRunner(), nil)
+	defer ctrl.CloseAll()
+	// 用例自报**实测**后端（读门面 backend() 的运行时类型），供 harness 做后端身份断言与矩阵。
+	t.Logf("SSHORE_E2E_BACKEND=%s", observedBackendName(ctrl))
 
 	// 本 task 只验「会话起得来 + 能力探测」；Home/List 要 Task 13 才实现（自审 S7）。
 	ok, err := g.Capabilities(host, "")
@@ -78,8 +135,6 @@ func TestGoBackendE2E(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(remote, srcName), data, 0600); err != nil {
 		t.Fatalf("写远端测试文件: %v", err)
 	}
-	ctrl := NewCtrl(osutil.NewRunner(), nil)
-	defer ctrl.CloseAll()
 	implName := map[BackendKind]string{KindBatch: "BatchBackend.TransferGet", KindGo: "GoBackend.Get"}[be]
 	req := TransferRequest{
 		ID:     "t7-" + localName,
@@ -235,8 +290,13 @@ func TestCancelWholeBatchE2E(t *testing.T) {
 	if host == "" || remote == "" {
 		t.Skip("未提供 SSHORE_E2E_*，跳过取消验证")
 	}
+	assertTransportMatchesEnv(t)
 	g := NewGoBackend(nil, nil)
 	defer g.CloseAll()
+	// 门面腿（gosftp 迭代真关会话 / batch 迭代诚实 false）会用到，提前建好并自报实测后端。
+	ctrl := NewCtrl(osutil.NewRunner(), nil)
+	defer ctrl.CloseAll()
+	t.Logf("SSHORE_E2E_BACKEND=%s", observedBackendName(ctrl))
 	// 自造 32MB 源文件并上传（不依赖脚本预置）。
 	big := filepath.Join(t.TempDir(), "big.bin")
 	if err := os.WriteFile(big, bytes.Repeat([]byte("x"), 32<<20), 0600); err != nil {
@@ -259,8 +319,6 @@ func TestCancelWholeBatchE2E(t *testing.T) {
 	}
 
 	// 腿 2：门面链路 / batch 诚实性。
-	ctrl := NewCtrl(osutil.NewRunner(), nil)
-	defer ctrl.CloseAll()
 	if be == KindBatch {
 		if ctrl.Cancel("t-cancel") {
 			t.Fatal("batch 后端无长驻会话，Cancel 必须诚实返回 false")
@@ -363,6 +421,9 @@ func TestResumeE2E(t *testing.T) {
 	if _, err := exec.LookPath("ssh"); err != nil {
 		t.Skip("缺少 ssh 二进制")
 	}
+	// 本用例全程直连 GoBackend（.part/续传是 Go 后端语义），与门面选中的后端无关：
+	// 自报 go-direct，harness 就不会把它误算成「batch+gosftp 各验了一次」。
+	t.Logf("SSHORE_E2E_BACKEND=go-direct")
 	g := NewGoBackend(nil, nil)
 	defer g.CloseAll()
 	be := resolveTransport(nil)
@@ -534,11 +595,13 @@ func TestTreeE2E(t *testing.T) {
 	if _, err := exec.LookPath("ssh"); err != nil {
 		t.Skip("缺少 ssh 二进制")
 	}
+	assertTransportMatchesEnv(t)
 	be := resolveTransport(nil)
 	impl := map[BackendKind]string{KindBatch: "BatchBackend.TransferGetTree/PutTree", KindGo: "GoBackend.GetTree/PutTree"}[be]
 	ctrl := NewCtrl(osutil.NewRunner(), nil)
 	defer ctrl.CloseAll()
 	atomic := ctrl.AtomicCapable()
+	t.Logf("SSHORE_E2E_BACKEND=%s", observedBackendName(ctrl))
 	t.Logf("目录传输实现 = %s（backend=%v, Atomic=%v）", impl, be, atomic)
 
 	src := t.TempDir()
@@ -634,6 +697,9 @@ func TestCapabilitiesE2E(t *testing.T) {
 	if !ok {
 		return
 	}
+	// 能力面（Mkdir/Rename/ListMany/RemoveRecursive）只存在于 GoBackend，两个迭代都直连它：
+	// 自报 go-direct，harness 不会谎称它分别在 batch/gosftp 上验过。
+	t.Logf("SSHORE_E2E_BACKEND=go-direct")
 	g := NewGoBackend(nil, nil)
 	defer g.CloseAll()
 	dir := remote + "/caps"
@@ -708,6 +774,11 @@ func TestNoLeftoverOnCloseE2E(t *testing.T) {
 	if !ok {
 		return
 	}
+	t.Logf("SSHORE_E2E_BACKEND=go-direct")
+	// 进程断言的前提：本机必须真能查（Linux 上 pgrep 缺失 = 环境缺陷，响亮失败；绝不静默 no-op）。
+	// 放在任何 ssh 动作之前：坏环境快速失败，而不是先跑完传输再假装没看见。
+	canCheckProc := requireSftpChildCheck(t)
+	// 全用例直连 GoBackend（CloseAll 的进程清理是 Go 后端行为），自报 go-direct。
 	g := NewGoBackend(nil, nil)
 	src := filepath.Join(t.TempDir(), "small.bin")
 	if err := os.WriteFile(src, []byte("hello"), 0600); err != nil {
@@ -717,16 +788,14 @@ func TestNoLeftoverOnCloseE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 退出前先确认这条会话确实起出了 ssh 子进程（否则「无残留」的断言没有意义）。
-	if runtime.GOOS != "windows" {
-		if _, err := exec.LookPath("pgrep"); err == nil && !hasLiveSftpChild(host) {
-			t.Fatalf("CloseAll 之前必须能看到 ssh 子进程（否则用例无法证明清理生效）")
-		}
+	if canCheckProc && !hasLiveSftpChild(host) {
+		t.Fatalf("CloseAll 之前必须能看到 ssh 子进程（否则用例无法证明清理生效）")
 	}
 	g.CloseAll()
 
 	// 1) 不得残留 ssh 子进程。**必须先查**：下面的 List 会重新 dial 出一条新会话，
 	//    那时 pgrep 看到的是新进程，断言就失去意义（实测踩过这个坑）。
-	if hasLiveSftpChild(host) {
+	if canCheckProc && hasLiveSftpChild(host) {
 		out, _ := exec.Command("pgrep", "-fa", "--", host+" sftp").CombinedOutput()
 		t.Fatalf("CloseAll 后仍有 ssh 子进程: %s", out)
 	}
@@ -741,8 +810,26 @@ func TestNoLeftoverOnCloseE2E(t *testing.T) {
 	t.Log("CloseAll 后无残留 ssh 子进程、无远端临时文件")
 }
 
-// hasLiveSftpChild 报告是否还有本次 sftp 会话起的 ssh 子进程（pgrep 不可用或 Windows 上
-// 返回 false，调用方据此只在能做有意义断言的平台上检查）。
+// requireSftpChildCheck 断言本机**真的能做**「无残留 ssh 子进程」的检查，并返回是否可检查。
+// Linux/macOS 上 pgrep 缺失属于环境缺陷，必须响亮失败：旧实现静默返回 false，会让进程断言
+// 退化成 no-op 而 harness 依旧全绿（Task 15 复审 M5）。Windows 上 pgrep 本就不存在，
+// 进程断言由 Task 16 的真机用例用 tasklist 覆盖，这里只记录、不检查（是显式留存，不是静默降级）。
+func requireSftpChildCheck(t *testing.T) bool {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Log("windows：无 pgrep，ssh 子进程断言留待 Task 16 的 tasklist 检查；本用例其余断言照跑")
+		return false
+	}
+	if _, err := exec.LookPath("pgrep"); err != nil {
+		t.Fatalf("pgrep 不可用（%v）：进程残留断言不得静默跳过（Linux/macOS 必须能做这项检查）", err)
+	}
+	return true
+}
+
+// hasLiveSftpChild 报告是否还有本次 sftp 会话起的 ssh 子进程。调用方必须先经
+// requireSftpChildCheck（非 Windows 上它保证 pgrep 可用）；Windows 上恒 false。
+// 这里的 LookPath 兜底只为「已 Fatal 的坏环境」不再 panic，绝不是静默 no-op ——
+// 正常路径上 pgrep 缺失已经在 requireSftpChildCheck 里响亮失败了（Minor-5）。
 func hasLiveSftpChild(host string) bool {
 	if runtime.GOOS == "windows" {
 		return false
@@ -777,6 +864,9 @@ func TestCloseAllCleansRegisteredPartsE2E(t *testing.T) {
 	if !ok {
 		return
 	}
+	t.Logf("SSHORE_E2E_BACKEND=go-direct")
+	// 登记表清理是 Go 后端的 knownParts/pool.dial 行为，与门面选中的后端无关：自报 go-direct。
+	canCheckProc := requireSftpChildCheck(t)
 	g := NewGoBackend(nil, nil)
 	defer g.CloseAll()
 
@@ -831,7 +921,7 @@ func TestCloseAllCleansRegisteredPartsE2E(t *testing.T) {
 		t.Fatalf("取消后的 .part 必须在登记表里（put=%v get=%v）—— 否则 CleanupParts 走不到删除分支", putReg, getReg)
 	}
 	// 两次取消都应已关掉会话：清理前不应还有在飞 ssh 子进程。
-	if hasLiveSftpChild(host) {
+	if canCheckProc && hasLiveSftpChild(host) {
 		t.Fatal("两次取消后不应还有 ssh 子进程（取消没有关干净会话）")
 	}
 
@@ -841,7 +931,7 @@ func TestCloseAllCleansRegisteredPartsE2E(t *testing.T) {
 
 	// ① **先**查子进程：CleanupParts 的 AcquireList 会重新 dial，之后任何远端调用都会再起
 	//    会话，让这条断言失去意义（Task 13 已实测踩过）。
-	if hasLiveSftpChild(host) {
+	if canCheckProc && hasLiveSftpChild(host) {
 		out, _ := exec.Command("pgrep", "-fa", "--", host+" sftp").CombinedOutput()
 		t.Fatalf("CloseAll 后仍有 ssh 子进程: %s", out)
 	}
