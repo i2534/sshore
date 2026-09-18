@@ -999,9 +999,20 @@ func (s *Session) setState(st sessionState) {
 	s.mu.Unlock()
 }
 
-// fromTransfer 标记该会话是否占用了传输额度（技术审核 S8：列表会话 Release 不得归还额度，否则并发 1 被突破）。
+// transfer 标记该会话是否占用了传输额度（技术审核 S8：列表会话 Release 不得归还额度）。
 func (s *Session) markTransfer() { s.mu.Lock(); s.transfer = true; s.mu.Unlock() }
-func (s *Session) isTransfer() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.transfer }
+
+// takeTransfer 是唯一的**消费**入口：返回旧值并清零。
+// Task 4 评审 Critical C1：若只在 Release 里读不清，传输会话停进 idle 后被 AcquireList 复用，
+// 它日后再 Release 会二次归还 token，于是「队列 token + 在飞行传输」可以同时 >=2，
+// 并发 1 被突破 —— queue 容量 1 拦不住已经在飞行的那个传输。
+func (s *Session) takeTransfer() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	was := s.transfer
+	s.transfer = false
+	return was
+}
 
 func (s *Session) close() {
 	s.mu.Lock()
@@ -1100,9 +1111,11 @@ func (p *Pool) Release(s *Session, reusable bool) {
 	if s == nil {
 		return
 	}
-	// 只有传输会话才归还并发额度；列表会话从不占用额度（技术审核 S8）。
+	// 只有传输会话才归还并发额度；列表会话从不占用额度（S8）。
+	// C1 修正：标记必须一次性消费（takeTransfer 清零），保证同一会话只归还一次。
+	wasTransfer := s.takeTransfer()
 	defer func() {
-		if s.isTransfer() {
+		if wasTransfer {
 			p.refill()
 		}
 	}()
