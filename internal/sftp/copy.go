@@ -120,27 +120,42 @@ func (w *countingWriter) Write(b []byte) (int, error) {
 // 创建在磁盘上、可续传。远端 Stat/Open 失败返回 ("", 0, 0, err)；本地 OpenFile 失败
 // 也返回 ("", 0, total, err)（错误里带 errLocalPart 标记），绝不给出不存在的假锚点。
 func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, local string, report func(Progress)) (string, int64, int64, error) {
-	st, err := s.Conn.Stat(remote)
-	if err != nil {
-		return "", 0, 0, err
-	}
-	total := st.Size()
-	rf, err := s.Conn.Open(remote)
-	if err != nil {
-		return "", 0, 0, err
-	}
 	part := req.PartPath
 	if part == "" {
 		part = PartName(local, req.ID)
 	}
 	// 续传（Task 11）：req.Resume + req.ResumeOffset 由 Get 的 decideResume 填好。
-	// 绝不能 O_TRUNC —— 那会把上一次留下的前缀清零，随后 Seek(offset) 写出「前 offset 字节
-	// 是 0」的静默损坏文件（事实 5）。远端也必须 Seek 到同一 offset，否则会把源的第 0 字节
-	// 写到本地 offset 处。
+	// I2/I3：判定用的 Stat 与真正打开读取之间存在窗口 —— 先过注入点（仅续传时）。
+	resume := req.Resume && req.ResumeOffset > 0
 	offset := int64(0)
-	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-	if req.Resume {
+	if resume {
 		offset = req.ResumeOffset
+		beforeOpenResumePart(part, remote, offset)
+	}
+	rf, err := s.Conn.Open(remote)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	// I3：指纹校验与数据读取绑定到**同一个已打开句柄**。下面的 fst 既是续传复核的依据，
+	// 也是随后记录锚点的依据；判定阶段那次 Stat 只用于决定「要不要尝试续传」。
+	fst, err := rf.Stat()
+	if err != nil {
+		_ = rf.Close()
+		return "", 0, 0, err
+	}
+	total := fst.Size()
+	if resume {
+		if !g.resumeSourceUnchanged(downloadAnchorKey(part), remote, fst.Size(), fst.ModTime()) {
+			// 源在判定与打开之间被改写（或锚点不可验证/身份不符）：绝不追加 —— 退回整份重传。
+			g.forgetResumeAnchor(downloadAnchorKey(part))
+			resume, offset = false, 0
+		}
+	}
+	// 续写绝不能 O_TRUNC —— 那会把上一次留下的前缀清零，随后 Seek(offset) 写出「前 offset
+	// 字节是 0」的静默损坏文件（事实 5）；只有整份重传才 O_TRUNC。远端也必须 Seek 到同一
+	// offset，否则会把源的第 0 字节写到本地 offset 处。
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if resume {
 		flags = os.O_WRONLY | os.O_CREATE
 	}
 	f, err := os.OpenFile(part, flags, 0600)
@@ -151,6 +166,25 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 		// 这条给 Task 11 的契约。错误只包一层本地标记，供 Get 判「不要附 RemoteMsg」（M4）。
 		_ = rf.Close()
 		return "", 0, total, fmt.Errorf("%w: %w", errLocalPart, err)
+	}
+	if resume {
+		// I2：打开后立刻按句柄自身的实际长度复核 offset —— 判定与打开之间的窗口里
+		// .part 可能被截断/追加，必须在这里兜住，绝不 Seek 越过 EOF。
+		ok, aerr := alignLocalPartHandle(f, offset)
+		if aerr != nil {
+			_ = rf.Close()
+			_ = f.Close()
+			return part, 0, total, wrapLocalIO(aerr)
+		}
+		if !ok {
+			// .part 缩水/消失：Truncate(offset) 会把缺口补成零洞，绝不能做 —— 退回整份重传。
+			if terr := f.Truncate(0); terr != nil {
+				_ = rf.Close()
+				_ = f.Close()
+				return part, 0, total, wrapLocalIO(terr)
+			}
+			resume, offset = false, 0
+		}
 	}
 	if offset > 0 {
 		if _, serr := rf.Seek(offset, io.SeekStart); serr != nil {
@@ -164,9 +198,10 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 			return part, 0, total, wrapLocalIO(serr)
 		}
 	}
-	// 记录源指纹（Task 11）：这份 .part 的已落盘字节对应远端源的 (size, mtime)。
-	// 续传请求带回同一个 PartPath 时用它验证「还是当初那份源吗」。
-	g.recordResumeAnchor(downloadAnchorKey(part), total, st.ModTime())
+	// 记录源指纹（Task 11）：这份 .part 的已落盘字节对应**已打开句柄**看到的远端源
+	// (身份, size, mtime)。续传请求带回同一个 PartPath 时用它验证「还是当初那份源吗」；
+	// 用句柄 Stat 而非判定时的 Stat，保证锚点与真正读到的字节出自同一份元数据（I3）。
+	g.recordResumeAnchor(downloadAnchorKey(part), remote, total, fst.ModTime())
 	em := newProgressEmitter(req.ID, report)
 	// 首帧 Done 从续传起点起算，UI 不会在续传时先看到 0/total。
 	cw := &countingWriter{f: f, e: em, p: Progress{Host: req.Host, Direction: DirDownload, Name: remote, PartPath: part, Done: offset, Total: total, Phase: PhaseTransfer}, n: offset}
@@ -184,6 +219,51 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 		return part, done, total, shortReadError(done, total, part)
 	}
 	return part, done, total, nil
+}
+
+// beforeOpenResumePart 是 I2/I3 的确定性注入点：在「续传判定已完成、但本地 .part 与远端源
+// 尚未被真正打开读取」的窗口里被调用（part=本地 .part 绝对路径，remote=远端源路径，
+// offset=判定出的续传起点）。生产实现是 no-op；单测用它模拟另一进程在这个窗口里
+// 截断/追加 .part，或同尺寸改写远端源。做成变量与 copyStream/posixRename 同思路。
+var beforeOpenResumePart = func(part, remote string, offset int64) {}
+
+// localPartIfExists 返回确实存在于磁盘上的本地 .part 路径；不存在（或为空）返回空串。
+// 用于错误分支如实上报锚点（M4）：判定阶段远端源可能连 Stat 都失败，但本地 .part 可能
+// 仍然保留着，调用方不该因此丢掉续传锚点。
+func localPartIfExists(part string) string {
+	if part == "" {
+		return ""
+	}
+	if st, err := os.Stat(part); err == nil && st.Mode().IsRegular() {
+		return part
+	}
+	return ""
+}
+
+// alignLocalPartHandle 在**已打开**的本地 .part 句柄上复核实际长度是否等于续传 offset（I2）
+//   - == offset：可续；
+//   - >  offset：Truncate(offset) 丢弃陈旧尾部（上次运行遗留的字节）；
+//   - <  offset（含 0）：返回 false，调用方退回整份重传 —— 绝不 Truncate(offset) 把缺口
+//     补成零洞，也绝不 Seek 越过 EOF（同样会零填充出洞，而 done==total 仍会提交）。
+func alignLocalPartHandle(f *os.File, offset int64) (bool, error) {
+	if offset <= 0 {
+		return true, nil
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case st.Size() == offset:
+		return true, nil
+	case st.Size() > offset:
+		if err := f.Truncate(offset); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 // getNonAtomic 是 legacy 面（req.Atomic=false，internal/sync）：直写目标，

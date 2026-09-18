@@ -93,7 +93,10 @@ func decideResume(in resumeInput) (resumeKind, int64) {
 const resumeAnchorMax = 256
 
 type resumeAnchor struct {
-	size  int64
+	// src 是源的**身份**（下载 = 远端源路径，上传 = 本地源路径）。只存 (size, mtime) 时，
+	// 另一份同尺寸、同 mtime 的无关源会被误当成合法前缀（M1）；身份必须逐字相符。
+	src   string
+	size  int64 // 传输开始时记录的源大小（期望长度）
 	mtime time.Time
 }
 
@@ -102,10 +105,10 @@ type resumeAnchor struct {
 func downloadAnchorKey(part string) string { return "d:" + part }
 func uploadAnchorKey(part string) string   { return "u:" + part }
 
-// recordResumeAnchor 记录（或覆盖）某个 .part 对应的源指纹。part 为空（无锚点）时 no-op。
-// 表有上限：失败/取消留下的锚点会一直留着供续传，长时间运行必须有界；超限时随机淘汰一条
-// （被淘汰的锚点会让下一次续传退化为整份重传，方向安全）。
-func (g *GoBackend) recordResumeAnchor(key string, size int64, mtime time.Time) {
+// recordResumeAnchor 记录（或覆盖）某个 .part 对应的源指纹（身份 + 期望长度 + mtime）。
+// key 为空（无锚点）时 no-op。表有上限：失败/取消留下的锚点会一直留着供续传，长时间运行
+// 必须有界；超限时随机淘汰一条（被淘汰的锚点会让下一次续传退化为整份重传，方向安全）。
+func (g *GoBackend) recordResumeAnchor(key, src string, size int64, mtime time.Time) {
 	if key == "" {
 		return
 	}
@@ -120,7 +123,7 @@ func (g *GoBackend) recordResumeAnchor(key string, size int64, mtime time.Time) 
 			break
 		}
 	}
-	g.resumeAnchors[key] = resumeAnchor{size: size, mtime: mtime}
+	g.resumeAnchors[key] = resumeAnchor{src: src, size: size, mtime: mtime}
 }
 
 func (g *GoBackend) lookupResumeAnchor(key string) (resumeAnchor, bool) {
@@ -183,7 +186,9 @@ func (g *GoBackend) decideDownloadResume(s *Session, req TransferRequest) (resum
 		return resumeFull, 0, nil
 	}
 	in := resumeInput{PartSize: pst.Size(), Total: st.Size(), SrcMtime: st.ModTime()}
-	if a, ok := g.lookupResumeAnchor(downloadAnchorKey(req.PartPath)); ok {
+	// M1：锚点必须记的是**同一个远端源**。仅比 (size,mtime) 时，另一份同尺寸同 mtime 的
+	// 无关源会被误当成合法前缀；身份不符一律按「不可验证」处理。
+	if a, ok := g.lookupResumeAnchor(downloadAnchorKey(req.PartPath)); ok && a.src == req.Remote {
 		in.SrcSize, in.RecMtime = a.size, a.mtime
 	} else {
 		in.SrcChanged = true
@@ -203,11 +208,22 @@ func (g *GoBackend) decideUploadResume(s *Session, req TransferRequest, total in
 		return resumeFull, 0, err
 	}
 	in := resumeInput{PartSize: pst.Size(), Total: total, SrcMtime: srcMtime}
-	if a, ok := g.lookupResumeAnchor(uploadAnchorKey(req.PartPath)); ok {
+	// M1：同下载方向，锚点必须记的是**同一个本地源**。
+	if a, ok := g.lookupResumeAnchor(uploadAnchorKey(req.PartPath)); ok && a.src == req.Local {
 		in.SrcSize, in.RecMtime = a.size, a.mtime
 	} else {
 		in.SrcChanged = true
 	}
 	k, off := decideResume(in)
 	return k, off, nil
+}
+
+// resumeSourceUnchanged 用**已打开数据句柄**拿到的 (size, mtime) 复核锚点（I3）。
+// decide*Resume 的判定用的是另一次 Stat；从那次 Stat 到真正 Open 之间存在窗口，
+// 同尺寸改写若发生在这个窗口里，只靠判定时的指纹会把旧前缀拼到新内容上。
+// 因此追加之前必须在打开的句柄上再核一次：锚点存在、源身份相符（M1）、size/mtime 都相等，
+// 任一不满足即返回 false，由调用方退回整份重传（绝不写坏文件）。
+func (g *GoBackend) resumeSourceUnchanged(key, src string, size int64, mtime time.Time) bool {
+	a, ok := g.lookupResumeAnchor(key)
+	return ok && a.src == src && a.size == size && a.mtime.Equal(mtime)
 }
