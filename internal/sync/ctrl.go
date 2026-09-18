@@ -540,11 +540,10 @@ func (c *Ctrl) drainQueue(r *ruleRuntime) {
 // "远端已删"并删掉本地文件（C2）。
 func inScope(rule config.SyncRule, rel string) bool {
 	// D18 内置忽略：sshore 自己的传输临时文件（中缀 .sshore-sftppart-）永远不属于本规则。
-	// 这是**唯一**判定点：consume 的事件入队过滤与 align 的删除候选过滤都走它，
-	// 一处生效即两处生效，绝不依赖用户配置的 excludes。
-	if watch.IsInternalTemp(rel) {
-		return false
-	}
+	// 这里**不再**单独调 watch.IsInternalTemp：MatchExclude 内部已经先判它（唯一的判定
+	// 实现），重复一层只会制造「测试打红这一行」的假象 —— 关掉它测试照样绿（修复轮 1 /
+	// F4 的变异 A2）。内置忽略由 watch 层的 TestMatchExcludeAlwaysDropsInternalTemp 与
+	// 本包的引擎级用例独立覆盖。
 	if watch.MatchExclude(rel, rule.Excludes) {
 		return false
 	}

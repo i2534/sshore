@@ -101,12 +101,17 @@ type GoBackend struct {
 	// Task 13（Task 6 重审 I3）：Connected 是**粘性连接意图**，不是「池里现在有没有会话」。
 	// 成功 dial 置位；只有显式 Disconnect / CloseAll 清除。池的 idle 上限 LRU 逐出、
 	// 会话被关、传输结束归还，都不能让 UI 翻回未连接。
-	//
-	// lastHost/lastUser 记录**最近一次成功握手**的凭据：journal 条目没有 host 字段，
-	// 恢复探测只能靠它；CloseAll 刻意不清（恢复发生在 CloseAll 之后）。
-	connMu             sync.Mutex
-	connected          map[string]bool
-	lastHost, lastUser string
+	connMu    sync.Mutex
+	connected map[string]bool
+
+	// Task 13 修复轮 1（F2）：退出静默。transferMu 把 acquireInflight 的
+	// 「检查 closing + transfersWG.Add」与 CloseAll 的「置 closing + Wait」串行化，
+	// 保证不会在 Wait 开始之后再 Add（Go WaitGroup 规约）。closing 一旦置位即拒绝新的
+	// 传输（应用正在退出）；transfersWG 计数在飞传输，CloseAll 先等它归零再做清理与恢复，
+	// 绝不删一条仍在提交中的 .part。
+	transferMu  sync.Mutex
+	closing     bool
+	transfersWG sync.WaitGroup
 }
 
 func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
@@ -127,9 +132,12 @@ func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
 	return g
 }
 
-// markConnected 记录一次成功握手（粘性连接意图 + 最近握手凭据）。由池在真正建出会话
+// markConnected 记录一次成功握手（粘性连接意图）。由池在真正建出会话
 // （有着落地的子进程，即不是测试替身）之后调用 —— AcquireList/AcquireTransfer/Probe 都走它。
+// 修复轮 1（F1）起这里**不再**记录「最近握手凭据」：journal 条目自带 host/user，
+// 恢复探测以条目为准，与本次进程握过谁无关。
 func (g *GoBackend) markConnected(host, user string) {
+	_ = user // 只用于回调签名；恢复不再依赖最近握手用户
 	if host == "" {
 		return
 	}
@@ -138,16 +146,7 @@ func (g *GoBackend) markConnected(host, user string) {
 		g.connected = map[string]bool{}
 	}
 	g.connected[host] = true
-	g.lastHost, g.lastUser = host, user
 	g.connMu.Unlock()
-}
-
-// recoverHostUser 返回恢复探测要用的 (host,user)：最近一次成功握手的那条。
-// 从未连接过 ⇒ 空 host，调用方必须据此放弃本次恢复（不动作、不删条目）。
-func (g *GoBackend) recoverHostUser() (string, string) {
-	g.connMu.Lock()
-	defer g.connMu.Unlock()
-	return g.lastHost, g.lastUser
 }
 
 // clearConnected 只在显式 Disconnect / CloseAll 调用（连接意图的清除点）。
@@ -891,7 +890,8 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 	bak := BakNameRemote(target) // 远端 POSIX 路径：必须用 Remote 家族
 	// 1) intent 先落盘；Begin 失败绝不进入破坏性改名。
 	if j != nil {
-		if err := j.Begin(target, bak, part); err != nil {
+		// host/user 取自本次会话：条目自带归属，恢复时只在该主机上探测（修复轮 1 / F1）。
+		if err := j.Begin(s.Host, s.User, target, bak, part); err != nil {
 			return fmt.Errorf("登记 swap journal 失败，未改动目标: %w", err)
 		}
 	}
@@ -901,7 +901,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 			// I4：非 ENOENT（权限/被占用）必须上报，绝不当作「目标不存在」直接提交 ——
 			// 那会把失败当成功，还会绕过 journal。target 没被动，清掉已无意义的 intent。
 			if j != nil {
-				if derr := j.Done(target); derr != nil {
+				if derr := j.Done(s.Host, target); derr != nil {
 					warn("清理 swap journal 条目失败（目标改名失败时）: %v", derr)
 				}
 			}
@@ -909,7 +909,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 		}
 		// 目标原本不存在：无旧内容可丢，直接提交；intent 已无意义，先清（清不掉只 warn）。
 		if j != nil {
-			if derr := j.Done(target); derr != nil {
+			if derr := j.Done(s.Host, target); derr != nil {
 				warn("清理 swap journal 条目失败（目标本不存在时）: %v", derr)
 			}
 		}
@@ -923,7 +923,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 				err, bak, target, rbErr)
 		}
 		if j != nil {
-			if derr := j.Done(target); derr != nil {
+			if derr := j.Done(s.Host, target); derr != nil {
 				return fmt.Errorf("%w（回滚成功但清理 journal 失败，条目保留）: %v", err, derr)
 			}
 		}
@@ -931,7 +931,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 	}
 	// 4) 提交成功：清理失败只 warn（见函数头错误策略）。
 	if j != nil {
-		if err := j.Done(target); err != nil {
+		if err := j.Done(s.Host, target); err != nil {
 			warn("提交成功但清理 swap journal 条目失败: %v", err)
 		}
 	}
@@ -1254,10 +1254,26 @@ func (g *GoBackend) Remove(host, user, path string) error {
 	return nil
 }
 
+// removeMaxDepth / removeMaxEntries 是递归删除的硬上限（修复轮 1 / F6）。
+// 做成变量而不是常量：单测可以调小，确定性地验证「撞上限即整体失败、且未删除任何东西」。
+var (
+	removeMaxDepth   = 64
+	removeMaxEntries = 100000
+)
+
 // RemoveRecursive 保留旧语义：拒绝根路径、目录不可读即整体失败（不静默漏删）。
 // Walk 的错误一律上报 —— 部分删除绝不回滚，也绝不把「有目录没走到」当成成功。
+//
+// 修复轮 1：
+//   - F5：条目类型用 Walker 自己的 Stat（Lstat 语义，与 Walk 的非跟随语义一致）。
+//     原先用 Conn.Stat（跟随符号链接）会把「指向目录的符号链接」误判成目录，
+//     RemoveDirectory(link) 报 ENOTDIR 让整次递归失败；顺带省掉每个条目一次往返。
+//     目标自身也用 Lstat 区分（符号链接按普通文件 unlink）。
+//   - F6：拒绝 "."/".." 等相对根；遍历有深度与条目数上限，且**在收集阶段**撞上限即
+//     整体失败 —— 此时还没删任何东西，不会留下删一半的树。
 func (g *GoBackend) RemoveRecursive(host, user, remotePath string) error {
-	if remotePath == "" || remotePath == "/" {
+	clean := path.Clean(remotePath)
+	if remotePath == "" || remotePath == "/" || clean == "." || clean == ".." || clean == "/" {
 		return fmt.Errorf("拒绝递归删除根路径: %q", remotePath)
 	}
 	s, err := g.pool.AcquireList(context.Background(), host, user)
@@ -1272,7 +1288,8 @@ func (g *GoBackend) RemoveRecursive(host, user, remotePath string) error {
 	}
 	// 两相：先把 Walk 完整走完（只收集，不在遍历中做任何远端写操作 —— 库的 Walk 在
 	// 遍历期间并发发请求会让连接紊乱，实测报 "connection lost"），再自底向上删除。
-	var files, dirs []string // dirs 自底向上（深者在前）
+	var files, dirs []string // dirs 按父→子收集，删除时倒序即子→父
+	entries := 0
 	w := s.Conn.Walk(remotePath)
 	for w.Step() {
 		if err := w.Err(); err != nil {
@@ -1280,11 +1297,23 @@ func (g *GoBackend) RemoveRecursive(host, user, remotePath string) error {
 			return &TransferError{Op: "sftp rm -r", Host: host, Path: remotePath, Err: err, RemoteMsg: s.Proc.StderrText()}
 		}
 		p := w.Path()
-		if path.Clean(p) == path.Clean(remotePath) {
+		if path.Clean(p) == clean {
 			continue // 目标自身最后删
 		}
-		if fi, serr := s.Conn.Stat(p); serr == nil && fi.IsDir() {
-			dirs = append([]string{p}, dirs...)
+		entries++
+		if entries > removeMaxEntries {
+			reusable = false
+			return &TransferError{Op: "sftp rm -r", Host: host, Path: remotePath,
+				Err: fmt.Errorf("递归删除条目数超过上限 %d，已中止（未删除任何文件）", removeMaxEntries)}
+		}
+		if depth := removeDepth(clean, p); depth > removeMaxDepth {
+			reusable = false
+			return &TransferError{Op: "sftp rm -r", Host: host, Path: remotePath,
+				Err: fmt.Errorf("递归删除深度超过上限 %d，已中止（未删除任何文件）", removeMaxDepth)}
+		}
+		// F5：用 Walker 自己的 FileInfo（Lstat 语义）分类，绝不 Conn.Stat 跟随符号链接。
+		if fi := w.Stat(); fi != nil && fi.IsDir() {
+			dirs = append(dirs, p)
 			continue
 		}
 		files = append(files, p)
@@ -1295,15 +1324,17 @@ func (g *GoBackend) RemoveRecursive(host, user, remotePath string) error {
 			return &TransferError{Op: "sftp rm -r", Host: host, Path: f, Err: err, RemoteMsg: s.Proc.StderrText()}
 		}
 	}
-	for _, d := range dirs {
-		if err := s.Conn.RemoveDirectory(d); err != nil {
+	// dirs 是父→子收集的，倒序删除保证先删空子目录再删父目录。
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := s.Conn.RemoveDirectory(dirs[i]); err != nil {
 			reusable = false
-			return &TransferError{Op: "sftp rm -r", Host: host, Path: d, Err: err, RemoteMsg: s.Proc.StderrText()}
+			return &TransferError{Op: "sftp rm -r", Host: host, Path: dirs[i], Err: err, RemoteMsg: s.Proc.StderrText()}
 		}
 	}
-	// 目标自身（文件或目录）最后删：用 Stat 区分，保证失败时上报的是**正确操作**的错误
-	// （对文件报 RemoveDirectory 的失败会掩盖真因）。Stat 失败按文件处理，错误原样上报。
-	if fi, serr := s.Conn.Stat(remotePath); serr == nil && fi.IsDir() {
+	// 目标自身（文件或目录）最后删：用 Lstat 区分（不跟随符号链接，符号链接按文件 unlink），
+	// 保证失败时上报的是**正确操作**的错误（对文件报 RemoveDirectory 的失败会掩盖真因）。
+	// Lstat 失败按文件处理，错误原样上报。
+	if fi, serr := s.Conn.Lstat(remotePath); serr == nil && fi.IsDir() {
 		if err := s.Conn.RemoveDirectory(remotePath); err != nil {
 			reusable = false
 			return &TransferError{Op: "sftp rm -r", Host: host, Path: remotePath, Err: err, RemoteMsg: s.Proc.StderrText()}
@@ -1313,6 +1344,16 @@ func (g *GoBackend) RemoveRecursive(host, user, remotePath string) error {
 		return &TransferError{Op: "sftp rm -r", Host: host, Path: remotePath, Err: err, RemoteMsg: s.Proc.StderrText()}
 	}
 	return nil
+}
+
+// removeDepth 返回 p 相对 root 的层级（root 的直接子项为 1）。
+func removeDepth(root, p string) int {
+	rel := strings.TrimPrefix(path.Clean(p), root)
+	rel = strings.TrimPrefix(rel, "/")
+	if rel == "" {
+		return 0
+	}
+	return strings.Count(rel, "/") + 1
 }
 
 func (g *GoBackend) Mkdir(host, user, path string) error {
@@ -1388,21 +1429,27 @@ func (g *GoBackend) Disconnect(host string) error {
 	return g.pool.Disconnect(host)
 }
 
-// CloseAll 关闭全部会话并清除所有连接意图（应用退出）。
-// 关会话之前先 best-effort 清掉本进程登记的已知 .part —— 顺序是硬约束：先关会话就再也删不掉
-// 远端临时文件了（技术审核 M5）。
+// CloseAll 关闭全部会话并清除所有连接意图（应用退出）。顺序是硬约束（修复轮 1 / F2）：
+//
+//  1. **静默**：置 closing 拒绝新传输，并等待所有在飞传输结束（提交成功或失败都算结束）。
+//     绝不能先删 .part —— 在飞传输的 .part 仍要参与提交，先删会让一次正在进行的
+//     rename(target→bak)/rename(part→target) 失败，留下 target 缺失、bak 残存的现场。
+//  2. 关闭全部会话（此刻没有在途 IO）。
+//  3. 清理已知 .part —— 必须放在关会话**之后**：CleanupParts 自己会为每个 host 取会话
+//     （pool.CloseAll 之后仍可 AcquireList 新建）。此时在飞传输已被静默，登记表里剩下的
+//     .part 都属于已停止的传输，删除不会打断任何提交。
+//  4. 清连接意图（CleanupParts 取会话会重新点亮 Connected，必须在最后清）。
+//
+// app.go 的 OnShutdown 在本方法返回后才调用 RecoverSwaps：静默保证恢复探测不会与
+// 在飞提交竞争（旧顺序下 RecoverSwaps 会把一次「target→bak 已成功、part→target 尚未」
+// 的在飞提交当成 W0，清掉条目并让回滚失败 —— target 与条目双失）。
 func (g *GoBackend) CloseAll() {
-	// 先快照恢复凭据：CleanupParts 可能为远端 .part 新建会话并覆盖 lastHost，而紧接着的
-	// RecoverSwaps（app.go 在 CloseAll 之后调用）必须用「关闭前最近一次真实握手」的 host。
-	recoverHost, recoverUser := g.recoverHostUser()
-	g.CleanupParts()
-	// 快照写回（CleanupParts 若新建过会话会改 lastHost）。
-	if recoverHost != "" {
-		g.connMu.Lock()
-		g.lastHost, g.lastUser = recoverHost, recoverUser
-		g.connMu.Unlock()
-	}
+	g.transferMu.Lock()
+	g.closing = true
+	g.transferMu.Unlock()
+	g.transfersWG.Wait()
 	g.pool.CloseAll()
+	g.CleanupParts()
 	g.connMu.Lock()
 	g.connected = map[string]bool{}
 	g.connMu.Unlock()
@@ -1427,19 +1474,40 @@ var cancelCloseSession = func(s *Session) { s.close() }
 func (g *GoBackend) acquireInflight(host, user, dir, target, id string) (func(), error) {
 	key := host + "|" + user + "|" + dir + "|" + target
 	g.inflightMu.Lock()
-	defer g.inflightMu.Unlock()
 	if g.inflight == nil {
 		g.inflight = map[string]string{}
 	}
 	if other, busy := g.inflight[key]; busy {
+		g.inflightMu.Unlock()
 		return nil, &TransferError{Op: "sftp transfer", Host: host, Path: target,
 			Err: fmt.Errorf("同一目标已在传输中（%s）", other)}
 	}
 	g.inflight[key] = id
+	g.inflightMu.Unlock()
+
+	// F2：把这次传输计入在飞计数，并拒绝「应用已开始退出」之后的新传输。
+	// 检查 closing 与 Add 必须在 transferMu 下与 CloseAll 的「置 closing + Wait」串行：
+	// 要么 Add 先于 closing 置位（Wait 一定看得到这个计数），要么这里看到 closing 而拒绝
+	//（绝不在 Wait 开始后再 Add —— 违反 WaitGroup 规约会让 Wait 提前返回）。两条互斥。
+	g.transferMu.Lock()
+	if g.closing {
+		g.transferMu.Unlock()
+		g.inflightMu.Lock()
+		delete(g.inflight, key)
+		g.inflightMu.Unlock()
+		return nil, &TransferError{Op: "sftp transfer", Host: host, Path: target,
+			Err: errors.New("应用正在退出，已拒绝新的传输")}
+	}
+	g.transfersWG.Add(1)
+	g.transferMu.Unlock()
+
+	// release 由调用方 defer（含所有失败路径）。defer 顺序保证它在 pool.Release 之后执行，
+	// 因此 CloseAll 的 Wait 返回时，会话也已归还/关闭，恢复探测不会撞上同一条会话。
 	return func() {
 		g.inflightMu.Lock()
 		delete(g.inflight, key)
 		g.inflightMu.Unlock()
+		g.transfersWG.Done()
 	}, nil
 }
 
@@ -1583,7 +1651,10 @@ func (g *GoBackend) takeParts() [][4]string {
 }
 
 // CleanupParts 删除登记表里所有已知 .part（本地 os.Remove、远端 Remove），best-effort：
-// 单个失败只发 warn，绝不让清理阻断退出。**必须在关会话之前调用**，否则远端 .part 删不掉。
+// 单个失败只发 warn，绝不让清理阻断退出。
+//
+// 远端删除**自己取会话**：修复轮 1（F2）把它移到 pool.CloseAll 之后执行（此时登记表里
+// 剩下的 .part 都属于已静默的传输），pool 关掉后仍可用 AcquireList 新建会话。
 func (g *GoBackend) CleanupParts() {
 	parts := g.takeParts()
 	if len(parts) == 0 {
@@ -1610,6 +1681,12 @@ func (g *GoBackend) CleanupParts() {
 		s, err := g.pool.AcquireList(context.Background(), host, user)
 		if err != nil {
 			g.warnf(host, "退出清理远端临时文件失败（会话不可用）: %v", err)
+			continue
+		}
+		// F7：与其它能力方法一致，先判 Conn 再解引用（测试替身/异常会话可能没有连接）。
+		if s.Conn == nil {
+			g.warnf(host, "退出清理远端临时文件失败（会话没有 SFTP 连接）")
+			g.pool.Release(s, false)
 			continue
 		}
 		for _, rp := range remotes {
@@ -1727,10 +1804,13 @@ type reopenSession interface {
 // 下次启动再试）。把 Recover 当自足契约「见条目就回滚」会在 W2 静默回退一个已提交成功的
 // 新文件 —— 这是本函数刻意用探测避免的 Critical 场景。
 //
-// 探测会话的凭据取自**最近一次成功握手**的 (host,user)：journal 条目里没有 host
-// （见 journal.go 的形状），多主机时无法从条目反推归属。刻意只用这一条、不遍历其它候选 ——
-// 探测一条**错误的** host 会走到「bak 不存在 ⇒ 清条目」，把别的主机上的中断现场静默丢掉
-// （比不恢复更糟）。从未连接过 ⇒ 放弃本次恢复（不动作、不删条目）。
+// 归属（修复轮 1 / F1）：条目自带 host/user，恢复**按 (host,user) 分组**，每组只用自己的
+// 凭据建会话探测。绝不再拿「最近一次成功握手」的 host 去探所有条目 —— 用错误主机的会话
+// 探测会走到「bak 不存在 ⇒ 清条目」，把别的主机上的中断现场静默丢掉（reviewer 的只读
+// overlay 复现：B 的条目被 A 的会话清掉，target 名永久缺失、旧内容只剩随机 bak）。
+//
+//	Host 为空的旧条目（升级前写入）归属未知 ⇒ 跳过，不动作、不删除；
+//	某组会话不可用 ⇒ 只跳过该组，其条目原样保留，其它可达主机照常恢复。
 func (g *GoBackend) RecoverSwaps() (int, error) {
 	if g.journal == nil {
 		return 0, nil
@@ -1739,66 +1819,82 @@ func (g *GoBackend) RecoverSwaps() (int, error) {
 	if len(entries) == 0 {
 		return 0, nil
 	}
-	host, user := g.recoverHostUser()
-	if host == "" {
-		// 会话不可用（本进程从未成功握手）：不动作、不删条目，留给下次启动。
-		return 0, nil
+	// 分组键必须含 user：同一主机不同用户看到的是不同家目录，用错用户探测同样会
+	// 把「看不见 bak」误判成 W0 而清条目。
+	groups := map[string][]swapEntry{}
+	var keys []string
+	for _, e := range entries {
+		if e.Host == "" {
+			// 归属未知（升级前写入的旧条目）：绝不动作、绝不删除，留给用户手工处理。
+			continue
+		}
+		k := e.Host + "\x00" + e.User
+		if _, ok := groups[k]; !ok {
+			keys = append(keys, k)
+		}
+		groups[k] = append(groups[k], e)
 	}
-	// 顺序固定：同一批恢复的日志顺序稳定，便于排查（journal 是 append 语义）。
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Target < entries[j].Target })
-
-	sess, err := probeRecoverSession(g, host, user)
-	if err != nil {
-		// 会话不可用：不动作、不删条目（调用方只记 warn，不阻断启动）。
-		return 0, nil
-	}
-	defer sess.close()
+	sort.Strings(keys) // 多主机的处理顺序稳定，便于排查
 
 	n := 0
-	for _, e := range entries {
-		bakExists, bakErr := sess.exists(e.Bak)
-		if bakErr != nil {
-			g.warnf(host, "恢复 swap：探测备份 %s 失败，保留条目待下次启动: %v", e.Bak, bakErr)
+	for _, k := range keys {
+		group := groups[k]
+		host, user := group[0].Host, group[0].User
+		// 组内顺序固定（journal 是 append 语义，这里显式排序）。
+		sort.Slice(group, func(i, j int) bool { return group[i].Target < group[j].Target })
+		sess, err := probeRecoverSession(g, host, user)
+		if err != nil {
+			// 只跳过该主机：它的条目原样保留，其它可达主机照常恢复。
+			g.warnf(host, "恢复 swap：主机会话不可用，保留 %d 条条目待下次启动: %v", len(group), err)
 			continue
 		}
-		// 步骤 1：bak 不存在 ⇒ rename 尚未发生（或已被人工清理），条目已无意义。
-		if !bakExists {
-			if derr := g.journal.Done(e.Target); derr != nil {
-				g.warnf(host, "恢复 swap：清理条目 %s 失败: %v", e.Target, derr)
+		for _, e := range group {
+			bakExists, bakErr := sess.exists(e.Bak)
+			if bakErr != nil {
+				g.warnf(host, "恢复 swap：探测备份 %s 失败，保留条目待下次启动: %v", e.Bak, bakErr)
+				continue
+			}
+			// 步骤 1：bak 不存在 ⇒ rename 尚未发生（或已被人工清理），条目已无意义。
+			if !bakExists {
+				if derr := g.journal.Done(e.Host, e.Target); derr != nil {
+					g.warnf(host, "恢复 swap：清理条目 %s 失败: %v", e.Target, derr)
+					continue
+				}
+				n++
+				continue
+			}
+			// bak 在：探测 target（从 e.Target 拷贝一份错误变量，避免遮蔽循环外 err）。
+			targetExists, tErr := sess.exists(e.Target)
+			if tErr != nil {
+				g.warnf(host, "恢复 swap：探测目标 %s 失败，保留条目待下次启动: %v", e.Target, tErr)
+				continue
+			}
+			// 步骤 2：bak 在、target 不在 ⇒ 回滚。
+			if !targetExists {
+				if rerr := sess.rename(e.Bak, e.Target); rerr != nil {
+					g.warnf(host, "恢复 swap：回滚 %s → %s 失败，保留条目待下次启动: %v", e.Bak, e.Target, rerr)
+					continue
+				}
+				if derr := g.journal.Done(e.Host, e.Target); derr != nil {
+					g.warnf(host, "恢复 swap：回滚成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
+					continue
+				}
+				n++
+				continue
+			}
+			// 步骤 3：bak 在、target 也在 ⇒ W2（新内容已成功提交）。保留 target，删掉孤儿 bak。
+			if rerr := sess.remove(e.Bak); rerr != nil {
+				g.warnf(host, "恢复 swap：删除孤儿备份 %s 失败，保留条目待下次启动: %v", e.Bak, rerr)
+				continue
+			}
+			if derr := g.journal.Done(e.Host, e.Target); derr != nil {
+				g.warnf(host, "恢复 swap：删备份成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
 				continue
 			}
 			n++
-			continue
 		}
-		// bak 在：探测 target（从 e.Target 拷贝一份错误变量，避免遮蔽循环外 err）。
-		targetExists, tErr := sess.exists(e.Target)
-		if tErr != nil {
-			g.warnf(host, "恢复 swap：探测目标 %s 失败，保留条目待下次启动: %v", e.Target, tErr)
-			continue
-		}
-		// 步骤 2：bak 在、target 不在 ⇒ 回滚。
-		if !targetExists {
-			if rerr := sess.rename(e.Bak, e.Target); rerr != nil {
-				g.warnf(host, "恢复 swap：回滚 %s → %s 失败，保留条目待下次启动: %v", e.Bak, e.Target, rerr)
-				continue
-			}
-			if derr := g.journal.Done(e.Target); derr != nil {
-				g.warnf(host, "恢复 swap：回滚成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
-				continue
-			}
-			n++
-			continue
-		}
-		// 步骤 3：bak 在、target 也在 ⇒ W2（新内容已成功提交）。保留 target，删掉孤儿 bak。
-		if rerr := sess.remove(e.Bak); rerr != nil {
-			g.warnf(host, "恢复 swap：删除孤儿备份 %s 失败，保留条目待下次启动: %v", e.Bak, rerr)
-			continue
-		}
-		if derr := g.journal.Done(e.Target); derr != nil {
-			g.warnf(host, "恢复 swap：删备份成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
-			continue
-		}
-		n++
+		// 每个分组跑完即关掉这条探测会话：恢复可能与磁盘状态不一致，绝不把它放回 idle。
+		sess.close()
 	}
 	return n, nil
 }

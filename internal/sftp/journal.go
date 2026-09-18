@@ -37,7 +37,16 @@ type swapJournal struct {
 const swapJournalFile = "swap-entries.json"
 
 // swapEntry 是一条未完成的 backup-swap。部分字段是恢复时定位残留文件所必需。
+//
+// Host/User 是 Task 13 修复轮 1（F1）新增的**归属**字段：恢复探测必须用条目自己的
+// 主机与用户。旧版本只有 target/bak/part，恢复只能拿「最近一次成功握手」的凭据探测；
+// 用别的主机的会话探测，会因为「bak 不存在」把那条条目当成 W0 清掉，而该主机的目标名
+// 与旧内容永远丢失（reviewer 的只读 overlay 复现）。两个字段都 omitempty：
+// 升级前写入的旧条目反序列化后 Host 为空，恢复侧把「空 host」当「归属未知」——
+// **绝不动作、绝不删除**（JSON 向后兼容，见 RecoverSwaps 的分组跳过）。
 type swapEntry struct {
+	Host   string `json:"host,omitempty"`
+	User   string `json:"user,omitempty"`
 	Target string `json:"target"`
 	Bak    string `json:"bak"`
 	Part   string `json:"part"`
@@ -108,10 +117,11 @@ func (j *swapJournal) store(entries []swapEntry) error {
 	return nil
 }
 
-// Begin 在**任何破坏性改名之前**登记一条 intent（target,bak,part）（C1 修复轮 1）。
+// Begin 在**任何破坏性改名之前**登记一条 intent（host,user,target,bak,part）（C1 修复轮 1）。
 // 调用方契约：Begin 返回错误时不得再执行 target→bak —— 否则会进入无 journal 保护的窗口。
-// 同一 target 重复 Begin（上次失败/本次重试）替换旧条目，绝不累积重复 target。
-func (j *swapJournal) Begin(target, bak, part string) error {
+// 同一 (host,target) 重复 Begin（上次失败/本次重试）替换旧条目，绝不累积重复项；
+// host 参与去重：两台主机上可能各有同名 target，按 target 去重会把另一台的条目顶掉。
+func (j *swapJournal) Begin(host, user, target, bak, part string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	entries, err := j.load()
@@ -120,16 +130,18 @@ func (j *swapJournal) Begin(target, bak, part string) error {
 	}
 	out := entries[:0]
 	for _, e := range entries {
-		if e.Target != target {
+		if e.Host != host || e.Target != target {
 			out = append(out, e)
 		}
 	}
-	out = append(out, swapEntry{Target: target, Bak: bak, Part: part})
+	out = append(out, swapEntry{Host: host, User: user, Target: target, Bak: bak, Part: part})
 	return j.store(out)
 }
 
-// Done 在 part → target 已完成后移除该项。target 不存在时幂等成功。
-func (j *swapJournal) Done(target string) error {
+// Done 在 part → target 已完成后移除该项。目标项不存在时幂等成功。
+// host 必须传登记时用的同一台主机：Done 只删该主机的这条 target，**绝不**误删另一台
+// 主机上同名 target 的条目（恢复按 host 分组的另一半）。
+func (j *swapJournal) Done(host, target string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	entries, err := j.load()
@@ -138,7 +150,7 @@ func (j *swapJournal) Done(target string) error {
 	}
 	out := entries[:0]
 	for _, e := range entries {
-		if e.Target != target {
+		if e.Host != host || e.Target != target {
 			out = append(out, e)
 		}
 	}

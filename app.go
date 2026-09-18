@@ -1046,19 +1046,21 @@ func (a *App) OnShutdown() {
 	if a.forward != nil {
 		a.forward.OnShutdown()
 	}
-	// 2. SFTP 生命周期：**顺序是硬约束**（Task 13 / 技术审核 M5）——
-	//    先 CloseAll 停传输、关会话（此时才没有在途写入），再按 journal 恢复 backup-swap
-	//    的中断现场，最后清掉已知 .part。顺序颠倒会在有传输在飞时删掉正要提交的临时文件。
+	// 2. SFTP 生命周期：**顺序是硬约束**（Task 13 / 技术审核 M5，修复轮 1 / F2）——
+	//    GoBackend.CloseAll 内部按固定顺序收尾：先静默（拒绝新传输 + 等待所有在飞传输
+	//    结束），再关会话，最后清掉已知 .part（CleanupParts 在关会话之后自己取新会话）。
+	//    CloseAll 返回后已无在飞提交，才做 journal 恢复：恢复探测因此不可能与一次正在
+	//    进行的 rename(target→bak)/rename(part→target) 竞争。顺序颠倒（有传输在飞时删
+	//    .part，或不等静默就恢复）会留下 target 缺失、bak 残存、journal 条目被清的现场。
 	if a.sftp != nil {
 		a.sftp.CloseAll()
-		// journal 条目没有 host；GoBackend 用最近一次成功握手的凭据探测，拿不到就
-		// 不动作、不删条目（下次启动再试）。
+		// journal 条目自带 host/user；恢复按 (host,user) 分组、只探条目自己的主机。
+		// 归属为空的旧条目跳过；主机不可达的那组条目原样保留（下次再试），绝不误清。
 		if n, err := a.sftp.RecoverSwaps(); err != nil {
 			a.logf("恢复 swap journal 失败: %v", err)
 		} else if n > 0 {
 			a.logf("恢复了 %d 处中断提交", n)
 		}
-		a.sftp.CleanupParts()
 	}
 	if a.cfg != nil {
 		_ = a.saveConfig()

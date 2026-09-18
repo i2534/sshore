@@ -1158,6 +1158,9 @@ func TestEngineFileRuleReportsPollEvenWhenInotifyPresent(t *testing.T) {
 
 // TestInScopeRejectsInternalTemp 钉住 D18 的内置忽略：sshore 自己的传输临时文件
 // （中缀 .sshore-sftppart-）永远不在规则范围内，且与用户配置的 excludes 无关。
+// 修复轮 1（F4）：inScope 里原先重复的 watch.IsInternalTemp 已删除 —— 判定由
+// watch.MatchExclude 内部完成（唯一实现）。本用例仍必须绿：它验证的是最终行为，
+// 而行为由 MatchExclude 保障。
 func TestInScopeRejectsInternalTemp(t *testing.T) {
 	rule := config.SyncRule{Excludes: nil, MaxDepth: -1}
 	for _, rel := range []string{
