@@ -16,7 +16,8 @@ const partNameMax = 200
 func randHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
-		return "000000000000"
+		// 熵不可用（几乎不可达）：保持 n 字符契约，避免同名与长度判定异常
+		return strings.Repeat("0", n)
 	}
 	return hex.EncodeToString(b)[:n]
 }

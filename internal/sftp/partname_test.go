@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -39,6 +40,38 @@ func TestPartNameFallsBackToShortFormWhenTooLong(t *testing.T) {
 	}
 	if !strings.HasPrefix(got, "/data/") {
 		t.Fatalf("退化短名必须留在同目录（rename 才能原子），got %q", got)
+	}
+}
+
+func TestPartNameBoundaryIsPinned(t *testing.T) {
+	id8 := "abcdef12"
+	// 恰好压线：len(target) = 200 - 17(marker) - 8(id) - 1('-') - 6(rand) = 168
+	target := "/data/" + strings.Repeat("y", partNameMax-len("/data/")-len(PartMarker)-len(id8)-1-6)
+	if len(target) != 168 {
+		t.Fatalf("测试自身前提错误：target len=%d，应为 168", len(target))
+	}
+	got := PartName(target, id8)
+	if len(got) != partNameMax {
+		t.Fatalf("恰好 200 字节不得退化：want len=%d, got %d (%q)", partNameMax, len(got), got)
+	}
+	if !strings.HasPrefix(got, target+PartMarker) {
+		t.Fatalf("未退化时必须保留 <target><marker> 形态，got %q", got)
+	}
+
+	// 超一字节：必须退化，且仍留在同目录、可被 IsInternalTemp 认出
+	longer := target + "y"
+	got2 := PartName(longer, id8)
+	if len(got2) > partNameMax {
+		t.Fatalf("超限必须退化，got len=%d (%q)", len(got2), got2)
+	}
+	if filepath.Dir(got2) != filepath.Dir(longer) {
+		t.Fatalf("退化短名必须留在同目录（否则 rename 不原子），got %q", got2)
+	}
+	if !strings.HasPrefix(filepath.Base(got2), PartMarker) {
+		t.Fatalf("退化短名必须以 marker 开头，got %q", got2)
+	}
+	if !IsInternalTemp(got2) {
+		t.Fatalf("退化短名必须被 IsInternalTemp 认出，got %q", got2)
 	}
 }
 
