@@ -9,6 +9,22 @@ function joinDir(dir, name) {
   return dir.replace(/\/+$/, '') + '/' + name
 }
 
+// —— 传输 id 生成（Task 9）——
+// 绑定 SftpGet/SftpPut 的**首参**已从 host 变成 id，事件 sftp:transfer-progress 也按 id 关联。
+// 格式 t<seq>-<n>：seq 一批一个（nextTransferSeq），n 是批内序号。绝不能把 host 传成首参 ——
+// 参数错位不会让 npm run build 报错，只会在运行期把取消/续传全部指向不存在的 id。
+let transferSeq = 0
+
+// nextTransferSeq 取一个新批次号（每次 runBatch / 每次单文件手势调一次）。
+export function nextTransferSeq() {
+  return ++transferSeq
+}
+
+// transferID 用批次号 + 批内序号拼出稳定 id。
+export function transferID(seq, n) {
+  return `t${seq}-${n}`
+}
+
 // isDirMap: { [name]: boolean }，由调用方从 items 构造。目录项决定执行时走递归传输。
 export function planTasks({ direction, names, sourceDir, targetDir, isDirMap }) {
   const dirs = isDirMap || {}

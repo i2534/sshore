@@ -111,6 +111,14 @@ func TestCapabilitiesPropagatesDialError(t *testing.T) {
 	}
 }
 
+// TestGoBackendAtomicCapable：GoBackend 的新面一律走 .part + 提交（posix-rename 或
+// backup-swap），所以它声明支持原子提交 —— 与 BatchBackend 的 false 形成对照（Task 9）。
+func TestGoBackendAtomicCapable(t *testing.T) {
+	if !NewGoBackend(nil, nil).AtomicCapable() {
+		t.Fatal("GoBackend 必须声明 AtomicCapable（.part + 提交）")
+	}
+}
+
 // TestNewGoBackendWiresPoolAndDeclaredFields 钉住 NewGoBackend 的接线与
 // 「字段一次性声明」约定（Task 7-13 只加方法，不再改结构体）。
 func TestNewGoBackendWiresPoolAndDeclaredFields(t *testing.T) {

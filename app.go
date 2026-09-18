@@ -432,8 +432,40 @@ func (a *App) findTunnel(id string) (config.Tunnel, bool) {
 func (a *App) SftpList(host, user, path string) ([]sftp.Item, error) {
 	return a.sftp.List(host, user, path)
 }
-func (a *App) SftpGet(host, user, remote, local string) error {
-	if err := a.sftp.Get(host, user, remote, local); err != nil {
+
+// —— Task 9：新传输面绑定（id + resume/partPath + 进度事件 + 取消）——
+//
+// id 由前端生成（runBatch 的 t<seq>-<n>），是取消与续传唯一的关联键；每次调用的 Progress
+// 帧都带它。resume/partPath 这轮由前端传 false/""，Task 14 的「续传」按钮才填真实锚点。
+// Atomic 一律能力驱动（见 sftpAtomic）：batch 不支持 .part + 提交，传 true 会被后端硬拒。
+//
+// 调用是阻塞的：Wails 绑定 + sftp:transfer-progress 事件回推（spec §6.1）。
+
+// progressToEvent 把 Progress 翻成前端事件载荷。字段名是前后端唯一契约（spec §6.3）：
+// 这里用显式 map 而不是直接序列化 struct —— 前端读 camelCase，且 Done/Total 保持 int64。
+func progressToEvent(p sftp.Progress) map[string]any {
+	return map[string]any{
+		"id": p.ID, "host": p.Host, "direction": string(p.Direction), "name": p.Name,
+		"partPath": p.PartPath, "done": p.Done, "total": p.Total,
+		"filesDone": p.FilesDone, "filesTotal": p.FilesTotal, "phase": string(p.Phase),
+	}
+}
+
+// emitProgress 转发一帧进度到前端。a.ctx 为空（startup 之前）时静默：绝不对 nil context
+// 调 runtime.EventsEmit。
+func (a *App) emitProgress(p sftp.Progress) {
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, "sftp:transfer-progress", progressToEvent(p))
+	}
+}
+
+// sftpAtomic 返回当前后端是否支持原子提交（.part + 提交）。绑定层的 Atomic 只从这里取值，
+// 绝不写死 true/false：写死 true 会让默认 batch 传输全盘失败，写死 false 会丢掉原子语义。
+func (a *App) sftpAtomic() bool { return a.sftp.AtomicCapable() }
+
+// SftpGet 下载单个远端文件；resume/partPath 为 Task 11 的续传参数。
+func (a *App) SftpGet(id, host, user, remote, local string, resume bool, partPath string) error {
+	if err := a.sftp.TransferGet(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
@@ -441,15 +473,17 @@ func (a *App) SftpGet(host, user, remote, local string) error {
 }
 
 // SftpGetDir recursively downloads a remote directory tree (`sftp get -r`).
-func (a *App) SftpGetDir(host, user, remote, local string) error {
-	if err := a.sftp.GetRecursive(host, user, remote, local); err != nil {
+func (a *App) SftpGetDir(id, host, user, remote, local string, resume bool, partPath string) error {
+	if err := a.sftp.TransferGetTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
 	return nil
 }
-func (a *App) SftpPut(host, user, local, remote string) error {
-	if err := a.sftp.Put(host, user, local, remote); err != nil {
+
+// SftpPut 上传单个本地文件；resume/partPath 为 Task 11 的续传参数。
+func (a *App) SftpPut(id, host, user, local, remote string, resume bool, partPath string) error {
+	if err := a.sftp.TransferPut(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
@@ -472,15 +506,20 @@ func (a *App) SftpRemoveRecursive(host, user, path string) error {
 }
 
 // SftpPutRecursive 递归上传本地目录到远端目录。
-// 透传 sftp.PutRecursive：put -r 在远端同名目录已存在时是**并入**（同名文件被本地内容覆盖），
-// 本绑定不加"整树替换"补偿；需要整树替换的调用方须先自行删除远端同名目录。
-func (a *App) SftpPutRecursive(host, user, local, remoteDir string) error {
-	if err := a.sftp.PutRecursive(host, user, local, remoteDir); err != nil {
+// put -r 在远端同名目录已存在时是**并入**（同名文件被本地内容覆盖），本绑定不加"整树替换"
+// 补偿；需要整树替换的调用方须先自行删除远端同名目录（语义与门面 TransferPutTree 一致）。
+func (a *App) SftpPutRecursive(id, host, user, local, remoteDir string, resume bool, partPath string) error {
+	if err := a.sftp.TransferPutTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remoteDir, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remoteDir), filepath.Dir(local))
 	return nil
 }
+
+// SftpTransferCancel 取消指定 id 的传输，返回是否真的取消到了正在跑的传输。
+// Task 9 只接线到门面；整批语义（取消当前项 + 停止派发后续项）由前端编排层落实（spec §6.1），
+// 真实的「关该传输会话」由 Task 10 的后端注册表提供（batch 恒 false，幂等）。
+func (a *App) SftpTransferCancel(id string) bool { return a.sftp.Cancel(id) }
 
 // SftpMove 语义等于远端 Rename（跨目录移动）。
 func (a *App) SftpMove(host, user, oldPath, newPath string) error {

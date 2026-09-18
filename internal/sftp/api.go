@@ -93,6 +93,13 @@ type Backend interface {
 	Connected(host string) bool
 	Disconnect(host string) error
 	CloseAll()
+
+	// Cancel 关闭某次传输独占的会话（库无逐请求取消）。幂等：未知/已完成 id 返回 false。
+	Cancel(id string) bool
+	// AtomicCapable 声明后端是否支持「.part + 提交」的原子传输。
+	// 这是让绑定层**能力驱动**地填 TransferRequest.Atomic 的唯一依据：BatchBackend 返回
+	// false（传 Atomic=true 会被 guardAtomic 硬拒，Task 6 的刻意裁决），GoBackend 返回 true。
+	AtomicCapable() bool
 }
 
 // 编译期断言（Task 5 评审 M2）：两个后端必须始终满足新传输面 Backend 接口。

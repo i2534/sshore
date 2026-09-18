@@ -658,6 +658,11 @@ func TestPutRecursiveRunsSftp(t *testing.T) {
 type fakeBackend struct {
 	lastReq TransferRequest
 	called  string
+
+	// Task 9：Cancel/AtomicCapable 的委派观测点。
+	lastCancelID string
+	cancelOK     bool
+	atomicOK     bool
 }
 
 func (f *fakeBackend) List(string, string, string) ([]Item, error) {
@@ -700,6 +705,11 @@ func (f *fakeBackend) Search(context.Context, string, string, string, string, in
 func (f *fakeBackend) Connected(string) bool   { f.called = "Connected"; return true }
 func (f *fakeBackend) Disconnect(string) error { f.called = "Disconnect"; return nil }
 func (f *fakeBackend) CloseAll()               { f.called = "CloseAll" }
+func (f *fakeBackend) Cancel(id string) bool {
+	f.called, f.lastCancelID = "Cancel", id
+	return f.cancelOK
+}
+func (f *fakeBackend) AtomicCapable() bool { return f.atomicOK }
 
 // TestFacadeLegacyFaceUsesSelectedBackendWithAtomicFalse 钉住门面契约：
 // legacy 四参面必须经 backend() 委派（而不是硬绑 batch），且 Atomic=false（直写目标，
@@ -738,6 +748,36 @@ func TestFacadeLegacyFaceUsesSelectedBackendWithAtomicFalse(t *testing.T) {
 	}
 	if fb.called != "TransferPutTree" {
 		t.Fatalf("PutRecursive 应委派 TransferPutTree, called=%q", fb.called)
+	}
+}
+
+// TestFacadeCancelDelegatesTheID 钉住门面 Cancel（Task 9）：必须把 id 原样转给后端，
+// 并把后端的 bool 结果原样上抛（未知/已完成 id ⇒ false）。绝不能在门面里吞掉。
+func TestFacadeCancelDelegatesTheID(t *testing.T) {
+	fb := &fakeBackend{cancelOK: true}
+	c := &Ctrl{forced: fb}
+	if !c.Cancel("t-9") {
+		t.Fatal("后端说取消成功时门面必须返回 true")
+	}
+	if fb.called != "Cancel" || fb.lastCancelID != "t-9" {
+		t.Fatalf("Cancel 必须把 id 原样转给后端: called=%q id=%q", fb.called, fb.lastCancelID)
+	}
+
+	fb2 := &fakeBackend{cancelOK: false}
+	c2 := &Ctrl{forced: fb2}
+	if c2.Cancel("t-unknown") {
+		t.Fatal("后端说未知 id 时门面必须返回 false（幂等语义）")
+	}
+}
+
+// TestFacadeAtomicCapableFollowsBackend 钉住能力访问器：门面必须回答「当前选中的后端
+// 是否支持原子提交」，而不是写死。绑定层据此决定 TransferRequest.Atomic。
+func TestFacadeAtomicCapableFollowsBackend(t *testing.T) {
+	if (&Ctrl{forced: &fakeBackend{atomicOK: false}}).AtomicCapable() {
+		t.Fatal("后端声明不支持时门面必须返回 false")
+	}
+	if !(&Ctrl{forced: &fakeBackend{atomicOK: true}}).AtomicCapable() {
+		t.Fatal("后端声明支持时门面必须返回 true")
 	}
 }
 
