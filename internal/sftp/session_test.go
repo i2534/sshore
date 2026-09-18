@@ -81,6 +81,48 @@ func TestDisconnectOnlyClosesIdle(t *testing.T) {
 	}
 }
 
+func TestDisconnectMatchesWholeHostComponent(t *testing.T) {
+	p, _ := newTestPool()
+	defer p.CloseAll()
+	ctx := context.Background()
+
+	// 两个前缀相同但不同的 host
+	s1, err := p.AcquireList(ctx, "h1", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Release(s1, true)
+	s10, err := p.AcquireList(ctx, "h10", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Release(s10, true)
+
+	if err := p.Disconnect("h1"); err != nil {
+		t.Fatal(err)
+	}
+	// h10 的 idle 会话必须还在：再 AcquireList("h10") 应当复用而不是新建
+	before := s10
+	again, err := p.AcquireList(ctx, "h10", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != before {
+		t.Fatal("Disconnect(\"h1\") 不得关掉 \"h10\" 的 idle 会话（前缀误伤）")
+	}
+	p.Release(again, true)
+
+	// h1 的 idle 确实被关掉了（再取会新建，因此不是同一个指针）
+	after, err := p.AcquireList(ctx, "h1", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after == s1 {
+		t.Fatal("Disconnect(\"h1\") 必须关掉 h1 自己的 idle 会话")
+	}
+	p.Release(after, true)
+}
+
 // (a) 列表会话的 Release 不得归还传输额度（技术审核 S8 的复现用例）：
 // 否则第二个 AcquireTransfer 会立刻拿到会话，并发 1 被突破。
 func TestListReleaseDoesNotFreeTransferToken(t *testing.T) {

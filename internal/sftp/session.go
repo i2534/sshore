@@ -2,6 +2,7 @@ package sftp
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -235,7 +236,9 @@ func (p *Pool) Disconnect(host string) error {
 	p.mu.Lock()
 	var drop []*Session
 	for key, lst := range p.idle {
-		if len(key) >= len(host) && key[:len(host)] == host {
+		// 必须匹配完整的 host 分量：key 形如 host + "\x00" + user。
+		// 用 key[:len(host)] == host 会把 "h1" 误伤到 "h10\x00u"（Task 4 自审 F1）。
+		if strings.HasPrefix(key, host+"\x00") {
 			drop = append(drop, lst...)
 			delete(p.idle, key)
 		}
