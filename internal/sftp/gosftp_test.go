@@ -165,7 +165,7 @@ func TestGoBackendMapsWritableAfterConstruction(t *testing.T) {
 			}
 		}()
 		g.regMu.Lock()
-		g.reg["id"] = nil
+		g.reg["id"] = &regEntry{}
 		g.regMu.Unlock()
 		g.inflightMu.Lock()
 		g.inflight["id"] = "key"

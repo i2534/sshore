@@ -270,5 +270,12 @@ func TestCancelWholeBatchE2E(t *testing.T) {
 			t.Fatal("门面取消同样必须幂等：已结束的 id 返回 false")
 		}
 	}
-	t.Logf("取消验证完成（后端=%v）：直连+门面均关会话、未提交、.part 保留、二次取消 false", be)
+	// 日志不得夸大 batch 腿：batch 迭代没有长驻会话可关，门面腿只断言 Ctrl.Cancel 诚实
+	// 返回 false（M4/M5）。只有 gosftp 迭代才真正验了「门面取消关会话」。
+	if be == KindBatch {
+		t.Logf("取消验证完成（后端=batch）：直连腿关会话/未提交/.part 保留/二次取消 false；" +
+			"门面腿仅断言 batch 无长驻会话、Ctrl.Cancel 诚实 false（未关任何会话）")
+	} else {
+		t.Logf("取消验证完成（后端=%v）：直连+门面均真关会话、未提交、.part 保留、二次取消 false", be)
+	}
 }

@@ -3,6 +3,7 @@ package sftp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -318,4 +319,259 @@ func mustReadDir(t *testing.T, dir string) []os.DirEntry {
 		t.Fatal(err)
 	}
 	return ents
+}
+
+// —— Task 10 修复轮 1 新增用例（I1/I2/I3 + M1）——
+
+// TestGoBackendCancelDoesNotRefundTokenWhileInFlight 钉住 I1：取消只关会话，**绝不**额外
+// 归还并发额度。原用例只在传输返回后看 len(queue)==1 —— refill 是非阻塞发送，多还一次会被
+// 静默丢弃，因此那断言证明不了「恰好一次」。本用例在 Cancel 返回 true、而原传输仍卡在首帧
+// 回调里时，用短超时 ctx 直接断言 AcquireTransfer **拿不到** token：任何在 Cancel 里顺手
+// refill 的实现都会让这里成功，断言失败。
+func TestGoBackendCancelDoesNotRefundTokenWhileInFlight(t *testing.T) {
+	remoteRoot, localDir := t.TempDir(), t.TempDir()
+	writeRemote(t, remoteRoot, "src.bin", bytes.Repeat([]byte("t"), 1<<20))
+	local := filepath.Join(localDir, "dst.bin")
+
+	g := backendForTestServer(t, remoteRoot)
+	entered, release := blockAfterFirstChunk(t)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- g.Get(TransferRequest{ID: "t-token", Host: "h", Remote: "src.bin", Local: local, Atomic: true}, nil)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("10s 内未写出首块：会话/协议卡死")
+	}
+	if !g.Cancel("t-token") {
+		t.Fatal("取消在飞传输必须返回 true")
+	}
+
+	// 此刻原传输仍卡在首帧回调里（Get 尚未返回），它的 defer Release 也尚未执行 ——
+	// 额度必须还在被占用。短超时 AcquireTransfer 必须拿不到 token。
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	s2, err := g.pool.AcquireTransfer(ctx, "h", "")
+	if err == nil {
+		g.pool.Release(s2, false)
+		t.Fatal("Cancel 提前归还了并发额度：原传输仍卡在首帧回调里，AcquireTransfer 不得拿到 token（I1）")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("AcquireTransfer 应因短超时失败（额度未被提前归还），got %v", err)
+	}
+	if got := len(g.pool.queue); got != 0 {
+		t.Fatalf("Cancel 返回后额度不得已归还（原传输仍在飞），queue 深度=%d want 0", got)
+	}
+
+	release()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("被取消的传输必须返回错误")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("取消后 10s 内 Get 仍未返回")
+	}
+	// 传输返回后额度才由 defer Release 归还，且恰好一次。
+	if got := len(g.pool.queue); got != 1 {
+		t.Fatalf("传输返回后额度必须恰好归还一次，queue 深度=%d want 1", got)
+	}
+}
+
+// TestGoBackendCancelDuringCommittedFinalFrameReturnsFalse 钉住 I2：Get 在提交成功之后、
+// 注销之前**同步**发末帧，UI 的 emitProgress 也是同步回调 —— 这个窗口可以被任意拉宽。
+// 若不先置 committed，Cancel 会在文件已落地时返回 true（不诚实）。把 Cancel 放进末帧回调
+// 正是把窗口加宽到确定性：必须返回 false，且目标文件完整落地。
+//
+// 判据：只有当 PartPath 指向**最终目标**（而非 .part）且 Done==Total 时才是提交后的末帧；
+// 传输中的节流帧 PartPath 恒为 .part，绝不会误触发。
+func TestGoBackendCancelDuringCommittedFinalFrameReturnsFalse(t *testing.T) {
+	remoteRoot, localDir := t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("f"), 1<<20)
+	writeRemote(t, remoteRoot, "src.bin", data)
+	local := filepath.Join(localDir, "dst.bin")
+
+	g := backendForTestServer(t, remoteRoot)
+	var called, result bool
+	report := func(p Progress) {
+		if !called && p.PartPath == local && p.Done == p.Total {
+			called = true
+			result = g.Cancel("t-final")
+		}
+	}
+	if err := g.Get(TransferRequest{ID: "t-final", Host: "h", Remote: "src.bin", Local: local, Atomic: true}, report); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !called {
+		t.Fatal("未观察到提交后末帧（PartPath=最终目标）")
+	}
+	if result {
+		t.Fatal("提交完成后 Cancel 必须诚实返回 false：文件已落地，不能假装取消成功（I2）")
+	}
+	got, err := os.ReadFile(local)
+	if err != nil {
+		t.Fatalf("提交后最终文件必须存在: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("提交后内容必须与源一致: got %d bytes want %d", len(got), len(data))
+	}
+	if g.Cancel("t-final") {
+		t.Fatal("传输结束后 Cancel 必须返回 false")
+	}
+}
+
+// TestGoBackendPutCancelDuringCommittedFinalFrameReturnsFalse 是 I2 的上传对称用例：
+// Put 的末帧同样在 commitRemote（PosixRename 或 backup-swap）成功之后同步发出。
+func TestGoBackendPutCancelDuringCommittedFinalFrameReturnsFalse(t *testing.T) {
+	remoteRoot, localDir := t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("g"), 1<<20)
+	local := filepath.Join(localDir, "src.bin")
+	if err := os.WriteFile(local, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	const target = "dst.bin"
+
+	g := backendForTestServer(t, remoteRoot)
+	var called, result bool
+	report := func(p Progress) {
+		// 上传方向的提交后末帧 PartPath 指向最终远端目标（传输中的帧指向远端 .part）。
+		if !called && p.PartPath == target && p.Done == p.Total {
+			called = true
+			result = g.Cancel("t-final-up")
+		}
+	}
+	if err := g.Put(TransferRequest{ID: "t-final-up", Host: "h", Remote: target, Local: local, Atomic: true}, report); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if !called {
+		t.Fatal("未观察到上传提交后末帧（PartPath=最终远端目标）")
+	}
+	if result {
+		t.Fatal("上传提交完成后 Cancel 必须诚实返回 false（I2）")
+	}
+	got, err := os.ReadFile(filepath.Join(remoteRoot, target))
+	if err != nil {
+		t.Fatalf("提交后远端最终名必须存在: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("提交后远端内容必须与源一致: got %d bytes want %d", len(got), len(data))
+	}
+	if g.Cancel("t-final-up") {
+		t.Fatal("传输结束后 Cancel 必须返回 false")
+	}
+}
+
+// TestGoBackendCancelledSessionNeverHandedOut 钉住 I3：Cancel 与 Release 竞争时，已关闭的
+// 会话绝不能留在 idle 被后续 AcquireList（Capabilities/Probe/List/ListMany 的入口）交出去。
+// 竞态顺序：Release 先看到 Closed()==false 并准备入 idle，Cancel 随后才关会话。
+// 用注入点 cancelCloseSession 把「删除注册表条目」与「真正 close」之间的窗口加宽成确定性：
+// Cancel 删条目后停住 → 让 Release 把会话放回 idle → 再放行 Cancel 关会话。
+// 断言：AcquireList 必须跳过这条 Closed 会话、新建一条，绝不把它交出去。
+func TestGoBackendCancelledSessionNeverHandedOut(t *testing.T) {
+	var mu sync.Mutex
+	dialed := 0
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
+	g.pool = NewPool(func(host, user string) (*Session, error) {
+		mu.Lock()
+		dialed++
+		mu.Unlock()
+		return &Session{Host: host, User: user}, nil // Conn/Proc 为 nil：close 安全且廉价
+	})
+
+	ctx := context.Background()
+	s, err := g.pool.AcquireTransfer(ctx, "h", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := g.register("t-race", s)
+	if entry == nil {
+		t.Fatal("非空 id 必须登记进取消表")
+	}
+
+	// 加宽窗口：Cancel 删条目后停在 close 之前。
+	closeEntered := make(chan struct{})
+	allowClose := make(chan struct{})
+	origClose := cancelCloseSession
+	cancelCloseSession = func(victim *Session) {
+		close(closeEntered)
+		<-allowClose
+		origClose(victim)
+	}
+	t.Cleanup(func() { cancelCloseSession = origClose })
+
+	cancelDone := make(chan bool, 1)
+	go func() { cancelDone <- g.Cancel("t-race") }()
+	select {
+	case <-closeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Cancel 未进入关闭窗口")
+	}
+
+	// Cancel 已删注册表条目但尚未 close：Release(reuse=true) 认为会话可用，把它放回 idle。
+	// 这正是竞态里「Closed 会话进 idle」的成因。
+	g.pool.Release(s, true)
+	close(allowClose)
+	if ok := <-cancelDone; !ok {
+		t.Fatal("取消在飞传输必须返回 true")
+	}
+	if !s.Closed() {
+		t.Fatal("Cancel 返回后会话必须已关闭")
+	}
+
+	// 关键断言：AcquireList 绝不能交出这条已关闭会话。
+	got, err := g.pool.AcquireList(ctx, "h", "")
+	if err != nil {
+		t.Fatalf("AcquireList: %v", err)
+	}
+	if got == s {
+		t.Fatal("已取消（Closed）的会话被再次交出：后续 Capabilities/Probe/List 必然伪失败（I3）")
+	}
+	if got.Closed() {
+		t.Fatal("AcquireList 交出的会话不得是 Closed")
+	}
+	mu.Lock()
+	n := dialed
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("必须跳过 Closed 会话并新建一条，dialed=%d want 2", n)
+	}
+	g.pool.Release(got, false)
+}
+
+// TestGoBackendEmptyIDNeverRegisters 钉住 M1：空 id（legacy 四参面不带 id）不登记进取消表，
+// Cancel("") 永远 false —— 绝不把「无身份标识」的传输伪装成可取消。
+func TestGoBackendEmptyIDNeverRegisters(t *testing.T) {
+	remoteRoot, localDir := t.TempDir(), t.TempDir()
+	writeRemote(t, remoteRoot, "src.bin", bytes.Repeat([]byte("e"), 1<<20))
+
+	g := backendForTestServer(t, remoteRoot)
+	entered, release := blockAfterFirstChunk(t)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- g.Get(TransferRequest{Host: "h", Remote: "src.bin", Local: filepath.Join(localDir, "d.bin"), Atomic: true}, nil)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("10s 内未写出首块")
+	}
+	if n := g.regSize(); n != 0 {
+		t.Fatalf("空 id 不得登记（legacy 面无身份标识），got %d 条", n)
+	}
+	if g.Cancel("") {
+		t.Fatal("Cancel(\"\") 必须返回 false（空 id 永不命中）")
+	}
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("未被取消的传输必须正常完成: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("10s 内 Get 未返回")
+	}
 }
