@@ -2,6 +2,7 @@ package sftp
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -277,5 +278,226 @@ func TestCancelWholeBatchE2E(t *testing.T) {
 			"门面腿仅断言 batch 无长驻会话、Ctrl.Cancel 诚实 false（未关任何会话）")
 	} else {
 		t.Logf("取消验证完成（后端=%v）：直连+门面均真关会话、未提交、.part 保留、二次取消 false", be)
+	}
+}
+
+// e2eSHA256File 读文件算 sha256（十六进制），e2e 续传用例的内容判据。
+func e2eSHA256File(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(b))
+}
+
+// cancelPartialDownloadE2E 用 blockAfterFirstChunk 确定性造出一份「部分下载」：
+// 首块（32 KiB）落盘后卡住 → Cancel 关会话 → 传输报错、最终名不存在、恰好一个 .part。
+// 返回该 .part 路径。blockAfterFirstChunk 的 release 在 t.Cleanup 兜底，用例中途失败也不会悬挂。
+func cancelPartialDownloadE2E(t *testing.T, g *GoBackend, host, remote, local, id string) string {
+	t.Helper()
+	entered, release := blockAfterFirstChunk(t)
+	done := make(chan error, 1)
+	go func() {
+		done <- g.Get(TransferRequest{ID: id, Host: host, Remote: remote, Local: local, Atomic: true}, nil)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("e2e：15s 内未写出首块（会话/协议卡死）")
+	}
+	if !g.Cancel(id) {
+		t.Fatal("e2e：取消在飞下载必须返回 true")
+	}
+	release()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("e2e：被取消的下载必须报错")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("e2e：取消后 15s 内 Get 未返回")
+	}
+	if _, serr := os.Stat(local); !os.IsNotExist(serr) {
+		t.Fatalf("e2e：取消后最终名不得存在，stat err=%v", serr)
+	}
+	parts, _ := filepath.Glob(filepath.Dir(local) + "/*" + PartMarker + "*")
+	if len(parts) != 1 {
+		t.Fatalf("e2e：取消后应恰好保留一个 .part，got %v", parts)
+	}
+	return parts[0]
+}
+
+// e2eSetRemoteMtime 通过 SFTP 把远端源的 mtime 设成确定值。时间戳是续传指纹的一部分，
+// 靠真实写入的秒级时间不够可控（同一秒内改写给不出「不同 mtime」），必须显式设置。
+func e2eSetRemoteMtime(t *testing.T, g *GoBackend, host, remotePath string, mt time.Time) {
+	t.Helper()
+	s, err := g.pool.AcquireList(context.Background(), host, "")
+	if err != nil {
+		t.Fatalf("e2e AcquireList: %v", err)
+	}
+	defer g.pool.Release(s, true)
+	if err := s.Conn.Chtimes(remotePath, mt, mt); err != nil {
+		t.Fatalf("e2e Chtimes(%s): %v", remotePath, err)
+	}
+}
+
+// TestResumeE2E 是 Task 11 的端到端续传用例（harness 的 batch/gosftp 双迭代都会跑）：
+//  1. 32MB 往返：取消到中途 → .part 是源前缀 → 用同一 PartPath 续传 → sha256 等于一次性完整下载；
+//  2. 同尺寸改写（技术审核 S10）：改前留下的旧 .part 在改后被续传请求撞上 → 必须整份重传，
+//     结果等于「用新源完整下载」，绝不是旧前缀 + 新内容拼接；
+//  3. 同目标并发去重：第二条同目标传输必须被拒（且第一条完成后同一目标可再传）。
+//
+// batch 迭代没有 .part/续传语义：额外断言它诚实拒绝 Atomic=true（guardAtomic），绝不用
+// 「batch 也跑绿」冒充「batch 支持续传」。
+func TestResumeE2E(t *testing.T) {
+	host := os.Getenv("SSHORE_E2E_HOST")
+	remote := os.Getenv("SSHORE_E2E_REMOTE")
+	if host == "" || remote == "" {
+		t.Skip("未提供 SSHORE_E2E_*，跳过续传验证")
+	}
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("缺少 ssh 二进制")
+	}
+	g := NewGoBackend(nil, nil)
+	defer g.CloseAll()
+	be := resolveTransport(nil)
+
+	// 造 4 MiB 源并上传（首块 32 KiB ⇒ 可控的部分 .part）。
+	payload := bytes.Repeat([]byte("sshore-t11-"), 384<<10) // 4 MiB
+	big := filepath.Join(t.TempDir(), "big.bin")
+	if err := os.WriteFile(big, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	src := remote + "/resume-src.bin"
+	if err := g.Put(TransferRequest{ID: "t11-seed", Host: host, Local: big, Remote: src, Atomic: true}, nil); err != nil {
+		t.Fatalf("种子上传失败: %v", err)
+	}
+	// 把远端源 mtime 钉在确定的「旧」时间，作为之后续传指纹的基准。
+	oldMT := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	e2eSetRemoteMtime(t, g, host, src, oldMT)
+	if be == KindGo {
+		t.Logf("gosftp 迭代：真实 .part 续传 + 同尺寸改写必须拒绝")
+	}
+
+	// 参考：一次性完整下载的 sha256。
+	full := filepath.Join(t.TempDir(), "full.bin")
+	if err := g.Get(TransferRequest{ID: "t11-full", Host: host, Remote: src, Local: full, Atomic: true}, nil); err != nil {
+		t.Fatalf("完整下载失败: %v", err)
+	}
+	wantSHA := e2eSHA256File(t, full)
+
+	// 1) 取消到中途，断言 .part 是源前缀。
+	partDir := t.TempDir()
+	part := filepath.Join(partDir, "part.bin")
+	partFile := cancelPartialDownloadE2E(t, g, host, src, part, "t11-cut-a")
+	cutBytes, err := os.ReadFile(partFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cutBytes) == 0 || len(cutBytes) >= len(payload) {
+		t.Fatalf("e2e：需要“部分”的 .part，got %d/%d 字节", len(cutBytes), len(payload))
+	}
+	if !bytes.Equal(cutBytes, payload[:len(cutBytes)]) {
+		t.Fatal("e2e：.part 必须是源的前缀 —— 拼错锚点会静默损坏文件")
+	}
+
+	// 续传并断言 sha256 == 一次性完整下载。
+	if err := g.Get(TransferRequest{ID: "t11-resume-a", Host: host, Remote: src, Local: part, Atomic: true,
+		Resume: true, PartPath: partFile}, nil); err != nil {
+		t.Fatalf("续传失败: %v", err)
+	}
+	if got := e2eSHA256File(t, part); got != wantSHA {
+		t.Fatalf("续传结果 sha256 不一致: got %s want %s", got, wantSHA)
+	}
+	t.Logf("续传成功: 断点 %d 字节，结果 sha256=%s", len(cutBytes), wantSHA)
+
+	// 2) 同尺寸改写：先在改前留下一份旧内容 .part（partB），再改源并重传。
+	partB := cancelPartialDownloadE2E(t, g, host, src, filepath.Join(t.TempDir(), "partB.bin"), "t11-cut-b")
+	partBDir := filepath.Dir(partB)
+	// 同尺寸改写：首字节换掉，其余不变，长度完全一致。
+	rewritten := append([]byte("Z"), payload[1:]...)
+	if err := os.WriteFile(big, rewritten, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(big, time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Put(TransferRequest{ID: "t11-seed2", Host: host, Local: big, Remote: src, Atomic: true}, nil); err != nil {
+		t.Fatalf("改写后重传失败: %v", err)
+	}
+	// 远端 mtime 换成「新」时间：与 partB 记录下的 oldMT 必须不同。
+	newMT := time.Now().Truncate(time.Second)
+	e2eSetRemoteMtime(t, g, host, src, newMT)
+
+	// 用旧 .part 发起续传：必须整份重传（mtime 指纹不符），结果 = 新源的完整下载。
+	freshA := filepath.Join(partBDir, "freshA.bin")
+	if err := g.Get(TransferRequest{ID: "t11-resume-b", Host: host, Remote: src, Local: freshA, Atomic: true,
+		Resume: true, PartPath: partB}, nil); err != nil {
+		t.Fatalf("同尺寸改写后的续传请求必须成功（整份重传）: %v", err)
+	}
+	freshB := filepath.Join(t.TempDir(), "freshB.bin")
+	if err := g.Get(TransferRequest{ID: "t11-fresh", Host: host, Remote: src, Local: freshB, Atomic: true}, nil); err != nil {
+		t.Fatalf("新源完整下载失败: %v", err)
+	}
+	gotA, gotB := e2eSHA256File(t, freshA), e2eSHA256File(t, freshB)
+	if gotA != gotB {
+		t.Fatalf("同尺寸改写后必须整份重传（而非旧前缀+新内容拼接）: got %s want %s", gotA, gotB)
+	}
+	if gotA == wantSHA {
+		t.Fatal("e2e 自检失败：源已改写，新结果不可能等于旧参考 sha256")
+	}
+	if _, serr := os.Stat(partB); !os.IsNotExist(serr) {
+		t.Fatalf("e2e：不可续的旧 .part 必须被清掉，stat err=%v", serr)
+	}
+	t.Logf("同尺寸改写被正确拒绝续传: 新 sha256=%s（旧 %s）", gotA, wantSHA)
+
+	// 3) 同目标并发去重：首帧进度回调里卡住第一条传输，第二条同目标必须立刻被拒。
+	dupLocal := filepath.Join(t.TempDir(), "dup.bin")
+	started := make(chan struct{})
+	hold := make(chan struct{})
+	var once sync.Once
+	doneDup := make(chan error, 1)
+	go func() {
+		doneDup <- g.Get(TransferRequest{ID: "t11-dup1", Host: host, Remote: src, Local: dupLocal, Atomic: true},
+			func(Progress) {
+				once.Do(func() {
+					close(started)
+					<-hold
+				})
+			})
+	}()
+	select {
+	case <-started:
+	case <-time.After(15 * time.Second):
+		t.Fatal("e2e：15s 内未收到首帧进度（去重用例无法确定在飞）")
+	}
+	errDup := g.Get(TransferRequest{ID: "t11-dup2", Host: host, Remote: src, Local: dupLocal, Atomic: true}, nil)
+	if errDup == nil {
+		t.Fatal("e2e：同一目标并发传输必须被拒绝（inflight 去重）")
+	}
+	close(hold)
+	select {
+	case err := <-doneDup:
+		if err != nil {
+			t.Fatalf("e2e：未被去重拒绝的那条传输必须正常完成: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("e2e：去重用例的首条传输 30s 内未完成")
+	}
+	if err := g.Get(TransferRequest{ID: "t11-dup3", Host: host, Remote: src, Local: dupLocal, Atomic: true}, nil); err != nil {
+		t.Fatalf("e2e：去重释放后同一目标必须能再传: %v", err)
+	}
+
+	// batch 迭代诚实性：batch 无 .part/续传语义，Atomic=true 必须被 guardAtomic 硬拒。
+	if be == KindBatch {
+		b := NewBatchBackend(osutil.NewRunner(), nil)
+		if b.AtomicCapable() {
+			t.Fatal("e2e：batch 后端不得声明 AtomicCapable（无 .part/续传语义）")
+		}
+		if err := b.TransferGet(TransferRequest{Host: host, Remote: src, Local: filepath.Join(t.TempDir(), "batch-x.bin"), Atomic: true}, nil); err == nil {
+			t.Fatal("e2e：batch 后端 Atomic=true 必须被硬拒，绝不能静默降级直写")
+		}
+		t.Log("batch 迭代：已断言 batch 诚实拒绝 Atomic（续传仅 gosftp 提供，绝不用 batch 跑绿冒充）")
 	}
 }
