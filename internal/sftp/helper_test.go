@@ -25,13 +25,29 @@ const (
 	helperEnvMode = "SSHORE_TEST_HELPER_PROC"
 	// helperEnvNoise 是写进 stderr 的一行「远端噪音」（供错误归属用例构造非空 StderrText）。
 	helperEnvNoise = "SSHORE_TEST_HELPER_NOISE"
+	// helperArgCat 是 helper 模式**必须同时命中**的 argv[1] 模式（Task 17 修复轮 2）。
+	// 只靠环境变量的写法已经被咬过一次：真实 sh 子进程会继承该开关并立刻退出
+	// （internal/osutil/helper_test.go 的同款修复）。这里补上 argv 闸门后，任何由
+	// osutil.StartPipes 以别的 argv（或无参）起出来的真实子进程都不会误入 helper。
+	helperArgCat = "cat"
 )
 
 // helperTestMain 在 helper 模式下扮演一个长驻子进程；正常模式下先导出 helper 环境变量
-// 再跑测试 —— 这样任何 osutil.StartPipes 起出来的后代进程（环境变量被继承）都会进入
-// helper 模式，而不是递归再跑一遍整个测试套件。
+// 再跑测试 —— 这样任何 osutil.StartPipes 起出来的后代进程（环境变量被继承）都会带上
+// 开关。但是否**扮演替身**还要看 argv[1]（helperArgCat）：只有环境变量 + 已知 argv 同时
+// 命中才进入 helper 分支，避免真实子进程（如 sh）因继承开关而静默变成 helper。
 func helperTestMain(m *testing.M) int {
-	if mode := os.Getenv(helperEnvMode); mode != "" {
+	argvMode := ""
+	if len(os.Args) >= 2 {
+		argvMode = os.Args[1]
+	}
+	if os.Getenv(helperEnvMode) != "" {
+		if argvMode != helperArgCat {
+			// 开关在但 argv 不是已知模式：例如被 StartPipes 以 sh -c …（或任何别的 argv）
+			// 起出来的**真实子进程**继承了开关。绝不能在这里递归 m.Run() —— 那会无限派生
+			// 测试二进制；直接成功退出（与 internal/osutil/helper_test.go 同一处置）。
+			return 0
+		}
 		if noise := os.Getenv(helperEnvNoise); noise != "" {
 			_, _ = fmt.Fprintln(os.Stderr, noise)
 		}
@@ -81,7 +97,9 @@ func testHelperPipes(t *testing.T, noise string) *osutil.PipedProcess {
 	if abs, err := filepath.Abs(self); err == nil {
 		self = abs
 	}
-	pp, err := osutil.StartPipes(self)
+	// 必须显式带上 argv 模式（helperArgCat）：helperTestMain 现在要求「环境变量 + 已知
+	// argv」同时命中才扮演替身，否则一律成功退出（绝不递归跑测试）。
+	pp, err := osutil.StartPipes(self, helperArgCat)
 	if err != nil {
 		t.Fatalf("起跨平台测试替身子进程失败（%s=%q，exe=%q）: %v", helperEnvMode, os.Getenv(helperEnvMode), self, err)
 	}
