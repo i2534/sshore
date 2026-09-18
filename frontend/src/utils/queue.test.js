@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { statusClass, summarizeQueue, directionArrow, failureText,
   percentOf, speedOf, etaOf, fmtSpeed, isInternalTempName, progressText,
   activeActions, failedActions, applyProgress, TRANSFER_PROGRESS_EVENT, PART_MARKER } from './queue'
@@ -86,9 +87,16 @@ describe('progressText：事件渲染契约', () => {
   it('事件名钉死：改名后前端订阅会静默失效，所以必须断言字面量', () => {
     expect(TRANSFER_PROGRESS_EVENT).toBe('sftp:transfer-progress')
   })
+  it('SftpView 必须用该常量订阅（拷字面量改名会在这里断）', () => {
+    const src = readFileSync(new URL('../views/SftpView.vue', import.meta.url), 'utf8')
+    expect(src).toContain('EventsOn(TRANSFER_PROGRESS_EVENT')
+  })
   it('无帧（降级 batch 后端从不发帧）给可用性占位，不显示 0% 卡条', () => {
     expect(progressText({ status: '处理中', startedAt: 1, partPath: '/tmp/a.txt.sshore-sftppart-t1-0' })).toBe('等待进度上报…')
     expect(progressText({ status: '处理中' })).toBe('等待进度上报…')
+  })
+  it('取消请求在飞时显示取消中（终态仍由操作结果决定）', () => {
+    expect(progressText({ status: '处理中', pendingCancel: true })).toBe('取消中…')
   })
   it('scan 相显示准备中', () => {
     expect(progressText({ status: '处理中', phase: 'scan', done: 3, total: 3 })).toBe('准备中…')
@@ -102,6 +110,11 @@ describe('progressText：事件渲染契约', () => {
   })
   it('有帧且总量已知时给出百分比与字节', () => {
     expect(progressText({ status: '处理中', done: 512, total: 1024 })).toBe('50% · 512B/1.0KB')
+  })
+  it('失败且没有任何前置帧（树预扫描失败返回裸错误）也要能渲染原因', () => {
+    const rec = { status: '失败', reason: '已传输 2 个文件/1KB，剩余文件数未知', partPath: '' }
+    expect(progressText(rec)).toBe('失败')
+    expect(failedActions(rec)).toEqual(['retry'])
   })
   it('完成 = 操作结果，不因取消请求改写（取消可能发生在提交之后）', () => {
     expect(progressText({ status: '完成', cancelRequested: true })).toBe('取消过晚（已完成）')

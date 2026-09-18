@@ -105,6 +105,7 @@ export function progressText(t) {
   if (status === '完成') return t.cancelRequested ? '取消过晚（已完成）' : '完成'
   if (status === '失败' || status === '取消') return status === '失败' ? '失败' : '已取消'
   if (status === '跳过') return '跳过'
+  if (t.pendingCancel) return '取消中…'
   if (t.phase === 'scan') return '准备中…'
   if (!hasFrame(t)) return '等待进度上报…'
   // total<0：扫描被文件/时间预算截断的降级上报（Task 12/13）。这不是失败，
