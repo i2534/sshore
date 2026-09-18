@@ -1,7 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { statusClass, summarizeQueue, directionArrow,
-  percentOf, speedOf, etaOf, fmtSpeed, progressText, activeActions, failedActions } from '../utils/queue'
+  speedOf, etaOf, fmtSpeed, rowNote, rowProgressText, barModel, activeActions, failedActions } from '../utils/queue'
 
 const props = defineProps({
   transfers: { type: Array, default: () => [] },
@@ -41,17 +41,9 @@ function fmtElapsed(t) {
 // 进度只对"运行中"的行有意义：完成/失败/取消项冻结，不再跟着事件变化。
 const live = (t) => t.status === '处理中'
 
-function pct(t) { return live(t) ? percentOf(t) : null }
-
-// total 为 0（0 字节）时 percentOf 给 100，但"100%"这句话是错的信息量：
-// 只用确定的大小做百分比文案（不定条 + 未知进度/已完成 N 个文件）。
-function barStyle(t) {
-  const p = pct(t)
-  if (p === null || !(Number(t.total) > 0)) return { indeterminate: true }
-  return { width: p.toFixed(1) + '%' }
-}
-// 事件可能晚于本地挂表：进度条只在确实收到过帧时才画（默认 batch 后端永不来帧）。
-function showBar(t) { return live(t) && (t.hasProgress || t.phase === 'scan' || Number(t.total) > 0) }
+// 进度条模型（是否画 / 是否不定 / 确定宽度）来自 queue.js 纯函数，单测与生产同一条路径：
+// 无帧不画假条、total<=0 用不定条，绝不假装 0%/100%（评审 I1）。
+function bar(t) { return barModel(t) }
 
 function speedText(t) {
   if (!live(t) || !t.hasProgress) return ''
@@ -78,22 +70,21 @@ function onAct(name, t) { emit(name, t) }
           <template v-if="etaText(t)"> | {{ etaText(t) }}</template>
         </span>
         <span class="status" :class="statusClass(t.status)">{{ t.status }}</span>
-        <span v-if="t.status === '完成' && t.cancelRequested" class="note">取消过晚（已完成）</span>
-        <span v-else-if="t.reason" class="note err" :title="t.reason">{{ t.reason }}</span>
+        <span v-if="rowNote(t)" class="note" :class="{ err: t.status === '失败' || t.status === '取消' }" :title="rowNote(t)">{{ rowNote(t) }}</span>
         <span v-if="acts(t).length" class="acts">
           <button v-for="a in acts(t)" :key="a" class="act" :data-act="a" @click="onAct(a, t)">
             {{ a === 'cancel' ? '取消' : a === 'retry' ? '重试' : a === 'resume' ? '续传' : '清理' }}
           </button>
         </span>
       </div>
-      <div v-if="showBar(t)" class="pbar">
-        <div class="pfill" :class="{ indet: barStyle(t).indeterminate }" :style="barStyle(t).indeterminate ? {} : { width: barStyle(t).width }"></div>
+      <div v-if="bar(t).show" class="pbar">
+        <div class="pfill" :class="{ indet: bar(t).indeterminate }" :style="bar(t).width ? { width: bar(t).width } : {}"></div>
       </div>
-      <div v-if="live(t)" class="ptext">{{ progressText(t) }}</div>
+      <div v-if="rowProgressText(t)" class="ptext">{{ rowProgressText(t) }}</div>
     </div>
     <div v-if="!transfers.length" class="empty">无传输任务</div>
     <div v-if="transfers.length" class="qsum">
-      成功 {{ summary.ok }} · 跳过 {{ summary.skipped }} · 失败 {{ summary.failed }} · 进行中 {{ summary.running }}
+      成功 {{ summary.ok }} · 跳过 {{ summary.skipped }} · 失败 {{ summary.failed }} · 取消 {{ summary.cancelled }} · 进行中 {{ summary.running }}
       <button v-if="summary.failed" class="copy" @click="emit('copy-failures')">复制失败清单</button>
     </div>
   </div>
@@ -111,6 +102,7 @@ function onAct(name, t) { emit(name, t) }
 .status.done { color: var(--success); }
 .status.err { color: var(--danger); }
 .status.skip { color: var(--text-faint); }
+.status.cancel { color: var(--text-faint); }
 .acts { display: flex; gap: 6px; }
 .act { font-size: var(--fs-11); padding: 0 6px; }
 .pbar { height: 3px; background: var(--border); border-radius: 2px; margin-top: 2px; overflow: hidden; }

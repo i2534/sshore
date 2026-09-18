@@ -14,7 +14,8 @@ import * as sel from '../utils/selection'
 import { join as localJoin, parentOf as localParent, joinRel, splitPath } from '../utils/localpath'
 import { actionFor } from '../utils/keys'
 import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName, nextTransferSeq, transferID } from '../utils/batch'
-import { failureText, isInternalTempName, applyProgress, TRANSFER_PROGRESS_EVENT } from '../utils/queue'
+import { failureText, isInternalTempName, applyProgress, TRANSFER_PROGRESS_EVENT,
+  applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch } from '../utils/queue'
 import { payloadFor, parsePayload, hitPane, canDropInto } from '../utils/dnd'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 // 说明：StatPaths / CopyLocal / SftpMove / ListLocal / RenameLocal 已在既有 import 行里，
@@ -81,6 +82,7 @@ async function dispatchTransfer(rec) {
   rec.reason = ''
   rec.elapsed = 0
   rec.cancelRequested = false
+  rec.cancelFailed = false
   rec.pendingCancel = false
   rec.pending = false
   rec.hasProgress = false
@@ -96,41 +98,40 @@ async function dispatchTransfer(rec) {
     } else {
       await (rec.isDir ? SftpPutRecursive(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath) : SftpPut(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath))
     }
-    // 操作返回 nil = 已提交。即使 cancel 返回过 true（提交已完成的窄窗口，
-    // Task 10 评审有真协议探测），也必须渲染为完成，绝不删掉已安装的目标文件。
-    rec.status = '完成'
-    rec.partPath = '' // 提交后锚点已不存在，不留一个会误导「清理/续传」的路径
+    // 终态决策在 queue.js 的 applyOutcome（唯一落点，单测同函数）：操作返回 nil = 已提交，
+    // 即使 Cancel 返回过 true（提交已完成的窄窗口，Task 10 评审有真协议探测），也必须渲染为
+    // 完成（"取消过晚"），绝不删掉已安装的目标文件。
+    applyOutcome(rec, { ok: true })
   } catch (e) {
-    rec.status = rec.cancelRequested ? '取消' : '失败'
-    rec.reason = String((e && e.message) || e)
+    // 抛错时是否算「取消」由 cancelFailed 区分：Cancel 明确返回 false（未能取消）之后，
+    // 这次失败是无关失败，绝不栽给取消（评审 I3）。
+    applyOutcome(rec, { ok: false, error: e })
     err(e)
   }
   rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
   return rec.status
 }
 
-// 取消 = 取消当前项 + 停止派发本批后续项（整批语义由前端编排层落实，spec §6.1）。
-// 只看操作结果判定终态：这里绝不直接写 rec.status。
+// 取消 = 取消被点项 + 停止派发本批后续项（整批语义由前端编排层落实，spec §6.1）。
+// 终态判定绝不在这里内联：在飞项的终态只看传输方法的返回（applyOutcome），
+// 未派发项的终态由 applyBatchCancel 立即落定。
 async function cancelTransfer(rec) {
   if (!rec || !rec.id) return
-  rec.cancelRequested = true // 用户意图；**不是**终态
-  rec.pendingCancel = true
-  // 整批语义：本批"还没开始派发"的项（pending）不会再有结果，立刻定终态。
-  // 用独立的 batchAborted 标记而不是改 rec.status —— 派发循环若只看 status，会把
-  // 已经被取消、尚未真正在飞的项当成"跳过"（status 是我们自己刚写的，不是操作结果）。
-  // 只按同批前缀处理：别的批次可能在等冲突确认/排队，不能被这次取消连坐。
-  const prefix = String(rec.id).split('-')[0] + '-'
-  for (const o of transfers.value) {
-    if (o.id === rec.id) continue
-    if (o.status !== '处理中' || !o.pending) continue
-    if (!String(o.id || '').startsWith(prefix)) continue
-    o.batchAborted = true
-    o.status = '取消'
-    o.reason = '已取消，停止后续项'
+  // 取消落点全在 queue.js 的 applyBatchCancel（唯一落点，单测同函数）：
+  //  - 被点的是 pending（还没派发）：它自己没有操作结果，立即定「取消」并 batchAborted，
+  //    绝不派发它，也绝不对未注册的 id 假称「取消中」（评审 I2）；
+  //  - 被点的是在飞项：置 cancelRequested/pendingCancel，终态等它自己的返回。
+  // 两种情况下同批后面的 pending 项都立即定「取消」，派发循环据此 break。
+  const plan = applyBatchCancel(transfers.value, rec)
+  if (!plan.inFlight) return
+  // Cancel 的返回值必须用起来（评审 I3）：true 保持「取消中…」；false 立刻转「未能取消」，
+  // 并且之后这次传输若以错误结束，也不算取消。
+  try {
+    applyCancelResult(rec, await SftpTransferCancel(rec.id))
+  } catch (e) {
+    applyCancelResult(rec, false)
+    err(e)
   }
-  // 不 await：取消绑定可能要等后端注册表/关会话，但它不影响这里的终态判定
-  // （终态只看那次传输方法的返回）。pendingCancel 保留到该次调用结束，UI 显示「取消中…」。
-  SftpTransferCancel(rec.id).catch((e) => err(e))
 }
 
 // 重试：整项重跑，resume=false。旧 partPath 仍传给后端，让后端先删同名 .part 再重来。
@@ -467,8 +468,9 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   }))
   for (const rec of batch) transfers.value.push(rec)
   for (const rec of batch) {
-    // 这一批已被取消：不再派发（已完成项保留，未开始的项在 cancelTransfer 里已定「取消」）。
-    if (rec.batchAborted) break
+    // 这一批已被取消：不再派发（已完成项保留，被点的 pending 行与它之后的项已在
+    // applyBatchCancel 里定「取消」）。shouldDispatch 是派发判定唯一落点。
+    if (!shouldDispatch(rec)) break
     rec.pending = false
     rec.pendingCancel = false
     await dispatchTransfer(rec)
