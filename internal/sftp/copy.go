@@ -164,8 +164,10 @@ func (g *GoBackend) getNonAtomic(s *Session, remote, local string) (int64, int64
 	}
 	f, err := os.OpenFile(local, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
+		// legacy 面的本地目标文件建不出来，同样是本地文件系统错误：与原子路径的 .part
+		// 失败共用 errLocalPart 标记，供 Get 的 legacy 分支判「不要附远端 stderr」（M4）。
 		_ = rf.Close()
-		return 0, total, err
+		return 0, total, fmt.Errorf("%w: %w", errLocalPart, err)
 	}
 	n, cerr := copyStream(f, rf)
 	_ = rf.Close()

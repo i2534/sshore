@@ -632,23 +632,10 @@ func TestGoBackendGetLocalErrorNotMaskedByStderr(t *testing.T) {
 	local := filepath.Join(roParent, "dst.bin")
 
 	g := backendForTestServer(t, remoteRoot)
-	origDial := g.pool.dial
 	// 故意的「远端噪音」：子进程写 stderr，drain goroutine 收进 StderrText。
 	// 先起进程再挂到会话上，保证断言时 stderr 一定非空（否则用例空转）。
 	const noisy = "ssh-noise-should-not-mask-local-error"
-	pp, err := osutil.StartPipes("sh", "-c", "printf '%s\\n' \"$1\" >&2; cat >/dev/null", "sh", noisy)
-	if err != nil {
-		t.Fatalf("StartPipes: %v", err)
-	}
-	t.Cleanup(func() { _ = pp.Kill() })
-	g.pool.dial = func(host, user string) (*Session, error) {
-		s, derr := origDial(host, user)
-		if derr != nil {
-			return nil, derr
-		}
-		s.Proc = pp
-		return s, nil
-	}
+	pp := noisyProcForDial(t, g, "sh", "-c", "printf '%s\\n' \"$1\" >&2; cat >/dev/null", "sh", noisy)
 	req := TransferRequest{ID: "mask", Host: "h", Remote: "src.bin", Local: local, Atomic: true}
 
 	// 等 drain 真的收到那行 stderr 再传输 —— 否则断言「没被盖掉」是因为 stderr 恰为空。
@@ -660,7 +647,7 @@ func TestGoBackendGetLocalErrorNotMaskedByStderr(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	err = g.Get(req, nil)
+	err := g.Get(req, nil)
 	if err == nil {
 		t.Fatal("只读目标必须报错")
 	}
@@ -683,5 +670,99 @@ func TestGoBackendGetLocalErrorNotMaskedByStderr(t *testing.T) {
 	}
 	if !strings.Contains(msg, local) {
 		t.Fatalf("本地错误应指向本地目标路径 %q，got: %s", local, msg)
+	}
+}
+
+// noisyProcForDial 把「会写 stderr 的子进程」挂成 dial 出来的会话 Proc，用于错误归属用例。
+// 两个细节都为了不漏进程（Task 7 修复轮 2 清理）：
+//  1. backendForTestServer 造的 cat 被顶替后不再被任何 Session 持有，CloseAll 收不到它，
+//     必须由用例自己收；
+//  2. 用 Close 而不是 Kill —— 命令里的 cat 后代只会在父端 stdin 关闭后收 EOF 退出，
+//     Kill 只杀直接子进程，会把 cat 留成孤儿。
+func noisyProcForDial(t *testing.T, g *GoBackend, name string, args ...string) *osutil.PipedProcess {
+	t.Helper()
+	pp, err := osutil.StartPipes(name, args...)
+	if err != nil {
+		t.Fatalf("StartPipes: %v", err)
+	}
+	origDial := g.pool.dial
+	var mu sync.Mutex
+	var displaced []*osutil.PipedProcess
+	g.pool.dial = func(host, user string) (*Session, error) {
+		s, derr := origDial(host, user)
+		if derr != nil {
+			return nil, derr
+		}
+		mu.Lock()
+		displaced = append(displaced, s.Proc)
+		mu.Unlock()
+		s.Proc = pp
+		return s, nil
+	}
+	t.Cleanup(func() {
+		mu.Lock()
+		ds := append([]*osutil.PipedProcess(nil), displaced...)
+		mu.Unlock()
+		for _, d := range ds {
+			if d != nil && d != pp {
+				_ = d.Close()
+			}
+		}
+		_ = pp.Close()
+	})
+	return pp
+}
+
+// TestGoBackendGetLegacyLocalErrorNotMaskedByStderr（Task 7 修复轮 2 / M4 剩余）：
+// Atomic=false 走 getNonAtomic 时，本地目标文件 OpenFile 失败同样是本地错误，
+// 不能被非空远端 stderr 盖掉。该分支经 ctrl.go 的 legacy 四参面被 internal/sync 实际调用，
+// 与原子路径共用 isRemoteError(err) 判据。
+func TestGoBackendGetLegacyLocalErrorNotMaskedByStderr(t *testing.T) {
+	remoteRoot := t.TempDir()
+	roParent := t.TempDir()
+	if err := os.Chmod(roParent, 0500); err != nil { // 父目录不可写 ⇒ 目标文件建不出来
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roParent, 0700) })
+	writeRemote(t, remoteRoot, "src.bin", bytes.Repeat([]byte("l"), 32))
+	local := filepath.Join(roParent, "dst.bin")
+
+	g := backendForTestServer(t, remoteRoot)
+	const noisy = "legacy-noise-should-not-mask-local-error"
+	pp := noisyProcForDial(t, g, "sh", "-c", "printf '%s\\n' \"$1\" >&2; cat >/dev/null", "sh", noisy)
+
+	// 先等 drain 真的收到 stderr 再传 —— 否则「没被盖掉」可能只是 stderr 恰为空。
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(pp.StderrText(), noisy) {
+		if time.Now().After(deadline) {
+			t.Fatal("5s 内未收到注入的 stderr（用例无法构成 M4 复现条件）")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	req := TransferRequest{ID: "legacy-mask", Host: "h", Remote: "src.bin", Local: local, Atomic: false}
+	err := g.Get(req, nil)
+	if err == nil {
+		t.Fatal("只读目标必须报错")
+	}
+	var te *TransferError
+	if !errors.As(err, &te) {
+		t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+	}
+	if te.RemoteMsg != "" {
+		t.Fatalf("legacy 本地错误不得附 RemoteMsg（会盖掉真正的本地原因），got %q", te.RemoteMsg)
+	}
+	if te.PartPath != "" {
+		t.Fatalf("legacy 面不使用 .part，PartPath 必须为空，got %q", te.PartPath)
+	}
+	msg := te.Error()
+	if strings.Contains(msg, noisy) {
+		t.Fatalf("legacy 本地错误被远端 stderr 盖掉: %s", msg)
+	}
+	if !strings.Contains(msg, local) {
+		t.Fatalf("legacy 本地错误应指向本地目标路径 %q，got: %s", local, msg)
+	}
+	if _, serr := os.Stat(local); !os.IsNotExist(serr) {
+		t.Fatalf("失败后最终名不得出现，stat err=%v", serr)
 	}
 }

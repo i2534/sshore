@@ -155,7 +155,14 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 		// legacy 面（internal/sync）：直写目标，原子性由 sync 自己的 .part+rename 保证。
 		n, total, err := g.getNonAtomic(s, req.Remote, req.Local)
 		if err != nil {
-			return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: err, RemoteMsg: s.Proc.StderrText()}
+			// 错误归属（M4）：legacy 分支与原子路径同一判据 —— 只有真正的远端失败才附
+			// s.Proc.StderrText()。本地目标文件建不出来（errLocalPart）保留自身 error，
+			// 否则 sshd stderr 非空就会在 api.go 的 Error() 里盖掉本地权限/磁盘真因。
+			var remoteMsg string
+			if isRemoteError(err) {
+				remoteMsg = s.Proc.StderrText()
+			}
+			return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: err, RemoteMsg: remoteMsg}
 		}
 		if decideCommit(n, total) != commitOK {
 			return &TransferError{Op: "sftp get", Path: req.Local, Err: shortReadError(n, total, "")}
