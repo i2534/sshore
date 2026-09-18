@@ -27,31 +27,50 @@ import (
 // 会话的 Proc 用 cat 兜住：Session.close() 会关管道 + Kill，没有真实子进程会 nil panic。
 
 // backendForTestServer 起一个只在内存里的 sftp 会话池，并把 dial 指向它。
+//
+// 每次 dial 都新起一对 pipe + 一个新 sftp.Server + 一个新 client：一条 sftp.Client 不能
+// 在多个「会话」上复用（CloseAll/Cancel/RecoverSwaps 会真的 close 它，后一个用例就会拿到
+// 死连接 —— 实测表现为 "connection lost"）。
 func backendForTestServer(t *testing.T, root string) *GoBackend {
 	t.Helper()
-	c1, c2 := net.Pipe()
-	srv, err := sftp.NewServer(c1, sftp.WithServerWorkingDirectory(root))
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	go func() { _ = srv.Serve() }()
-	cl, err := sftp.NewClientPipe(c2, c2)
-	if err != nil {
-		t.Fatalf("NewClientPipe: %v", err)
-	}
-	pp, err := osutil.StartPipes("cat")
-	if err != nil {
-		t.Fatalf("StartPipes(cat): %v", err)
-	}
 	g := NewGoBackend(nil, nil)
+	var mu sync.Mutex
+	var servers []*sftp.Server
+	var conns []net.Conn
 	g.pool.dial = func(host, user string) (*Session, error) {
-		return &Session{Host: host, User: user, Conn: cl, Proc: pp, state: sessBusy}, nil
+		c1, c2 := net.Pipe()
+		srv, err := sftp.NewServer(c1, sftp.WithServerWorkingDirectory(root))
+		if err != nil {
+			return nil, err
+		}
+		go func() { _ = srv.Serve() }()
+		cl, err := sftp.NewClientPipe(c2, c2)
+		if err != nil {
+			_ = srv.Close()
+			return nil, err
+		}
+		// Proc 必须有真实子进程：Session.close 会 Kill，nil Proc 会 nil panic；且带 Proc 的
+		// 会话才算「真的建立过连接」（GoBackend.Connected 的粘性置位判据）。
+		p, perr := osutil.StartPipes("cat")
+		if perr != nil {
+			return nil, perr
+		}
+		mu.Lock()
+		servers = append(servers, srv)
+		conns = append(conns, c1, c2)
+		mu.Unlock()
+		return &Session{Host: host, User: user, Conn: cl, Proc: p, state: sessBusy}, nil
 	}
 	t.Cleanup(func() {
 		g.CloseAll()
-		_ = srv.Close()
-		_ = c1.Close()
-		_ = c2.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, s := range servers {
+			_ = s.Close()
+		}
+		for _, c := range conns {
+			_ = c.Close()
+		}
 	})
 	return g
 }
@@ -285,8 +304,13 @@ func TestGoBackendGetTransportErrorKeepsPartAndClosesSession(t *testing.T) {
 	if !s.Closed() {
 		t.Fatal("失败后会话必须被关闭而不是塞回 idle")
 	}
-	if g.Connected("h") {
-		t.Fatal("会话关闭后 Connected 必须为 false")
+	// Task 13（Task 6 重审 I3）：会话被关不等于用户断开 —— Connected 保持粘性 true；
+	// 未连接过的 host 仍必须 false。
+	if !g.Connected("h") {
+		t.Fatal("会话关闭不得清除粘性连接意图（Connected 必须仍为 true）")
+	}
+	if g.Connected("never-connected") {
+		t.Fatal("从未连接过的 host 必须 false")
 	}
 	// .part 必须存在（续传锚点）。
 	ents, _ := os.ReadDir(localDir)

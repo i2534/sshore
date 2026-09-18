@@ -112,7 +112,9 @@ type SyncRule struct {
 }
 
 // DefaultExcludes 是远端路径的默认忽略集合（过滤的是**远端**路径）。
-// 不要放 *.part：那是我们本地临时文件的后缀，远端不会出现。
+// 注意：sshore 自己的传输临时文件（中缀 .sshore-sftppart-）由 watch/sync 的**内置忽略**
+// 处理（见 watch.IsInternalTemp），不依赖本表 —— 用户删改本表也不会让 .part/.bak
+// 被当业务文件。
 func DefaultExcludes() []string {
 	return []string{".git/", "node_modules/", "*.swp", "*~", ".DS_Store"}
 }

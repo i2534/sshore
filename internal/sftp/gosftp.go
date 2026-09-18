@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -95,7 +96,17 @@ type GoBackend struct {
 	resumeAnchors map[string]resumeAnchor
 
 	partsMu    sync.Mutex           // Task 13：已知 .part（退出清理用）
-	knownParts map[string][2]string // id → {local, remote}
+	knownParts map[string][4]string // id → {host, user, local, remote}
+
+	// Task 13（Task 6 重审 I3）：Connected 是**粘性连接意图**，不是「池里现在有没有会话」。
+	// 成功 dial 置位；只有显式 Disconnect / CloseAll 清除。池的 idle 上限 LRU 逐出、
+	// 会话被关、传输结束归还，都不能让 UI 翻回未连接。
+	//
+	// lastHost/lastUser 记录**最近一次成功握手**的凭据：journal 条目没有 host 字段，
+	// 恢复探测只能靠它；CloseAll 刻意不清（恢复发生在 CloseAll 之后）。
+	connMu             sync.Mutex
+	connected          map[string]bool
+	lastHost, lastUser string
 }
 
 func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
@@ -107,10 +118,43 @@ func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
 		reg:           map[string]*regEntry{},
 		inflight:      map[string]string{},
 		resumeAnchors: map[string]resumeAnchor{},
-		knownParts:    map[string][2]string{},
+		knownParts:    map[string][4]string{},
+		connected:     map[string]bool{},
 	}
-	g.pool = NewPool(g.dial)
+	// Task 13：池每真正建出一条会话就置 Connected 粘性 true（回调在池内，覆盖
+	// AcquireList/AcquireTransfer/Probe 的全部返回点）。
+	g.pool = NewPoolWithConnected(g.dial, g.markConnected)
 	return g
+}
+
+// markConnected 记录一次成功握手（粘性连接意图 + 最近握手凭据）。由池在真正建出会话
+// （有着落地的子进程，即不是测试替身）之后调用 —— AcquireList/AcquireTransfer/Probe 都走它。
+func (g *GoBackend) markConnected(host, user string) {
+	if host == "" {
+		return
+	}
+	g.connMu.Lock()
+	if g.connected == nil {
+		g.connected = map[string]bool{}
+	}
+	g.connected[host] = true
+	g.lastHost, g.lastUser = host, user
+	g.connMu.Unlock()
+}
+
+// recoverHostUser 返回恢复探测要用的 (host,user)：最近一次成功握手的那条。
+// 从未连接过 ⇒ 空 host，调用方必须据此放弃本次恢复（不动作、不删条目）。
+func (g *GoBackend) recoverHostUser() (string, string) {
+	g.connMu.Lock()
+	defer g.connMu.Unlock()
+	return g.lastHost, g.lastUser
+}
+
+// clearConnected 只在显式 Disconnect / CloseAll 调用（连接意图的清除点）。
+func (g *GoBackend) clearConnected(host string) {
+	g.connMu.Lock()
+	delete(g.connected, host)
+	g.connMu.Unlock()
 }
 
 // sftpDialArgs 构造 ssh 的参数（纯函数，便于单测逐字钉顺序）。
@@ -200,14 +244,87 @@ func (g *GoBackend) warnf(host, format string, args ...any) {
 	})
 }
 
-// —— Task 7-13 才实现的正文；本 task 只落引导与能力探测（自审 S7）——
+// —— Task 7-13 才实现的正文 ——
 
-func (g *GoBackend) Home(host, user string) (string, error) { return "", errors.New("未实现") }
-func (g *GoBackend) List(host, user, path string) ([]Item, error) {
-	return nil, errors.New("未实现")
+// itemFrom 是唯一构造 Item 的地方：ModTime 必须逐字保持 2006-01-02 15:04。
+// watch/sync 用它做**字符串比较**（远端快照 vs 记录值），格式一变就会出现假冲突；
+// 零值 mtime 输出空串，前端据此显示 "—"。Mode 必须填（UI 暂不使用，但字段不可空）。
+func itemFrom(name string, size int64, isDir bool, mode os.FileMode, mtime time.Time) Item {
+	mt := ""
+	if !mtime.IsZero() {
+		mt = mtime.Format("2006-01-02 15:04")
+	}
+	return Item{Name: name, Size: size, IsDir: isDir, Mode: mode.String(), ModTime: mt}
 }
+
+func (g *GoBackend) Home(host, user string) (string, error) {
+	s, err := g.pool.AcquireList(context.Background(), host, user)
+	if err != nil {
+		return "", err
+	}
+	defer g.pool.Release(s, true)
+	if s.Conn == nil {
+		return "", &TransferError{Op: "sftp pwd", Host: host, Err: errors.New("会话没有 SFTP 连接")}
+	}
+	return s.Conn.Getwd()
+}
+
+func (g *GoBackend) List(host, user, path string) ([]Item, error) {
+	s, err := g.pool.AcquireList(context.Background(), host, user)
+	if err != nil {
+		return nil, err
+	}
+	reusable := true
+	defer func() { g.pool.Release(s, reusable) }()
+	if s.Conn == nil {
+		reusable = false
+		return nil, &TransferError{Op: "sftp ls", Host: host, Path: path, Err: errors.New("会话没有 SFTP 连接")}
+	}
+	infos, err := s.Conn.ReadDirContext(context.Background(), path)
+	if err != nil {
+		// 会话级失败（含关会话导致的取消）：不归还给 idle 复用。
+		reusable = false
+		return nil, &TransferError{Op: "sftp ls", Host: host, Path: path, Err: err, RemoteMsg: s.Proc.StderrText()}
+	}
+	items := make([]Item, 0, len(infos))
+	for _, fi := range infos {
+		if fi.Name() == "." || fi.Name() == ".." {
+			continue
+		}
+		items = append(items, itemFrom(fi.Name(), fi.Size(), fi.IsDir(), fi.Mode(), fi.ModTime()))
+	}
+	return items, nil
+}
+
+// ListMany：失败目录**缺席**于返回 map（绝不返回空切片）—— Search 与 sync 都依赖这条契约，
+// 一旦把「列不出来」当成「空目录」，sync 的删除闸门会误删本地文件。
 func (g *GoBackend) ListMany(host, user string, paths []string) (map[string][]Item, error) {
-	return nil, errors.New("未实现")
+	s, err := g.pool.AcquireList(context.Background(), host, user)
+	if err != nil {
+		return nil, err
+	}
+	reusable := true
+	defer func() { g.pool.Release(s, reusable) }()
+	if s.Conn == nil {
+		reusable = false
+		return nil, &TransferError{Op: "sftp ls", Host: host, Err: errors.New("会话没有 SFTP 连接")}
+	}
+	res := make(map[string][]Item, len(paths))
+	for _, p := range paths {
+		infos, err := s.Conn.ReadDirContext(context.Background(), p)
+		if err != nil {
+			continue // 缺席 = 未知
+		}
+		items := make([]Item, 0, len(infos))
+		for _, fi := range infos {
+			if fi.Name() == "." || fi.Name() == ".." {
+				continue
+			}
+			items = append(items, itemFrom(fi.Name(), fi.Size(), fi.IsDir(), fi.Mode(), fi.ModTime()))
+		}
+		res[p] = items
+	}
+	return res, nil
 }
 
 // Get/GetTree/Put/PutTree 是 GoBackend 的正文方法（后续 task 填充）。
@@ -280,14 +397,18 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 		case resumeFull:
 			// 源已变/不可验证：旧 .part 只会污染结果，删掉再走全新流程。
 			g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, req.PartPath))
+			g.forgetPart(req.ID, req.PartPath)
 			_ = os.Remove(req.PartPath)
 			req.Resume, req.ResumeOffset = false, 0
 		case resumeCommit:
 			// .part 已完整（== 源大小且指纹相符）：直接提交，绝不「续传 0 字节」。
+			// 提交前先登记（提交失败时它是可续传锚点，退出清理必须能删掉它）。
+			g.recordPart(req.Host, req.User, req.ID, req.PartPath, "")
 			if err := os.Rename(req.PartPath, req.Local); err != nil {
 				return &TransferError{Op: "sftp get", Path: req.Local, PartPath: req.PartPath, Err: err}
 			}
 			g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, req.PartPath))
+			g.forgetPart(req.ID, req.PartPath)
 			g.markCommitted(entry)
 			newProgressEmitter(req.ID, report).send(Progress{
 				Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: req.Local,
@@ -320,8 +441,9 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	if err := os.Rename(part, req.Local); err != nil {
 		return &TransferError{Op: "sftp get", Path: req.Local, PartPath: part, Err: err}
 	}
-	// 提交成功后 .part 已不存在（被 rename 成目标），锚点随之失效。
+	// 提交成功后 .part 已不存在（被 rename 成目标），锚点与登记随之失效。
 	g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, part))
+	g.forgetPart(req.ID, part)
 	// I2：提交已完成，先标记 committed 再发末帧 —— 末帧经 UI 同步回调，无论它多慢，
 	// Cancel 都只会看到 false（绝不出现「文件已落地却答应用户取消」）。
 	g.markCommitted(entry)
@@ -441,6 +563,9 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 				return fail(&TransferError{Op: op, Path: localPath, PartPath: part, Err: rerr})
 			}
 			g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, part))
+			// Task 13：这一项的 .part 已提交成最终名，注销登记（树的 id 全树共用，
+			// 键里的目标路径区分每一项 —— 见 partKey）。
+			g.forgetPart(req.ID, part)
 			// M2/NEW-2：expected 用枚举大小、actual 用已打开句柄的 Stat —— finishFile 据此对账分母。
 			tp.finishFile(f.size, ftotal)
 			continue
@@ -585,6 +710,8 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 		// .part 根本没建出来 ⇒ PartPath 必须为空（约束 5：绝不发布假锚点）。
 		return &TransferError{Op: "sftp put", Host: req.Host, Path: part, Err: err, RemoteMsg: s.Proc.StderrText()}
 	}
+	// Task 13：远端 .part 已真实建出 ⇒ 登记进已知表（提交成功后注销），退出清理据此删除。
+	g.recordPart(req.Host, req.User, req.ID, "", part)
 	if req.Resume && offset > 0 {
 		if _, err := wf.Seek(offset, io.SeekStart); err != nil {
 			_ = wf.Close()
@@ -649,8 +776,9 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 		}
 		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, PartPath: part, Err: err, RemoteMsg: remoteMsg}
 	}
-	// 提交成功后 .part 已不存在（被 rename 成目标），锚点随之失效。
+	// 提交成功后 .part 已不存在（被 rename 成目标），锚点与登记随之失效。
 	g.forgetResumeAnchor(uploadAnchorKey(req.Host, req.User, req.Remote, part))
+	g.forgetPart(req.ID, part)
 	// I2：提交已完成，先标记 committed 再发末帧（末帧经 UI 同步回调）—— Cancel 绝不
 	// 能在「远端文件已落地」时返回 true。
 	g.markCommitted(entry)
@@ -1046,6 +1174,8 @@ func (g *GoBackend) putFileAtomic(s *Session, req TransferRequest, local, remote
 		// .part 根本没建出来 ⇒ PartPath 必须为空（绝不发布假锚点）。
 		return 0, &TransferError{Op: op, Host: req.Host, Path: part, Err: err, RemoteMsg: s.Proc.StderrText()}
 	}
+	// Task 13：远端 .part 已真实建出 ⇒ 登记（键含目标路径，树内每一项各自一条）。
+	g.recordPart(req.Host, req.User, req.ID, "", part)
 	// I3/NEW-2 注入点：单测在「枚举完成、本地源尚未打开」的窗口里把文件改大，构造分母/分子
 	// 的真实分叉（与 Put 的续传复核共用同一注入点，语义一致）。
 	beforeOpenLocalSource(local)
@@ -1086,6 +1216,8 @@ func (g *GoBackend) putFileAtomic(s *Session, req TransferRequest, local, remote
 		}
 		return total, &TransferError{Op: op, Host: req.Host, Path: remote, PartPath: part, Err: err, RemoteMsg: remoteMsg}
 	}
+	// Task 13：这一项的 .part 已提交成最终名，注销登记。
+	g.forgetPart(req.ID, part)
 	// 末帧：提交成功后才发，PartPath 指向已提交的最终目标（与 Put 同一 PartPath 语义）。
 	em.send(Progress{Host: req.Host, Direction: DirUpload, Name: remote, PartPath: remote, Done: total, Total: total, Phase: PhaseTransfer}, true)
 	return total, nil
@@ -1104,29 +1236,177 @@ func (g *GoBackend) TransferPutTree(req TransferRequest, report func(Progress)) 
 	return g.PutTree(req, report)
 }
 
-func (g *GoBackend) Remove(host, user, path string) error             { return errors.New("未实现") }
-func (g *GoBackend) RemoveRecursive(host, user, path string) error    { return errors.New("未实现") }
-func (g *GoBackend) Mkdir(host, user, path string) error              { return errors.New("未实现") }
-func (g *GoBackend) Rename(host, user, oldPath, newPath string) error { return errors.New("未实现") }
+func (g *GoBackend) Remove(host, user, path string) error {
+	s, err := g.pool.AcquireList(context.Background(), host, user)
+	if err != nil {
+		return err
+	}
+	reusable := true
+	defer func() { g.pool.Release(s, reusable) }()
+	if s.Conn == nil {
+		reusable = false
+		return &TransferError{Op: "sftp rm", Host: host, Path: path, Err: errors.New("会话没有 SFTP 连接")}
+	}
+	if err := s.Conn.Remove(path); err != nil {
+		reusable = false
+		return &TransferError{Op: "sftp rm", Host: host, Path: path, Err: err, RemoteMsg: s.Proc.StderrText()}
+	}
+	return nil
+}
+
+// RemoveRecursive 保留旧语义：拒绝根路径、目录不可读即整体失败（不静默漏删）。
+// Walk 的错误一律上报 —— 部分删除绝不回滚，也绝不把「有目录没走到」当成成功。
+func (g *GoBackend) RemoveRecursive(host, user, remotePath string) error {
+	if remotePath == "" || remotePath == "/" {
+		return fmt.Errorf("拒绝递归删除根路径: %q", remotePath)
+	}
+	s, err := g.pool.AcquireList(context.Background(), host, user)
+	if err != nil {
+		return err
+	}
+	reusable := true
+	defer func() { g.pool.Release(s, reusable) }()
+	if s.Conn == nil {
+		reusable = false
+		return &TransferError{Op: "sftp rm -r", Host: host, Path: remotePath, Err: errors.New("会话没有 SFTP 连接")}
+	}
+	// 两相：先把 Walk 完整走完（只收集，不在遍历中做任何远端写操作 —— 库的 Walk 在
+	// 遍历期间并发发请求会让连接紊乱，实测报 "connection lost"），再自底向上删除。
+	var files, dirs []string // dirs 自底向上（深者在前）
+	w := s.Conn.Walk(remotePath)
+	for w.Step() {
+		if err := w.Err(); err != nil {
+			reusable = false
+			return &TransferError{Op: "sftp rm -r", Host: host, Path: remotePath, Err: err, RemoteMsg: s.Proc.StderrText()}
+		}
+		p := w.Path()
+		if path.Clean(p) == path.Clean(remotePath) {
+			continue // 目标自身最后删
+		}
+		if fi, serr := s.Conn.Stat(p); serr == nil && fi.IsDir() {
+			dirs = append([]string{p}, dirs...)
+			continue
+		}
+		files = append(files, p)
+	}
+	for _, f := range files {
+		if err := s.Conn.Remove(f); err != nil {
+			reusable = false
+			return &TransferError{Op: "sftp rm -r", Host: host, Path: f, Err: err, RemoteMsg: s.Proc.StderrText()}
+		}
+	}
+	for _, d := range dirs {
+		if err := s.Conn.RemoveDirectory(d); err != nil {
+			reusable = false
+			return &TransferError{Op: "sftp rm -r", Host: host, Path: d, Err: err, RemoteMsg: s.Proc.StderrText()}
+		}
+	}
+	// 目标自身（文件或目录）最后删：用 Stat 区分，保证失败时上报的是**正确操作**的错误
+	// （对文件报 RemoveDirectory 的失败会掩盖真因）。Stat 失败按文件处理，错误原样上报。
+	if fi, serr := s.Conn.Stat(remotePath); serr == nil && fi.IsDir() {
+		if err := s.Conn.RemoveDirectory(remotePath); err != nil {
+			reusable = false
+			return &TransferError{Op: "sftp rm -r", Host: host, Path: remotePath, Err: err, RemoteMsg: s.Proc.StderrText()}
+		}
+	} else if err := s.Conn.Remove(remotePath); err != nil {
+		reusable = false
+		return &TransferError{Op: "sftp rm -r", Host: host, Path: remotePath, Err: err, RemoteMsg: s.Proc.StderrText()}
+	}
+	return nil
+}
+
+func (g *GoBackend) Mkdir(host, user, path string) error {
+	s, err := g.pool.AcquireList(context.Background(), host, user)
+	if err != nil {
+		return err
+	}
+	reusable := true
+	defer func() { g.pool.Release(s, reusable) }()
+	if s.Conn == nil {
+		reusable = false
+		return &TransferError{Op: "sftp mkdir", Host: host, Path: path, Err: errors.New("会话没有 SFTP 连接")}
+	}
+	if err := s.Conn.Mkdir(path); err != nil {
+		reusable = false
+		return &TransferError{Op: "sftp mkdir", Host: host, Path: path, Err: err, RemoteMsg: s.Proc.StderrText()}
+	}
+	return nil
+}
+
+// Rename 必须覆盖已存在目标（保持旧 sftp rename 语义）→ 用 PosixRename，扩展缺失时明确失败
+// 而不是退化成一条会静默失败的普通 rename（那会让用户以为改名成功了）。
+func (g *GoBackend) Rename(host, user, oldPath, newPath string) error {
+	s, err := g.pool.AcquireList(context.Background(), host, user)
+	if err != nil {
+		return err
+	}
+	reusable := true
+	defer func() { g.pool.Release(s, reusable) }()
+	if s.Conn == nil {
+		reusable = false
+		return &TransferError{Op: "sftp rename", Host: host, Path: oldPath, Err: errors.New("会话没有 SFTP 连接")}
+	}
+	if _, ok := s.Conn.HasExtension(posixRenameExt); !ok {
+		reusable = false
+		return &TransferError{Op: "sftp rename", Host: host, Path: oldPath,
+			Err: errors.New("远端不支持原子覆盖改名，请先删除目标")}
+	}
+	if err := s.Conn.PosixRename(oldPath, newPath); err != nil {
+		reusable = false
+		return &TransferError{Op: "sftp rename", Host: host, Path: oldPath, Err: err, RemoteMsg: s.Proc.StderrText()}
+	}
+	return nil
+}
 
 // Connect 对 GoBackend 而言就是「握手 + 探测」；建立长驻会话由池按需完成。
+// 握手成功由池的 dial 包装置 Connected（粘性意图）。
 func (g *GoBackend) Connect(host, user string) error {
 	_, err := g.Capabilities(host, user)
 	return err
 }
 
-// Search 的 Go 实现要等后续 task；先返回未实现，避免静默空结果。
+// Search 复用与 BatchBackend 相同的 BFS 主体，lister 传 GoBackend 自己的 ListMany。
 func (g *GoBackend) Search(ctx context.Context, host, user, root, pattern string, maxDepth, limit int,
 	onProgress func(scanned int)) (SearchOutcome, error) {
-	return SearchOutcome{}, errors.New("未实现")
+	return searchBFS(ctx, g.ListMany, host, user, root, pattern, maxDepth, limit, onProgress)
 }
 
-// Connected 报告 host 是否有已成功建立的会话（池内 idle 或传输中，跨 user）。
-// 会话惰性建立：从未连过 ⇒ false 正确；Connect/Capabilities 真握手入池后 ⇒ true；
-// Disconnect/CloseAll 关掉后回到 false。绝不能对未连接过的 host 硬造 true（Task 6 评审 I3）。
-func (g *GoBackend) Connected(host string) bool   { return g.pool.Connected(host) }
-func (g *GoBackend) Disconnect(host string) error { return g.pool.Disconnect(host) }
-func (g *GoBackend) CloseAll()                    { g.pool.CloseAll() }
+// Connected 报告「本 host 是否处于已连接状态」——**粘性连接意图**（Task 6 重审 I3）：
+// 一次成功握手（Connect/Capabilities/任何一次真实传输/列表）即置位；只有显式
+// Disconnect 或 CloseAll 清除。刻意**不**看池内是否还有活会话：池的 idle 上限 LRU 逐出
+// 或一条会话被关都会让「按池推导」的实现在连接仍可用时把 UI 翻回未连接。
+// 从未连接过的 host 必须 false（绝不硬造 true）。
+func (g *GoBackend) Connected(host string) bool {
+	g.connMu.Lock()
+	defer g.connMu.Unlock()
+	return g.connected[host]
+}
+
+// Disconnect 关闭该 host 的空闲会话，并清除连接意图（用户显式断开）。
+func (g *GoBackend) Disconnect(host string) error {
+	g.clearConnected(host)
+	return g.pool.Disconnect(host)
+}
+
+// CloseAll 关闭全部会话并清除所有连接意图（应用退出）。
+// 关会话之前先 best-effort 清掉本进程登记的已知 .part —— 顺序是硬约束：先关会话就再也删不掉
+// 远端临时文件了（技术审核 M5）。
+func (g *GoBackend) CloseAll() {
+	// 先快照恢复凭据：CleanupParts 可能为远端 .part 新建会话并覆盖 lastHost，而紧接着的
+	// RecoverSwaps（app.go 在 CloseAll 之后调用）必须用「关闭前最近一次真实握手」的 host。
+	recoverHost, recoverUser := g.recoverHostUser()
+	g.CleanupParts()
+	// 快照写回（CleanupParts 若新建过会话会改 lastHost）。
+	if recoverHost != "" {
+		g.connMu.Lock()
+		g.lastHost, g.lastUser = recoverHost, recoverUser
+		g.connMu.Unlock()
+	}
+	g.pool.CloseAll()
+	g.connMu.Lock()
+	g.connected = map[string]bool{}
+	g.connMu.Unlock()
+}
 
 // AtomicCapable：GoBackend 的新面一律走 .part + 提交（posix-rename 或 backup-swap），
 // 因此声明支持原子提交。绑定层据此把 TransferRequest.Atomic 置 true（Task 9）。
@@ -1251,4 +1531,274 @@ func (g *GoBackend) Cancel(id string) bool {
 	g.pool.RemoveIdle(e.sess)
 	cancelCloseSession(e.sess)
 	return true
+}
+
+// —— Task 13：已知 .part 登记与退出清理 ——
+//
+// knownParts 是「本进程正在使用 / 失败后保留」的临时文件登记表：Get/Put 生成 .part 时登记，
+// 提交成功后注销。它的**唯一**用途是优雅退出时 best-effort 删除已知残留；崩溃退出后登记表
+// 随进程消失，只能靠 journal 恢复与 7 天陈旧清理兜底（见 CleanupStaleLocalParts）。
+
+// partKey 是登记表的键：传输 id + 接收侧目标路径。
+// 为什么必须带目标：目录传输的**整棵树共用一个 req.ID**（GetTree/PutTree），只按 id 登记会让
+// 后一个文件覆盖前一个的条目 —— 树里失败保留下来的 .part 就再也清理不到。
+func partKey(id, target string) string { return id + "\x00" + target }
+
+// recordPart 登记一个已知 .part（local/remote 任一侧为空表示该侧不存在）。
+// host/user 必须一起登记：远端 .part 只能用原 host+user 的会话删 —— 凭 remote 路径既反推
+// 不出 host，相对路径也无法在另一个用户的家目录下解析。
+func (g *GoBackend) recordPart(host, user, id, local, remote string) {
+	if id == "" || (local == "" && remote == "") {
+		return
+	}
+	g.partsMu.Lock()
+	if g.knownParts == nil {
+		g.knownParts = map[string][4]string{}
+	}
+	g.knownParts[partKey(id, local+remote)] = [4]string{host, user, local, remote}
+	g.partsMu.Unlock()
+}
+
+// forgetPart 注销一个已提交（或被主动清掉）的 .part。target 传登记时用的同一个
+// local+remote 拼接；空 id 是 no-op。
+func (g *GoBackend) forgetPart(id, target string) {
+	if id == "" {
+		return
+	}
+	g.partsMu.Lock()
+	delete(g.knownParts, partKey(id, target))
+	g.partsMu.Unlock()
+}
+
+// takeParts 取出并清空登记表（关闭路径在关会话之前调用，绝不在持锁时做 IO）。
+func (g *GoBackend) takeParts() [][4]string {
+	g.partsMu.Lock()
+	defer g.partsMu.Unlock()
+	out := make([][4]string, 0, len(g.knownParts))
+	for _, p := range g.knownParts {
+		out = append(out, p)
+	}
+	g.knownParts = map[string][4]string{}
+	return out
+}
+
+// CleanupParts 删除登记表里所有已知 .part（本地 os.Remove、远端 Remove），best-effort：
+// 单个失败只发 warn，绝不让清理阻断退出。**必须在关会话之前调用**，否则远端 .part 删不掉。
+func (g *GoBackend) CleanupParts() {
+	parts := g.takeParts()
+	if len(parts) == 0 {
+		return
+	}
+	// 本地删除不需要会话；ENOENT 不算失败（文件可能已被提交重命名或用户清掉）。
+	remoteByKey := map[string][]string{}
+	keyHostUser := map[string][2]string{}
+	for _, p := range parts {
+		host, user, local, remote := p[0], p[1], p[2], p[3]
+		if local != "" {
+			if err := os.Remove(local); err != nil && !os.IsNotExist(err) {
+				g.warnf(host, "退出清理本地临时文件 %s 失败: %v", local, err)
+			}
+		}
+		if remote != "" {
+			k := host + "\x00" + user
+			remoteByKey[k] = append(remoteByKey[k], remote)
+			keyHostUser[k] = [2]string{host, user}
+		}
+	}
+	for k, remotes := range remoteByKey {
+		host, user := keyHostUser[k][0], keyHostUser[k][1]
+		s, err := g.pool.AcquireList(context.Background(), host, user)
+		if err != nil {
+			g.warnf(host, "退出清理远端临时文件失败（会话不可用）: %v", err)
+			continue
+		}
+		for _, rp := range remotes {
+			if rerr := s.Conn.Remove(rp); rerr != nil && !os.IsNotExist(rerr) {
+				g.warnf(host, "退出清理远端临时文件 %s 失败: %v", rp, rerr)
+			}
+		}
+		// 关闭而不归还 idle：这是退出路径，留下 idle 会话会在进程退出后变成孤儿 ssh。
+		g.pool.Release(s, false)
+	}
+}
+
+// CleanupStaleLocalParts 是启动时的陈旧临时文件清理：在 root 下递归找名字含 PartMarker
+// 且修改时间早于 now-olderThan 的普通文件并删除，返回删除数量。
+//
+// 为什么需要它：进程崩溃退出时 knownParts 随进程消失，那些 .part 永远不会被优雅清理；
+// 只靠登记表会让它们无限堆积。root 不存在/不可读一律静默 no-op（尽力而为，绝不阻断启动）。
+func CleanupStaleLocalParts(root string, now time.Time) (int, error) {
+	if root == "" {
+		return 0, nil
+	}
+	cutoff := now.Add(-stalePartAge)
+	n := 0
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			// 不可读的子树跳过，不阻断其它清理（与 internal/sync.CleanupParts 同策略）。
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !IsInternalTemp(d.Name()) {
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		if !info.ModTime().Before(cutoff) {
+			return nil
+		}
+		if rerr := os.Remove(p); rerr == nil {
+			n++
+		}
+		return nil
+	})
+	if err != nil {
+		if os.IsNotExist(err) {
+			return n, nil
+		}
+		return n, err
+	}
+	return n, nil
+}
+
+// stalePartAge 是启动时清理本地临时文件的年龄阈值（spec D14 / 计划 Task 13）。
+const stalePartAge = 7 * 24 * time.Hour
+
+// —— Task 13：journal 恢复决策表（Task 8 重审 D1）——
+
+// probeRecoverSession 是恢复探测会话的唯一注入点（生产：池 + 真实会话）。
+// 返回的 reopenSession 由调用方 defer Close：恢复可能与磁盘状态不一致，做完直接关掉，
+// 绝不把这条会话放回 idle 供后续操作复用。
+var probeRecoverSession = func(g *GoBackend, host, user string) (reopenSession, error) {
+	s, err := g.pool.AcquireList(context.Background(), host, user)
+	if err != nil {
+		return nil, err
+	}
+	if s.Conn == nil {
+		g.pool.Release(s, false)
+		return nil, errors.New("会话没有 SFTP 连接")
+	}
+	return &sessionReopener{s}, nil
+}
+
+// sessionReopener 把 *Session 适配成 reopenSession：close 走 Session.close（有界退出，
+// 保证 ssh 子进程被回收）。
+type sessionReopener struct{ s *Session }
+
+func (r *sessionReopener) exists(p string) (bool, error) {
+	if _, err := r.s.Conn.Stat(p); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+func (r *sessionReopener) remove(p string) error    { return r.s.Conn.Remove(p) }
+func (r *sessionReopener) rename(o, n string) error { return r.s.Conn.Rename(o, n) }
+func (r *sessionReopener) close()                   { r.s.close() }
+
+// reopenSession 是恢复探测所需的最小远端能力（单测可注入内存替身，见 gosftp_test.go）。
+type reopenSession interface {
+	exists(path string) (bool, error)
+	remove(path string) error
+	rename(oldname, newname string) error
+	close()
+}
+
+// RecoverSwaps 按决策表恢复 backup-swap 的中断现场，返回实际处理的条目数。
+//
+// 为什么单凭 journal 条目不够（Task 8 重审 D1）：条目没有 phase 字段，而
+// 「W0 rename 尚未发生」「W1 target 已改名、替换物未落位」「W2 替换物已落位、新内容已提交」
+// 三种状态在 journal 里字节完全相同。必须用文件系统探测区分：
+//
+//	bak 不存在            → W0：清条目（没有破坏性改动需要撤销）；
+//	bak 在、target 不在   → W1：回滚 bak→target（旧内容只在这个随机名里）；
+//	bak 在、target 也在   → W2：保留 target（新内容已成功提交）、删掉 bak 孤儿。
+//
+// 探测失败（Stat 非 ENOENT 错误）或会话不可用 ⇒ **不动作、不删条目**（尽力而为，
+// 下次启动再试）。把 Recover 当自足契约「见条目就回滚」会在 W2 静默回退一个已提交成功的
+// 新文件 —— 这是本函数刻意用探测避免的 Critical 场景。
+//
+// 探测会话的凭据取自**最近一次成功握手**的 (host,user)：journal 条目里没有 host
+// （见 journal.go 的形状），多主机时无法从条目反推归属。刻意只用这一条、不遍历其它候选 ——
+// 探测一条**错误的** host 会走到「bak 不存在 ⇒ 清条目」，把别的主机上的中断现场静默丢掉
+// （比不恢复更糟）。从未连接过 ⇒ 放弃本次恢复（不动作、不删条目）。
+func (g *GoBackend) RecoverSwaps() (int, error) {
+	if g.journal == nil {
+		return 0, nil
+	}
+	entries := g.journal.Recover()
+	if len(entries) == 0 {
+		return 0, nil
+	}
+	host, user := g.recoverHostUser()
+	if host == "" {
+		// 会话不可用（本进程从未成功握手）：不动作、不删条目，留给下次启动。
+		return 0, nil
+	}
+	// 顺序固定：同一批恢复的日志顺序稳定，便于排查（journal 是 append 语义）。
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Target < entries[j].Target })
+
+	sess, err := probeRecoverSession(g, host, user)
+	if err != nil {
+		// 会话不可用：不动作、不删条目（调用方只记 warn，不阻断启动）。
+		return 0, nil
+	}
+	defer sess.close()
+
+	n := 0
+	for _, e := range entries {
+		bakExists, bakErr := sess.exists(e.Bak)
+		if bakErr != nil {
+			g.warnf(host, "恢复 swap：探测备份 %s 失败，保留条目待下次启动: %v", e.Bak, bakErr)
+			continue
+		}
+		// 步骤 1：bak 不存在 ⇒ rename 尚未发生（或已被人工清理），条目已无意义。
+		if !bakExists {
+			if derr := g.journal.Done(e.Target); derr != nil {
+				g.warnf(host, "恢复 swap：清理条目 %s 失败: %v", e.Target, derr)
+				continue
+			}
+			n++
+			continue
+		}
+		// bak 在：探测 target（从 e.Target 拷贝一份错误变量，避免遮蔽循环外 err）。
+		targetExists, tErr := sess.exists(e.Target)
+		if tErr != nil {
+			g.warnf(host, "恢复 swap：探测目标 %s 失败，保留条目待下次启动: %v", e.Target, tErr)
+			continue
+		}
+		// 步骤 2：bak 在、target 不在 ⇒ 回滚。
+		if !targetExists {
+			if rerr := sess.rename(e.Bak, e.Target); rerr != nil {
+				g.warnf(host, "恢复 swap：回滚 %s → %s 失败，保留条目待下次启动: %v", e.Bak, e.Target, rerr)
+				continue
+			}
+			if derr := g.journal.Done(e.Target); derr != nil {
+				g.warnf(host, "恢复 swap：回滚成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
+				continue
+			}
+			n++
+			continue
+		}
+		// 步骤 3：bak 在、target 也在 ⇒ W2（新内容已成功提交）。保留 target，删掉孤儿 bak。
+		if rerr := sess.remove(e.Bak); rerr != nil {
+			g.warnf(host, "恢复 swap：删除孤儿备份 %s 失败，保留条目待下次启动: %v", e.Bak, rerr)
+			continue
+		}
+		if derr := g.journal.Done(e.Target); derr != nil {
+			g.warnf(host, "恢复 swap：删备份成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
+			continue
+		}
+		n++
+	}
+	return n, nil
 }

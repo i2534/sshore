@@ -169,6 +169,9 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 		_ = rf.Close()
 		return "", 0, total, fmt.Errorf("%w: %w", errLocalPart, err)
 	}
+	// Task 13：.part 已真实建在磁盘上 ⇒ 登记进已知表（提交成功或主动丢弃时注销）。
+	// 优雅退出（CloseAll）据此把它删掉；崩溃退出后由 7 天陈旧清理兜底。
+	g.recordPart(req.Host, req.User, req.ID, part, "")
 	if resume {
 		// I2：打开后立刻按句柄自身的实际长度复核 offset —— 判定与打开之间的窗口里
 		// .part 可能被截断/追加，必须在这里兜住，绝不 Seek 越过 EOF。

@@ -109,12 +109,21 @@ type Pool struct {
 	transfers int
 	queue     chan struct{} // 传输并发额度（容量 1）
 	all       map[*Session]struct{}
+
+	// onConnected 在池真正建出一条会话后被调用（host,user）。GoBackend 用它把 Connected
+	// 置为粘性 true 并记住最近握手凭据；为 nil 时 no-op（纯池测试不关心连接意图）。
+	onConnected func(host, user string)
 }
 
 func NewPool(d DialFunc) *Pool {
+	return NewPoolWithConnected(d, nil)
+}
+
+// NewPoolWithConnected 额外注入「成功建立会话」的回调（Task 13 的粘性 Connected）。
+func NewPoolWithConnected(d DialFunc, onConnected func(host, user string)) *Pool {
 	q := make(chan struct{}, 1)
 	q <- struct{}{}
-	return &Pool{dial: d, idle: map[string][]*Session{}, queue: q, all: map[*Session]struct{}{}}
+	return &Pool{dial: d, idle: map[string][]*Session{}, queue: q, all: map[*Session]struct{}{}, onConnected: onConnected}
 }
 
 func (p *Pool) track(s *Session) *Session {
@@ -145,7 +154,21 @@ func (p *Pool) AcquireTransfer(ctx context.Context, host, user string) (*Session
 	}
 	s.markTransfer()
 	s.setState(sessBusy)
+	// Task 13：真建出会话 ⇒ 记录粘性连接意图。
+	p.markSessionConnected(s)
 	return p.track(s), nil
+}
+
+// markSessionConnected 在池**真正建出会话**之后通知宿主（GoBackend.Connected 的
+// 粘性置位点）。放在池里而不是 dial 包装里：AcquireList/AcquireTransfer/Probe 都
+// 经过这几个返回点，一处挂钩即全覆盖，且不依赖池的 dial 字段被谁替换过。
+// 判据含 Conn/Proc 非 nil：只有真的起出子进程并握手成功的会话才算一次「连接」，
+// 测试替身（纯内存 Session）不点亮 UI 的连接状态。
+func (p *Pool) markSessionConnected(s *Session) {
+	if s == nil || s.Conn == nil || s.Proc == nil || p.onConnected == nil {
+		return
+	}
+	p.onConnected(s.Host, s.User)
 }
 
 // AcquireList：优先复用 idle；池空则新建；超出 idle 上限关最久未用者。
@@ -187,6 +210,7 @@ func (p *Pool) AcquireList(ctx context.Context, host, user string) (*Session, er
 		return nil, err
 	}
 	s.setState(sessBusy)
+	p.markSessionConnected(s)
 	return p.track(s), nil
 }
 
