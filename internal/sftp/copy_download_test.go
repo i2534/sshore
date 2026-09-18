@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -151,8 +152,17 @@ func TestGoBackendGetHappyPathCommitsAtomically(t *testing.T) {
 		t.Fatalf("末帧必须是完整终值，got %d/%d", last.Done, last.Total)
 	}
 	if last.ID != "t1" || last.Host != "h" || last.Direction != DirDownload ||
-		last.Name != "src.bin" || last.PartPath == "" || last.Phase != PhaseTransfer {
+		last.Name != "src.bin" || last.Phase != PhaseTransfer {
 		t.Fatalf("末帧字段不完整: %+v", last)
+	}
+	// M1（Task 7 评审）：末帧在 rename 之后发出，PartPath 必须指向**已提交的最终目标**，
+	// 而不是那个已经被 rename 掉、不再存在的旧 .part（探针实测 STALE）。这里不只断言非空，
+	// 而是逐字钉住语义 + 目标真实存在，避免以后再退回「随便给个非空 part」的假实现。
+	if last.PartPath != local {
+		t.Fatalf("末帧 PartPath 应为已提交的目标路径 %q，got %q", local, last.PartPath)
+	}
+	if _, err := os.Stat(last.PartPath); err != nil {
+		t.Fatalf("末帧 PartPath 必须指向真实存在的文件（不得 STALE）: %v", err)
 	}
 	for i := 1; i < len(frames); i++ {
 		if frames[i].Done < frames[i-1].Done {
@@ -505,12 +515,20 @@ func TestCopyFileToLocalLocalOpenErrorIsPathError(t *testing.T) {
 	}
 	defer g.pool.Release(s, false)
 
-	_, _, total, err := g.copyFileToLocal(sess, TransferRequest{ID: "e", Host: "h"}, "src.bin", local, nil)
+	part, _, total, err := g.copyFileToLocal(sess, TransferRequest{ID: "e", Host: "h"}, "src.bin", local, nil)
 	if err == nil {
 		t.Fatal("本地目标不可写必须报错")
 	}
 	if total != 10 {
 		t.Fatalf("应先 Stat 到远端大小 10，got %d", total)
+	}
+	// I2（Task 7 评审）：.part 根本没建出来 ⇒ 返回的 part 必须为空。原先返回 part，
+	// 调用方会据此填一个 ENOENT 的假锚点；这里从 helper 契约上钉死「空 = 没有可续传文件」。
+	if part != "" {
+		t.Fatalf(".part 未创建时 helper 必须返回空 part，got %q", part)
+	}
+	if !errors.Is(err, errLocalPart) {
+		t.Fatalf("本地 .part 创建失败必须带 errLocalPart 标记（供 Get 判不要附 RemoteMsg）: %v", err)
 	}
 	var pe *os.PathError
 	if !errors.As(err, &pe) {
@@ -564,5 +582,106 @@ func TestGoBackendGetShortReadPartPathOnError(t *testing.T) {
 	}
 	if _, err := os.Stat(te.PartPath); err != nil {
 		t.Fatalf("PartPath 指向的 .part 必须真实存在: %v", err)
+	}
+}
+
+// TestGoBackendGetReadOnlyDestPartPathIsEmpty（Task 7 评审 I2）：本地 .part 建不出来时
+// TransferError.PartPath 必须为空。假锚点会让 Task 11 拿到一条 ENOENT 的「可续传」路径。
+func TestGoBackendGetReadOnlyDestPartPathIsEmpty(t *testing.T) {
+	remoteRoot := t.TempDir()
+	roParent := t.TempDir()
+	if err := os.Chmod(roParent, 0500); err != nil { // 父目录不可写 ⇒ .part 建不出来
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roParent, 0700) })
+	writeRemote(t, remoteRoot, "src.bin", bytes.Repeat([]byte("r"), 64))
+	local := filepath.Join(roParent, "dst.bin")
+
+	g := backendForTestServer(t, remoteRoot)
+	req := TransferRequest{ID: "ro", Host: "h", Remote: "src.bin", Local: local, Atomic: true}
+	err := g.Get(req, nil)
+	if err == nil {
+		t.Fatal("只读目标必须报错")
+	}
+	var te *TransferError
+	if !errors.As(err, &te) {
+		t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+	}
+	if te.PartPath != "" {
+		t.Fatalf(".part 未创建时 PartPath 必须为空（假锚点违反 api.go「未用到时为空」），got %q", te.PartPath)
+	}
+	if _, serr := os.Stat(filepath.Join(roParent, "dst.bin")); !os.IsNotExist(serr) {
+		t.Fatalf("失败后最终名不得出现，stat err=%v", serr)
+	}
+	if ents, _ := os.ReadDir(roParent); len(ents) != 0 {
+		t.Fatalf("只读目标下不该留下任何文件: %v", ents)
+	}
+}
+
+// TestGoBackendGetLocalErrorNotMaskedByStderr（Task 7 评审 M4）：本地文件系统错误
+// 绝不能被非空的远端 stderr 盖掉。api.go 的 Error() 优先打印 RemoteMsg；若本地错误也被
+// 套上 stderr，生产上就会看到远端噪音而看不到「本地磁盘/权限」这个真正原因。
+func TestGoBackendGetLocalErrorNotMaskedByStderr(t *testing.T) {
+	remoteRoot := t.TempDir()
+	roParent := t.TempDir()
+	if err := os.Chmod(roParent, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roParent, 0700) })
+	writeRemote(t, remoteRoot, "src.bin", bytes.Repeat([]byte("s"), 32))
+	local := filepath.Join(roParent, "dst.bin")
+
+	g := backendForTestServer(t, remoteRoot)
+	origDial := g.pool.dial
+	// 故意的「远端噪音」：子进程写 stderr，drain goroutine 收进 StderrText。
+	// 先起进程再挂到会话上，保证断言时 stderr 一定非空（否则用例空转）。
+	const noisy = "ssh-noise-should-not-mask-local-error"
+	pp, err := osutil.StartPipes("sh", "-c", "printf '%s\\n' \"$1\" >&2; cat >/dev/null", "sh", noisy)
+	if err != nil {
+		t.Fatalf("StartPipes: %v", err)
+	}
+	t.Cleanup(func() { _ = pp.Kill() })
+	g.pool.dial = func(host, user string) (*Session, error) {
+		s, derr := origDial(host, user)
+		if derr != nil {
+			return nil, derr
+		}
+		s.Proc = pp
+		return s, nil
+	}
+	req := TransferRequest{ID: "mask", Host: "h", Remote: "src.bin", Local: local, Atomic: true}
+
+	// 等 drain 真的收到那行 stderr 再传输 —— 否则断言「没被盖掉」是因为 stderr 恰为空。
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(pp.StderrText(), noisy) {
+		if time.Now().After(deadline) {
+			t.Fatal("5s 内未收到注入的 stderr（用例无法构成 M4 复现条件）")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	err = g.Get(req, nil)
+	if err == nil {
+		t.Fatal("只读目标必须报错")
+	}
+	var te *TransferError
+	if !errors.As(err, &te) {
+		t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+	}
+	if te.RemoteMsg != "" {
+		t.Fatalf("本地错误不得附 RemoteMsg（会盖掉真正的本地原因），got %q", te.RemoteMsg)
+	}
+	if te.PartPath != "" {
+		t.Fatalf("本地错误且无 .part 时 PartPath 必须为空，got %q", te.PartPath)
+	}
+	msg := te.Error()
+	if strings.Contains(msg, noisy) {
+		t.Fatalf("本地错误被远端 stderr 盖掉: %s", msg)
+	}
+	if !strings.Contains(msg, "本地 .part 创建失败") {
+		t.Fatalf("本地错误必须保留自身原因，got: %s", msg)
+	}
+	if !strings.Contains(msg, local) {
+		t.Fatalf("本地错误应指向本地目标路径 %q，got: %s", local, msg)
 	}
 }

@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -105,7 +106,9 @@ func (w *countingWriter) Write(b []byte) (int, error) {
 // **调用方负责提交**（done==total 后 rename），失败/取消时 .part 保留（续传锚点）。
 // Task 12 的目录传输复用它，避免每个文件都新建会话。
 // 本地临时名一律用 PartName（filepath 家族）—— 远端 POSIX 路径才用 PartNameRemote。
-// 错误发生在远端打开之前时返回 ("", 0, 0, err)：不创建任何本地文件。
+// 返回值契约（Task 11/12 依赖，Task 7 评审 I2 修正）：返回的 part 非空 ⇔ .part 已真实
+// 创建在磁盘上、可续传。远端 Stat/Open 失败返回 ("", 0, 0, err)；本地 OpenFile 失败
+// 也返回 ("", 0, total, err)（错误里带 errLocalPart 标记），绝不给出不存在的假锚点。
 func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, local string, report func(Progress)) (string, int64, int64, error) {
 	st, err := s.Conn.Stat(remote)
 	if err != nil {
@@ -122,8 +125,12 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 	}
 	f, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
+		// 本地 .part 根本没建出来：**必须返回空 part**（Task 7 评审 I2）。
+		// 原先这里返回 part，Get 据此填 TransferError.PartPath 给出一个 ENOENT 的假锚点，
+		// 违反 api.go「未用到时为空」，也推翻「err!=nil 且 part 非空 ⇒ .part 已保留可续传」
+		// 这条给 Task 11 的契约。错误只包一层本地标记，供 Get 判「不要附 RemoteMsg」（M4）。
 		_ = rf.Close()
-		return part, 0, total, err
+		return "", 0, total, fmt.Errorf("%w: %w", errLocalPart, err)
 	}
 	em := newProgressEmitter(req.ID, report)
 	cw := &countingWriter{f: f, e: em, p: Progress{Host: req.Host, Direction: DirDownload, Name: remote, PartPath: part, Total: total, Phase: PhaseTransfer}}
@@ -176,4 +183,16 @@ func shortReadError(done, total int64, part string) error {
 		return fmt.Errorf("传输不完整：%d/%d 字节", done, total)
 	}
 	return fmt.Errorf("传输不完整：%d/%d 字节，已保留 %s", done, total, part)
+}
+
+// errLocalPart 标记「本地 .part 建不出来」这一类**本地**文件系统错误（Task 7 评审 M4）。
+// 它经 errors.Is 穿透 copyFileToLocal 的返回值，让 Get 只对真正的远端失败附 RemoteMsg：
+// 否则生产上 sshd stderr 只要非空，api.go 的 Error() 就会优先打印 RemoteMsg，
+// 把「本地磁盘/权限问题」这个真正原因盖掉。
+var errLocalPart = errors.New("本地 .part 创建失败")
+
+// isRemoteError 判「这个错误该不该带远端 stderr 原文」。
+// 本地文件系统错误（errLocalPart）绝不带 RemoteMsg：它不是远端的锅。
+func isRemoteError(err error) bool {
+	return err != nil && !errors.Is(err, errLocalPart)
 }

@@ -169,18 +169,29 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	// 返回 shortReadError，绝不能把半截文件改名成最终名（R13）。
 	part, _, total, err := g.copyFileToLocal(s, req, req.Remote, req.Local, report)
 	if err != nil {
-		if part == "" { // 远端 Stat/Open 失败：不创建本地文件，错误带远端原文（spec D12）
-			return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: err, RemoteMsg: s.Proc.StderrText()}
+		// 错误归属（Task 7 评审 M4）：只有**真正的远端失败**才附 s.Proc.StderrText()。
+		// 本地文件系统错误（如 .part 建不出来）保留自己的 error —— 否则 api.go 的 Error()
+		// 会优先打印 RemoteMsg，生产上 stderr 非空就把本地原因盖掉了。
+		var remoteMsg string
+		if isRemoteError(err) {
+			remoteMsg = s.Proc.StderrText()
 		}
-		// 失败/取消：.part 保留（Task 11 续传锚点），reuse=false 关掉会话。
-		return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, PartPath: part, Err: err, RemoteMsg: s.Proc.StderrText()}
+		// part 非空 ⇔ .part 已真实存在（helper 契约）：失败/取消保留它作 Task 11 续传锚点。
+		// part 为空且错误是远端 Stat/Open → 没建任何本地文件；错误是本地 OpenFile 失败 →
+		// 同样不给 PartPath，绝不发布一个 ENOENT 的假锚点（评审 I2）。
+		return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, PartPath: part, Err: err, RemoteMsg: remoteMsg}
 	}
 	if err := os.Rename(part, req.Local); err != nil {
 		return &TransferError{Op: "sftp get", Path: req.Local, PartPath: part, Err: err}
 	}
 	// 末帧强制：终值必须达（D7）。done==total 已成立，补发带完整计数的终态。
+	// 时序：**rename 成功之后**才发，保证「末帧 = 提交完成」而不是「字节到齐」——否则
+	// rename 失败时 UI 已经收下 done==total 的成功终态，随后却拿到错误。
+	// PartPath 语义（Task 7 评审 M1）：这里填**已提交的最终目标路径**，因为发出的这一帧
+	// 描述的是「传输已结束、内容在 req.Local」；绝不填已经被 rename 掉的旧 .part，
+	// 那是探针实测 STALE 的假路径。失败路径上 PartPath 仍只是保留的 .part（可续传）。
 	newProgressEmitter(req.ID, report).send(Progress{
-		Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: part,
+		Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: req.Local,
 		Done: total, Total: total, Phase: PhaseTransfer,
 	}, true)
 	reuse = true
