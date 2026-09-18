@@ -288,22 +288,34 @@ func TestTransferTokenReturnedOnlyOnceAcrossReuse(t *testing.T) {
 	}
 	p.Release(reused, false) // 复用来的会话按 list 语义归还：不得释放额度
 
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		s, err := p.AcquireTransfer(ctx, "h1", "u")
-		if err == nil {
-			p.Release(s, false)
+		// Task 4 评审 N1：AcquireTransfer 若因丢 token 永久阻塞，这里必须快速失败，
+		// 而不是挂到 go test 的默认 10m panic。
+		wctx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		s, err := p.AcquireTransfer(wctx, "h1", "u")
+		if err != nil {
+			done <- err
+			return
 		}
-		close(done)
+		p.Release(s, false)
+		done <- nil
 	}()
 	select {
-	case <-done:
-		t.Fatal("CRITICAL：复用会话的 Release 二次归还了 token，并发 1 被突破")
+	case err := <-done:
+		if err == nil {
+			t.Fatal("CRITICAL：复用会话的 Release 二次归还了 token，并发 1 被突破")
+		}
+		t.Fatalf("token 丢失回归：第三次 AcquireTransfer 未在 1s 内拿到额度: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	p.Release(t2, false)
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("释放 t2 后第三个传输应立刻拿到额度，却失败: %v", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("释放 t2 后第三个传输应立刻拿到额度")
 	}
