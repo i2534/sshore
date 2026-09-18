@@ -123,7 +123,17 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) Init(emit func(forward.Event)) {
 	a.emit = emit
 	a.forward = forward.NewCtrl(osutil.NewSpawner(), emit, nil)
-	a.sftp = sftp.NewCtrl(osutil.NewRunner(), emit)
+	// 选择器懒解析配置（Task 5）：app_test 直接构造时 a.cfg 可能为 nil，
+	// 闭包必须回退内置默认而不是 panic（三审 R11）。
+	a.sftp = sftp.NewCtrlWith(osutil.NewRunner(), emit, func() string {
+		if a.cfg == nil {
+			return ""
+		}
+		return a.cfg.App.SftpTransport
+	})
+	if dir := stateDir(); dir != "" {
+		a.sftp.SetJournalDir(dir) // Task 8 的 backup-swap journal（S6）
+	}
 	transfer, lister := sync.NewSftpAdapter(a.sftp)
 	a.sync = sync.NewCtrl(sync.Deps{
 		Spawner:  osutil.NewStreamer(),
