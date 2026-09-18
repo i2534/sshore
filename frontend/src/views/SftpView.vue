@@ -1,6 +1,6 @@
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ref, reactive, computed, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
+import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import { useLocationsStore } from '../stores/locations'
 import SearchOverlay from '../components/SearchOverlay.vue'
@@ -14,7 +14,7 @@ import * as sel from '../utils/selection'
 import { join as localJoin, parentOf as localParent, joinRel, splitPath } from '../utils/localpath'
 import { actionFor } from '../utils/keys'
 import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName, nextTransferSeq, transferID } from '../utils/batch'
-import { failureText } from '../utils/queue'
+import { failureText, isInternalTempName, applyProgress, TRANSFER_PROGRESS_EVENT } from '../utils/queue'
 import { payloadFor, parsePayload, hitPane, canDropInto } from '../utils/dnd'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 // 说明：StatPaths / CopyLocal / SftpMove / ListLocal / RenameLocal 已在既有 import 行里，
@@ -60,6 +60,108 @@ const connected = ref(false)
 const pendingPath = ref('')
 
 const transfers = ref([])
+
+// 面板不显示我们自己的临时文件（.sshore-sftppart-*，含 backup 名）。
+// 隐藏而不是删除：列表刷新后仍在，选中/删除等动作够不到它们。
+const visibleRemoteItems = computed(() => (remoteItems.value || []).filter((it) => !isInternalTempName(it.name)))
+const visibleLocalItems = computed(() => (localItems.value || []).filter((it) => !isInternalTempName(it.name)))
+
+// 进度订阅的退订函数：KeepAlive 下 setup 只跑一次，必须成对挂摘（先例 offDrop）。
+let offProgress = null
+
+// 事件按 id 落到队列项，并把 PartPath 存进该项 —— 续传/清理都靠这个锚点。
+function onTransferProgress(frame) {
+  applyProgress(transfers.value, frame) // transfers 是 ref([])，内部 mutate 即可触发重绘
+}
+
+// 单文件/目录项的实际派发：runBatch 与「重试」共用。
+// 终态**只由这次调用的结果决定**（见 task-14 渲染契约第 1 条）。
+async function dispatchTransfer(rec) {
+  rec.status = '处理中'
+  rec.reason = ''
+  rec.elapsed = 0
+  rec.cancelRequested = false
+  rec.pendingCancel = false
+  rec.hasProgress = false
+  rec.done = undefined
+  rec.total = undefined
+  rec.filesDone = undefined
+  rec.filesTotal = undefined
+  rec.phase = ''
+  rec.startedAt = Date.now()
+  try {
+    if (rec.direction === 'download') {
+      await (rec.isDir ? SftpGetDir(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath) : SftpGet(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath))
+    } else {
+      await (rec.isDir ? SftpPutRecursive(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath) : SftpPut(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath))
+    }
+    // 操作返回 nil = 已提交。即使 cancel 返回过 true（提交已完成的窄窗口，
+    // Task 10 评审有真协议探测），也必须渲染为完成，绝不删掉已安装的目标文件。
+    rec.status = '完成'
+    rec.partPath = '' // 提交后锚点已不存在，不留一个会误导「清理/续传」的路径
+  } catch (e) {
+    rec.status = rec.cancelRequested ? '取消' : '失败'
+    rec.reason = String((e && e.message) || e)
+    err(e)
+  }
+  rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
+  return rec.status
+}
+
+// 取消 = 取消当前项 + 停止派发本批后续项（整批语义由前端编排层落实，spec §6.1）。
+// 只看操作结果判定终态：这里绝不直接写 rec.status。
+async function cancelTransfer(rec) {
+  if (!rec || !rec.id) return
+  rec.cancelRequested = true // 用户意图；**不是**终态
+  rec.pendingCancel = true
+  // 本批中"还没开始派发"的项（pending）不会再有结果，可以立刻定终态；当前在飞的项等它自己的返回。
+  // pending 与 status 一起写：派发循环用 rec.pending 判定"还没开始"，单独改 status 会被
+  // dispatchTransfer 重置成「处理中」而重新派发。
+  for (const o of transfers.value) {
+    if (o.id === rec.id) continue
+    if (o.pending || o.status !== '处理中') continue
+    o.status = '取消'
+    o.reason = '已取消，停止后续项'
+  }
+  try {
+    await SftpTransferCancel(rec.id)
+  } catch (e) {
+    err(e)
+    if (rec.status === '处理中') rec.pendingCancel = false
+  }
+  if (rec.status === '处理中') rec.pendingCancel = false
+}
+
+// 重试：整项重跑，resume=false。旧 partPath 仍传给后端，让后端先删同名 .part 再重来。
+async function retryItem(rec) {
+  if (!rec || !rec.id) return
+  const keep = rec.partPath
+  rec.resume = false
+  rec.partPath = keep
+  await dispatchTransfer(rec)
+  await (rec.direction === 'download' ? loadLocal() : loadRemote())
+}
+
+// 续传：从已保存的 .part 锚点续写（仅单文件项提供该按钮）。
+async function resumeItem(rec) {
+  if (!rec || !rec.id || !rec.partPath || rec.isDir) return
+  rec.resume = true
+  await dispatchTransfer(rec)
+  await (rec.direction === 'download' ? loadLocal() : loadRemote())
+}
+
+// 清理：立即删掉该项的 .part（对 7 天崩溃清理窗口的补偿，D14）。失败只提示、不抛。
+async function cleanItem(rec) {
+  if (!rec || !rec.partPath) return
+  try {
+    if (rec.direction === 'download') await DeleteLocal(rec.partPath)
+    else await SftpRemove(host.value, '', rec.partPath)
+    rec.partPath = ''
+    logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'info', ts: new Date().toISOString(), message: '已清理临时文件 ' + rec.src })
+  } catch (e) {
+    err('清理临时文件失败：' + String((e && e.message) || e))
+  }
+}
 
 // clock ticks every second so the transfer queue's elapsed times repaint.
 const now = ref(Date.now())
@@ -302,10 +404,10 @@ function runBatchFor(pane, name) {
   const names = [...s.keys]
   if (!names.length) return null
   if (name === 'download') {
-    return runBatch({ direction: 'download', names, sourceDir: remotePath.value, targetDir: localPath.value || '/', sourceItems: remoteItems.value })
+    return runBatch({ direction: 'download', names, sourceDir: remotePath.value, targetDir: localPath.value || '/', sourceItems: visibleRemoteItems.value })
   }
   // 上传只可能来自本地面板（远程面板没有上传入口，spec §6.2）
-  return runBatch({ direction: 'upload', names, sourceDir: localPath.value || '/', targetDir: remotePath.value, sourceItems: localItems.value })
+  return runBatch({ direction: 'upload', names, sourceDir: localPath.value || '/', targetDir: remotePath.value, sourceItems: visibleLocalItems.value })
 }
 
 function onSelect(pane, { item, event }) {
@@ -334,7 +436,7 @@ function onConflictCancel() { conflict.visible = false; if (conflict.resolve) co
 //   面板头下拉、多选批量、系统拖入 = batch → 保留 needsConfirm/askConflict 流程。
 async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, systemPaths, gesture = 'batch' }) {
   const sourceSelection = direction === 'upload' ? localSelection : remoteSelection
-  const targetItems = direction === 'download' ? localItems.value : remoteItems.value
+  const targetItems = direction === 'download' ? visibleLocalItems.value : visibleRemoteItems.value
   const tasks = systemPaths
     ? systemPaths.map((i) => ({ name: i.name, src: i.path, dst: (direction === 'download' ? localJoin : posixJoin)(targetDir, i.name), isDir: i.isDir }))
     : planTasks({ direction, names, sourceDir, targetDir, isDirMap: (sourceItems || []).reduce((m, it) => (m[it.name] = it.isDir, m), {}) })
@@ -356,22 +458,19 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   const results = skipped.map((t) => ({ ...t, status: '跳过' }))
   for (const t of skipped) transfers.value.push({ direction, name: t.name, src: t.src, dst: t.dst, size: 0, status: '跳过', elapsed: 0 })
   const seq = nextTransferSeq() // 同一批共享前缀 t<seq>-，批内序号从 0 起
-  let n = -1
-  for (const t of run) {
-    // 每个队列项一个稳定 id（Task 9）：绑定首参已从 host 变成 id，进度事件也按 id 关联。
-    // resume/partPath 这轮先给 false/''，Task 14 再接「续传」按钮；失败/取消项保留 id/partPath。
-    const rec = { id: transferID(seq, ++n), direction, name: t.name, src: t.src, dst: t.dst, size: 0, status: '处理中', startedAt: Date.now(), partPath: '', resume: false }
-    transfers.value.push(rec)
-    try {
-      if (direction === 'download') await (t.isDir ? SftpGetDir(rec.id, host.value, '', t.src, t.dst, rec.resume, rec.partPath) : SftpGet(rec.id, host.value, '', t.src, t.dst, rec.resume, rec.partPath))
-      else await (t.isDir ? SftpPutRecursive(rec.id, host.value, '', t.src, t.dst, rec.resume, rec.partPath) : SftpPut(rec.id, host.value, '', t.src, t.dst, rec.resume, rec.partPath))
-      rec.status = '完成'
-    } catch (e) {
-      rec.status = '失败'
-      rec.reason = String((e && e.message) || e)
-      err(e)
-    }
-    rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
+  // 每个队列项一个稳定 id（Task 9）：绑定首参是 id（不是 host），进度事件也按 id 关联。
+  // 先把整批项挂进队列（未派发的状态也是「处理中」，取消时才能整批停下），再逐项 await。
+  const batch = run.map((t, n) => ({
+    id: transferID(seq, n), direction, name: t.name, src: t.src, dst: t.dst,
+    size: 0, status: '处理中', startedAt: Date.now(), partPath: '', resume: false, isDir: !!t.isDir, pending: true,
+  }))
+  for (const rec of batch) transfers.value.push(rec)
+  for (const rec of batch) {
+    // 取消已经落在这批的某项上：不再派发（已完成项保留，未开始的项直接记取消）。
+    if (rec.status !== '处理中') continue
+    rec.pending = false
+    rec.pendingCancel = false
+    await dispatchTransfer(rec)
     results.push(rec)
   }
   await (direction === 'download' ? loadLocal() : loadRemote())
@@ -472,13 +571,12 @@ async function uploadPicked() {
     const local = await PickLocalFile()
     if (!local) return
     const name = local.split(/[\\/]/).pop()
-    // 单文件手势同样要有 id（绑定首参已从 host 变成 id）；resume/partPath 待 Task 14 接线。
-    t = { id: transferID(nextTransferSeq(), 0), direction: 'upload', name, src: local, dst: posixJoin(remotePath.value, name), size: 0, status: '处理中', startedAt: Date.now(), partPath: '', resume: false }
+    // 单文件手势同样要有 id（绑定首参是 id）：复用 dispatchTransfer，才能同时拿到
+    // 进度订阅、取消返回值的终态判定与失败后的重试/续传/清理锚点。
+    t = { id: transferID(nextTransferSeq(), 0), direction: 'upload', name, src: local, dst: posixJoin(remotePath.value, name), size: 0, status: '处理中', startedAt: Date.now(), partPath: '', resume: false, isDir: false }
     try { t.size = await StatLocal(local) } catch (e) { t.size = 0 }
     transfers.value.push(t)
-    await SftpPut(t.id, host.value, '', local, posixJoin(remotePath.value, name), t.resume, t.partPath)
-    t.status = '完成'
-    t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
+    await dispatchTransfer(t)
     await loadRemote()
   } catch (e) {
     err(e)
@@ -508,7 +606,7 @@ async function doAction(name) {
   // 绝不能用远程 names + 本地 sourceDir 去跑 runBatch：那会把远端路径当本地源执行 SftpPut。
   if (name === 'upload') {
     if (pane === 'remote') return uploadPicked()
-    return runBatch({ direction: 'upload', names, sourceDir: localPath.value || '/', targetDir: remotePath.value, sourceItems: localItems.value, gesture })
+    return runBatch({ direction: 'upload', names, sourceDir: localPath.value || '/', targetDir: remotePath.value, sourceItems: visibleLocalItems.value, gesture })
   }
   if (name === 'remove') return removeSelected(pane)
   return legacyAction(name, pane, it)
@@ -546,9 +644,9 @@ async function onPaneDrop(targetPane, { event }) {
   if (!guard.ok) { err(guard.reason); return }
   const gesture = payload.names.length === 1 ? 'single' : 'batch'
   if (payload.pane === 'remote') {
-    await runBatch({ direction: 'download', names: payload.names, sourceDir: remotePath.value, targetDir: localPath.value, sourceItems: remoteItems.value, gesture })
+    await runBatch({ direction: 'download', names: payload.names, sourceDir: remotePath.value, targetDir: localPath.value, sourceItems: visibleRemoteItems.value, gesture })
   } else {
-    await runBatch({ direction: 'upload', names: payload.names, sourceDir: localPath.value, targetDir: remotePath.value, sourceItems: localItems.value, gesture })
+    await runBatch({ direction: 'upload', names: payload.names, sourceDir: localPath.value, targetDir: remotePath.value, sourceItems: visibleLocalItems.value, gesture })
   }
 }
 
@@ -629,11 +727,11 @@ async function handleSystemDrop(pane, paths) {
   if (!ok.length) return
   if (pane === 'remote') {
     if (!connected.value) { err('远程未连接，无法上传'); return }
-    await runBatch({ direction: 'upload', names: ok.map((i) => i.name), sourceDir: '', targetDir: remotePath.value, sourceItems: localItems.value, systemPaths: ok })
+    await runBatch({ direction: 'upload', names: ok.map((i) => i.name), sourceDir: '', targetDir: remotePath.value, sourceItems: visibleLocalItems.value, systemPaths: ok })
     return
   }
   const base = localPath.value || '/'
-  const existing = (localItems.value || []).map((it) => it.name)
+  const existing = (visibleLocalItems.value || []).map((it) => it.name)
   const conflicts = ok.filter((i) => existing.includes(i.name))
   let policy = 'skip'
   if (needsConfirm({ conflictCount: conflicts.length, hiddenSelected: 0 })) {
@@ -703,6 +801,8 @@ onActivated(() => {
   // 系统拖入订阅同样成对挂摘：KeepAlive 下 setup 只跑一次，切走标签必须退订，
   // 否则「端口转发/文件同步」标签下拖入文件也会投递到 SFTP 面板。
   offDrop = EventsOn('files:dropped', onFilesDropped)
+  // 进度订阅同样成对挂摘：切走标签后仍在的订阅会把帧落到已离开的视图上。
+  offProgress = EventsOn(TRANSFER_PROGRESS_EVENT, onTransferProgress)
   startClock()
   syncConnection()
 })
@@ -710,12 +810,14 @@ onDeactivated(() => {
   window.removeEventListener('click', outsideClick)
   window.removeEventListener('keydown', onKeydown)
   if (offDrop) { offDrop(); offDrop = null }
+  if (offProgress) { offProgress(); offProgress = null }
   stopClock()
 })
 onUnmounted(() => {
   window.removeEventListener('click', outsideClick)
   window.removeEventListener('keydown', onKeydown)
   if (offDrop) { offDrop(); offDrop = null }
+  if (offProgress) { offProgress(); offProgress = null }
   stopClock()
 })
 </script>
@@ -735,7 +837,7 @@ onUnmounted(() => {
     </div>
     <div class="panes">
       <div class="pane-wrap" data-pane="local" @dragover.prevent @drop.prevent="onPaneDrop('local', $event)">
-        <FilePane title="本地" pane="local" host="" :path="localPath || '/'" :items="localItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
+        <FilePane title="本地" pane="local" host="" :path="localPath || '/'" :items="visibleLocalItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
           :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
           :presets="locations.presetsForPane('local', '')" :disks="locations.disksForPane('local')"
           :bookmarks="locations.bookmarksForPane('local', '')" :recents="locations.recentsForPane('local', '')" :bookmarked="bookmarkedFor('local')"
@@ -746,7 +848,7 @@ onUnmounted(() => {
           @dragstart="onDragStart('local', $event)" @dropon="onMoveDrop('local', $event)" />
       </div>
       <div class="pane-wrap" data-pane="remote" @dragover.prevent @drop.prevent="onPaneDrop('remote', $event)">
-        <FilePane title="远程" pane="remote" :host="host" :path="remotePath" :items="remoteItems" :sel-keys="[...remoteSelection.keys]" :anchor="remoteSelection.anchor"
+        <FilePane title="远程" pane="remote" :host="host" :path="remotePath" :items="visibleRemoteItems" :sel-keys="[...remoteSelection.keys]" :anchor="remoteSelection.anchor"
           :show-hidden="showAll" :loading="remoteLoading" :actions="actionsFor('remote')" :hidden-selected="hiddenFor('remote')"
           :presets="locations.presetsForPane('remote', host)"
           :bookmarks="locations.bookmarksForPane('remote', host)" :recents="locations.recentsForPane('remote', host)" :bookmarked="bookmarkedFor('remote')"
@@ -757,7 +859,8 @@ onUnmounted(() => {
           @dragstart="onDragStart('remote', $event)" @dropon="onMoveDrop('remote', $event)" />
       </div>
     </div>
-    <TransferQueue :transfers="transfers" :now="now" @copy-failures="copyFailures" />
+    <TransferQueue :transfers="transfers" :now="now" @copy-failures="copyFailures"
+      @cancel="cancelTransfer" @retry="retryItem" @resume="resumeItem" @clean="cleanItem" />
     <div class="logpane ui-panel"><LogPanel :source-types="['sftp', 'system']" /></div>
 
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
