@@ -75,6 +75,9 @@ type GoBackend struct {
 	inflightMu sync.Mutex // Task 11：同目标去重
 	inflight   map[string]string
 
+	resumeMu      sync.Mutex // Task 11：.part 路径 → 传输开始时的源指纹（内存态）
+	resumeAnchors map[string]resumeAnchor
+
 	partsMu    sync.Mutex           // Task 13：已知 .part（退出清理用）
 	knownParts map[string][2]string // id → {local, remote}
 }
@@ -85,9 +88,10 @@ func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
 		sel:  sel,
 		// Task 6 评审 M2：这些 map 到 Task 10/11/13 才被写入。构造时就初始化，
 		// 后续 task 直接写字段（g.reg[id] = e 等）不会 panic: assignment to entry in nil map。
-		reg:        map[string]*regEntry{},
-		inflight:   map[string]string{},
-		knownParts: map[string][2]string{},
+		reg:           map[string]*regEntry{},
+		inflight:      map[string]string{},
+		resumeAnchors: map[string]resumeAnchor{},
+		knownParts:    map[string][2]string{},
 	}
 	g.pool = NewPool(g.dial)
 	return g
@@ -204,6 +208,14 @@ func (g *GoBackend) ListMany(host, user string, paths []string) (map[string][]It
 // 取消由调用方关会话完成（库无逐请求 ctx，spec §2.3）：关会话会让 copyStream 立刻返回错误，
 // 此时 .part 及其已落盘字节保留，reuse=false 走会话关闭路径。
 func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
+	// Task 11 去重：同一 (host, 方向, 目标) 只允许一条在飞传输。放在取会话之前 ——
+	// 重复触发必须立刻被拒，而不是排队等额度（排队会让「同目标并发」变成隐式串行）。
+	release, err := g.acquireInflight(req.Host, string(DirDownload), req.Local, req.ID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
 	if err != nil {
 		return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: err}
@@ -237,6 +249,37 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 		return nil
 	}
 
+	// —— Task 11 双向续传：先判定这份 .part 能不能续 ——
+	// req.Resume 但无 PartPath（没有锚点）时不进入判定，直接走全新流程。
+	if req.Resume && req.PartPath != "" {
+		kind, off, derr := g.decideDownloadResume(s, req)
+		if derr != nil {
+			return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: derr, RemoteMsg: s.Proc.StderrText()}
+		}
+		switch kind {
+		case resumeFull:
+			// 源已变/不可验证：旧 .part 只会污染结果，删掉再走全新流程。
+			g.forgetResumeAnchor(downloadAnchorKey(req.PartPath))
+			_ = os.Remove(req.PartPath)
+			req.Resume, req.ResumeOffset = false, 0
+		case resumeCommit:
+			// .part 已完整（== 源大小且指纹相符）：直接提交，绝不「续传 0 字节」。
+			if err := os.Rename(req.PartPath, req.Local); err != nil {
+				return &TransferError{Op: "sftp get", Path: req.Local, PartPath: req.PartPath, Err: err}
+			}
+			g.forgetResumeAnchor(downloadAnchorKey(req.PartPath))
+			g.markCommitted(entry)
+			newProgressEmitter(req.ID, report).send(Progress{
+				Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: req.Local,
+				Done: off, Total: off, Phase: PhaseTransfer,
+			}, true)
+			reuse = true
+			return nil
+		case resumeAppend:
+			req.ResumeOffset = off
+		}
+	}
+
 	// 远端 → 本地 .part（Task 12 的目录传输复用同一个 helper，避免逐文件重建会话）。
 	// helper 内部已执行唯一提交前置 done==total：远端被截断（库对 EOF 返回 nil）时
 	// 返回 shortReadError，绝不能把半截文件改名成最终名（R13）。
@@ -257,6 +300,8 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	if err := os.Rename(part, req.Local); err != nil {
 		return &TransferError{Op: "sftp get", Path: req.Local, PartPath: part, Err: err}
 	}
+	// 提交成功后 .part 已不存在（被 rename 成目标），锚点随之失效。
+	g.forgetResumeAnchor(downloadAnchorKey(part))
 	// I2：提交已完成，先标记 committed 再发末帧 —— 末帧经 UI 同步回调，无论它多慢，
 	// Cancel 都只会看到 false（绝不出现「文件已落地却答应用户取消」）。
 	g.markCommitted(entry)
@@ -287,12 +332,21 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 // （**严禁 O_TRUNC**）并 Seek(offset)，**本地源也必须 Seek 到同一 offset** ——
 // 只 Seek 远端而本地从 0 读，会把源的第 0 字节写到远端 offset 处，拼出损坏文件。
 func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
+	// Task 11 去重：与 Get 对称，键里的目标是远端目标路径。
+	release, err := g.acquireInflight(req.Host, string(DirUpload), req.Remote, req.ID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	st, err := os.Stat(req.Local)
 	if err != nil {
 		// 本地源不存在/不可读：在建会话之前失败，且是本地错误（不附远端 stderr）。
 		return &TransferError{Op: "sftp put", Path: req.Local, Err: err}
 	}
 	total := st.Size()
+	// 本地源指纹（Task 11 续传用）：与 total 一起记录在远端 .part 上。
+	srcMtime := st.ModTime()
 
 	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
 	if err != nil {
@@ -321,6 +375,55 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	if part == "" {
 		part = PartNameRemote(req.Remote, req.ID) // 远端 POSIX 路径：必须用 Remote 家族（Task 2 评审 Important-2）
 	}
+	// —— Task 11 双向续传：先判定远端 .part 能不能续 ——
+	if req.Resume && req.PartPath != "" {
+		kind, off, derr := g.decideUploadResume(s, req, total, srcMtime)
+		if derr != nil {
+			return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath, Err: derr, RemoteMsg: s.Proc.StderrText()}
+		}
+		switch kind {
+		case resumeFull:
+			// 源已变/不可验证：旧 .part 只会污染结果，删掉再走全新流程。
+			g.forgetResumeAnchor(uploadAnchorKey(req.PartPath))
+			if rerr := removeRemote(s.Conn, req.PartPath); rerr != nil && !os.IsNotExist(rerr) {
+				return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath, Err: rerr, RemoteMsg: s.Proc.StderrText()}
+			}
+			req.Resume, req.ResumeOffset = false, 0
+		case resumeCommit:
+			// 远端 .part 已完整（== 本地源大小且指纹相符）：直接提交，绝不「续传 0 字节」。
+			if err := commitRemote(s, hasPosix, req.PartPath, req.Remote, g.journal, func(f string, a ...any) { g.warnf(s.Host, f, a...) }); err != nil {
+				var remoteMsg string
+				if isRemoteError(err) {
+					remoteMsg = s.Proc.StderrText()
+				}
+				return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, PartPath: req.PartPath, Err: err, RemoteMsg: remoteMsg}
+			}
+			g.forgetResumeAnchor(uploadAnchorKey(req.PartPath))
+			g.markCommitted(entry)
+			newProgressEmitter(req.ID, report).send(Progress{
+				Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: req.Remote,
+				Done: total, Total: total, Phase: PhaseTransfer,
+			}, true)
+			reuse = true
+			return nil
+		case resumeAppend:
+			req.ResumeOffset = off
+			// 事实 4：Seek 越过 EOF 会零填充出洞，所以续写前必须把远端 .part 的长度对齐到
+			// offset（长于则截断丢弃陈旧尾部）；短于 offset 无法凭空补齐 —— 退回整份重传，
+			// 绝不 Truncate(offset) 把缺口补成零洞。
+			ok, aerr := g.alignRemotePart(s, req.PartPath, off)
+			if aerr != nil {
+				return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath, Err: aerr, RemoteMsg: s.Proc.StderrText()}
+			}
+			if !ok {
+				g.forgetResumeAnchor(uploadAnchorKey(req.PartPath))
+				if rerr := removeRemote(s.Conn, req.PartPath); rerr != nil && !os.IsNotExist(rerr) {
+					return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath, Err: rerr, RemoteMsg: s.Proc.StderrText()}
+				}
+				req.Resume, req.ResumeOffset = false, 0
+			}
+		}
+	}
 	// 新建：O_WRONLY|O_CREATE|O_TRUNC；续传（Task 11）：O_WRONLY（严禁 O_TRUNC）+ Seek(partSize)。
 	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 	var offset int64
@@ -339,6 +442,8 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 			return &TransferError{Op: "sftp put", Host: req.Host, Path: part, Err: err, RemoteMsg: s.Proc.StderrText()}
 		}
 	}
+	// 记录本地源指纹（Task 11）：这份远端 .part 的已写字节对应本地源的 (size, mtime)。
+	g.recordResumeAnchor(uploadAnchorKey(part), total, srcMtime)
 	lf, err := os.Open(req.Local)
 	if err != nil {
 		_ = wf.Close()
@@ -375,6 +480,8 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 		}
 		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, PartPath: part, Err: err, RemoteMsg: remoteMsg}
 	}
+	// 提交成功后 .part 已不存在（被 rename 成目标），锚点随之失效。
+	g.forgetResumeAnchor(uploadAnchorKey(part))
 	// I2：提交已完成，先标记 committed 再发末帧（末帧经 UI 同步回调）—— Cancel 绝不
 	// 能在「远端文件已落地」时返回 true。
 	g.markCommitted(entry)
@@ -573,6 +680,29 @@ func (g *GoBackend) AtomicCapable() bool { return true }
 // 同思路）。单测用它把「Cancel 删除注册表条目」与「真正关闭会话」之间的窗口加宽成确定性，
 // 从而复现 I3 竞态：Release 已把会话放回 idle，Cancel 随后才关掉它。
 var cancelCloseSession = func(s *Session) { s.close() }
+
+// acquireInflight 是同目标去重的唯一入口（Task 11）：键 = host|方向|目标，
+// 下载的目标是本地路径、上传的目标是远端路径。重复触发立刻报错，绝不排队 ——
+// 排队会把「同目标并发」变成隐式串行，且第一个完成后第二个照样覆盖，用户看不到任何提示。
+// 返回的 release 必须 defer 调用（含失败路径），否则该目标会永久被判为「在传输中」。
+func (g *GoBackend) acquireInflight(host, dir, target, id string) (func(), error) {
+	key := host + "|" + dir + "|" + target
+	g.inflightMu.Lock()
+	defer g.inflightMu.Unlock()
+	if g.inflight == nil {
+		g.inflight = map[string]string{}
+	}
+	if other, busy := g.inflight[key]; busy {
+		return nil, &TransferError{Op: "sftp transfer", Host: host, Path: target,
+			Err: fmt.Errorf("同一目标已在传输中（%s）", other)}
+	}
+	g.inflight[key] = id
+	return func() {
+		g.inflightMu.Lock()
+		delete(g.inflight, key)
+		g.inflightMu.Unlock()
+	}, nil
+}
 
 // register 把一次在飞传输登记进取消表（id → 传输条目），返回条目供 markCommitted /
 // unregister 使用。

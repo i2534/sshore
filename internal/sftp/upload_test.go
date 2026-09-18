@@ -697,36 +697,10 @@ func TestCommitRemoteBakRemovalFailureIsLoggedNotFatal(t *testing.T) {
 	}
 }
 
-// TestGoBackendPutResumeSeeksLocalSourceToo（修复轮 1 M）：上传续传必须让远端 .part 与
-// 本地源都从同一 offset 续写；只 Seek 远端而本地从 0 读会拼出损坏文件（且 n+offset 对不上总量）。
-func TestGoBackendPutResumeSeeksLocalSourceToo(t *testing.T) {
-	remoteRoot, localDir := t.TempDir(), t.TempDir()
-	data := bytes.Repeat([]byte("resume-"), 500) // 3500 字节
-	local := filepath.Join(localDir, "src.bin")
-	if err := os.WriteFile(local, data, 0600); err != nil {
-		t.Fatal(err)
-	}
-	g := backendForTestServer(t, remoteRoot)
-	const target = "dst.bin"
-	part := PartNameRemote(target, "r1")
-	writeRemote(t, remoteRoot, part, data[:1000]) // 上次中断留下的完整前缀
-
-	req := TransferRequest{ID: "r1", Host: "h", Remote: target, Local: local, Atomic: true,
-		Resume: true, PartPath: part, ResumeOffset: 1000}
-	if err := g.Put(req, nil); err != nil {
-		t.Fatalf("续传 Put: %v", err)
-	}
-	got, err := os.ReadFile(filepath.Join(remoteRoot, target))
-	if err != nil {
-		t.Fatalf("提交后目标必须存在: %v", err)
-	}
-	if !bytes.Equal(got, data) {
-		t.Fatalf("续传结果与源不一致（本地源未按 offset 续读）: got %d bytes want %d", len(got), len(data))
-	}
-	if temps := remoteTemps(t, remoteRoot); len(temps) != 0 {
-		t.Fatalf("续传成功后不得残留 .part/.bak: %v", temps)
-	}
-}
+// TestGoBackendPutResumeSeeksLocalSourceToo 已移到 resume_paths_test.go（Task 11）：
+// 原用例直接传 ResumeOffset、绕过 decideResume，Task 11 起 Put 自己判定续传，旧形态
+// 会因为「无指纹锚点」退化成整份重传而变得空转 —— 新用例用「取消留下部分 .part → 续传」
+// 的真实流程驱动，仍然钉住「远端与本地必须从同一 offset 续写」这条不变量。
 
 // TestGoBackendSetJournalDir：空目录表示不做崩溃恢复（journal=nil），非空则建实例。
 func TestGoBackendSetJournalDir(t *testing.T) {
