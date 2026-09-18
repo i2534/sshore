@@ -108,13 +108,22 @@ func TestMarkerLiteralIsPinned(t *testing.T) {
 // 依然全绿。这里直接读前端 frontend/src/utils/queue.js 的 PART_MARKER 与 sftp.PartMarker 逐字
 // 比对：任一侧单独漂移都会在这里变红。反向（前端读本文件比对）见 queue.test.js。
 func TestPartMarkerPinnedWithFrontend(t *testing.T) {
-	// 先用相对 CWD 的常规路径；找不到时回退到**编译期记录的源码位置**（runtime.Caller）。
-	// 后者让本用例在「从别的目录运行交叉编译出来的 test 二进制」时也能找到前端文件
-	//（真机 Windows 手工跑 sftp.test.exe 的场景），而不是假红成「找不到文件」。
+	// 两个候选位置：相对 CWD 的常规路径（go test ./... 在源码树里跑），以及**编译期记录的
+	// 源码位置**（runtime.Caller；从别的 CWD 跑 test 二进制时用）。两者都不可用（典型：
+	// 把交叉编译出的测试二进制投到没有源码树的真机上手工跑）时显式 Skip —— 此时没有任何
+	// 可读的前端源文件，硬 Fatal 只会是环境噪声；CI 在源码树里跑，这条互钉始终生效。
+	// 前端侧的等价断言（queue.test.js 读 internal/sftp/partname.go）同样在 CI 生效。
 	path := filepath.Join("..", "..", "frontend", "src", "utils", "queue.js")
 	if _, err := os.Stat(path); err != nil {
+		found := false
 		if _, thisFile, _, ok := runtime.Caller(0); ok {
-			path = filepath.Join(filepath.Dir(thisFile), "..", "..", "frontend", "src", "utils", "queue.js")
+			cand := filepath.Join(filepath.Dir(thisFile), "..", "..", "frontend", "src", "utils", "queue.js")
+			if _, cerr := os.Stat(cand); cerr == nil {
+				path, found = cand, true
+			}
+		}
+		if !found {
+			t.Skip("找不到 frontend/src/utils/queue.js（运行环境没有源码树）：前端口径的互钉只在源码树里可判定")
 		}
 	}
 	b, err := os.ReadFile(path)
