@@ -61,6 +61,25 @@ func TestProgressEmitterThrottlesButForcesFinalFrame(t *testing.T) {
 	}
 }
 
+// TestScanLimitReachedAndDegradedProgress（Task 12 Step 1）：把 D16 的两个阈值与降级帧
+// 字段闭环钉死在纯函数上 —— 19999 个文件/1s 不降级；20001 个文件或 6s 必须降级；
+// 降级帧必须是 Total=-1 && FilesTotal=-1 && Phase=transfer（UI 据此走不定进度）。
+func TestScanLimitReachedAndDegradedProgress(t *testing.T) {
+	if scanLimitReached(19999, 1*time.Second) {
+		t.Fatal("未到阈值不应降级")
+	}
+	if !scanLimitReached(20001, 1*time.Second) {
+		t.Fatal("超过 20000 文件必须降级")
+	}
+	if !scanLimitReached(10, 6*time.Second) {
+		t.Fatal("超过 5s 必须降级")
+	}
+	p := degradedProgress("t1", "h", DirDownload, "d")
+	if p.Total != -1 || p.FilesTotal != -1 || p.Phase != PhaseTransfer {
+		t.Fatalf("降级后必须是 Total=-1/FilesTotal=-1/Phase=transfer, got %#v", p)
+	}
+}
+
 // TestProgressEmitterStampsIDAndToleratesNilReport：ID 由发射器统一盖戳
 // （调用方不必逐个填），nil report 不得 panic（legacy 面/未接线时）。
 func TestProgressEmitterStampsIDAndToleratesNilReport(t *testing.T) {

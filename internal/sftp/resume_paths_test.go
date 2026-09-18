@@ -155,7 +155,7 @@ func TestGoBackendGetResumeCommitsCompletePart(t *testing.T) {
 	if err := os.WriteFile(part, data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	g.recordResumeAnchor(downloadAnchorKey(part), "src.bin", st.Size(), st.ModTime())
+	g.recordResumeAnchor(downloadAnchorKey("h", "", part), "src.bin", st.Size(), st.ModTime())
 
 	var sink progressSink
 	if err := g.Get(TransferRequest{ID: "commit", Host: "h", Remote: "src.bin", Local: local, Atomic: true,
@@ -402,11 +402,21 @@ func TestGoBackendGetResumeRevalidatesLocalPartSize(t *testing.T) {
 				t.Fatal(err)
 			}
 			g.pool.Release(s, true)
-			g.recordResumeAnchor(downloadAnchorKey(part), "src.bin", st.Size(), st.ModTime())
+			g.recordResumeAnchor(downloadAnchorKey("h", "", part), "src.bin", st.Size(), st.ModTime())
 
+			// Task 12 加固（a）：本用例原先只断言「结果等于源」——若日后误删 beforeOpenResumePart
+			// 的调用点，Get 会走「判定层复核通过 → 打开后不复核」，但目标内容仍可能等于源（整份
+			// 重传），用例静默通过、I2 覆盖蒸发。这里显式钉住：钩子确实被调用过，且它确实改变了
+			// .part 长度（否则这条用例对窗口形态没有牙）。
+			fired := false
+			sizeBefore, sizeAfter := int64(-1), int64(-1)
 			restore := swapBeforeOpenResumePart(t, func(p, remote string, off int64) {
 				if p != part {
 					return
+				}
+				fired = true
+				if st, serr := os.Stat(part); serr == nil {
+					sizeBefore = st.Size()
 				}
 				switch mode {
 				case "truncate":
@@ -424,6 +434,9 @@ func TestGoBackendGetResumeRevalidatesLocalPartSize(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				if st, serr := os.Stat(part); serr == nil {
+					sizeAfter = st.Size()
+				}
 			})
 			defer restore()
 
@@ -434,6 +447,15 @@ func TestGoBackendGetResumeRevalidatesLocalPartSize(t *testing.T) {
 			got, err := os.ReadFile(local)
 			if err != nil || !bytes.Equal(got, data) {
 				t.Fatalf("结果必须逐字节等于源（窗口内 .part 长度变化必须被兜住）: err=%v got=%d want=%d", err, len(got), len(data))
+			}
+			if !fired {
+				t.Fatal("I2 注入点未被调用：删掉 beforeOpenResumePart 调用点会让本用例静默失去覆盖")
+			}
+			if sizeBefore != offset {
+				t.Fatalf("窗口内 .part 起始长度应为续传 offset %d，got %d（前提未成立）", offset, sizeBefore)
+			}
+			if sizeAfter == offset {
+				t.Fatal("注入点必须真的改变 .part 长度，否则本用例对 I2 窗口没有牙")
 			}
 		})
 	}
@@ -469,7 +491,7 @@ func TestGoBackendGetResumeRefusesRewriteInWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.pool.Release(s, true)
-	g.recordResumeAnchor(downloadAnchorKey(part), "src.bin", st.Size(), st.ModTime())
+	g.recordResumeAnchor(downloadAnchorKey("h", "", part), "src.bin", st.Size(), st.ModTime())
 
 	newMT := time.Now().Truncate(time.Second)
 	restore := swapBeforeOpenResumePart(t, func(p, remote string, off int64) {
@@ -530,7 +552,7 @@ func TestGoBackendGetResumeRefusesAnchorForOtherSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.pool.Release(s, true)
-	g.recordResumeAnchor(downloadAnchorKey(part), "other.bin", st.Size(), st.ModTime())
+	g.recordResumeAnchor(downloadAnchorKey("h", "", part), "other.bin", st.Size(), st.ModTime())
 
 	if err := g.Get(TransferRequest{ID: "m1", Host: "h", Remote: "src.bin", Local: local, Atomic: true,
 		Resume: true, PartPath: part}, nil); err != nil {
@@ -670,10 +692,12 @@ func TestGoBackendGetResumeErrorKeepsPartPath(t *testing.T) {
 	}
 }
 
-// TestGoBackendPutResumeStatErrorKeepsPartPath（M4 上传方向）：decideUploadResume 里的远端
-// Stat 失败原因**不是** ENOENT（这里用「父路径是普通文件」触发），.part 很可能仍保留着，
-// 错误必须带上 req.PartPath 保住锚点。
-func TestGoBackendPutResumeStatErrorKeepsPartPath(t *testing.T) {
+// TestGoBackendPutResumeStatErrorNeverFabricatesPartPath（Task 12 加固 M4）：decideUploadResume
+// 里的远端 Stat 失败原因**不是** ENOENT（这里用「父路径是普通文件」即 ENOTDIR 触发）。
+// Task 11 的实现乐观地把 req.PartPath 回填进 TransferError —— 但那个路径根本没核实过存在，
+// 等于发布一个假锚点（违反 api.go「未用到时为空」）。Task 12 起与下载方向的
+// localPartIfExists 对齐：只上报 remotePartIfExists 核实过的路径，核不到就给空串。
+func TestGoBackendPutResumeStatErrorNeverFabricatesPartPath(t *testing.T) {
 	remoteRoot, localDir := t.TempDir(), t.TempDir()
 	if err := os.WriteFile(filepath.Join(remoteRoot, "blocker"), []byte("not-a-dir"), 0600); err != nil {
 		t.Fatal(err)
@@ -694,7 +718,101 @@ func TestGoBackendPutResumeStatErrorKeepsPartPath(t *testing.T) {
 	if !errors.As(err, &te) {
 		t.Fatalf("应为 *TransferError, got %T", err)
 	}
-	if te.PartPath != part {
-		t.Fatalf("Stat 非 ENOENT 失败时错误必须带 PartPath（保住锚点），got %q", te.PartPath)
+	if te.PartPath != "" {
+		t.Fatalf("未核实存在的 req.PartPath 绝不能当锚点上报（Task 12 加固 M4），got %q", te.PartPath)
+	}
+}
+
+// TestRemotePartIfExists 钉住「只上报已核实存在的远端 .part」这条判据本身（Task 12 加固 M4）：
+// 存在 ⇒ 原样返回；不存在 / 空串 ⇒ 空串。
+func TestRemotePartIfExists(t *testing.T) {
+	remoteRoot := t.TempDir()
+	writeRemote(t, remoteRoot, "real.part", []byte("x"))
+	g := backendForTestServer(t, remoteRoot)
+	s, err := g.pool.AcquireList(context.Background(), "h", "")
+	if err != nil {
+		t.Fatalf("AcquireList: %v", err)
+	}
+	defer g.pool.Release(s, true)
+
+	if got := remotePartIfExists(s, "real.part"); got != "real.part" {
+		t.Fatalf("存在的远端 .part 必须被核实并返回，got %q", got)
+	}
+	if got := remotePartIfExists(s, "missing.part"); got != "" {
+		t.Fatalf("不存在的远端 .part 必须返回空串，got %q", got)
+	}
+	if got := remotePartIfExists(s, ""); got != "" {
+		t.Fatalf("空路径必须返回空串，got %q", got)
+	}
+}
+
+// TestGoBackendGetResumeRefusesAnchorFromOtherHost（Task 12 加固 M1 残余）：锚点键原先只含
+// .part 路径，同一后端服务多个 host 时，A 主机记录的锚点会被 B 主机的续传请求命中 ——
+// 同 size+mtime 时会把 B 的错位 .part 当合法前缀续写，拼出静默损坏的文件。
+// 这里把合法锚点记在另一台 host 名下，B 必须判「不可验证」→ 清掉旧 .part、整份重传。
+func TestGoBackendGetResumeRefusesAnchorFromOtherHost(t *testing.T) {
+	remoteRoot, localDir := t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("host-"), 1000) // 5000 字节
+	writeRemote(t, remoteRoot, "src.bin", data)
+	local := filepath.Join(localDir, "dst.bin")
+	part := PartName(local, "m1h")
+	const offset = int64(2000)
+	// .part 是「同长度但内容错位」的前缀：若被续写，结果必然不等于源。
+	if err := os.WriteFile(part, bytes.Repeat([]byte("X"), int(offset)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	g := backendForTestServer(t, remoteRoot)
+	s, err := g.pool.AcquireList(context.Background(), "h", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := s.Conn.Stat("src.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.pool.Release(s, true)
+	// 锚点记在**另一台 host** 名下（身份、size、mtime 全部与当前源一致，只有 host 不同）。
+	g.recordResumeAnchor(downloadAnchorKey("other-host", "", part), "src.bin", st.Size(), st.ModTime())
+
+	if err := g.Get(TransferRequest{ID: "m1h", Host: "h", Remote: "src.bin", Local: local, Atomic: true,
+		Resume: true, PartPath: part}, nil); err != nil {
+		t.Fatalf("跨 host 锚点必须被判不可验证并整份重传而不是报错: %v", err)
+	}
+	got, err := os.ReadFile(local)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("跨 host 锚点被误认：结果被拼坏（Task 12 加固 M1）: err=%v got=%d want=%d", err, len(got), len(data))
+	}
+}
+
+// TestGoBackendPutResumeRefusesAnchorForOtherDestination（Task 12 加固 M1 残余，上传方向）：
+// 上传锚点键原先只含 .part 路径。同一 host 把同一个 PartPath 用于不同远端目标时，源相同
+// 但目的地不同，绝不能互认锚点 —— 否则会把 B 目标的错位 .part 当 A 的前缀续写。
+func TestGoBackendPutResumeRefusesAnchorForOtherDestination(t *testing.T) {
+	remoteRoot, localDir := t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("dest-"), 1000) // 5000 字节
+	local := filepath.Join(localDir, "src.bin")
+	if err := os.WriteFile(local, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	const part = "shared.part"
+	const offset = int64(2000)
+	if err := os.WriteFile(filepath.Join(remoteRoot, part), bytes.Repeat([]byte("X"), int(offset)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	g := backendForTestServer(t, remoteRoot)
+	st, err := os.Stat(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 锚点记在**另一个远端目标**名下（src/size/mtime 全一致，只有 dest 不同）。
+	g.recordResumeAnchor(uploadAnchorKey("h", "", "dstA.bin", part), local, st.Size(), st.ModTime())
+
+	if err := g.Put(TransferRequest{ID: "m1d", Host: "h", Remote: "dstB.bin", Local: local, Atomic: true,
+		Resume: true, PartPath: part}, nil); err != nil {
+		t.Fatalf("跨目的锚点必须被判不可验证并整份重传而不是报错: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(remoteRoot, "dstB.bin"))
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("跨目的锚点被误认：结果被拼坏（Task 12 加固 M1）: err=%v got=%d want=%d", err, len(got), len(data))
 	}
 }
