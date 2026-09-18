@@ -50,6 +50,29 @@ func writeRemoteTree(t *testing.T, root, rel string, data []byte) {
 	}
 }
 
+// splitScanFrames 把进度帧切成「扫描相前缀」与「传输相帧」。D8 规定先 scan 再 transfer，
+// 所以扫描帧只能是前缀：任何 transfer 帧之后再出现 scan 帧都属于相位倒挂，直接 Fatal。
+// 同时拒绝未知相位 —— 相位枚举只有 PhaseScan/PhaseTransfer 两个合法值。
+func splitScanFrames(t *testing.T, frames []Progress) (scan, transfer []Progress) {
+	t.Helper()
+	seenTransfer := false
+	for _, p := range frames {
+		switch p.Phase {
+		case PhaseScan:
+			if seenTransfer {
+				t.Fatalf("相位倒挂：transfer 帧之后不得再出现 scan 帧，got %+v", p)
+			}
+			scan = append(scan, p)
+		case PhaseTransfer:
+			seenTransfer = true
+			transfer = append(transfer, p)
+		default:
+			t.Fatalf("未知进度相位 %q（枚举只有 scan/transfer）: %+v", p.Phase, p)
+		}
+	}
+	return scan, transfer
+}
+
 // treeParts 返回 dir 树下所有内部临时文件（.part/.bak）的路径。
 func treeParts(t *testing.T, dir string) []string {
 	t.Helper()
@@ -95,26 +118,27 @@ func TestGoBackendGetTreeHappyPathCommitsPerFile(t *testing.T) {
 		t.Fatalf("成功后不得残留 .part: %v", parts)
 	}
 
-	frames := sink.all()
-	if len(frames) == 0 {
-		t.Fatal("目录传输必须有进度帧")
+	scan, xfer := splitScanFrames(t, sink.all())
+	// D8：枚举之前必须先发 scan 相首帧（前端「准备中…」的唯一来源）。删除生产者这里就红。
+	if len(scan) != 1 || scan[0].Phase != PhaseScan || scan[0].Direction != DirDownload || scan[0].ID != "t12-get" {
+		t.Fatalf("GetTree 必须恰好发一帧 scan 相（且带正确方向/id），got %+v", scan)
+	}
+	if len(xfer) == 0 {
+		t.Fatal("目录传输必须有 transfer 相进度帧")
 	}
 	sum := int64(len(one) + len(two))
-	first := frames[0]
-	if first.Phase != PhaseTransfer || first.Total != sum || first.FilesTotal != 2 || first.Done != 0 {
-		t.Fatalf("首帧应给出完整分母（Total=%d/FilesTotal=2/Phase=transfer），got %+v", sum, first)
+	first := xfer[0]
+	if first.Total != sum || first.FilesTotal != 2 || first.Done != 0 {
+		t.Fatalf("transfer 首帧应给出完整分母（Total=%d/FilesTotal=2），got %+v", sum, first)
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.Done != sum || last.FilesDone != 2 || last.FilesTotal != 2 || last.Phase != PhaseTransfer {
 		t.Fatalf("末帧应闭环（Done=%d/FilesDone=2/FilesTotal=2），got %+v", sum, last)
 	}
 	if last.ID != "t12-get" || last.Host != "h" || last.Direction != DirDownload {
 		t.Fatalf("末帧字段不完整: %+v", last)
 	}
-	for _, p := range frames {
-		if p.Phase != PhaseTransfer {
-			t.Fatalf("目录传输帧必须都是 transfer 相，got %q", p.Phase)
-		}
+	for _, p := range xfer {
 		if p.FilesTotal == 0 {
 			t.Fatalf("FilesTotal 绝不能是 0（UI 会读成 0 个文件）: %+v", p)
 		}
@@ -206,19 +230,19 @@ func TestGoBackendGetTreeDegradesWhenScanLimitHit(t *testing.T) {
 			t.Fatalf("降级后已枚举到的文件仍必须传完: %v", err)
 		}
 	}
-	frames := sink.all()
-	if len(frames) == 0 {
-		t.Fatal("降级也必须有进度帧")
+	_, xfer := splitScanFrames(t, sink.all())
+	if len(xfer) == 0 {
+		t.Fatal("降级也必须有 transfer 相进度帧")
 	}
-	first := frames[0]
+	first := xfer[0]
 	if first.Total != -1 || first.FilesTotal != -1 || first.Phase != PhaseTransfer {
 		t.Fatalf("降级首帧必须 Total=-1/FilesTotal=-1/Phase=transfer, got %+v", first)
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.Total != -1 || last.FilesTotal != -1 || last.FilesDone != 3 || last.Done != want {
 		t.Fatalf("降级末帧应保留真实 Done/FilesDone 但分母未知, got %+v", last)
 	}
-	for _, p := range frames {
+	for _, p := range xfer {
 		if p.FilesTotal > 0 || p.Total > 0 {
 			t.Fatalf("降级路径不得出现正分母（UI 会误以为枚举完整）: %+v", p)
 		}
@@ -278,6 +302,7 @@ func TestGoBackendPutTreeMergesWithoutNesting(t *testing.T) {
 	sink := &progressSink{}
 	put := func(id string) {
 		t.Helper()
+		sink.reset() // 每次传输独立观测帧序列（否则第二轮 scan 会跟在第一轮 transfer 之后）
 		req := TransferRequest{ID: id, Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}
 		if err := g.PutTree(req, sink.report); err != nil {
 			t.Fatalf("PutTree(%s): %v", id, err)
@@ -309,11 +334,14 @@ func TestGoBackendPutTreeMergesWithoutNesting(t *testing.T) {
 	if parts := treeParts(t, remoteRoot); len(parts) != 0 {
 		t.Fatalf("成功后不得残留 .part/.bak: %v", parts)
 	}
-	frames := sink.all()
-	if len(frames) == 0 {
+	scan, xfer := splitScanFrames(t, sink.all())
+	if len(scan) != 1 || scan[0].Phase != PhaseScan || scan[0].Direction != DirUpload {
+		t.Fatalf("PutTree 必须先发一帧 scan 相，got %+v", scan)
+	}
+	if len(xfer) == 0 {
 		t.Fatal("目录上传必须有进度帧")
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.Direction != DirUpload || last.FilesDone != 2 || last.FilesTotal != 2 {
 		t.Fatalf("上传末帧字段不完整: %+v", last)
 	}
@@ -671,19 +699,19 @@ func TestGoBackendPutTreeDegradesByStoppingLocalWalk(t *testing.T) {
 	if committed != 1 {
 		t.Fatalf("降级必须在阈值处停止枚举：只应上传 1 个文件，got %d", committed)
 	}
-	frames := sink.all()
-	if len(frames) == 0 {
-		t.Fatal("降级也必须有进度帧")
+	_, xfer := splitScanFrames(t, sink.all())
+	if len(xfer) == 0 {
+		t.Fatal("降级也必须有 transfer 相进度帧")
 	}
-	first := frames[0]
+	first := xfer[0]
 	if first.Total != -1 || first.FilesTotal != -1 || first.Phase != PhaseTransfer {
 		t.Fatalf("降级首帧必须 Total=-1/FilesTotal=-1/Phase=transfer, got %+v", first)
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.Total != -1 || last.FilesTotal != -1 || last.FilesDone != 1 || last.Done != 1 {
 		t.Fatalf("降级末帧应保留真实 Done/FilesDone 但分母未知, got %+v", last)
 	}
-	for _, p := range frames {
+	for _, p := range xfer {
 		if p.Total > 0 || p.FilesTotal > 0 {
 			t.Fatalf("上传降级路径不得出现正分母（UI 会误以为枚举完整）: %+v", p)
 		}
@@ -732,11 +760,11 @@ func TestGoBackendGetTreePartialFailureReportsCountsAndFinalFrame(t *testing.T) 
 	if te.PartPath == "" {
 		t.Fatal("失败项必须保留 .part 作重试锚点")
 	}
-	frames := sink.all()
-	if len(frames) == 0 {
+	_, xfer := splitScanFrames(t, sink.all())
+	if len(xfer) == 0 {
 		t.Fatal("失败路径也必须有进度帧")
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.PartPath != te.PartPath {
 		t.Fatalf("失败末帧必须由失败路径补发并带重试锚点 PartPath=%q，got %+v", te.PartPath, last)
 	}
@@ -782,11 +810,11 @@ func TestGoBackendPutTreePartialFailureReportsCountsAndFinalFrame(t *testing.T) 
 	if te.PartPath == "" {
 		t.Fatal("失败项必须保留远端 .part 作重试锚点")
 	}
-	frames := sink.all()
-	if len(frames) == 0 {
+	_, xfer := splitScanFrames(t, sink.all())
+	if len(xfer) == 0 {
 		t.Fatal("失败路径也必须有进度帧")
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.PartPath != te.PartPath {
 		t.Fatalf("失败末帧必须带重试锚点 PartPath=%q，got %+v", te.PartPath, last)
 	}
@@ -1003,11 +1031,14 @@ func TestGoBackendGetTreeScanPhaseFailureEmitsTerminalFrameAndCounts(t *testing.
 	if !te.TreeCounts || te.CommittedFiles != 0 || te.CommittedBytes != 0 || te.RemainingFiles != -1 {
 		t.Fatalf("扫描相失败必须回填诚实计数（0 个已提交、剩余未知），got %+v", te)
 	}
-	frames := sink.all()
-	if len(frames) == 0 {
+	scan, xfer := splitScanFrames(t, sink.all())
+	if len(scan) != 1 || scan[0].Phase != PhaseScan {
+		t.Fatalf("GetTree 枚举失败前也必须先发 scan 首帧，got %+v", scan)
+	}
+	if len(xfer) == 0 {
 		t.Fatal("NEW-1：扫描相失败也必须发末帧，否则调用方无从告诉用户发生了什么")
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.Phase != PhaseTransfer || last.Total != -1 || last.FilesTotal != -1 || last.Done != 0 || last.Direction != DirDownload {
 		t.Fatalf("扫描相失败末帧必须是「分母未知、0 已传」的 transfer 帧，got %+v", last)
 	}
@@ -1041,11 +1072,14 @@ func TestGoBackendPutTreeScanPhaseFailureEmitsTerminalFrameAndCounts(t *testing.
 	if !te.TreeCounts || te.CommittedFiles != 0 || te.RemainingFiles != -1 {
 		t.Fatalf("扫描相失败必须回填诚实计数（0 个已提交、剩余未知），got %+v", te)
 	}
-	frames := sink.all()
-	if len(frames) == 0 {
+	scan, xfer := splitScanFrames(t, sink.all())
+	if len(scan) != 1 || scan[0].Phase != PhaseScan {
+		t.Fatalf("PutTree 本地枚举失败前也必须先发 scan 首帧，got %+v", scan)
+	}
+	if len(xfer) == 0 {
 		t.Fatal("NEW-1：本地扫描相失败也必须发末帧")
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.Phase != PhaseTransfer || last.Total != -1 || last.FilesTotal != -1 || last.Done != 0 || last.Direction != DirUpload {
 		t.Fatalf("本地扫描相失败末帧必须是「分母未知、0 已传」的 transfer 帧，got %+v", last)
 	}
@@ -1091,11 +1125,14 @@ func TestGoBackendPutTreeScanPhaseCancelEmitsTerminalFrameAndCounts(t *testing.T
 	if !te.TreeCounts || te.CommittedFiles != 0 || te.CommittedBytes != 0 || te.RemainingFiles != -1 {
 		t.Fatalf("扫描相取消必须回填诚实计数（0 个已提交、剩余未知），got %+v", te)
 	}
-	frames := sink.all()
-	if len(frames) == 0 {
+	scan, xfer := splitScanFrames(t, sink.all())
+	if len(scan) != 1 || scan[0].Phase != PhaseScan {
+		t.Fatalf("PutTree 扫描相取消前也必须先发 scan 首帧，got %+v", scan)
+	}
+	if len(xfer) == 0 {
 		t.Fatal("NEW-1：扫描相取消也必须发末帧")
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.Phase != PhaseTransfer || last.Total != -1 || last.FilesTotal != -1 || last.Done != 0 || last.Direction != DirUpload {
 		t.Fatalf("扫描相取消末帧必须是「分母未知、0 已传」的 transfer 帧，got %+v", last)
 	}
@@ -1139,16 +1176,19 @@ func TestGoBackendPutTreeReconcilesFileGrownAfterEnumeration(t *testing.T) {
 	if b, rerr := os.ReadFile(filepath.Join(remoteRoot, "a", "grow.bin")); rerr != nil || len(b) != 150 {
 		t.Fatalf("远端内容应为改大后的 150 字节: err=%v len=%d", rerr, len(b))
 	}
-	frames := sink.all()
-	if len(frames) == 0 {
+	scan, xfer := splitScanFrames(t, sink.all())
+	if len(scan) != 1 || scan[0].Phase != PhaseScan {
+		t.Fatalf("PutTree 必须先发一帧 scan 相，got %+v", scan)
+	}
+	if len(xfer) == 0 {
 		t.Fatal("必须有进度帧")
 	}
-	for _, p := range frames {
+	for _, p := range xfer {
 		if p.Total >= 0 && p.Done > p.Total {
 			t.Fatalf("任何一帧都不得 Done>Total（夹取兜底），got %+v", p)
 		}
 	}
-	last := frames[len(frames)-1]
+	last := xfer[len(xfer)-1]
 	if last.Total != 150 || last.Done != 150 {
 		t.Fatalf("末帧分母必须对账到实际大小 150（NEW-2/M2），got %+v", last)
 	}

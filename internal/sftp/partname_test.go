@@ -5,6 +5,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -42,8 +43,10 @@ func TestPartNameFallsBackToShortFormWhenTooLong(t *testing.T) {
 	if !IsInternalTemp(got) {
 		t.Fatalf("退化短名也必须被 IsInternalTemp 认出（中缀判定），got %q", got)
 	}
-	if !strings.HasPrefix(got, "/data/") {
-		t.Fatalf("退化短名必须留在同目录（rename 才能原子），got %q", got)
+	// 「留在同目录」的判据必须用本机路径语义（Windows 的 filepath.Dir 给反斜杠），
+	// 不能硬编码 POSIX 前缀 —— 否则本用例在 Windows 上假红，而真契约其实成立。
+	if filepath.Dir(got) != filepath.Dir(long) {
+		t.Fatalf("退化短名必须留在同目录（rename 才能原子），got %q want dir %q", got, filepath.Dir(long))
 	}
 }
 
@@ -105,7 +108,16 @@ func TestMarkerLiteralIsPinned(t *testing.T) {
 // 依然全绿。这里直接读前端 frontend/src/utils/queue.js 的 PART_MARKER 与 sftp.PartMarker 逐字
 // 比对：任一侧单独漂移都会在这里变红。反向（前端读本文件比对）见 queue.test.js。
 func TestPartMarkerPinnedWithFrontend(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join("..", "..", "frontend", "src", "utils", "queue.js"))
+	// 先用相对 CWD 的常规路径；找不到时回退到**编译期记录的源码位置**（runtime.Caller）。
+	// 后者让本用例在「从别的目录运行交叉编译出来的 test 二进制」时也能找到前端文件
+	//（真机 Windows 手工跑 sftp.test.exe 的场景），而不是假红成「找不到文件」。
+	path := filepath.Join("..", "..", "frontend", "src", "utils", "queue.js")
+	if _, err := os.Stat(path); err != nil {
+		if _, thisFile, _, ok := runtime.Caller(0); ok {
+			path = filepath.Join(filepath.Dir(thisFile), "..", "..", "frontend", "src", "utils", "queue.js")
+		}
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("读前端 PART_MARKER 失败: %v", err)
 	}

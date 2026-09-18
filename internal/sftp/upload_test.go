@@ -213,7 +213,7 @@ func TestGoBackendPutLocalReadErrorNotMaskedByStderr(t *testing.T) {
 
 	g := backendForTestServer(t, remoteRoot)
 	const noisy = "put-noise-should-not-mask-local-error"
-	pp := noisyProcForDial(t, g, "sh", "-c", "printf 'put-noise-should-not-mask-local-error\n' >&2; cat >/dev/null")
+	pp := noisyProcForDial(t, g, noisy)
 	deadline := time.Now().Add(5 * time.Second)
 	for !strings.Contains(pp.StderrText(), noisy) {
 		if time.Now().After(deadline) {

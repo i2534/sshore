@@ -24,7 +24,8 @@ import (
 // 用 net.Pipe 把 pkg/sftp 的**真实客户端与真实服务端**接在一起：不联网、不起 ssh，
 // 但走的是真正的 SFTP 协议（Stat/Open/Read），因此 Get 的提交前置、进度上报、
 // 取消保留 .part、会话关闭都被真实执行，而不是被 mock 掉。
-// 会话的 Proc 用 cat 兜住：Session.close() 会关管道 + Kill，没有真实子进程会 nil panic。
+// 会话的 Proc 用跨平台替身子进程兜住（helper_test.go）：Session.close() 会关管道 + Kill，
+// 没有真实子进程会 nil panic。
 
 // backendForTestServer 起一个只在内存里的 sftp 会话池，并把 dial 指向它。
 //
@@ -51,10 +52,8 @@ func backendForTestServer(t *testing.T, root string) *GoBackend {
 		}
 		// Proc 必须有真实子进程：Session.close 会 Kill，nil Proc 会 nil panic；且带 Proc 的
 		// 会话才算「真的建立过连接」（GoBackend.Connected 的粘性置位判据）。
-		p, perr := osutil.StartPipes("cat")
-		if perr != nil {
-			return nil, perr
-		}
+		// 子进程是跨平台替身（helper_test.go）—— 修复前这里是 Unix-only 的 "cat"。
+		p := testHelperPipes(t, "")
 		mu.Lock()
 		servers = append(servers, srv)
 		conns = append(conns, c1, c2)
@@ -102,6 +101,14 @@ func (s *progressSink) all() []Progress {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]Progress(nil), s.frames...)
+}
+
+// reset 清空已收集的帧。同一 sink 被复用多次传输（如同一用例里连续两次 PutTree）时必须调用，
+// 否则后一次的 scan 相会紧跟在上一轮的 transfer 帧之后，被 splitScanFrames 判成相位倒挂。
+func (s *progressSink) reset() {
+	s.mu.Lock()
+	s.frames = nil
+	s.mu.Unlock()
 }
 
 // swapCopyStream 在用例期间替换字节搬运入口，返回还原函数。
@@ -516,9 +523,7 @@ func TestCopyFileToLocalReturnsPartWithoutCommitting(t *testing.T) {
 // TestCopyFileToLocalLocalOpenErrorIsPathError：本地 .part 建不出来时（只读父目录）
 // 必须原样返回 *os.PathError（Get 据此把错误归到本地路径而不是远端）。
 func TestCopyFileToLocalLocalOpenErrorIsPathError(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root 下 CAP_DAC_OVERRIDE 会绕过目录权限，0500 不构成只读")
-	}
+	skipUnlessUnixDirPerms(t)
 	remoteRoot := t.TempDir()
 	roParent := t.TempDir() // 只读父目录 ⇒ 连 .part 也建不出来（父目录不可写）
 	if err := os.Chmod(roParent, 0500); err != nil {
@@ -615,9 +620,7 @@ func TestGoBackendGetShortReadPartPathOnError(t *testing.T) {
 // TestGoBackendGetReadOnlyDestPartPathIsEmpty（Task 7 评审 I2）：本地 .part 建不出来时
 // TransferError.PartPath 必须为空。假锚点会让 Task 11 拿到一条 ENOENT 的「可续传」路径。
 func TestGoBackendGetReadOnlyDestPartPathIsEmpty(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root 下 CAP_DAC_OVERRIDE 会绕过目录权限，0500 不构成只读")
-	}
+	skipUnlessUnixDirPerms(t)
 	remoteRoot := t.TempDir()
 	roParent := t.TempDir()
 	if err := os.Chmod(roParent, 0500); err != nil { // 父目录不可写 ⇒ .part 建不出来
@@ -652,9 +655,7 @@ func TestGoBackendGetReadOnlyDestPartPathIsEmpty(t *testing.T) {
 // 绝不能被非空的远端 stderr 盖掉。api.go 的 Error() 优先打印 RemoteMsg；若本地错误也被
 // 套上 stderr，生产上就会看到远端噪音而看不到「本地磁盘/权限」这个真正原因。
 func TestGoBackendGetLocalErrorNotMaskedByStderr(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root 下 CAP_DAC_OVERRIDE 会绕过目录权限，0500 不构成只读")
-	}
+	skipUnlessUnixDirPerms(t)
 	remoteRoot := t.TempDir()
 	roParent := t.TempDir()
 	if err := os.Chmod(roParent, 0500); err != nil {
@@ -668,7 +669,7 @@ func TestGoBackendGetLocalErrorNotMaskedByStderr(t *testing.T) {
 	// 故意的「远端噪音」：子进程写 stderr，drain goroutine 收进 StderrText。
 	// 先起进程再挂到会话上，保证断言时 stderr 一定非空（否则用例空转）。
 	const noisy = "ssh-noise-should-not-mask-local-error"
-	pp := noisyProcForDial(t, g, "sh", "-c", "printf '%s\\n' \"$1\" >&2; cat >/dev/null", "sh", noisy)
+	pp := noisyProcForDial(t, g, noisy)
 	req := TransferRequest{ID: "mask", Host: "h", Remote: "src.bin", Local: local, Atomic: true}
 
 	// 等 drain 真的收到那行 stderr 再传输 —— 否则断言「没被盖掉」是因为 stderr 恰为空。
@@ -707,17 +708,15 @@ func TestGoBackendGetLocalErrorNotMaskedByStderr(t *testing.T) {
 }
 
 // noisyProcForDial 把「会写 stderr 的子进程」挂成 dial 出来的会话 Proc，用于错误归属用例。
-// 两个细节都为了不漏进程（Task 7 修复轮 2 清理）：
-//  1. backendForTestServer 造的 cat 被顶替后不再被任何 Session 持有，CloseAll 收不到它，
+// 子进程由 testHelperPipes 提供（跨平台，修复前是 Unix-only 的 "sh -c …"），噪音经 helper
+// 环境变量传给子进程。两个细节都为了不漏进程（Task 7 修复轮 2 清理）：
+//  1. backendForTestServer 造的替身子进程被顶替后不再被任何 Session 持有，CloseAll 收不到它，
 //     必须由用例自己收；
-//  2. 用 Close 而不是 Kill —— 命令里的 cat 后代只会在父端 stdin 关闭后收 EOF 退出，
-//     Kill 只杀直接子进程，会把 cat 留成孤儿。
-func noisyProcForDial(t *testing.T, g *GoBackend, name string, args ...string) *osutil.PipedProcess {
+//  2. 用 Close 而不是 Kill —— 替身子进程在父端 stdin 关闭后才收 EOF 退出，
+//     Kill 只杀直接子进程，会把它留成孤儿。
+func noisyProcForDial(t *testing.T, g *GoBackend, noise string) *osutil.PipedProcess {
 	t.Helper()
-	pp, err := osutil.StartPipes(name, args...)
-	if err != nil {
-		t.Fatalf("StartPipes: %v", err)
-	}
+	pp := testHelperPipes(t, noise)
 	origDial := g.pool.dial
 	var mu sync.Mutex
 	var displaced []*osutil.PipedProcess
@@ -751,9 +750,7 @@ func noisyProcForDial(t *testing.T, g *GoBackend, name string, args ...string) *
 // 不能被非空远端 stderr 盖掉。该分支经 ctrl.go 的 legacy 四参面被 internal/sync 实际调用，
 // 与原子路径共用 isRemoteError(err) 判据。
 func TestGoBackendGetLegacyLocalErrorNotMaskedByStderr(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root 下 CAP_DAC_OVERRIDE 会绕过目录权限，0500 不构成只读")
-	}
+	skipUnlessUnixDirPerms(t)
 	remoteRoot := t.TempDir()
 	roParent := t.TempDir()
 	if err := os.Chmod(roParent, 0500); err != nil { // 父目录不可写 ⇒ 目标文件建不出来
@@ -765,7 +762,7 @@ func TestGoBackendGetLegacyLocalErrorNotMaskedByStderr(t *testing.T) {
 
 	g := backendForTestServer(t, remoteRoot)
 	const noisy = "legacy-noise-should-not-mask-local-error"
-	pp := noisyProcForDial(t, g, "sh", "-c", "printf '%s\\n' \"$1\" >&2; cat >/dev/null", "sh", noisy)
+	pp := noisyProcForDial(t, g, noisy)
 
 	// 先等 drain 真的收到 stderr 再传 —— 否则「没被盖掉」可能只是 stderr 恰为空。
 	deadline := time.Now().Add(5 * time.Second)

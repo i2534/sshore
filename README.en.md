@@ -290,6 +290,16 @@ make e2e    # equivalent to: bash e2e/test_local.sh
 sshore relies on: `ssh -G` alias resolution, `-N -L` local forward binding, and
 `sftp ls -l` output parsing. Requires `/usr/sbin/sshd`, `ssh-keygen`, and `python3`.
 
+**When running the e2e tests directly on Windows (or any machine), note** that the e2e tests in
+`internal/sftp` and `internal/sync` now require all **three** variables:
+`SSHORE_E2E_HOST` / `SSHORE_E2E_REMOTE` / `SSHORE_SFTP_TRANSPORT`. Specifically:
+
+- missing `SSHORE_E2E_HOST` / `SSHORE_E2E_REMOTE` ⇒ **Skip** (so `go test ./...` stays silent
+  without a network or sshd);
+- `SSHORE_E2E_HOST` set but `SSHORE_SFTP_TRANSPORT` missing ⇒ a deliberate `t.Fatalf`
+  (`SSHORE_SFTP_TRANSPORT 未送达：后端身份无法证明`) — an anti-false-green guard, not a bug:
+  if both iterations silently ran the same backend, the "backend matrix" would be fake.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on push/PR:
