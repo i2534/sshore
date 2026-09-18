@@ -125,8 +125,10 @@ cancelled transfer: bytes=95813632 err=... elapsed=305ms   ← 取消 305ms 内�
 
 - **决定**：`ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 [-o User=…] -s host sftp` 起子系统（`-s` **前置**：不依赖 getopt 置换；Task 0 实测 Win32-OpenSSH 9.5p1 前后置都可用，前置是两平台都无歧义的写法）（与现状 `ctrl.go:69-71` 的选项对齐），`pkg/sftp.NewClientPipe` 建客户端。**不引入 `x/crypto/ssh` 直连**。
 - **阶段 1 已实测（Task 0，Win32-OpenSSH 9.5p1）**：`-s` 前置与后置**都可用**（`[pre]/[post] client ok`），故采用前置写法；同一程序在 Linux OpenSSH 8.9p1 上后置亦可（早期 spike）。
+- **Task 0 回写（环境限制，进 README 已知限制）**：Session 0（服务/非交互会话）里由 Go 进程 spawn 的 `ssh.exe` 会卡在 SFTP INIT 之后（≥15–25s 无响应，未观察到更长等待下的恢复；被测的 4 个 console 创建标志均无效，window station/desktop 未试）。改到交互桌面会话（Session 1）后全部正常 ⇒ **应用必须运行在交互桌面会话**，不得作为服务启动。
+- **Task 0 回写（stderr）**：`pkg/sftp.NewClientPipe` 以 `stderr=nil` 调用 `newClientPipe`（client.go:227），库不读 `ssh` 的 stderr ⇒ 由 raw-pipe 原语后台 drain（drain 是**源码推断必要**的保守做法；「写满 64KB 会反压」本轮未实测，只观测到 ssh 确实会写 stderr）。
 - **理由**：鉴权/配置/跳板机语义零漂移；实测建会话 216ms 后长期复用。
-- **代价**：仍依赖系统 `ssh`（`README.md:22` 由 ssh+sftp 收窄为只需 ssh）；远端必须启用 sftp 子系统（被禁用/被替换实现的场景要在错误文案里说清）。
+- **代价**：仍依赖系统 `ssh`（`README.md:22` 由 ssh+sftp 收窄为只需 ssh；仅 `batch` 回退需要 `sftp`）；远端必须启用 sftp 子系统（被禁用/被替换实现的场景要在错误文案里说清）；必须在交互会话运行（见上）。
 
 ### D2 会话模型：池化 + 传输独占 + 显式状态机
 
@@ -145,7 +147,7 @@ cancelled transfer: bytes=95813632 err=... elapsed=305ms   ← 取消 305ms 内�
 - **配置落点三处（缺一即等于没配）**：`internal/config/store.go:17-24` 字段、`:28` `Normalize()`、`:172-183` `DefaultAppConfig()`（`AppConfig.normalize()` 在 `:156` 调它）。
 - **必须同步前端（否则会被静默清空）**：`app.go:230-239` 的 `SetSettings` 是 `a.cfg.App = s` **整结构覆盖**，而 `frontend/src/stores/settings.js:94-102` 的 `save()` 只提交 6 个字段 → `sftp_transport` 不进 load/save 就会在用户每次保存设置时丢值。必做：重生成 `frontend/wailsjs/go/models.ts`（`AppSettings`，该文件已入库）并改 `settings.js` 的 load/save；`SettingsDialog` 露出下拉（§12.2 g，已确认）。
 - **降级安全**：`store.go:193` 用 `toml.DecodeFile` 不查 Undecoded → 旧二进制忽略新键；新二进制读旧配置由 `Normalize` 填默认。
-- **默认切换时机**：内置默认先 `batch`；**Windows + Linux 真机验收通过后在本轮发布内改为 `gosftp`**。
+- **默认切换时机**：内置默认先 `batch`；**Task 16 已按计划切到 `gosftp`**（`internal/sftp/backend.go` 的 `defaultTransport = KindGo`，由 `TestDefaultTransportIsGo` 钉住）。Windows 真机验收清单已交付（`docs/windows-acceptance-checklist.md`），由人工执行；验收失败时一行回退为 `KindBatch`。
 - **寿命**：batch 后端与开关保留一个发布周期，**v0.8 删除**（含 `parser.go`/`listmany_parse.go` 与批处理专用测试）。
 
 ### D4 包布局、门面双面与运行原语
@@ -247,6 +249,8 @@ internal/sftp/
 - **命名**：`<name>.sshore-sftppart-<id8>-<rand>`（同目录）。**与 sync 的 `.sshore-part-<ruleid8>-` 明确区分** —— 后者的清理靠 `strings.Contains`（`transfer.go:68`），同前缀会互相误删（评审 A 的次要 4）。
 - **文件名长度（自审新增）**：临时名/备份名会让名字加长约 30 字符，接近文件系统 NAME_MAX（ext4/NTFS 均约 255）时会 `ENAMETOOLONG` → 超过阈值（**200 字节**，本轮定值）时退化为同目录短名 `.sshore-sftppart-<id8>-<rand>`；归属由传输表的 `PartPath` 决定，**不依赖名字里的原名**；备份名超限时同样退化为 `.sshore-sftppart-bak-<rand>`。
 - **Windows 上的本地提交**：Go 的 `os.Rename` 在 Windows 走 `MoveFileEx(..., MOVEFILE_REPLACE_EXISTING)`（`internal/syscall/windows/syscall_windows.go:366`），且 sync 的 `internal/sync/transfer.go:49` 已长期依赖该覆盖语义 → 下载提交在 Windows 同样直接覆盖，无需 backup-swap。
+- **Windows 上传提交（Task 0 回写）**：真机（Win32-OpenSSH 9.5p1 客户端）实测服务端**通告** `posix-rename@openssh.com`（证据弱：仅 `ext=true`/`value="1"`，6 次观测、无扩展缺失的对照），且 `PosixRename` **真的覆盖**已存在目标（证据强：返回 `<nil>` + 读回 `NEW2` + `statSize=4` + 磁盘 4 字节，6 次观测）⇒ Windows 常态走 `PosixRename` 原子提交，backup-swap 只是扩展缺失时的退路。plain `Rename` 到已存在目标按期望失败（`SSH_FX_FAILURE`，目标内容不变）。
+- **`Seek(partSize)` 续写（Task 0 回写）**：真机实测有效 —— `Seek(3)+Write` 得 `ABCXY`；补边界 `Seek(5)`（恰好末尾）得 `ABCDEYZ`（7 B）、`Seek(7)`（越过 EOF）得 `ABCDE\x00\x00XY`（9 B，**空洞补 0**）。上传续传在 Windows 成立，无需退回「整份重传」；注意越界续写会以零填充空洞，因此续传偏移必须来自真实 part 大小而不是可推断值。
 - **下载**：写同目录临时文件 → 本地 `os.Rename`（覆盖式）提交。
 - **上传**：写远端同目录临时文件 → 提交用 `PosixRename`（原子覆盖）；**连接后探测 `HasExtension("posix-rename@openssh.com")`**（返回 `(string, bool)`，client.go:359 —— 三审 R12 的更正），不靠「试失败再回退」。
 - **扩展缺失或提交失败 → backup-swap**：`Rename(target → target.sshore-sftppart-bak-<rand>)`（**复用同一中缀**，这样清理/面板过滤/内部忽略一套规则就覆盖它，避免孤儿文件） → `Rename(part → target)` → 删除 bak；任一步失败则**回滚 bak** 并报出明确错误。**绝不先删目标**（评审 A 的 S5/A-S4：先删会让目标消失，比现状更糟）。**journal（三审 R4）**：swap 前把 `(target, bak, part)` 三元组写入状态目录（与 sync 的 state 同处），成功/回滚后删除；若会话正好在两次 `Rename` 之间断开（目标名暂缺 + bak 存在），下次启动/下次连接时按 journal 恢复并校验，恢复失败必须报出 `bak` 路径而不是静默。

@@ -49,6 +49,11 @@ func TestMain(m *testing.M) {
 // 所有 sftp 调用成功，stdout 为给定的固定输出（不启动真实进程）。
 func appWithFakeSFTP(t *testing.T, stdout string) *App {
 	t.Helper()
+	// 这些用例的假 runner 只会应答 `sftp -b` 进程，因此**必须显式钉住 batch 后端**：
+	// Task 16 把内置默认切到 gosftp 后，NewCtrl 会按内置默认去起真实 `ssh -s sftp`，
+	// 让本组用例（本意是验最近位置记录等绑定层行为）在 CI 里真连 DNS/网络而失败。
+	// 显式设置也让本组用例不再随内置默认漂移。
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "batch")
 	a := NewApp()
 	a.Init(func(forward.Event) {})
 	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
