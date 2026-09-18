@@ -22,6 +22,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- E2E_RUN 校验（必须在起 sshd/生成密钥之前，失败要快速且无残留）---
+# E2E_RUN 是**用例全名**（不是正则）：防线 3 按名字精确比对。若允许 ERE，用户传 "." 会把
+# 「任一用例 PASS」悄悄变成「目标用例 PASS」（Task 6 重审 I2）。故逐字拒绝正则元字符与 /。
+# 不用 case 的括号类：bash 对括号类里的 ( ) 有配对歧义，实测 *[][.\*?+^$(){}|/]* 会把 "." 判成合法。
+E2E_BAD_CHARS='][.*?+^$(){}|/\\'
+for (( _i=0; _i<${#E2E_BAD_CHARS}; _i++ )); do
+  _c="${E2E_BAD_CHARS:_i:1}"
+  if [[ "$E2E_RUN" == *"$_c"* ]]; then
+    echo "FAIL: E2E_RUN 只接受用例全名（不得含正则元字符或 /）：'$E2E_RUN'" >&2
+    exit 2
+  fi
+done
+unset _i _c
+
 echo "== generating test keys =="
 ssh-keygen -t ed25519 -N "" -f "$TMPD/hostkey" -q
 ssh-keygen -t ed25519 -N "" -f "$TMPD/client_key" -q
@@ -228,7 +242,7 @@ chmod +x "$SHIM/ssh" "$SHIM/sftp"
 
 # 双后端循环：每次迭代显式导出 SSHORE_SFTP_TRANSPORT，并保留 SSHORE_E2E_*、PATH 垫片、
 # GOPATH/GOMODCACHE/GOCACHE。漏掉任一项都会「别名解析不到 → 测试全 skip → 假绿」。
-E2E_RUN="${E2E_RUN:-E2E$}"   # 默认只跑以 E2E 结尾的用例（E2E$ 是正则，不是笔误）
+#
 E2E_FAIL=0
 for backend in batch gosftp; do
   echo "--- backend=$backend run=$E2E_RUN ---"
@@ -236,7 +250,7 @@ for backend in batch gosftp; do
      GOPATH="$REAL_GOPATH" GOMODCACHE="$REAL_GOMODCACHE" GOCACHE="$REAL_GOCACHE" \
      SSHORE_E2E_HOST=sshore-e2e SSHORE_E2E_REMOTE="$REMOTE_DIR" \
      SSHORE_SFTP_TRANSPORT="$backend" \
-     HOME="$HOME" go test ./internal/sftp/ ./internal/sync/ -run "$E2E_RUN" -count=1 -v 2>&1)" || E2E_FAIL=1
+     HOME="$HOME" go test ./internal/sftp/ ./internal/sync/ -run "^${E2E_RUN}\$" -count=1 -v 2>&1)" || E2E_FAIL=1
   printf '%s\n' "$OUT"
   # 假绿防线 1：任何用例 SKIP 都说明环境没送达（缺 env / 垫片失效），必须失败。
   if printf '%s\n' "$OUT" | grep -q '^--- SKIP'; then
@@ -248,12 +262,14 @@ for backend in batch gosftp; do
     echo "FAIL: backend=$backend 没有任何用例真正通过（-run 未匹配 / 编译失败）" >&2
     E2E_FAIL=1
   fi
-  # 假绿防线 3（I2）：PASS 必须来自**目标用例**（名字匹配 E2E_RUN 的用例），而不是同一批
-  # -run 里任意一个无关用例。防线 2 只看「有无 PASS」：目标用例一旦改名/被 -run 漏掉，
-  # 无关用例仍能撑过防线 —— 双后端迭代会退化成「随便跑点什么都算数」。
+  # 假绿防线 3（I2，Task 6 重审）：PASS 必须来自**目标用例本身**，而不是同一批 -run 里
+  # 任意一个无关用例。防线 2 只看「有无 PASS」：目标用例一旦改名/被 -run 漏掉，无关用例
+  # 仍能撑过防线 —— 双后端迭代会退化成「随便跑点什么都算数」。
+  # 这里用 grep -qxF **逐字精确**比对（-x 整行、-F 字面量、无 -E）：Task 6 原版是 -qE
+  # 非锚定 ERE，重审已证明「目标用例改名 + 一个名字含同正则的空用例」能让 harness 假绿。
   PASSED_NAMES="$(printf '%s\n' "$OUT" | sed -n 's/^--- PASS: \([^ ]*\).*/\1/p')"
-  if [ -z "$PASSED_NAMES" ] || ! printf '%s\n' "$PASSED_NAMES" | grep -qE "$E2E_RUN"; then
-    echo "FAIL: backend=$backend 没有名字匹配 E2E_RUN='$E2E_RUN' 的用例真正 PASS（目标用例被改名 / 被 -run 漏掉）" >&2
+  if [ -z "$PASSED_NAMES" ] || ! printf '%s\n' "$PASSED_NAMES" | grep -qxF -- "$E2E_RUN"; then
+    echo "FAIL: backend=$backend 没有名字**精确等于** E2E_RUN='$E2E_RUN' 的用例真正 PASS（目标用例被改名 / 被 -run 漏掉）" >&2
     E2E_FAIL=1
   fi
 done
