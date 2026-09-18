@@ -72,7 +72,7 @@ function onAct(name, t) { emit(name, t) }
         <span class="status" :class="statusClass(t.status)">{{ t.status }}</span>
         <span v-if="rowNote(t)" class="note" :class="{ err: t.status === '失败' || t.status === '取消' }" :title="rowNote(t)">{{ rowNote(t) }}</span>
         <span v-if="acts(t).length" class="acts">
-          <button v-for="a in acts(t)" :key="a" class="act" :data-act="a" @click="onAct(a, t)">
+          <button v-for="a in acts(t)" :key="a" class="act" :data-act="a" :disabled="a === 'cancel' && !!t.pendingCancel" @click="onAct(a, t)">
             {{ a === 'cancel' ? '取消' : a === 'retry' ? '重试' : a === 'resume' ? '续传' : '清理' }}
           </button>
         </span>

@@ -84,6 +84,7 @@ async function dispatchTransfer(rec) {
   rec.cancelRequested = false
   rec.cancelFailed = false
   rec.pendingCancel = false
+  rec.cancelOk = false // 上一轮「真取消」的锁存（修复轮 3）必须清掉，重试是全新一次取消周期
   rec.outcome = null // 上一轮的操作结果原文（I3 顺序 B 的修正依据）必须清掉，否则重试会误判
   rec.pending = false
   rec.hasProgress = false
@@ -585,7 +586,10 @@ async function uploadPicked() {
   } catch (e) {
     err(e)
     if (t) {
-      t.status = '失败'
+      // 外层兜底：不得自己写终态（e-weak 结构性 pin），仍走共享终态落点。
+      // t 有 id、正常已经过 dispatchTransfer/applyOutcome；这里只覆盖 dispatchTransfer
+      // 之外（如 loadRemote）的异常。shared helper 会把终态/原因交给 finalizeOutcome 统一推导。
+      applyOutcome(t, { ok: false, error: e })
       t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
     }
   }

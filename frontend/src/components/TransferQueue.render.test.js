@@ -53,6 +53,14 @@ describe('TransferQueue.vue 生产渲染（SSR）', () => {
     expect(html).toContain(CANCELLING_TEXT)
   })
 
+  it('取消请求在飞（pendingCancel）时取消按钮禁用：防止并发第二发 Cancel 返回 false（修复轮 3）', async () => {
+    const html = await render([row({ cancelRequested: true, pendingCancel: true })])
+    expect(html).toContain(CANCELLING_TEXT)
+    const btn = (html.match(/<button[^>]*data-act="cancel"[^>]*>/) || [''])[0]
+    expect(btn).toContain('data-act="cancel"')
+    expect(btn).toContain('disabled')
+  })
+
   it('整批取消后汇总显示「取消 N」且进行中为 0（M1）', async () => {
     const html = await render([
       row({ id: 't1-0', status: '取消', reason: '已取消', elapsed: 1 }),

@@ -170,31 +170,51 @@ export function applyOutcome(rec, { ok, error } = {}) {
 }
 
 // applyCancelResult：把 SftpTransferCancel 的返回值落到队列项上的**唯一落点**（I3）。
+//  - **cancelOk 锁存（修复轮 3）**：只要任一 Cancel 返回过 true，就认定这是**真取消**并锁存
+//    `rec.cancelOk = true`；后到的 Cancel=false 一律当作假信息丢弃，绝不写 cancelFailed，
+//    也绝不把真取消翻成「失败」。这直接覆盖评审探测的两条顺序：
+//      · C(true) C(false) 然后 M(error) ⇒ 取消（false 被锁存挡下）；
+//      · M(error) C(true) C(false)     ⇒ 取消（终态本已推出取消，false 仍被锁存挡下）。
+//    它确实可达：GoBackend.Cancel 首次成功后从注册表删除条目，重复/并发第二发必返回 false。
 //  - 项仍在飞：
-//    · true：确实取消到 ⇒ 保持 pendingCancel，等那次传输自己返回终态；
-//    · false：已提交/未知/从未开始/batch 后端恒 false ⇒ 立刻转成 cancelFailed，
+//    · true：锁存 cancelOk、清掉任何先前 false 写的 cancelFailed，保持「取消中…」，终态等传输返回；
+//    · false（且尚未锁存）：已提交/未知/从未开始/batch 后端恒 false ⇒ 立刻转成 cancelFailed，
 //      UI 如实显示「未能取消」，绝不停在「取消中…」；这次传输后续若失败也不算取消。
 //  - 项已是终态（I3 修复轮 2，顺序 B）：若这次 false 发生在操作结果之后，当时终态是按
 //    「cancelRequested 且尚未 cancelFailed」推出来的「取消」——那是错的，必须用保存的操作结果
 //    + 新的 cancelFailed 重推一次，把「取消」修正成「失败」并配上原始失败原因。
 //    反过来：操作已「完成」（ok=true）时 Cancel 的返回值一律无关，绝不改正结果；
-//    Cancel 返回 true 时没有任何可修正的终态（只会保持/已是取消），也不动。
+//    true 是锁存事实：若终态曾按无关失败推出「失败」，用保存的操作结果重推回「取消」。
 // 返回 'cancelling' | 'failed' | 'done'。
 export function applyCancelResult(rec, ok) {
   if (!rec) return 'done'
+  if (ok) {
+    // 锁存真取消事实；先清掉可能由更早的 false 写下的 cancelFailed（false→true 顺序的纠偏）。
+    rec.cancelOk = true
+    rec.cancelFailed = false
+    if (rec.status !== RUNNING_TEXT) {
+      // 终态已落：若它是锁存前按「无关失败」推出的「失败」，用真取消事实纠回「取消」。
+      if (rec.outcome && !rec.outcome.ok) finalizeOutcome(rec)
+      rec.pendingCancel = false
+      return 'done'
+    }
+    rec.pendingCancel = true
+    return 'cancelling'
+  }
+  // ok === false
+  if (rec.cancelOk) {
+    // 已经真取消过：后到的 false 是重复/并发第二发的假信息，绝不改写终态。
+    rec.pendingCancel = false
+    return 'done'
+  }
   if (rec.status !== RUNNING_TEXT) {
     // 终态只有在「记录过操作结果、且结果不是成功、且这次明确没能取消」时才可能被修正。
-    if (!ok && rec.outcome && !rec.outcome.ok) {
+    if (rec.outcome && !rec.outcome.ok) {
       rec.cancelFailed = true
       return finalizeOutcome(rec) === FAILED_TEXT ? 'failed' : 'done'
     }
     rec.pendingCancel = false
     return 'done'
-  }
-  if (ok) {
-    rec.cancelFailed = false
-    rec.pendingCancel = true
-    return 'cancelling'
   }
   rec.cancelFailed = true
   rec.pendingCancel = false
