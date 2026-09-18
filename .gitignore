@@ -6,6 +6,9 @@ frontend/dist
 # 本地 Go 构建缓存(绕过被污染的只读 GOMODCACHE)
 .gocache/
 
+# e2e/winprobe 的本地构建产物（清单 §2 交叉构建）
+e2e/winprobe/winprobe.exe
+
 # tool/index dirs
 .codegraph
 .omo

@@ -142,13 +142,17 @@ authentication always stay with the system `ssh` (keys / ssh-agent / `~/.ssh/con
 jump hosts); only who drives the transfer and directory listing differs:
 
 - `gosftp` (**default**) — a long-lived `ssh -s <host> sftp` subsystem driven directly by
-  `pkg/sftp`; one session is reused, with real byte-level progress, whole-batch cancel,
-  retry and `.part` resume.
+  `pkg/sftp`; **a transfer takes an exclusive, freshly dialed session (concurrency 1)** while
+  **list/change operations reuse an idle session (at most 2 per host)**, with real byte-level
+  progress, whole-batch cancel, retry and `.part` resume.
 - `batch` (compat, kept for one release) — one `sftp -b` process per operation parsing
   `ls -la` text; no progress and no resume, i.e. the pre-upgrade behaviour.
 
 **Precedence: `SSHORE_SFTP_TRANSPORT` env > `[app] sftp_transport` config > built-in default
-(`gosftp`).** Invalid values are ignored and fall back to the default without blocking startup.
+(`gosftp`).** Invalid values never block startup: an invalid **env** value is ignored and the
+config value is consulted next; an invalid **config** value (including `""` / `auto`) is
+normalized on load (`Normalize` in `internal/config/store.go`) and finally falls back to the
+built-in default (`resolveTransport` in `internal/sftp/backend.go`).
 
 ```bash
 SSHORE_SFTP_TRANSPORT=batch sshore    # temporarily fall back to the legacy backend
@@ -169,8 +173,12 @@ SSHORE_SFTP_TRANSPORT=gosftp sshore   # explicitly select the new backend
   degrade to "N files done" when enumeration exceeds its budget.
 - **Cancel is whole-batch**: it cancels the in-flight item (closing the session makes the
   in-flight IO fail at once, so no half-written target name ever appears) and marks the rest of
-  the batch as "已取消，停止后续项". A `false` return means the item was already committed or
-  was not in flight — the UI then shows "取消过晚（已完成）" instead of pretending it cancelled.
+  the batch as "已取消，停止后续项". Cancel reports three honest states instead of pretending it
+  succeeded: (1) `Cancel` returns `true` and the item ends in failure ⇒ final state "取消";
+  (2) `Cancel` returns `false` (already committed / not in flight / never started) while the item
+  is still running ⇒ the running row shows "未能取消"; if that item later fails, the final state
+  is "失败" with the original error; (3) a cancel was requested but the item finally **committed**
+  ⇒ final state "完成" with the row note "取消过晚（已完成）", and the target file is kept.
 - **Retry** re-runs a failed item; **resume** reuses the `.part` kept from the failure and
   continues from the bytes already on disk. Resume first re-checks the source size/mtime
   fingerprint: if the source changed between attempts it re-transfers in full instead of
@@ -195,17 +203,34 @@ never synced out or downloaded as new files.
 ### Known limitations (not softened)
 
 - **Must run in an interactive desktop session**: in Session 0 (Windows service / non-interactive
-  session) the `ssh.exe` this app spawns hangs after the SFTP INIT (measured ≥15–25s with no
-  observed recovery). This is an environment limitation found on the real machine, so **do not
-  start it as a service**; even a scheduled task needs `/it` to land in the interactive session.
+  session) the `ssh.exe` this app spawns hangs after the SFTP INIT (observed ≥15–25s; **no**
+  experiment was run on whether a longer wait would recover). This is an observation on **this
+  machine's mixed install** (client 9.5p1 + the only server sshd 9.2p1; no second sshd was
+  available as a control): all four tested console-creation flags were ineffective, window
+  station / desktop was untested, and it is not a general claim about other Windows / OpenSSH
+  combinations. Conclusion: **do not start it as a service**; even a scheduled task needs `/it`
+  to land in the interactive session.
 - **An over-budget tree scan transfers only the enumerated prefix**: when a single tree scan
   exceeds **20000 files** or a **5s** budget it stops enumerating and transfers only what it
   enumerated; the call returns **success** and signals the unknown denominator with `-1`
   (`total`/`filesTotal` negative) — i.e. "transfer succeeded" does not mean "the whole tree
   was transferred".
 - **The `Atomic=false` path writes directly, with no `.part` and no journal**: the legacy
-  four-argument `Get/Put` face (including `internal/sync`'s use) writes the target directly and
-  leaves atomicity to sync; this path produces no resumable `.part`.
+  four-argument `Get/Put` and the legacy tree face `GetRecursive/PutRecursive` (including
+  `internal/sync`'s use) both write the target directly, produce no resumable `.part` and write
+  no backup-swap journal; atomicity is left to sync (its own `.part` + rename).
+- **The temp-file paths are trusted to be private**: the `.part` / `.sshore-sftppart-bak-` paths
+  (local or remote) assume only this app writes them; **other processes on the same machine are
+  not defended against** if they rewrite/truncate them mid-transfer. The only commit precondition
+  is the byte-count guard `done == total` (`decideCommit` in `internal/sftp/copy.go`), which
+  cannot see a **sparse hole** — e.g. seeking past EOF is zero-filled on the server while the
+  count still matches, so a holed file may be committed as the final file. Do not treat
+  multi-user-writable / shared directories as trusted transfer targets.
+- **Tree transfers dial before enumerating**: `GetTree` / `PutTree` take the single transfer
+  session (`AcquireTransfer`, i.e. one fresh handshake) *before* enumerating, so the whole scan
+  window holds the transfer concurrency slot. The scan phase issues no session IO (cancel uses
+  ctx), but **an instantly cancelled scan has already paid one handshake**, and no subsequent
+  transfer can start while it scans.
 - **Stale `.part` cleanup only scans the configured LocalRecent directories**: at startup only
   recently used local directories are cleaned (temp files older than 7 days); there is no
   whole-disk index, so orphaned `.part` files elsewhere are left for manual cleanup.
