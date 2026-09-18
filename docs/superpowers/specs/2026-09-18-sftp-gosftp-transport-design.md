@@ -78,6 +78,7 @@ cancelled transfer: bytes=95813632 err=... elapsed=305ms   ← 取消 305ms 内�
 | 可用面：`ReadDir` / `ReadDirContext` / `Stat` / `Lstat` / `Walk` / `Open` / `OpenFile` / `Create` / `Remove` / `RemoveDirectory` / `Mkdir` / `MkdirAll` / `Rename` / `PosixRename` / `RealPath` / `Getwd` / `StatVFS` / `HasExtension` | 同上；行号：ReadDir 371、ReadDirContext 379、Create 303-305、HasExtension 359、OpenFile 664、PosixRename 912 |
 | **只有 `ReadDirContext` 是 ctx 感知的**；`File.Read/Write` 无 ctx（其余走 `sendPacket(context.Background())`）→ **文件传输无逐请求取消**，取消只能关会话 | client.go:379 等 |
 | `Client.Rename` 发 plain `SSH_FXP_RENAME`：OpenSSH sftp-server 走 `link()`，**目标已存在必失败**（sftp-server.c:1278-1307）；而现状 `sftp rename` 实测**覆盖**已存在目标 → 迁移必须用 `PosixRename`（评审 B 本机 sshd 实测） | sftp-server.c；client.go:912 |
+| `PosixRename` 在 Win32-OpenSSH 上**真覆盖**已存在目标（Task 0：返回 nil + 读回新内容 + statSize 旁证，6 次观测；**无独立失败观测**，零次构造「扩展缺失」对照）→ 因此**必须保留 backup-swap 回退**（见全局约束） | probe.md §6/§7 |
 | `Client.Create` = `O_RDWR\|O_CREATE\|O_TRUNC`（部分服务器不支持读写同开）→ 上传用 `OpenFile(O_WRONLY\|O_CREATE\|O_TRUNC)` | client.go:303-305 |
 | `File.Write` 走 `f.writeAt(b, f.offset)`（client.go:1621-1631），`File.Seek` 就是改 `f.offset`（client.go:2098+），`writeChunkAt` 把 offset 放进 `SSH_FXP_WRITE` 包（client.go:1634）→ **上传续传用普通 `O_WRONLY` 句柄 + `Seek(partSize)` 即可**（协议级显式 offset、跨服务端），不必依赖 `O_APPEND` 的「服务端忽略 offset」行为 | 本机核对 client.go |
 | `File.WriteTo` = 并发读 + **顺序写**（Reduce 阶段串行 `w.Write`）→ 中断文件是前缀；上传默认不并发写 | client.go:1425-1586 |
@@ -392,7 +393,7 @@ type Backend interface {
 | 取消后同一次运行内 | 队列项提供「清理」动作立即删本地/远端 `.part`（对 7 天窗口的补偿，D14） |
 | 文件名接近长度上限 | 临时名/备份名退化为同目录短名 `.sshore-sftppart-<id8>-<rand>`（归属靠 `PartPath`），不会 `ENAMETOOLONG` |
 | 会话中途断线 / 探活超时 | 传输报错并标为可重试；该会话丢弃（close），下次重建 |
-| **Session 0（服务/非交互会话）** | Task 0 实测：Session 0 里由 Go 进程 spawn 的 ssh.exe 会在 SFTP INIT 之后卡死（recvVersion→recvPacket→io.ReadFull；裸 ssh 远端命令同样 10s 无返回），改到交互桌面会话（Session 1）后全部正常。**应用必须运行在交互会话**（真机验收一律在 Session 1 执行）。注：「WebView2 在 Session 0 不可用」是此前 v0.6.0 会话的既有观察，**不是本 task 的证据**；Task 0 只证明了 Go spawn 的 ssh 在 Session 0 无响应。**另（Task 0 修复轮 1 的附带发现，2/2 复现）**：Session 0 里把 stdout 与 stderr 合并重定向到同一文件时 ssh 也会无响应（rc=124），而只重定向 stdout、只重定向 stderr、或分开写两个文件都正常；根因未定位——这与「Go spawn ssh 无响应」是两个可分别复现的现象，同属 Session 0 环境限制 |
+| **Session 0（服务/非交互会话）** | Task 0 在本机这一次的混装组合（客户端 9.5p1 + 旧安装服务端 sshd 9.2p1；本机没有第二套 sshd 可作对照）下观测到：Session 0 里由 Go 进程 spawn 的 ssh.exe **≥15–25s 无响应**（recvVersion→recvPacket→io.ReadFull；从未观察到更长等待后的恢复，也没有做「更长等待是否自行恢复」的实验；window station/desktop 未试）。改到交互桌面会话（Session 1）后全部正常。**应用必须运行在交互会话**（真机验收一律在 Session 1 执行）。注：「WebView2 在 Session 0 不可用」是此前 v0.6.0 会话的既有观察，**不是本 task 的证据**。**另（修复轮 1 附带发现，2/2 复现）**：Session 0 里把 stdout 与 stderr 合并重定向到同一文件时 ssh 同样无响应（rc=124），只重定向一路或分开写文件都正常；根因未定位，且**与上一条是否同因未证明**（修复轮的 T1–T4 子进程流接线未记录，存在混杂变量） |
 | 会话容量（自审后已无「池满失败」） | 传输并发上限 1（超出 FIFO 排队）；idle 池满（2）时 `List`/`Connected` 仍**复用或新建**、永不排队也不会失败（D2） |
 | 远端磁盘满 / 权限拒绝 | 远端原文上屏；提示额外空间需求（临时文件与目标并存） |
 | 子系统缺失（subsystem request failed） | 明确文案 + 检查远端 sshd_config 的 `Subsystem sftp`；阶段 1 同时验 `-s` 前置/后置写法 |
