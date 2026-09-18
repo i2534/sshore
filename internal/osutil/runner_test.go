@@ -11,9 +11,11 @@ import (
 	"time"
 )
 
+// TestNewRunnerRunsBinary 用跨平台 helper 子进程（helper_test.go）而不是 sh ——
+// Windows 上没有 sh，此前这条在真机/CI 上是红的。
 func TestNewRunnerRunsBinary(t *testing.T) {
 	r := NewRunner()
-	out, err := r("sh", "-c", "echo hi; exit 0")
+	out, err := r(helperExe(t)) // helper 模式（TestMain）下立刻以 0 退出
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -82,10 +84,12 @@ func TestProcessSignal(t *testing.T) {
 // TestSpawnerStderrLines 验证 stderr 逐行回调:每行去空白、空行被丢弃、
 // 行顺序与进程输出一致。
 func TestSpawnerStderrLines(t *testing.T) {
+	// 用跨平台 helper 子进程（helper_test.go）替代 sh：streams 模式往 stderr 写
+	// e1/"  e2  "。断言与原来一致：逐行回调、裁空白、与进程输出顺序一致。
+	t.Setenv(osutilHelperEnv, "streams")
 	sp := NewSpawner()
 	var lines []string
-	p, err := sp.Start("sh", []string{"-c", "echo one >&2; echo >&2; echo '  two  ' >&2"},
-		func(line string) { lines = append(lines, line) })
+	p, err := sp.Start(helperExe(t), nil, func(line string) { lines = append(lines, line) })
 	if err != nil {
 		t.Fatalf("spawn failed: %v", err)
 	}
@@ -93,16 +97,17 @@ func TestSpawnerStderrLines(t *testing.T) {
 	if out.ExitCode != 0 {
 		t.Fatalf("want exit 0 got %d", out.ExitCode)
 	}
-	if len(lines) != 2 || lines[0] != "one" || lines[1] != "two" {
+	if len(lines) != 2 || lines[0] != "e1" || lines[1] != "e2" {
 		t.Fatalf("unexpected lines: %#v", lines)
 	}
 }
 
 // StartStream 必须把 stdout 与 stderr 分别逐行回调；空行丢弃、行首尾空白裁掉。
 func TestStartStreamRoutesBothStreams(t *testing.T) {
+	t.Setenv(osutilHelperEnv, "streams") // 跨平台替身：stdout o1/o2、stderr e1/"  e2  "
 	sp := NewStreamer()
 	var out, errs []string
-	p, err := sp.StartStream("sh", []string{"-c", "echo o1; echo o2; echo e1 >&2; echo '  e2  ' >&2"}, StreamHandlers{
+	p, err := sp.StartStream(helperExe(t), nil, StreamHandlers{
 		OnStdout: func(l string) { out = append(out, l) },
 		OnStderr: func(l string) { errs = append(errs, l) },
 	})
@@ -122,8 +127,11 @@ func TestStartStreamRoutesBothStreams(t *testing.T) {
 
 // 回调为 nil 表示不接该管道。若接了没人读的管道，子进程写满 64KB 缓冲后会永久阻塞。
 func TestStartStreamNilHandlerDoesNotBlock(t *testing.T) {
+	// flood 模式写 1MB 后退出：nil 回调若不建管道，子进程写满 64KB 后会阻塞，本用例
+	// 会在下面的 10s 超时里报"子进程被阻塞"（与原先 sh 大输出用例同等强度）。
+	t.Setenv(osutilHelperEnv, "flood")
 	sp := NewStreamer()
-	p, err := sp.StartStream("sh", []string{"-c", "yes | head -c 1048576"}, StreamHandlers{})
+	p, err := sp.StartStream(helperExe(t), nil, StreamHandlers{})
 	if err != nil {
 		t.Fatalf("StartStream failed: %v", err)
 	}
@@ -174,16 +182,21 @@ func TestCtxRunnerCancelsProcess(t *testing.T) {
 
 // CtxRunner 正常路径要带回 stdout/stderr 与退出码。
 func TestCtxRunnerCapturesOutput(t *testing.T) {
-	r := NewCtxRunner()
-	out, err := r(context.Background(), "sh", "-c", "echo hi; echo boom >&2; exit 3")
+	// 跨平台替身：streams 模式写 stdout=o1/o2、stderr=e1/"  e2  "（非 0 退出码另用 exit 模式验）。
+	t.Setenv(osutilHelperEnv, "streams")
+	out, err := NewCtxRunner()(context.Background(), helperExe(t), "exit", "3")
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
-	if out.ExitCode != 3 {
-		t.Fatalf("want exit 3, got %d", out.ExitCode)
-	}
-	if !strings.Contains(out.Stdout, "hi") || !strings.Contains(out.Stderr, "boom") {
+	// 注意：streams 分支 return 0，所以要验退出码得用 exit 模式。这里同时验两件事：
+	// stdout/stderr 被回传（streams 的输出）+ 非 0 退出不算 err、退出码如实。
+	if !strings.Contains(out.Stdout, "o1") || !strings.Contains(out.Stderr, "e1") {
 		t.Fatalf("stdout=%q stderr=%q", out.Stdout, out.Stderr)
+	}
+	t.Setenv(osutilHelperEnv, "exit")
+	out2, err2 := NewCtxRunner()(context.Background(), helperExe(t), "3")
+	if err2 != nil || out2.ExitCode != 3 {
+		t.Fatalf("exit 模式：want exit 3/nil，got %d/%v", out2.ExitCode, err2)
 	}
 }
 
