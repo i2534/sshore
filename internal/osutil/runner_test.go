@@ -3,6 +3,8 @@ package osutil
 import (
 	"context"
 	"errors"
+	"io"
+	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
@@ -182,5 +184,53 @@ func TestCtxRunnerCapturesOutput(t *testing.T) {
 	}
 	if !strings.Contains(out.Stdout, "hi") || !strings.Contains(out.Stderr, "boom") {
 		t.Fatalf("stdout=%q stderr=%q", out.Stdout, out.Stderr)
+	}
+}
+
+func TestStartPipesRoundTrip(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("缺少 sh")
+	}
+	p, err := StartPipes("sh", "-c", "cat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	if _, err := p.Stdin.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	_ = p.Stdin.Close()
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(p.Stdout, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "hello" {
+		t.Fatalf("want hello, got %q", buf)
+	}
+}
+
+// 关键：stderr 写了 200KB 而调用方从不读它，进程仍必须正常结束（否则 64KB 管道写满会让 ssh 假死）。
+func TestStartPipesDoesNotBlockWhenStderrUnread(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("缺少 sh")
+	}
+	p, err := StartPipes("sh", "-c", "head -c 200000 /dev/zero >&2; echo done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(p.Stdout, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "done" {
+		t.Fatalf("want done, got %q", buf)
+	}
+	out := p.Wait()
+	if out.ExitCode != 0 {
+		t.Fatalf("exit=%d stderr=%q", out.ExitCode, p.StderrText())
+	}
+	if len(p.StderrText()) == 0 {
+		t.Fatal("stderr 应被后台 drain 到有界缓冲，供错误上报")
 	}
 }
