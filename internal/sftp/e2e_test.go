@@ -48,7 +48,7 @@ func observedBackendName(c *Ctrl) string {
 // assertTransportMatchesEnv 钉住「选择器真的读了环境变量」这半条后端身份断言。
 // harness 的两轮迭代分别导出 SSHORE_SFTP_TRANSPORT=batch|gosftp：
 //   - 把 resolveTransport 改成忽略 env（恒返回 batch）⇒ 这里 got≠want，立即失败；
-//   - 把 harness 里的变量名拼错/漏导出（env 为空 ⇒ 回落内置默认 batch）⇒ 这里也失败，
+//   - 把 harness 里的变量名拼错/漏导出（env 为空 ⇒ 回落内置默认 gosftp）⇒ 这里也失败，
 //     而不是让两轮迭代都悄悄跑 batch 还打印 batch/gosftp 的假矩阵。
 func assertTransportMatchesEnv(t *testing.T) {
 	t.Helper()
