@@ -122,8 +122,8 @@ cancelled transfer: bytes=95813632 err=... elapsed=305ms   ← 取消 305ms 内�
 
 ### D1 连接归 OpenSSH，传输归库
 
-- **决定**：`ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 [-o User=…] host -s sftp` 起子系统（与现状 `ctrl.go:69-71` 的选项对齐），`pkg/sftp.NewClientPipe` 建客户端。**不引入 `x/crypto/ssh` 直连**。
-- **阶段 1 必验**：`-s` 前置/后置两种写法（`ssh -s … host sftp` 与 `ssh … host -s sftp`）；`-s` 在 Win32-OpenSSH 上的 getopt 置换行为未验证。
+- **决定**：`ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 [-o User=…] -s host sftp` 起子系统（`-s` **前置**：不依赖 getopt 置换；Task 0 实测 Win32-OpenSSH 9.5p1 前后置都可用，前置是两平台都无歧义的写法）（与现状 `ctrl.go:69-71` 的选项对齐），`pkg/sftp.NewClientPipe` 建客户端。**不引入 `x/crypto/ssh` 直连**。
+- **阶段 1 已实测（Task 0，Win32-OpenSSH 9.5p1）**：`-s` 前置与后置**都可用**（`[pre]/[post] client ok`），故采用前置写法；同一程序在 Linux OpenSSH 8.9p1 上后置亦可（早期 spike）。
 - **理由**：鉴权/配置/跳板机语义零漂移；实测建会话 216ms 后长期复用。
 - **代价**：仍依赖系统 `ssh`（`README.md:22` 由 ssh+sftp 收窄为只需 ssh）；远端必须启用 sftp 子系统（被禁用/被替换实现的场景要在错误文案里说清）。
 
@@ -392,6 +392,7 @@ type Backend interface {
 | 取消后同一次运行内 | 队列项提供「清理」动作立即删本地/远端 `.part`（对 7 天窗口的补偿，D14） |
 | 文件名接近长度上限 | 临时名/备份名退化为同目录短名 `.sshore-sftppart-<id8>-<rand>`（归属靠 `PartPath`），不会 `ENAMETOOLONG` |
 | 会话中途断线 / 探活超时 | 传输报错并标为可重试；该会话丢弃（close），下次重建 |
+| **Session 0（服务/非交互会话）** | Task 0 实测：Session 0 里由 Go 进程 spawn 的 ssh.exe 会在 SFTP INIT 之后卡死（recvVersion→recvPacket→io.ReadFull；裸 ssh 远端命令同样 10s 无返回），改到交互桌面会话（Session 1）后全部正常。**应用必须运行在交互会话**（GUI 本来也如此：WebView2 在 Session 0 同样不可用）；真机验收一律在 Session 1 执行 |
 | 会话容量（自审后已无「池满失败」） | 传输并发上限 1（超出 FIFO 排队）；idle 池满（2）时 `List`/`Connected` 仍**复用或新建**、永不排队也不会失败（D2） |
 | 远端磁盘满 / 权限拒绝 | 远端原文上屏；提示额外空间需求（临时文件与目标并存） |
 | 子系统缺失（subsystem request failed） | 明确文案 + 检查远端 sshd_config 的 `Subsystem sftp`；阶段 1 同时验 `-s` 前置/后置写法 |
