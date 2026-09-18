@@ -242,6 +242,13 @@ func (g *GoBackend) regSize() int {
 	return len(g.reg)
 }
 
+// inflightSize 读取同目标去重表条目数（测试观测点）。
+func (g *GoBackend) inflightSize() int {
+	g.inflightMu.Lock()
+	defer g.inflightMu.Unlock()
+	return len(g.inflight)
+}
+
 // TestGoBackendCancelConcurrentExactlyOneWinsAndRaceFree -race 下并发取消同一在飞 id：
 // 必须**恰好一个** true（其余看到条目已被移除，返回 false），绝不双重关会话；
 // 并发取消未知 id 则一律 false。

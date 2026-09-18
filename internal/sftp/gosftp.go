@@ -56,6 +56,10 @@ var removeRemote = func(c *sftp.Client, path string) error {
 // beforeOpenLocalSource 是上传方向 I3 的确定性注入点：在 Put 已完成 os.Stat 与续传判定、
 // 但尚未 os.Open 本地源时被调用。生产实现是 no-op；单测用它模拟「判定与打开之间本地源被
 // 同尺寸改写」，验证 Put 会在已打开句柄上复核指纹并拒绝续传。
+//
+// Task 12 修复轮 2：putFileAtomic（目录上传的逐文件原语）在 os.Open 本地源之前也调用它，
+// 单测据此在「枚举已完成、共享 helper 尚未打开源」的窗口里把文件改大，构造 M2/NEW-2 的
+// 真实分母/分子分叉（不是只靠 treeProgress 的夹取单测）。
 var beforeOpenLocalSource = func(local string) {}
 
 // regEntry 是一次在飞传输在取消表里的条目。committed 在**提交成功之后、末帧进度上报
@@ -371,23 +375,25 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 	// 会共用同一个 .part 路径互相覆盖，最后各自 rename 出别人的内容 —— 静默损坏。
 	req.Resume, req.ResumeOffset, req.PartPath = false, 0, ""
 
+	// NEW-1：聚合器与失败收口必须在扫描**之前**就位 —— 扫描相（ReadDirContext 失败或被
+	// Cancel 中止）同样是一条「传输已终止」的路径，必须发出末帧并回填诚实计数，否则调用方
+	// 无从告诉用户到底发生了什么。扫描前分母未知，先按 -1/-1 占位（与降级帧同形状）。
+	tp := newTreeProgress(req.ID, req.Host, DirDownload, req.Remote, -1, -1, report)
+	// I4：失败/取消路径也补一发末帧并回填「已提交/剩余」计数 —— 否则调用方无从告诉用户
+	// 到底传完了多少（原先 markCommitted/tp.frame 只在成功路径存在）。
+	fail := func(te *TransferError) error {
+		te.CommittedFiles, te.CommittedBytes, te.RemainingFiles = tp.fail(te.PartPath)
+		te.TreeCounts = true
+		return te
+	}
+
 	files, subdirs, degraded, serr := scanTree(ctx, s, req.Remote, time.Now())
 	if serr != nil {
 		var remoteMsg string
 		if isRemoteError(serr) {
 			remoteMsg = s.Proc.StderrText()
 		}
-		return &TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: serr, RemoteMsg: remoteMsg}
-	}
-	// 目录本身（含空目录）按 D11 建出，与 sftp get -r 一致 —— 空目录也必须在本地出现。
-	if merr := os.MkdirAll(req.Local, 0o755); merr != nil {
-		return &TransferError{Op: op, Path: req.Local, Err: wrapLocalIO(merr)}
-	}
-	for _, d := range subdirs {
-		p := filepath.Join(req.Local, filepath.FromSlash(d))
-		if merr := os.MkdirAll(p, 0o755); merr != nil {
-			return &TransferError{Op: op, Path: p, Err: wrapLocalIO(merr)}
-		}
+		return fail(&TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: serr, RemoteMsg: remoteMsg})
 	}
 	total, filesTotal := int64(0), len(files)
 	if degraded {
@@ -398,14 +404,19 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 			total += f.size
 		}
 	}
-	tp := newTreeProgress(req.ID, req.Host, DirDownload, req.Remote, total, filesTotal, report)
-	tp.begin()
-	// I4：失败/取消路径也补一发末帧并回填「已提交/剩余」计数 —— 否则调用方无从告诉用户
-	// 到底传完了多少（原先 markCommitted/tp.frame 只在成功路径存在）。
-	fail := func(te *TransferError) error {
-		te.CommittedFiles, te.CommittedBytes, te.RemainingFiles = tp.fail(te.PartPath)
-		return te
+	// 扫描成功：把真实分母写回聚合器；此后的建目录失败也就能报出诚实的「剩余文件数」。
+	tp.total, tp.files = total, filesTotal
+	// 目录本身（含空目录）按 D11 建出，与 sftp get -r 一致 —— 空目录也必须在本地出现。
+	if merr := os.MkdirAll(req.Local, 0o755); merr != nil {
+		return fail(&TransferError{Op: op, Path: req.Local, Err: wrapLocalIO(merr)})
 	}
+	for _, d := range subdirs {
+		p := filepath.Join(req.Local, filepath.FromSlash(d))
+		if merr := os.MkdirAll(p, 0o755); merr != nil {
+			return fail(&TransferError{Op: op, Path: p, Err: wrapLocalIO(merr)})
+		}
+	}
+	tp.begin()
 
 	for _, f := range files {
 		localPath := filepath.Join(req.Local, filepath.FromSlash(f.rel))
@@ -430,7 +441,8 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 				return fail(&TransferError{Op: op, Path: localPath, PartPath: part, Err: rerr})
 			}
 			g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, part))
-			tp.finishFile(ftotal)
+			// M2/NEW-2：expected 用枚举大小、actual 用已打开句柄的 Stat —— finishFile 据此对账分母。
+			tp.finishFile(f.size, ftotal)
 			continue
 		}
 		// legacy 面（Atomic=false）：直写目标，与 Get 的 legacy 分支同一语义与校验。
@@ -445,7 +457,7 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 		if decideCommit(n, ftotal) != commitOK {
 			return fail(&TransferError{Op: op, Path: freq.Remote, Err: shortReadError(n, ftotal, "")})
 		}
-		tp.finishFile(ftotal)
+		tp.finishFile(f.size, ftotal)
 	}
 	// 与 Get/Put 同一时序：先标 committed（此后 Cancel 只答 false），再发末帧。
 	g.markCommitted(entry)
@@ -850,34 +862,10 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 		_, hasPosix = s.Conn.HasExtension(posixRenameExt)
 	}
 
-	// D16：枚举阈值在本地遍历**过程中**评估（不是走完整棵树再判）—— 命中即停止枚举
-	// （停止发现后续条目，与下载方向「停止发起下一批」同义），返回已枚举到的子集并降级。
-	scanStart := time.Now()
-	files, subdirs, total, degraded, werr := scanLocalTree(ctx, req.Local, scanStart)
-	if werr != nil {
-		return &TransferError{Op: op, Path: req.Local, Err: werr}
-	}
-	filesTotal := len(files)
-	if degraded {
-		// 与下载方向同一条 D16 规则：枚举超阈值 ⇒ 分母未知（-1），Done/FilesDone 继续累加。
-		total, filesTotal = -1, -1
-	}
-	// 合并语义：目标根 = <remoteDir>/<base(local)>。用 path（POSIX）拼接，绝不碰 filepath
-	// 的远端语义（Windows 客户端会把 / 变成反斜杠）。
-	rootRemote := path.Join(req.Remote, filepath.Base(filepath.Clean(req.Local)))
-	// 远端目录（含空目录）按 D11 一次性建出：WalkDir 已给出完整子目录清单，绝不逐文件
-	// 重复 MkdirAll（那是每文件一次多余往返）。
-	if derr := s.Conn.MkdirAll(rootRemote); derr != nil {
-		return &TransferError{Op: op, Host: req.Host, Path: rootRemote, Err: derr, RemoteMsg: s.Proc.StderrText()}
-	}
-	for _, d := range subdirs {
-		p := path.Join(rootRemote, d)
-		if derr := s.Conn.MkdirAll(p); derr != nil {
-			return &TransferError{Op: op, Host: req.Host, Path: p, Err: derr, RemoteMsg: s.Proc.StderrText()}
-		}
-	}
-	tp := newTreeProgress(req.ID, req.Host, DirUpload, req.Remote, total, filesTotal, report)
-	tp.begin()
+	// NEW-1：聚合器与失败收口必须在扫描**之前**就位 —— 本地 WalkDir 失败或被 Cancel 中止
+	// 同样是一条「传输已终止」的路径，必须发出末帧并回填诚实计数，否则调用方无从告诉用户
+	// 到底发生了什么。扫描前分母未知，先按 -1/-1 占位（与降级帧同形状）。
+	tp := newTreeProgress(req.ID, req.Host, DirUpload, req.Remote, -1, -1, report)
 	// I4：失败/取消路径也补一发末帧并回填「已提交/剩余」计数（逐文件原语返回 *TransferError）。
 	fail := func(err error) error {
 		var te *TransferError
@@ -888,15 +876,47 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 		cf, cb, rem := tp.fail(part)
 		if te != nil {
 			te.CommittedFiles, te.CommittedBytes, te.RemainingFiles = cf, cb, rem
+			te.TreeCounts = true
 		}
 		return err
 	}
 
+	// D16：枚举阈值在本地遍历**过程中**评估（不是走完整棵树再判）—— 命中即停止枚举
+	// （停止发现后续条目，与下载方向「停止发起下一批」同义），返回已枚举到的子集并降级。
+	scanStart := time.Now()
+	files, subdirs, total, degraded, werr := scanLocalTree(ctx, req.Local, scanStart)
+	if werr != nil {
+		return fail(&TransferError{Op: op, Path: req.Local, Err: werr})
+	}
+	filesTotal := len(files)
+	if degraded {
+		// 与下载方向同一条 D16 规则：枚举超阈值 ⇒ 分母未知（-1），Done/FilesDone 继续累加。
+		total, filesTotal = -1, -1
+	}
+	// 扫描成功：把真实分母写回聚合器；此后的建远端目录失败也就能报出诚实的「剩余文件数」。
+	tp.total, tp.files = total, filesTotal
+	// 合并语义：目标根 = <remoteDir>/<base(local)>。用 path（POSIX）拼接，绝不碰 filepath
+	// 的远端语义（Windows 客户端会把 / 变成反斜杠）。
+	rootRemote := path.Join(req.Remote, filepath.Base(filepath.Clean(req.Local)))
+	// 远端目录（含空目录）按 D11 一次性建出：WalkDir 已给出完整子目录清单，绝不逐文件
+	// 重复 MkdirAll（那是每文件一次多余往返）。
+	if derr := s.Conn.MkdirAll(rootRemote); derr != nil {
+		return fail(&TransferError{Op: op, Host: req.Host, Path: rootRemote, Err: derr, RemoteMsg: s.Proc.StderrText()})
+	}
+	for _, d := range subdirs {
+		p := path.Join(rootRemote, d)
+		if derr := s.Conn.MkdirAll(p); derr != nil {
+			return fail(&TransferError{Op: op, Host: req.Host, Path: p, Err: derr, RemoteMsg: s.Proc.StderrText()})
+		}
+	}
+	tp.begin()
+
 	for _, f := range files {
 		localPath := filepath.Join(req.Local, filepath.FromSlash(f.rel))
 		remotePath := path.Join(rootRemote, f.rel)
-		// 累计值必须用**实际提交的字节数**（原子路径取已打开句柄的 Stat），不能拿枚举时的
-		// f.size —— 文件在枚举与打开之间被改写时，progress 的分母/分子会自相矛盾。
+		// 分子用**实际提交的字节数**（原子路径取已打开句柄的 Stat）；同时把枚举大小 f.size
+		// 作为 expected 交给 finishFile，让它把分母对账到同一来源（M2/NEW-2）—— 文件在枚举
+		// 与打开之间被改写时分母会跟随实际值，不再自相矛盾、也不再静默少报。
 		committed := f.size
 		if req.Atomic {
 			n, perr := g.putFileAtomic(s, req, localPath, remotePath, hasPosix, tp.file)
@@ -911,7 +931,7 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 				return fail(perr)
 			}
 		}
-		tp.finishFile(committed)
+		tp.finishFile(f.size, committed)
 	}
 	g.markCommitted(entry)
 	tp.frame(true)
@@ -927,6 +947,9 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 // Task 12 修复轮 1：接受取消上下文与枚举起点时间。WalkDir 不是 ctx 感知 API，靠每一步
 // 的 ctx 检查（scanCheckpoint 注入点 + ctx.Err()）实现扫描相取消；D16 阈值在遍历中评估，
 // 命中即 degraded=true 并停止枚举（SkipAll 丢弃剩余条目）。
+//
+// Task 12 修复轮 2（NEW-3）：阈值判定对**每一个条目**（含目录、含根目录）都执行，而不是
+// 只在追加文件之后 —— 目录-only 树不能因为「没有文件可追加」而绕过 5s 预算。
 func scanLocalTree(ctx context.Context, root string, start time.Time) (files []treeFile, subdirs []string, total int64, degraded bool, err error) {
 	// 源目录本身若是软链，WalkDir 不会跟随根（会把它当非目录项、一个文件都枚举不到）：
 	// 先解析成真实目录。用户从系统拖入的目录经常是软链。
@@ -944,15 +967,22 @@ func scanLocalTree(ctx context.Context, root string, start time.Time) (files []t
 			return cerr
 		}
 		if d.IsDir() {
-			if p == root {
-				return nil
+			if p != root {
+				rel, rerr := filepath.Rel(root, p)
+				if rerr != nil {
+					return rerr
+				}
+				if !IsInternalTemp(filepath.Base(rel)) {
+					subdirs = append(subdirs, filepath.ToSlash(rel))
+				}
 			}
-			rel, rerr := filepath.Rel(root, p)
-			if rerr != nil {
-				return rerr
-			}
-			if !IsInternalTemp(filepath.Base(rel)) {
-				subdirs = append(subdirs, filepath.ToSlash(rel))
+			// NEW-3（Task 12 修复轮 2）：目录也必须参与 D16 预算判定 —— 否则「目录-only /
+			// 一个文件都没有」的走查永远碰不到原先只在文件分支里的阈值，可以无限期持有并发
+			// 令牌与传输会话（下载方向的 scanTree 是按目录批检查的，这里补齐对称性）。
+			// 根目录也检查：预算耗尽时连枚举都不再展开。
+			if scanLimit(len(files), time.Since(start)) {
+				degraded = true
+				return fs.SkipAll
 			}
 			return nil
 		}
@@ -997,18 +1027,28 @@ func scanLocalTree(ctx context.Context, root string, start time.Time) (files []t
 // putFileAtomic 把一个本地文件原子上传到远端目标：写远端同目录 .part → done==total →
 // commitRemote（posix-rename 或 backup-swap + journal）。
 //
-// 目录上传专用：调用方已持有一个会话、并保证远端父目录已建立；**不走单文件续传**
-// （目录项只重试，P3.1），每一项都新建 .part。提交仍复用唯一的 commitRemote —— 目录传输
-// 不新增第二条提交路径。total 取**已打开句柄**的 Stat，避免「枚举 size 与打开之间被改写」
-// 的窗口；done==total 仍是唯一提交前置（copyFileToLocal 的同款守卫）。
+// 目录上传专用：调用方已持有一个可用的 .part 锚点时会**复用它**（见 part 的取值），但
+// PutTree 在进入本函数前已清空 req.PartPath/Resume（目录项只重试，P3.1），因此生产路径
+// 每一项都各自新建 .part。这里的取值与下载方向 copyFileToLocal 的 part 处理**对称**，
+// 使 PutTree 的清空成为可被观测、可被变异杀死的真实守卫（I2 修复轮 2），而不是死代码。
+// 提交仍复用唯一的 commitRemote —— 目录传输不新增第二条提交路径。total 取**已打开句柄**
+// 的 Stat，避免「枚举 size 与打开之间被改写」的窗口；done==total 仍是唯一提交前置。
 func (g *GoBackend) putFileAtomic(s *Session, req TransferRequest, local, remote string, hasPosix bool, report func(Progress)) (int64, error) {
 	const op = "sftp put -r"
-	part := PartNameRemote(remote, req.ID) // 远端 POSIX 路径：必须用 Remote 家族（Task 2 评审 Important-2）
+	// 远端 POSIX 路径：必须用 Remote 家族（Task 2 评审 Important-2）。与 copyFileToLocal
+	// 同一契约：调用方给了锚点就用它（PutTree 必须已清空，否则整棵树会共用一个 .part）。
+	part := req.PartPath
+	if part == "" {
+		part = PartNameRemote(remote, req.ID)
+	}
 	wf, err := s.Conn.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		// .part 根本没建出来 ⇒ PartPath 必须为空（绝不发布假锚点）。
 		return 0, &TransferError{Op: op, Host: req.Host, Path: part, Err: err, RemoteMsg: s.Proc.StderrText()}
 	}
+	// I3/NEW-2 注入点：单测在「枚举完成、本地源尚未打开」的窗口里把文件改大，构造分母/分子
+	// 的真实分叉（与 Put 的续传复核共用同一注入点，语义一致）。
+	beforeOpenLocalSource(local)
 	lf, err := os.Open(local)
 	if err != nil {
 		_ = wf.Close()
