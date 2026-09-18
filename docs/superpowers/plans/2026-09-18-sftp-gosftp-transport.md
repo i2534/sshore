@@ -1731,7 +1731,7 @@ func (c *Ctrl) backend() Backend {
 先把 `e2e/test_local.sh` 末尾那条单次 `go test` 换成**保留全部环境的双后端循环**（自审 S4/S5：现有脚本不 export 也不打印 `SSHORE_E2E_*`，且 `PATH=$SHIM` 与 `GOPATH/GOMODCACHE/GOCACHE` 都是必需的，漏了三样就会「垫片失效 → 别名解析不到 → 测试全 skip → 假绿」）：
 
 ```bash
-E2E_RUN="${E2E_RUN:-E2E$}"   # 允许按用例名过滤；默认跑所有以 E2E 结尾的用例
+E2E_RUN="${E2E_RUN:-TestGoBackendE2E,TestSyncE2E}"   # 逗号分隔的**用例全名**列表（不是正则）；未设置时用完整期望名单，使 make e2e 无 env 也能跑
 for backend in batch gosftp; do
   echo "--- backend=$backend run=$E2E_RUN ---"
   PATH="$SHIM:$PATH" \
@@ -2478,7 +2478,7 @@ func (g *GoBackend) Cancel(id string) bool {
 
 - [ ] **Step 4: 跑 e2e**
 
-Run: `E2E_RUN='TestGoBackendE2E|TestCancelWholeBatchE2E' bash e2e/test_local.sh`
+Run: `E2E_RUN='TestGoBackendE2E,TestCancelWholeBatchE2E' bash e2e/test_local.sh`
 Expected: PASS（四条断言全绿）
 
 - [ ] **Step 5: 提交**
