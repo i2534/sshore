@@ -488,7 +488,7 @@ func TestGoBackendCancelledSessionNeverHandedOut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry := g.register("t-race", s)
+	entry := g.register("t-race", s, nil)
 	if entry == nil {
 		t.Fatal("非空 id 必须登记进取消表")
 	}

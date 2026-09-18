@@ -64,6 +64,10 @@ var beforeOpenLocalSource = func(local string) {}
 type regEntry struct {
 	sess      *Session
 	committed bool
+	// cancel 取消本次传输的扫描相上下文（Task 12 修复轮 1 / I1）。目录传输在扫描相
+	// （远端枚举 / 本地 WalkDir）不经过会话 IO，关会话拦不住它，必须有一个能被 Cancel
+	// 主动触发的 ctx；单文件传输传 nil。
+	cancel context.CancelFunc
 }
 
 // GoBackend 是基于 pkg/sftp 的新传输后端（spec D1）。
@@ -231,7 +235,8 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	reuse := false
 	defer func() { g.pool.Release(s, reuse) }()
 	// Task 10：会话一取到就登记进取消表（defer 的注销先于 Release 执行 —— LIFO）。
-	entry := g.register(req.ID, s)
+	// 单文件传输无扫描相，不需要可取消 ctx（取消靠关会话让在飞 IO 立刻失败）。
+	entry := g.register(req.ID, s, nil)
 	defer g.unregister(req.ID, entry)
 
 	if !req.Atomic {
@@ -354,14 +359,19 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 	}
 	reuse := false
 	defer func() { g.pool.Release(s, reuse) }()
-	entry := g.register(req.ID, s)
+	// I1（Task 12 修复轮 1）：扫描相取消上下文。PUT 方向在扫描相不经过会话 IO，
+	// 只关会话拦不住本地 WalkDir；GET 方向的 scanTree 两处 ctx.Err() 检查原先因为传
+	// context.Background() 而是死代码。Cancel(id) 触发的 cancel 让两处检查都真正生效。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entry := g.register(req.ID, s, cancel)
 	defer g.unregister(req.ID, entry)
 
 	// 目录项不接受续传（P3.1）：清空单文件锚点参数。若照搬 req.PartPath，整棵树的所有文件
 	// 会共用同一个 .part 路径互相覆盖，最后各自 rename 出别人的内容 —— 静默损坏。
 	req.Resume, req.ResumeOffset, req.PartPath = false, 0, ""
 
-	files, subdirs, degraded, serr := scanTree(context.Background(), s, req.Remote, time.Now())
+	files, subdirs, degraded, serr := scanTree(ctx, s, req.Remote, time.Now())
 	if serr != nil {
 		var remoteMsg string
 		if isRemoteError(serr) {
@@ -390,11 +400,17 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 	}
 	tp := newTreeProgress(req.ID, req.Host, DirDownload, req.Remote, total, filesTotal, report)
 	tp.begin()
+	// I4：失败/取消路径也补一发末帧并回填「已提交/剩余」计数 —— 否则调用方无从告诉用户
+	// 到底传完了多少（原先 markCommitted/tp.frame 只在成功路径存在）。
+	fail := func(te *TransferError) error {
+		te.CommittedFiles, te.CommittedBytes, te.RemainingFiles = tp.fail(te.PartPath)
+		return te
+	}
 
 	for _, f := range files {
 		localPath := filepath.Join(req.Local, filepath.FromSlash(f.rel))
 		if merr := os.MkdirAll(filepath.Dir(localPath), 0o755); merr != nil {
-			return &TransferError{Op: op, Path: filepath.Dir(localPath), Err: wrapLocalIO(merr)}
+			return fail(&TransferError{Op: op, Path: filepath.Dir(localPath), Err: wrapLocalIO(merr)})
 		}
 		freq := req
 		freq.Remote = path.Join(req.Remote, f.rel) // 远端 POSIX 路径：path 而非 filepath
@@ -408,10 +424,10 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 				if isRemoteError(cerr) {
 					remoteMsg = s.Proc.StderrText()
 				}
-				return &TransferError{Op: op, Host: req.Host, Path: freq.Remote, PartPath: part, Err: cerr, RemoteMsg: remoteMsg}
+				return fail(&TransferError{Op: op, Host: req.Host, Path: freq.Remote, PartPath: part, Err: cerr, RemoteMsg: remoteMsg})
 			}
 			if rerr := os.Rename(part, localPath); rerr != nil {
-				return &TransferError{Op: op, Path: localPath, PartPath: part, Err: rerr}
+				return fail(&TransferError{Op: op, Path: localPath, PartPath: part, Err: rerr})
 			}
 			g.forgetResumeAnchor(downloadAnchorKey(req.Host, req.User, part))
 			tp.finishFile(ftotal)
@@ -424,10 +440,10 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 			if isRemoteError(cerr) {
 				remoteMsg = s.Proc.StderrText()
 			}
-			return &TransferError{Op: op, Host: req.Host, Path: freq.Remote, Err: cerr, RemoteMsg: remoteMsg}
+			return fail(&TransferError{Op: op, Host: req.Host, Path: freq.Remote, Err: cerr, RemoteMsg: remoteMsg})
 		}
 		if decideCommit(n, ftotal) != commitOK {
-			return &TransferError{Op: op, Path: freq.Remote, Err: shortReadError(n, ftotal, "")}
+			return fail(&TransferError{Op: op, Path: freq.Remote, Err: shortReadError(n, ftotal, "")})
 		}
 		tp.finishFile(ftotal)
 	}
@@ -470,8 +486,8 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	}
 	reuse := false
 	defer func() { g.pool.Release(s, reuse) }()
-	// Task 10：同 Get —— 会话一取到就登记，函数返回时注销。
-	entry := g.register(req.ID, s)
+	// Task 10：同 Get —— 会话一取到就登记，函数返回时注销。单文件传输无扫描相，ctx 为 nil。
+	entry := g.register(req.ID, s, nil)
 	defer g.unregister(req.ID, entry)
 
 	if !req.Atomic {
@@ -811,31 +827,40 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	}
 	defer release()
 
-	scanStart := time.Now()
-	files, subdirs, total, werr := scanLocalTree(req.Local)
-	if werr != nil {
-		return &TransferError{Op: op, Path: req.Local, Err: werr}
-	}
-	filesTotal := len(files)
-	if scanLimit(filesTotal, time.Since(scanStart)) {
-		// 与下载方向同一条 D16 规则：枚举超阈值 ⇒ 分母未知。
-		total, filesTotal = -1, -1
-	}
-	// 目录项不接受续传（P3.1）：清空单文件锚点参数，避免同一个 PartPath 被整棵树复用。
-	req.Resume, req.ResumeOffset, req.PartPath = false, 0, ""
-
 	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
 	if err != nil {
 		return &TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: err}
 	}
 	reuse := false
 	defer func() { g.pool.Release(s, reuse) }()
-	entry := g.register(req.ID, s)
+
+	// I1（Task 12 修复轮 1）：**先登记再枚举**。本地 WalkDir 可能长时间运行，在这个窗口里
+	// Cancel(id) 必须已经能命中条目（否则用户的取消被静默吞掉、上传照旧进行）。扫描相不经过
+	// 会话 IO，光关会话拦不住 WalkDir；注册一个 Cancel 能触发的 ctx，WalkDir 每步检查它。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entry := g.register(req.ID, s, cancel)
 	defer g.unregister(req.ID, entry)
+
+	// 目录项不接受续传（P3.1）：清空单文件锚点参数，避免同一个 PartPath 被整棵树复用。
+	req.Resume, req.ResumeOffset, req.PartPath = false, 0, ""
 
 	hasPosix := false
 	if req.Atomic {
 		_, hasPosix = s.Conn.HasExtension(posixRenameExt)
+	}
+
+	// D16：枚举阈值在本地遍历**过程中**评估（不是走完整棵树再判）—— 命中即停止枚举
+	// （停止发现后续条目，与下载方向「停止发起下一批」同义），返回已枚举到的子集并降级。
+	scanStart := time.Now()
+	files, subdirs, total, degraded, werr := scanLocalTree(ctx, req.Local, scanStart)
+	if werr != nil {
+		return &TransferError{Op: op, Path: req.Local, Err: werr}
+	}
+	filesTotal := len(files)
+	if degraded {
+		// 与下载方向同一条 D16 规则：枚举超阈值 ⇒ 分母未知（-1），Done/FilesDone 继续累加。
+		total, filesTotal = -1, -1
 	}
 	// 合并语义：目标根 = <remoteDir>/<base(local)>。用 path（POSIX）拼接，绝不碰 filepath
 	// 的远端语义（Windows 客户端会把 / 变成反斜杠）。
@@ -853,6 +878,19 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	}
 	tp := newTreeProgress(req.ID, req.Host, DirUpload, req.Remote, total, filesTotal, report)
 	tp.begin()
+	// I4：失败/取消路径也补一发末帧并回填「已提交/剩余」计数（逐文件原语返回 *TransferError）。
+	fail := func(err error) error {
+		var te *TransferError
+		part := ""
+		if errors.As(err, &te) {
+			part = te.PartPath
+		}
+		cf, cb, rem := tp.fail(part)
+		if te != nil {
+			te.CommittedFiles, te.CommittedBytes, te.RemainingFiles = cf, cb, rem
+		}
+		return err
+	}
 
 	for _, f := range files {
 		localPath := filepath.Join(req.Local, filepath.FromSlash(f.rel))
@@ -863,14 +901,14 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 		if req.Atomic {
 			n, perr := g.putFileAtomic(s, req, localPath, remotePath, hasPosix, tp.file)
 			if perr != nil {
-				return perr
+				return fail(perr)
 			}
 			committed = n
 		} else {
 			freq := req
 			freq.Local, freq.Remote = localPath, remotePath
 			if perr := g.putNonAtomic(s, freq, f.size, tp.file, nil); perr != nil {
-				return perr
+				return fail(perr)
 			}
 		}
 		tp.finishFile(committed)
@@ -885,7 +923,11 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 // 与 sftp put -r 一致）。rel 统一转成 POSIX 相对路径，便于 path.Join 拼远端路径
 // （Windows 客户端的反斜杠绝不能进远端路径）。文件软链跟随（与远端枚举及现状一致），
 // 目录软链不递归；我方临时/备份文件（本地 .part）不进清单（D18）。
-func scanLocalTree(root string) (files []treeFile, subdirs []string, total int64, err error) {
+//
+// Task 12 修复轮 1：接受取消上下文与枚举起点时间。WalkDir 不是 ctx 感知 API，靠每一步
+// 的 ctx 检查（scanCheckpoint 注入点 + ctx.Err()）实现扫描相取消；D16 阈值在遍历中评估，
+// 命中即 degraded=true 并停止枚举（SkipAll 丢弃剩余条目）。
+func scanLocalTree(ctx context.Context, root string, start time.Time) (files []treeFile, subdirs []string, total int64, degraded bool, err error) {
 	// 源目录本身若是软链，WalkDir 不会跟随根（会把它当非目录项、一个文件都枚举不到）：
 	// 先解析成真实目录。用户从系统拖入的目录经常是软链。
 	if resolved, rerr := filepath.EvalSymlinks(root); rerr == nil {
@@ -894,6 +936,12 @@ func scanLocalTree(root string) (files []treeFile, subdirs []string, total int64
 	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return werr
+		}
+		// I1：扫描相取消的确定性注入点（先钩子、后 ctx 检查）—— 单测在这里卡住扫描，
+		// 调 Cancel(id)（触发 cancel），放行后 ctx.Err() 立刻让整项中止。
+		scanCheckpoint()
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
 		}
 		if d.IsDir() {
 			if p == root {
@@ -932,9 +980,18 @@ func scanLocalTree(root string) (files []treeFile, subdirs []string, total int64
 		}
 		files = append(files, treeFile{rel: filepath.ToSlash(rel), size: info.Size()})
 		total += info.Size()
+		// D16：阈值在遍历中评估并**停止枚举**（fs.SkipAll 丢弃剩余条目）。这是与下载方向
+		// 「停止发起下一批」对称的真实降级语义 —— 走完整棵树再只报 -1 不算降级（评审 I3）。
+		if scanLimit(len(files), time.Since(start)) {
+			degraded = true
+			return fs.SkipAll
+		}
 		return nil
 	})
-	return files, subdirs, total, err
+	if err == fs.SkipAll {
+		err = nil
+	}
+	return files, subdirs, total, degraded, err
 }
 
 // putFileAtomic 把一个本地文件原子上传到远端目标：写远端同目录 .part → done==total →
@@ -1076,11 +1133,11 @@ func (g *GoBackend) acquireInflight(host, user, dir, target, id string) (func(),
 // 为什么 id 作键是安全的（Task 10 事实 4）：注册表是**进程内**的，进程重启即空，跨重启的
 // 陈旧 id 够不到新进程；又因池的传输并发上限为 1（AcquireTransfer 先取额度再登记），任一
 // 时刻至多一条在飞条目。
-func (g *GoBackend) register(id string, s *Session) *regEntry {
+func (g *GoBackend) register(id string, s *Session, cancel context.CancelFunc) *regEntry {
 	if id == "" {
 		return nil
 	}
-	e := &regEntry{sess: s}
+	e := &regEntry{sess: s, cancel: cancel}
 	g.regMu.Lock()
 	g.reg[id] = e
 	g.regMu.Unlock()
@@ -1144,6 +1201,13 @@ func (g *GoBackend) Cancel(id string) bool {
 	// I3(b)：关闭前先把会话从 idle 摘掉 —— 竞态里 Release 可能已把它放回 idle。
 	// 注意仍留一条尾巴：RemoveIdle 之后 Release 才追加的话，会话会以 Closed 状态留在
 	// idle；由 AcquireList 出池时的 Closed 兜底拦住（I3(a)），两处缺一不可。
+	// I1（Task 12 修复轮 1）：先取消扫描相上下文再关会话。扫描相（远端枚举/本地 WalkDir）
+	// 不经过会话 IO，只关会话拦不住它；cancel 让 scanTree/scanLocalTree 的 ctx 检查立刻生效，
+	// 传输在扫描阶段就能中止。cancel 幂等，且绝不在此归还并发额度（额度仍由原传输的
+	// defer Release 恰好归还一次 —— Task 10 I1）。
+	if e.cancel != nil {
+		e.cancel()
+	}
 	g.pool.RemoveIdle(e.sess)
 	cancelCloseSession(e.sess)
 	return true

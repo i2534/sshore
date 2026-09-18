@@ -2,11 +2,14 @@ package sftp
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -429,5 +432,487 @@ func TestGoBackendPutTreeFollowsLocalRootSymlink(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(remoteRoot, "link", "one.txt")); err != nil || string(b) != "ONE" {
 		t.Fatalf("软链根下的文件必须被上传: err=%v content=%q", err, string(b))
+	}
+}
+
+// —— Task 12 修复轮 1 新增用例（I1/I2/I3/I4/M1/M2）——
+
+// blockScanCheckpoint 把「扫描检查点」换成「首次进入即卡住，直到 release」的实现，
+// 让「取消发生在扫描相」成为确定性（不靠 sleep，也不需要造一个恰好很慢的目录）。
+// release 幂等并挂在 t.Cleanup 上：用例中途失败也不会把扫描 goroutine 永久悬挂。
+func blockScanCheckpoint(t *testing.T) (entered <-chan struct{}, release func()) {
+	t.Helper()
+	enteredCh := make(chan struct{})
+	releaseCh := make(chan struct{})
+	var once sync.Once
+	var relOnce sync.Once
+	orig := scanCheckpoint
+	scanCheckpoint = func() {
+		once.Do(func() {
+			close(enteredCh)
+			<-releaseCh
+		})
+	}
+	release = func() { relOnce.Do(func() { close(releaseCh) }) }
+	t.Cleanup(func() {
+		release()
+		scanCheckpoint = orig
+	})
+	return enteredCh, release
+}
+
+// TestGoBackendGetTreeCancelDuringScanAborts（I1）：GetTree 必须把真实可取消的 ctx 传进
+// scanTree（而不是 context.Background()），并先登记再扫描 —— Cancel(id) 触发 cancel 后，
+// 卡在扫描检查点的整项传输必须立刻以 context.Canceled 中止、不提交任何文件，并发额度仍由
+// 原传输的 defer Release 恰好归还一次。
+func TestGoBackendGetTreeCancelDuringScanAborts(t *testing.T) {
+	remoteRoot, dst := t.TempDir(), t.TempDir()
+	writeRemoteTree(t, remoteRoot, "src/a.bin", []byte("AAAA"))
+
+	g := backendForTestServer(t, remoteRoot)
+	entered, release := blockScanCheckpoint(t)
+	done := make(chan error, 1)
+	go func() {
+		done <- g.GetTree(TransferRequest{ID: "t12-scan-get", Host: "h", Remote: "src", Local: dst, Atomic: true}, nil)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("10s 内未进入扫描检查点")
+	}
+	if got := len(g.pool.queue); got != 0 {
+		t.Fatalf("扫描相必须仍占用并发额度，queue=%d want 0", got)
+	}
+	if !g.Cancel("t12-scan-get") {
+		t.Fatal("扫描相取消必须命中登记条目并返回 true（否则用户取消被静默吞掉）")
+	}
+	release()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("取消后 15s 内 GetTree 未返回")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("扫描相取消必须把 context.Canceled 透出（证明 scanTree 的 ctx 检查是活的），got %v", err)
+	}
+	if entries, rerr := os.ReadDir(dst); rerr != nil {
+		t.Fatalf("本地目标目录必须可读: %v", rerr)
+	} else if len(entries) != 0 {
+		t.Fatalf("扫描相取消后不得提交任何文件，got %v", entries)
+	}
+	if g.Cancel("t12-scan-get") {
+		t.Fatal("扫描相取消必须幂等：第二次返回 false")
+	}
+	if n := g.regSize(); n != 0 {
+		t.Fatalf("取消后注册表必须清空，got %d 条", n)
+	}
+	if got := len(g.pool.queue); got != 1 {
+		t.Fatalf("取消后额度必须恰好归还一次（Cancel 绝不自己归还），queue=%d want 1", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	s2, aerr := g.pool.AcquireTransfer(ctx, "h", "")
+	if aerr != nil {
+		t.Fatalf("取消后额度必须立即可用: %v", aerr)
+	}
+	g.pool.Release(s2, false)
+}
+
+// TestGoBackendPutTreeCancelDuringScanAborts（I1 上传方向）：PutTree 必须**先取会话并登记**
+// 再做本地枚举 —— 本地 WalkDir 窗口内 Cancel(id) 必须命中并让扫描以 context.Canceled 中止，
+// 不建远端目录、不产生任何 .part，额度恰好归还一次。
+func TestGoBackendPutTreeCancelDuringScanAborts(t *testing.T) {
+	remoteRoot, src := t.TempDir(), t.TempDir()
+	makeLocalTree(t, src, map[string]string{"a/one.bin": "ONE"})
+
+	g := backendForTestServer(t, remoteRoot)
+	entered, release := blockScanCheckpoint(t)
+	done := make(chan error, 1)
+	go func() {
+		done <- g.PutTree(TransferRequest{ID: "t12-scan-put", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, nil)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("10s 内未进入本地扫描检查点")
+	}
+	if got := len(g.pool.queue); got != 0 {
+		t.Fatalf("扫描相必须仍占用并发额度，queue=%d want 0", got)
+	}
+	// 关键断言：登记必须早于本地枚举 —— 否则这里返回 false，用户的取消被静默吞掉。
+	if !g.Cancel("t12-scan-put") {
+		t.Fatal("PutTree 在本地枚举窗口内必须已登记：Cancel=false 即取消被吞（I1）")
+	}
+	release()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("取消后 15s 内 PutTree 未返回")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("扫描相取消必须把 context.Canceled 透出（证明 scanLocalTree 的 ctx 检查是活的），got %v", err)
+	}
+	if _, serr := os.Stat(filepath.Join(remoteRoot, "a")); !os.IsNotExist(serr) {
+		t.Fatalf("扫描相取消后不得建出远端目录/文件，stat err=%v", serr)
+	}
+	if parts := treeParts(t, remoteRoot); len(parts) != 0 {
+		t.Fatalf("扫描相取消后不得产生任何远端 .part，got %v", parts)
+	}
+	if g.Cancel("t12-scan-put") {
+		t.Fatal("扫描相取消必须幂等：第二次返回 false")
+	}
+	if got := len(g.pool.queue); got != 1 {
+		t.Fatalf("取消后额度必须恰好归还一次，queue=%d want 1", got)
+	}
+}
+
+// TestGoBackendGetTreeIgnoresSinglePartPathAndResume（I2）：目录项只重试、不续传 ——
+// 调用方即使带了单值 PartPath/ResumeOffset，整棵树也**绝不能**把它当每条目的 .part：
+// 否则所有条目共用一个 .part、互相覆盖后各自 rename 出错误内容（静默损坏）。
+// 这里在 PartPath 位置放一个哨兵文件：正确实现必须原封不动地留着它（逐文件另生成 .part）。
+func TestGoBackendGetTreeIgnoresSinglePartPathAndResume(t *testing.T) {
+	remoteRoot, dst := t.TempDir(), t.TempDir()
+	one := bytes.Repeat([]byte("one-"), 128)
+	two := bytes.Repeat([]byte("two-"), 200)
+	writeRemoteTree(t, remoteRoot, "src/one.txt", one)
+	writeRemoteTree(t, remoteRoot, "src/sub/two.txt", two)
+
+	sentinel := filepath.Join(dst, "caller-provided-anchor.bin")
+	if err := os.WriteFile(sentinel, []byte("SENTINEL"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	g := backendForTestServer(t, remoteRoot)
+	req := TransferRequest{ID: "t12-onepart", Host: "h", Remote: "src", Local: dst, Atomic: true,
+		Resume: true, ResumeOffset: 4, PartPath: sentinel}
+	if err := g.GetTree(req, nil); err != nil {
+		t.Fatalf("GetTree: %v", err)
+	}
+	got, err := os.ReadFile(sentinel)
+	if err != nil || string(got) != "SENTINEL" {
+		t.Fatalf("目录传输复用了调用方的单值 PartPath：哨兵被覆盖/改名（err=%v content=%q）", err, string(got))
+	}
+	for rel, want := range map[string][]byte{"one.txt": one, "sub/two.txt": two} {
+		b, rerr := os.ReadFile(filepath.Join(dst, filepath.FromSlash(rel)))
+		if rerr != nil || !bytes.Equal(b, want) {
+			t.Fatalf("内容不一致 %s: err=%v got=%d want=%d", rel, rerr, len(b), len(want))
+		}
+	}
+	for _, f := range mustReadDir(t, dst) {
+		if IsInternalTemp(f.Name()) {
+			t.Fatalf("成功提交后不得残留逐文件 .part: %s", f.Name())
+		}
+	}
+}
+
+// TestGoBackendPutTreeIgnoresSinglePartPathAndResume 是上传方向的对称契约用例：请求带单值
+// PartPath/ResumeOffset 时，每个远端条目必须各自生成 .part，绝不共用一个；调用方给出的
+// 远端 PartPath 位置上的既有文件不得被占用/删除。
+func TestGoBackendPutTreeIgnoresSinglePartPathAndResume(t *testing.T) {
+	remoteRoot, src := t.TempDir(), t.TempDir()
+	makeLocalTree(t, src, map[string]string{"a/one.txt": "ONE1", "a/two.txt": "TWO2"})
+	const sentinel = "caller-anchor.bin"
+	writeRemoteTree(t, remoteRoot, sentinel, []byte("SENTINEL"))
+
+	g := backendForTestServer(t, remoteRoot)
+	req := TransferRequest{ID: "t12-onepart-up", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true,
+		Resume: true, ResumeOffset: 2, PartPath: sentinel}
+	if err := g.PutTree(req, nil); err != nil {
+		t.Fatalf("PutTree: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(remoteRoot, sentinel)); err != nil || string(b) != "SENTINEL" {
+		t.Fatalf("目录上传复用了调用方的单值 PartPath：哨兵被覆盖/改名（err=%v content=%q）", err, string(b))
+	}
+	for name, want := range map[string]string{"one.txt": "ONE1", "two.txt": "TWO2"} {
+		b, err := os.ReadFile(filepath.Join(remoteRoot, "a", name))
+		if err != nil || string(b) != want {
+			t.Fatalf("内容不一致 %s: err=%v content=%q", name, err, string(b))
+		}
+	}
+	if parts := treeParts(t, remoteRoot); len(parts) != 0 {
+		t.Fatalf("成功提交后不得残留远端 .part: %v", parts)
+	}
+}
+
+// TestGoBackendPutTreeDegradesByStoppingLocalWalk（I3）：上传方向的 D16 降级必须是**真的**
+// 停止枚举（在本地 WalkDir 过程中评估阈值并丢弃剩余条目），而不是走完整棵树后只把计数
+// 报成 -1。注入阈值在第 1 个文件后命中：只应上传该文件，且进度分母必须是 -1（降级）。
+// 关掉降级标志（变异 A6）会让首帧分母变正、或把剩余文件也传上去 —— 本用例因此变红。
+func TestGoBackendPutTreeDegradesByStoppingLocalWalk(t *testing.T) {
+	remoteRoot, src := t.TempDir(), t.TempDir()
+	makeLocalTree(t, src, map[string]string{
+		"a/1.txt": "1", "a/2.txt": "2", "a/3.txt": "3", "a/4.txt": "4", "a/5.txt": "5",
+	})
+	called := false
+	orig := scanLimit
+	scanLimit = func(files int, elapsed time.Duration) bool {
+		called = true
+		return files >= 1 // 第一个文件枚举完就命中阈值
+	}
+	t.Cleanup(func() { scanLimit = orig })
+
+	g := backendForTestServer(t, remoteRoot)
+	sink := &progressSink{}
+	if err := g.PutTree(TransferRequest{ID: "t12-putdeg", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, sink.report); err != nil {
+		t.Fatalf("降级只影响进度字段，传输仍须成功: %v", err)
+	}
+	if !called {
+		t.Fatal("scanLimit 注入点未被调用：上传降级是假覆盖")
+	}
+	committed := 0
+	_ = filepath.WalkDir(filepath.Join(remoteRoot, "a"), func(p string, d os.DirEntry, werr error) error {
+		if werr == nil && !d.IsDir() && !IsInternalTemp(d.Name()) {
+			committed++
+		}
+		return nil
+	})
+	if committed != 1 {
+		t.Fatalf("降级必须在阈值处停止枚举：只应上传 1 个文件，got %d", committed)
+	}
+	frames := sink.all()
+	if len(frames) == 0 {
+		t.Fatal("降级也必须有进度帧")
+	}
+	first := frames[0]
+	if first.Total != -1 || first.FilesTotal != -1 || first.Phase != PhaseTransfer {
+		t.Fatalf("降级首帧必须 Total=-1/FilesTotal=-1/Phase=transfer, got %+v", first)
+	}
+	last := frames[len(frames)-1]
+	if last.Total != -1 || last.FilesTotal != -1 || last.FilesDone != 1 || last.Done != 1 {
+		t.Fatalf("降级末帧应保留真实 Done/FilesDone 但分母未知, got %+v", last)
+	}
+	for _, p := range frames {
+		if p.Total > 0 || p.FilesTotal > 0 {
+			t.Fatalf("上传降级路径不得出现正分母（UI 会误以为枚举完整）: %+v", p)
+		}
+	}
+}
+
+// TestGoBackendGetTreePartialFailureReportsCountsAndFinalFrame（I4）：部分成功后的失败必须
+// 诚实：TransferError 带已提交文件数/字节数与剩余文件数，且失败路径也要发一发**末帧**
+// （PartPath=保留的重试锚点、Done 只含已提交文件、不含失败项在飞字节）。
+func TestGoBackendGetTreePartialFailureReportsCountsAndFinalFrame(t *testing.T) {
+	remoteRoot, dst := t.TempDir(), t.TempDir()
+	// 三个等长文件：失败项与已提交项字节数相同，因此无需依赖 readdir 顺序。
+	for _, n := range []string{"a.bin", "b.bin", "c.bin"} {
+		writeRemoteTree(t, remoteRoot, "src/"+n, bytes.Repeat([]byte("x"), 100))
+	}
+
+	g := backendForTestServer(t, remoteRoot)
+	calls := 0
+	swapCopyStream(t, func(dstW io.Writer, srcR io.Reader) (int64, error) {
+		calls++
+		if calls == 2 {
+			return io.Copy(dstW, io.LimitReader(srcR, 5))
+		}
+		return io.Copy(dstW, srcR)
+	})
+
+	sink := &progressSink{}
+	var te *TransferError
+	err := g.GetTree(TransferRequest{ID: "t12-i4-get", Host: "h", Remote: "src", Local: dst, Atomic: true}, sink.report)
+	if err == nil {
+		t.Fatal("短传必须报错")
+	}
+	if !errors.As(err, &te) {
+		t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+	}
+	if te.CommittedFiles != 1 || te.CommittedBytes != 100 || te.RemainingFiles != 2 {
+		t.Fatalf("失败错误必须报诚实计数（1 个已提交/100 字节/2 个剩余），got files=%d bytes=%d remaining=%d",
+			te.CommittedFiles, te.CommittedBytes, te.RemainingFiles)
+	}
+	if te.PartPath == "" {
+		t.Fatal("失败项必须保留 .part 作重试锚点")
+	}
+	frames := sink.all()
+	if len(frames) == 0 {
+		t.Fatal("失败路径也必须有进度帧")
+	}
+	last := frames[len(frames)-1]
+	if last.PartPath != te.PartPath {
+		t.Fatalf("失败末帧必须由失败路径补发并带重试锚点 PartPath=%q，got %+v", te.PartPath, last)
+	}
+	if last.Done != 100 || last.FilesDone != 1 || last.FilesTotal != 3 || last.Total != 300 {
+		t.Fatalf("失败末帧只应计入已提交字节/文件，got %+v", last)
+	}
+}
+
+// TestGoBackendPutTreePartialFailureReportsCountsAndFinalFrame 是 I4 的上传对称用例。
+func TestGoBackendPutTreePartialFailureReportsCountsAndFinalFrame(t *testing.T) {
+	remoteRoot, src := t.TempDir(), t.TempDir()
+	makeLocalTree(t, src, map[string]string{"a/a.bin": "aaaa", "a/b.bin": "bbbb", "a/c.bin": "cccc"})
+
+	g := backendForTestServer(t, remoteRoot)
+	calls := 0
+	swapCopyStream(t, func(dstW io.Writer, srcR io.Reader) (int64, error) {
+		calls++
+		if calls == 2 {
+			return io.Copy(dstW, io.LimitReader(srcR, 2))
+		}
+		return io.Copy(dstW, srcR)
+	})
+
+	sink := &progressSink{}
+	var te *TransferError
+	err := g.PutTree(TransferRequest{ID: "t12-i4-put", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, sink.report)
+	if err == nil {
+		t.Fatal("短传必须报错")
+	}
+	if !errors.As(err, &te) {
+		t.Fatalf("应为 *TransferError, got %T: %v", err, err)
+	}
+	if te.CommittedFiles != 1 || te.CommittedBytes != 4 || te.RemainingFiles != 2 {
+		t.Fatalf("失败错误必须报诚实计数（1 个已提交/4 字节/2 个剩余），got files=%d bytes=%d remaining=%d",
+			te.CommittedFiles, te.CommittedBytes, te.RemainingFiles)
+	}
+	if te.PartPath == "" {
+		t.Fatal("失败项必须保留远端 .part 作重试锚点")
+	}
+	frames := sink.all()
+	if len(frames) == 0 {
+		t.Fatal("失败路径也必须有进度帧")
+	}
+	last := frames[len(frames)-1]
+	if last.PartPath != te.PartPath {
+		t.Fatalf("失败末帧必须带重试锚点 PartPath=%q，got %+v", te.PartPath, last)
+	}
+	if last.Done != 4 || last.FilesDone != 1 || last.FilesTotal != 3 || last.Total != 12 {
+		t.Fatalf("失败末帧只应计入已提交字节/文件，got %+v", last)
+	}
+}
+
+// TestScanTreeSkipsInternalTempAndDoesNotFollowDirSymlinks（M1）：远端枚举必须
+// ①跳过名字含 PartMarker 的内部临时/备份文件（D18），②不递归目录软链（只当普通项，
+// 绝不进入其子树）。两个不变量各自被变异 A3/A7 移除后会分别让断言失败。
+func TestScanTreeSkipsInternalTempAndDoesNotFollowDirSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 创建软链需要额外权限")
+	}
+	remoteRoot := t.TempDir()
+	writeRemoteTree(t, remoteRoot, "src/real/keep.txt", []byte("KEEP"))
+	// 内部临时/备份文件：不得进业务清单（否则上次中断的 .part 会被当真实文件再传）。
+	writeRemoteTree(t, remoteRoot, "src/junk"+PartMarker+"dead.bin", []byte("JUNK"))
+	if err := os.MkdirAll(filepath.Join(remoteRoot, "src", "emptydir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 目录软链：readdir 用 lstat 语义把它当非目录项，绝不递归进 real。
+	if err := os.Symlink(filepath.Join(remoteRoot, "src", "real"), filepath.Join(remoteRoot, "src", "linkdir")); err != nil {
+		t.Skipf("无法创建软链: %v", err)
+	}
+
+	g := backendForTestServer(t, remoteRoot)
+	s, err := g.pool.AcquireTransfer(context.Background(), "h", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.pool.Release(s, false)
+
+	files, subdirs, degraded, err := scanTree(context.Background(), s, "src", time.Now())
+	if err != nil {
+		t.Fatalf("scanTree: %v", err)
+	}
+	if degraded {
+		t.Fatal("小目录不应降级")
+	}
+	fileSet := map[string]bool{}
+	for _, f := range files {
+		fileSet[f.rel] = true
+		if IsInternalTemp(f.rel) {
+			t.Fatalf("内部临时文件不得进清单: %s", f.rel)
+		}
+	}
+	if !fileSet["real/keep.txt"] {
+		t.Fatalf("真实文件必须被枚举到，got %v", fileSet)
+	}
+	for rel := range fileSet {
+		if strings.HasPrefix(rel, "linkdir/") {
+			t.Fatalf("目录软链子树不得进清单: %s", rel)
+		}
+	}
+	subSet := map[string]bool{}
+	for _, d := range subdirs {
+		subSet[d] = true
+	}
+	if subSet["linkdir"] {
+		t.Fatal("目录软链不得作为子目录入队（否则会被递归下载/上传）")
+	}
+	if !subSet["real"] || !subSet["emptydir"] {
+		t.Fatalf("真实子目录（含空目录）必须被枚举到，got %v", subSet)
+	}
+}
+
+// TestScanLocalTreeSkipsInternalTempAndDoesNotFollowDirSymlink 是本地枚举的 M1 对称用例。
+func TestScanLocalTreeSkipsInternalTempAndDoesNotFollowDirSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 创建软链需要额外权限")
+	}
+	root := t.TempDir()
+	makeLocalTree(t, root, map[string]string{
+		"real/keep.txt":               "KEEP",
+		"junk" + PartMarker + "x.bin": "JUNK",
+	})
+	if err := os.Symlink(filepath.Join(root, "real"), filepath.Join(root, "linkdir")); err != nil {
+		t.Skipf("无法创建软链: %v", err)
+	}
+	files, subdirs, total, degraded, err := scanLocalTree(context.Background(), root, time.Now())
+	if err != nil {
+		t.Fatalf("scanLocalTree: %v", err)
+	}
+	if degraded {
+		t.Fatal("小目录不应降级")
+	}
+	if total != 4 {
+		t.Fatalf("total 只应统计真实文件（4 字节），got %d", total)
+	}
+	rels := map[string]bool{}
+	for _, f := range files {
+		rels[f.rel] = true
+		if IsInternalTemp(f.rel) {
+			t.Fatalf("内部临时文件不得进清单: %s", f.rel)
+		}
+	}
+	if !rels["real/keep.txt"] {
+		t.Fatalf("真实文件必须被枚举到，got %v", rels)
+	}
+	for rel := range rels {
+		if strings.HasPrefix(rel, "linkdir/") {
+			t.Fatalf("本地目录软链子树不得进清单: %s", rel)
+		}
+	}
+	for _, d := range subdirs {
+		if d == "linkdir" {
+			t.Fatal("本地目录软链不得作为子目录（否则会被递归上传）")
+		}
+	}
+}
+
+// TestTreeProgressClampsDoneToTotal（M2）：分母来自枚举、分子来自已打开句柄的 Stat ——
+// 源在枚举与打开之间变大时，Done 绝不能超过 Total（本次取显式夹取）。FilesDone 同理。
+func TestTreeProgressClampsDoneToTotal(t *testing.T) {
+	var frames []Progress
+	tp := newTreeProgress("id", "h", DirDownload, "src", 100, 2, func(p Progress) { frames = append(frames, p) })
+	tp.begin()
+	tp.finishFile(150) // 实际提交字节 > 枚举分母
+	tp.frame(true)
+	last := frames[len(frames)-1]
+	if last.Done != 100 {
+		t.Fatalf("Done 必须夹到 Total=100（枚举与打开之间变大）, got %+v", last)
+	}
+	if last.FilesDone > last.FilesTotal {
+		t.Fatalf("FilesDone 不得超过 FilesTotal, got %+v", last)
+	}
+
+	frames = nil
+	tp2 := newTreeProgress("id2", "h", DirUpload, "src", 30, 2, func(p Progress) { frames = append(frames, p) })
+	tp2.begin()
+	tp2.finishFile(10)
+	tp2.finishFile(10)
+	tp2.finishFile(10) // 3 个文件 > FilesTotal=2
+	tp2.frame(true)
+	last2 := frames[len(frames)-1]
+	if last2.FilesDone != 2 || last2.Done > last2.Total {
+		t.Fatalf("FilesDone 必须夹到 FilesTotal=2 且 Done<=Total, got %+v", last2)
 	}
 }
