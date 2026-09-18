@@ -12,8 +12,8 @@ usage() {
            每个名字都必须在该后端的 go test 输出里出现 "--- PASS: <名字>"，
            少一个就判失败；防线 1/2（有 SKIP / 一个 PASS 都没有）同时生效。
            未设置时使用脚本内置的完整期望名单：TestGoBackendE2E
-           （TestSyncE2E 要等 GoBackend 的列表/上传补齐、两个后端都能绿之后再追加，
-            否则 gosftp 迭代必然失败）
+           （TestSyncE2E 仍未进默认名单：它的 gosftp 迭代走 GoBackend.ListMany，
+            该方法是 Task 13 的桩；Task 8 已补齐 Put，但 List 未落地前追加必红）
            例：E2E_RUN='TestGoBackendE2E,TestCancelWholeBatchE2E' bash e2e/test_local.sh
 USAGE
 }
@@ -46,9 +46,10 @@ trap cleanup EXIT
 # 每个名字都走防线 3 逐字比对，少一个就判失败（I3：名单里任何一个缺失都算失败）。
 # 默认名单 = 当前**两个后端都真能跑绿**的完整期望集合。
 # 为什么不直接照抄 plan 的 TestGoBackendE2E,TestSyncE2E：TestSyncE2E 走 sync → Ctrl → backend()
-# → 当前选中的后端，而 gosftp 后端此刻（Task 7）只实现了 Get，ListMany/Put 仍是「未实现」
-# 桩；把它放进默认名单会让 gosftp 迭代必然失败、make e2e 永远不会 0。等 GoBackend 的
-# 列表/上传补齐（Task 8/9/13）后，再把 TestSyncE2E 追加进这一行。
+# → 当前选中的后端。Task 8 已实现 GoBackend.Put（上传），但 GoBackend.ListMany 仍是
+# 「未实现」桩（Task 13），实测 E2E_RUN=TestSyncE2E 时 batch 迭代 PASS、gosftp 迭代
+# 15s 超时失败，所以此刻把它放进默认名单会让 make e2e 变红。等 Task 13 的
+# List/ListMany 落地、两个后端都绿之后，再把 TestSyncE2E 追加进这一行。
 E2E_DEFAULT_LIST='TestGoBackendE2E'
 E2E_RUN="${E2E_RUN:-$E2E_DEFAULT_LIST}"
 

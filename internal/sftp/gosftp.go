@@ -26,6 +26,16 @@ var (
 	}
 )
 
+// posixRenameExt 是 OpenSSH 的原子覆盖扩展名（spec §2.3）。
+const posixRenameExt = "posix-rename@openssh.com"
+
+// posixRename 是远端覆盖提交原语的注入点。Task 0 只在极少样本上观测到它能覆盖
+// （6 次运行、零次独立失败），单测必须能分别钉住「成功 → 直接提交」与
+// 「返回非 nil → 必须回退 backup-swap」两条分支（约束 3），故做成变量。
+var posixRename = func(c *sftp.Client, oldname, newname string) error {
+	return c.PosixRename(oldname, newname)
+}
+
 // GoBackend 是基于 pkg/sftp 的新传输后端（spec D1）。
 // 技术审核 S5：Go 没有 partial struct —— 后续 task 新增字段必须回来改**这一处**声明。
 // 这里一次性声明全部字段，后续 task 只实现方法，避免每个 task 都要改结构体。
@@ -120,6 +130,18 @@ func (g *GoBackend) Capabilities(host, user string) (bool, error) {
 	return ok, nil
 }
 
+// SetJournalDir 注入 backup-swap 崩溃恢复日志目录（app 装配时用 stateDir()）。
+// dir=="" 表示不做崩溃恢复（journal=nil）：commitRemote 仍会 backup-swap + 回滚，
+// 只是不落 journal。由 Ctrl.SetJournalDir 在 GoBackend 懒构造前后统一转发。
+func (g *GoBackend) SetJournalDir(dir string) {
+	g.journalDir = dir
+	if dir == "" {
+		g.journal = nil
+		return
+	}
+	g.journal = newSwapJournal(dir)
+}
+
 // —— Task 7-13 才实现的正文；本 task 只落引导与能力探测（自审 S7）——
 
 func (g *GoBackend) Home(host, user string) (string, error) { return "", errors.New("未实现") }
@@ -207,9 +229,179 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 	return errors.New("未实现")
 }
+
+// Put 上传本地单个文件到远端（新面：.part + 原子提交）。
+//
+// 提交前置同样只有 done == total：短传/截断绝不提交（R13/约束 4）。远端临时名一律用
+// Remote 家族（path.Dir）—— Windows 客户端的 filepath 会把远端 / 变成 \，临时文件会落到
+// 别的目录（Task 2 评审 Important-2）。失败/取消保留远端 .part 作为 Task 11 续传锚点。
+//
+// 续传（Task 11）预接线：req.Resume 时用 O_WRONLY（**严禁 O_TRUNC**）并 Seek(offset)。
 func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
-	return errors.New("未实现")
+	st, err := os.Stat(req.Local)
+	if err != nil {
+		// 本地源不存在/不可读：在建会话之前失败，且是本地错误（不附远端 stderr）。
+		return &TransferError{Op: "sftp put", Path: req.Local, Err: err}
+	}
+	total := st.Size()
+
+	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
+	if err != nil {
+		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, Err: err}
+	}
+	reuse := false
+	defer func() { g.pool.Release(s, reuse) }()
+
+	if !req.Atomic {
+		// legacy 面（internal/sync / app.SftpPut）：直写目标，不建我方 .part、不提交、不登记 journal。
+		if err := g.putNonAtomic(s, req, total, report); err != nil {
+			return err
+		}
+		reuse = true
+		return nil
+	}
+
+	// 能力探测：HasExtension 返回 (string, bool)（spec §2.3）。
+	_, hasPosix := s.Conn.HasExtension(posixRenameExt)
+	part := req.PartPath
+	if part == "" {
+		part = PartNameRemote(req.Remote, req.ID) // 远端 POSIX 路径：必须用 Remote 家族（Task 2 评审 Important-2）
+	}
+	// 新建：O_WRONLY|O_CREATE|O_TRUNC；续传（Task 11）：O_WRONLY（严禁 O_TRUNC）+ Seek(partSize)。
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	var offset int64
+	if req.Resume {
+		flags = os.O_WRONLY
+		offset = req.ResumeOffset
+	}
+	wf, err := s.Conn.OpenFile(part, flags)
+	if err != nil {
+		// .part 根本没建出来 ⇒ PartPath 必须为空（约束 5：绝不发布假锚点）。
+		return &TransferError{Op: "sftp put", Host: req.Host, Path: part, Err: err, RemoteMsg: s.Proc.StderrText()}
+	}
+	if req.Resume && offset > 0 {
+		if _, err := wf.Seek(offset, io.SeekStart); err != nil {
+			_ = wf.Close()
+			return &TransferError{Op: "sftp put", Host: req.Host, Path: part, Err: err, RemoteMsg: s.Proc.StderrText()}
+		}
+	}
+	lf, err := os.Open(req.Local)
+	if err != nil {
+		_ = wf.Close()
+		// 本地源打不开：远端 .part 已建出、按约束 4 保留可续传，但不附远端 stderr（本地错误）。
+		return &TransferError{Op: "sftp put", Path: req.Local, PartPath: part, Err: wrapLocalIO(err)}
+	}
+	em := newProgressEmitter(req.ID, report)
+	// 首帧 Done 从续传起点起算，UI 不会在续传时先看到 0。
+	cr := &countingReader{r: lf, e: em, p: Progress{Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: part, Done: offset, Total: total, Phase: PhaseTransfer}, base: offset}
+	em.send(cr.p, true)
+	n, cerr := copyStream(wf, cr)
+	_ = wf.Close()
+	_ = lf.Close()
+	if cerr != nil {
+		return putCopyError(req, part, cerr, s.Proc.StderrText())
+	}
+	if decideCommit(n+offset, total) != commitOK {
+		return &TransferError{Op: "sftp put", Path: req.Remote, PartPath: part, Err: shortReadError(n+offset, total, part)}
+	}
+	if err := commitRemote(s, hasPosix, part, req.Remote, g.journal); err != nil {
+		// 提交失败：只有真正的远端失败才附 stderr；.part 仍在（提交没成功）⇒ 如实给出锚点。
+		var remoteMsg string
+		if isRemoteError(err) {
+			remoteMsg = s.Proc.StderrText()
+		}
+		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, PartPath: part, Err: err, RemoteMsg: remoteMsg}
+	}
+	// 末帧强制且只有在提交成功之后才发：末帧 = 提交完成（约束 6 的 PartPath 语义）。
+	// PartPath 必须指向**已提交的最终目标**，绝不能填那个已被 rename 掉、不再存在的旧 .part。
+	em.send(Progress{
+		Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: req.Remote,
+		Done: total, Total: total, Phase: PhaseTransfer,
+	}, true)
+	reuse = true
+	return nil
 }
+
+// putCopyError 给搬运阶段（copyStream）的错误定性：本地源读失败不附远端 stderr（约束 6），
+// 远端写失败才附。PartPath 在两条分支上都有值 —— 远端 .part 此时已真实建立。
+func putCopyError(req TransferRequest, part string, err error, stderr string) *TransferError {
+	if isRemoteError(err) {
+		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, PartPath: part, Err: err, RemoteMsg: stderr}
+	}
+	return &TransferError{Op: "sftp put", Path: req.Local, PartPath: part, Err: err}
+}
+
+// putNonAtomic 是 legacy 面（req.Atomic=false）：直写远端目标，不建我方 .part、
+// 不做 PosixRename/backup-swap、不登记 journal —— 原子性由调用方（internal/sync 自己的
+// .part+rename）保证。与 Get 的 legacy 分支对称，错误归属同样用 isRemoteError 判据。
+// 先开本地源再开远端目标：本地源打不开时绝不先把远端目标截断。
+func (g *GoBackend) putNonAtomic(s *Session, req TransferRequest, total int64, report func(Progress)) error {
+	lf, err := os.Open(req.Local)
+	if err != nil {
+		return &TransferError{Op: "sftp put", Path: req.Local, Err: wrapLocalIO(err)}
+	}
+	defer func() { _ = lf.Close() }()
+	wf, err := s.Conn.OpenFile(req.Remote, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	if err != nil {
+		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, Err: err, RemoteMsg: s.Proc.StderrText()}
+	}
+	defer func() { _ = wf.Close() }()
+
+	em := newProgressEmitter(req.ID, report)
+	cr := &countingReader{r: lf, e: em, p: Progress{Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: req.Remote, Total: total, Phase: PhaseTransfer}}
+	em.send(cr.p, true)
+	n, cerr := copyStream(wf, cr)
+	if cerr != nil {
+		// legacy 面没有我方 .part：PartPath 必须为空（Task 7 同款契约，绝不把直写目标当锚点）。
+		return putCopyError(req, "", cerr, s.Proc.StderrText())
+	}
+	if decideCommit(n, total) != commitOK {
+		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, Err: shortReadError(n, total, "")}
+	}
+	em.send(Progress{
+		Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: req.Remote,
+		Done: total, Total: total, Phase: PhaseTransfer,
+	}, true)
+	return nil
+}
+
+// commitRemote 把已完整落盘的远端 .part 提交成 target。
+//
+// 有 posix-rename 且真的成功 → 原子覆盖；否则（扩展缺失 / PosixRename 返回任何非 nil）
+// 一律回退 backup-swap（约束 3：Task 0 只在 6 次运行、零次独立失败上观测到覆盖成功，
+// 绝不把「扩展可用」当「覆盖必成」）。
+//
+// backup-swap 的顺序是 target → bak，part → target：**绝不先删目标**，替换物没落位前
+// 目标内容始终存在（要么原名、要么 bak 名）。第一条 rename 成功后登记 journal，
+// 第二条失败则回滚 bak → target 并原样上报。只有「目标本来就不存在」的 ENOENT 才走
+// 直接提交；其它错误（权限/被占用）必须上报，否则会把失败当成功还绕过 journal。
+func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal) error {
+	if hasPosix {
+		if err := posixRename(s.Conn, part, target); err == nil {
+			return nil
+		}
+	}
+	bak := BakNameRemote(target) // 远端 POSIX 路径：必须用 Remote 家族
+	if err := s.Conn.Rename(target, bak); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		return s.Conn.Rename(part, target)
+	}
+	if j != nil {
+		_ = j.Begin(target, bak, part)
+	}
+	if err := s.Conn.Rename(part, target); err != nil {
+		_ = s.Conn.Rename(bak, target) // 回滚：替换物没落位，绝不丢目标
+		return err
+	}
+	if j != nil {
+		_ = j.Done(target)
+	}
+	_ = s.Conn.Remove(bak)
+	return nil
+}
+
 func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	return errors.New("未实现")
 }
