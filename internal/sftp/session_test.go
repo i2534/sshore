@@ -10,6 +10,14 @@ import (
 // fakeSession 让测试完全不碰网络。
 type fakeSession struct{ host string }
 
+// transferFlag 在测试里只读地窥探 transfer 标记。
+// 生产代码只保留消费入口 takeTransfer：只读不清正是 C1 的成因，故已删除 isTransfer。
+func transferFlag(s *Session) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transfer
+}
+
 func newTestPool() (*Pool, *int) {
 	dialed := 0
 	p := NewPool(func(host, user string) (*Session, error) {
@@ -137,7 +145,7 @@ func TestListReleaseDoesNotFreeTransferToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ls.isTransfer() {
+	if transferFlag(ls) {
 		t.Fatal("列表会话不得被标记为传输会话")
 	}
 	p.Release(ls, true)
@@ -249,4 +257,134 @@ func TestProbeCanceledContextFailsAndDoesNotReuse(t *testing.T) {
 	if got := len(p.idle["h1\x00u"]); got != 0 {
 		t.Fatalf("探活失败必须丢弃会话，idle=%d", got)
 	}
+}
+
+// TestTransferTokenReturnedOnlyOnceAcrossReuse 复现 Task 4 评审 Critical C1：
+// 传输会话 Release(_, true) 停进 idle 后被 AcquireList 复用，再按 list 语义
+// Release(_, false) 时不得二次归还 token —— 否则第三个传输会在 t2 仍在飞行时
+// 立刻拿到额度，并发 1 被突破。queue 容量 1 看不见在飞行的传输。
+func TestTransferTokenReturnedOnlyOnceAcrossReuse(t *testing.T) {
+	p, dialed := newTestPool()
+	defer p.CloseAll()
+	ctx := context.Background()
+
+	t1, err := p.AcquireTransfer(ctx, "h1", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Release(t1, true) // 计划形状：传输成功后停进 idle
+
+	reused, err := p.AcquireList(ctx, "h1", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused != t1 {
+		t.Fatalf("前置条件：期望复用同一会话，dialed=%d", *dialed)
+	}
+
+	t2, err := p.AcquireTransfer(ctx, "h1", "u") // 取走唯一额度，仍在飞行
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Release(reused, false) // 复用来的会话按 list 语义归还：不得释放额度
+
+	done := make(chan struct{})
+	go func() {
+		s, err := p.AcquireTransfer(ctx, "h1", "u")
+		if err == nil {
+			p.Release(s, false)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("CRITICAL：复用会话的 Release 二次归还了 token，并发 1 被突破")
+	case <-time.After(100 * time.Millisecond):
+	}
+	p.Release(t2, false)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("释放 t2 后第三个传输应立刻拿到额度")
+	}
+}
+
+// TestIdleCapEvictsOldestReleasedAndKeepsOtherHosts 覆盖 idle 上限 2 + LRU 淘汰。
+// 同时持有 3 条列表会话（强制 3 次 dial），按 a、b、c 顺序归还：
+//   - 该 (host,user) 键恰好留 2 条 idle；
+//   - 最早归还的 a 被关闭并移出 all；b/c 存活；
+//   - 下一次 AcquireList 复用最近归还的 c（不新建）；
+//   - 另一 host 的 idle 会话完全不受影响。
+func TestPoolIdleCapEvictsOldestReleasedAndKeepsOtherHosts(t *testing.T) {
+	p, dialed := newTestPool()
+	defer p.CloseAll()
+	ctx := context.Background()
+
+	a, err := p.AcquireList(ctx, "h1", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := p.AcquireList(ctx, "h1", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := p.AcquireList(ctx, "h1", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := p.AcquireList(ctx, "h2", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *dialed != 4 {
+		t.Fatalf("测试前提错误：并持有 3+1 条会话应 dial 4 次，dialed=%d", *dialed)
+	}
+
+	// 按 a、b、c 顺序归还：c 触发上限，最早归还的 a 必须被淘汰。
+	p.Release(a, true)
+	p.Release(b, true)
+	p.Release(c, true)
+	p.Release(other, true)
+
+	p.mu.Lock()
+	h1Idle := len(p.idle["h1\x00u"])
+	h2Idle := len(p.idle["h2\x00u"])
+	p.mu.Unlock()
+	if h1Idle != maxIdlePerHost {
+		t.Fatalf("idle 上限必须为 %d，实际 %d", maxIdlePerHost, h1Idle)
+	}
+	if h2Idle != 1 {
+		t.Fatalf("另一 host 的 idle 不得被牵连，实际 %d", h2Idle)
+	}
+
+	if !a.Closed() {
+		t.Fatal("LRU 必须关闭最早归还的会话 a")
+	}
+	if b.Closed() || c.Closed() {
+		t.Fatalf("b/c 必须存活，b.Closed=%v c.Closed=%v", b.Closed(), c.Closed())
+	}
+
+	// 复用最近归还的 c，且不新建会话。
+	beforeDial := *dialed
+	got, err := p.AcquireList(ctx, "h1", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != c {
+		t.Fatal("AcquireList 必须复用最近归还的 c（LIFO/LRU）")
+	}
+	if *dialed != beforeDial {
+		t.Fatalf("复用不得新建会话，dialed %d -> %d", beforeDial, *dialed)
+	}
+
+	// 另一 host 的会话仍可复用，不受 h1 淘汰影响。
+	gotOther, err := p.AcquireList(ctx, "h2", "u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOther != other {
+		t.Fatal("另一 host 的 idle 会话必须仍可复用")
+	}
+	p.Release(got, true)
+	p.Release(gotOther, true)
 }
