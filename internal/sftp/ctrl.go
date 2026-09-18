@@ -118,7 +118,14 @@ func (c *Ctrl) TransferPutTree(req TransferRequest, report func(Progress)) error
 	return c.backend().TransferPutTree(req, report)
 }
 
-func (c *Ctrl) Cancel(id string) bool { return false } // Task 10 接线
+// Cancel 转发到当前后端（Task 9）：绑定的 SftpTransferCancel(id) 唯一入口。
+// 真实取消（关该传输的会话）由 Task 10 的 GoBackend 注册表实现；batch 恒 false（幂等）。
+func (c *Ctrl) Cancel(id string) bool { return c.backend().Cancel(id) }
+
+// AtomicCapable 回答「当前选中的后端是否支持 .part + 提交」。
+// 绑定层必须据此填 TransferRequest.Atomic（能力驱动，绝不写死）：batch 传 true 会被
+// guardAtomic 硬拒（Task 6 的刻意裁决），写死 true 会让默认传输全盘失败。
+func (c *Ctrl) AtomicCapable() bool { return c.backend().AtomicCapable() }
 
 // TransportKind 返回当前选择器解析出的后端种类（评审 I2：让「选了哪个后端」可观测，
 // 杜绝开关静默 no-op）。测试直接读它，运行期由 backend() 记录一条日志。

@@ -820,3 +820,11 @@ func (c *BatchBackend) TransferPutTree(req TransferRequest, _ func(Progress)) er
 	}
 	return c.PutRecursive(req.Host, req.User, req.Local, req.Remote)
 }
+
+// AtomicCapable：batch 没有 .part + 提交语义，永远返回 false。
+// 绑定层据此把 Atomic 置 false（直写目标）；传 true 会被 guardAtomic 硬拒。
+func (c *BatchBackend) AtomicCapable() bool { return false }
+
+// Cancel：batch 的传输是阻塞的一次性 sftp -b 批处理，没有可单独关闭的会话注册表，
+// 恒返回 false（未知/不可取消 id 的幂等语义）。整批新面的取消由 Task 10 的 GoBackend 提供。
+func (c *BatchBackend) Cancel(string) bool { return false }

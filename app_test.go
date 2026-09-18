@@ -580,7 +580,7 @@ func TestStartupMigratesLegacyRecentsToDisk(t *testing.T) {
 // LocalRecent，且持久化落盘；旧 recent_sftp 不再被写入（spec §10.2）。
 func TestSftpGetRecordsRecent(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
-	if err := a.SftpGet("prod-db", "alice", "/var/log/app.log", "/tmp/dl/app.log"); err != nil {
+	if err := a.SftpGet("t-recent-get", "prod-db", "alice", "/var/log/app.log", "/tmp/dl/app.log", false, ""); err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	cfg, err := config.LoadConfig(a.cfgPath)
@@ -611,7 +611,7 @@ func TestSftpGetRecordsRecent(t *testing.T) {
 // P2: SftpPut 成功后同样写双侧新字段（remote/local 目录与 Get 对称）。
 func TestSftpPutRecordsRecent(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
-	if err := a.SftpPut("prod-db", "alice", "/tmp/dl/app.log", "/var/log/app.log"); err != nil {
+	if err := a.SftpPut("t-recent-put", "prod-db", "alice", "/tmp/dl/app.log", "/var/log/app.log", false, ""); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	cfg, err := config.LoadConfig(a.cfgPath)
@@ -663,13 +663,13 @@ func TestSftpHomeRecordsRecent(t *testing.T) {
 // P2: 重复记录同一 (host, path) 时旧条目被移除、新条目置顶；本地侧同理按 path 去重。
 func TestRecordRecentSFTPDedupMovesToFront(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
-	if err := a.SftpGet("h1", "", "/a/x", "/l1/x"); err != nil {
+	if err := a.SftpGet("t-h1", "h1", "", "/a/x", "/l1/x", false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.SftpGet("h2", "", "/b/y", "/l2/y"); err != nil {
+	if err := a.SftpGet("t-h2", "h2", "", "/b/y", "/l2/y", false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.SftpGet("h1", "", "/a/x", "/l1/x"); err != nil {
+	if err := a.SftpGet("t-h1", "h1", "", "/a/x", "/l1/x", false, ""); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.LoadConfig(a.cfgPath)
@@ -697,7 +697,7 @@ func TestRecordRecentSFTPDedupMovesToFront(t *testing.T) {
 // 所以这条在 Linux 是"恒真"的护栏，真正的判别力在 Windows。
 func TestRemoteRecentNeverContainsBackslash(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
-	if err := a.SftpGet("prod", "", "/a/b/c.txt", "/l/c.txt"); err != nil {
+	if err := a.SftpGet("t-prod", "prod", "", "/a/b/c.txt", "/l/c.txt", false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(a.cfg.RemoteRecent) != 1 {
@@ -716,7 +716,7 @@ func TestRecordRecentSFTPCapsAtTwenty(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
 	for i := 0; i < 25; i++ {
 		host := "host" + string(rune('a'+i))
-		if err := a.SftpGet(host, "", "/r"+string(rune('0'+i)), "/local"); err != nil {
+		if err := a.SftpGet("t-"+host, host, "", "/r"+string(rune('0'+i)), "/local", false, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -744,7 +744,7 @@ func TestRecordRecentSFTPCapsAtTwenty(t *testing.T) {
 func TestRecordRecentWritesNewFieldsOnly(t *testing.T) {
 	a3 := appWithFakeSFTP(t, "")
 	for _, host := range []string{"h1", "h2", "h3"} {
-		if err := a3.SftpGet(host, "", "/r/"+host, "/l/"+host); err != nil {
+		if err := a3.SftpGet("t3-"+host, host, "", "/r/"+host, "/l/"+host, false, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1226,6 +1226,76 @@ func TestStartupSeedsPresetsFileOnce(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(pp); string(after) != bad {
 		t.Fatal("坏文件不得被覆盖")
+	}
+}
+
+// —— Task 9：进度事件载荷 + 绑定层（id / Atomic 能力 / Cancel）——
+
+// TestSftpTransferProgressEventShape 钉住 sftp:transfer-progress 的载荷字段名与取值：
+// 字段名是前端（Task 14）与后端的唯一契约，改名/漏字段必须在这里变红。
+func TestSftpTransferProgressEventShape(t *testing.T) {
+	got := progressToEvent(sftp.Progress{ID: "t1", Done: 5, Total: 10, Phase: sftp.PhaseTransfer})
+	if got["id"] != "t1" || got["done"] != int64(5) || got["total"] != int64(10) || got["phase"] != "transfer" {
+		t.Fatalf("事件字段不符: %#v", got)
+	}
+	// 全部字段都必须存在：缺键会让前端静默读到 undefined（Task 14 的进度条/速度会算错）。
+	full := progressToEvent(sftp.Progress{
+		ID: "t2", Host: "h", Direction: sftp.DirDownload, Name: "/r/a.bin", PartPath: "/l/a.bin.part",
+		Done: 3, Total: 9, FilesDone: 0, FilesTotal: 0, Phase: sftp.PhaseTransfer,
+	})
+	want := map[string]any{
+		"id": "t2", "host": "h", "direction": "download", "name": "/r/a.bin",
+		"partPath": "/l/a.bin.part", "done": int64(3), "total": int64(9),
+		"filesDone": 0, "filesTotal": 0, "phase": "transfer",
+	}
+	if len(full) != len(want) {
+		t.Fatalf("事件字段数不符（多/漏字段）: got %d want %d: %#v", len(full), len(want), full)
+	}
+	for k, v := range want {
+		if full[k] != v {
+			t.Fatalf("字段 %s = %#v, want %#v", k, full[k], v)
+		}
+	}
+}
+
+// TestEmitProgressWithoutContextIsNoop：startup 之前（a.ctx == nil）emit 必须静默，
+// 绝不在后台 goroutine 里对 nil context 调 runtime.EventsEmit（会 panic）。
+func TestEmitProgressWithoutContextIsNoop(t *testing.T) {
+	a := NewApp() // 不调 startup ⇒ a.ctx 为 nil
+	a.emitProgress(sftp.Progress{ID: "t1", Done: 1, Total: 2, Phase: sftp.PhaseTransfer})
+}
+
+// TestSftpOutputBindingsUsableUnderDefaultBatch 钉住能力驱动的 Atomic 取值（Task 9 步骤 3）：
+// 默认后端是 batch（不 AtomicCapable，Task 6 的 M4 守卫对 Atomic=true 硬报错），四个输出
+// 绑定必须照常可用 —— 这只有在绑定层从 AtomicCapable 取 Atomic 时才成立。写死 Atomic=true
+// 会让默认传输全盘失败；写死 false 会丢掉 gosftp 的 .part + 提交语义。
+// （能力本身的来源由 internal/sftp 的 TestFacadeAtomicCapableFollowsBackend 钉住。）
+func TestSftpOutputBindingsUsableUnderDefaultBatch(t *testing.T) {
+	// batch 的 Transfer* 是「真执行」：假 runner 对 sftp 批处理一律返回成功。
+	a := appWithFakeSFTP(t, "")
+	cases := []struct {
+		name string
+		run  func() error
+	}{
+		{"SftpGet", func() error { return a.SftpGet("t1", "h", "u", "/r/a", "/l/a", true, "/l/a.part") }},
+		{"SftpGetDir", func() error { return a.SftpGetDir("t2", "h", "u", "/r/d", "/l/d", false, "") }},
+		{"SftpPut", func() error { return a.SftpPut("t3", "h", "u", "/l/a", "/r/a", false, "") }},
+		{"SftpPutRecursive", func() error { return a.SftpPutRecursive("t4", "h", "u", "/l/d", "/r/d", true, "/r/d.part") }},
+	}
+	for _, tc := range cases {
+		if err := tc.run(); err != nil {
+			t.Fatalf("%s: batch 后端下必须成功（Atomic=false 直写）: %v", tc.name, err)
+		}
+	}
+}
+
+// TestSftpTransferCancelDelegatesToFacade 钉住 SftpTransferCancel 绑定：
+// 必须把 id 原样转给门面（Cancel），返回值也原样上抛（未知 id ⇒ false）。
+// 真实取消（整批）由 Task 10 实现；本 task 只要求不吞错、不错位。
+func TestSftpTransferCancelDelegatesToFacade(t *testing.T) {
+	a := appWithFakeSFTP(t, "")
+	if a.SftpTransferCancel("t-unknown") {
+		t.Fatal("未知 id 必须返回 false（batch 门面当前恒 false）")
 	}
 }
 

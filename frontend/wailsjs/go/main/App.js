@@ -154,12 +154,12 @@ export function SftpDisconnect(arg1) {
   return window['go']['main']['App']['SftpDisconnect'](arg1);
 }
 
-export function SftpGet(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['SftpGet'](arg1, arg2, arg3, arg4);
+export function SftpGet(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['SftpGet'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }
 
-export function SftpGetDir(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['SftpGetDir'](arg1, arg2, arg3, arg4);
+export function SftpGetDir(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['SftpGetDir'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }
 
 export function SftpHome(arg1) {
@@ -178,12 +178,12 @@ export function SftpMove(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['SftpMove'](arg1, arg2, arg3, arg4);
 }
 
-export function SftpPut(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['SftpPut'](arg1, arg2, arg3, arg4);
+export function SftpPut(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['SftpPut'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }
 
-export function SftpPutRecursive(arg1, arg2, arg3, arg4) {
-  return window['go']['main']['App']['SftpPutRecursive'](arg1, arg2, arg3, arg4);
+export function SftpPutRecursive(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {
+  return window['go']['main']['App']['SftpPutRecursive'](arg1, arg2, arg3, arg4, arg5, arg6, arg7);
 }
 
 export function SftpRemove(arg1, arg2, arg3) {
@@ -200,6 +200,10 @@ export function SftpRename(arg1, arg2, arg3, arg4) {
 
 export function SftpSearch(arg1) {
   return window['go']['main']['App']['SftpSearch'](arg1);
+}
+
+export function SftpTransferCancel(arg1) {
+  return window['go']['main']['App']['SftpTransferCancel'](arg1);
 }
 
 export function StartSyncRule(arg1) {

@@ -13,7 +13,7 @@ import ConflictDialog from '../components/ConflictDialog.vue'
 import * as sel from '../utils/selection'
 import { join as localJoin, parentOf as localParent, joinRel, splitPath } from '../utils/localpath'
 import { actionFor } from '../utils/keys'
-import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName } from '../utils/batch'
+import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName, nextTransferSeq, transferID } from '../utils/batch'
 import { failureText } from '../utils/queue'
 import { payloadFor, parsePayload, hitPane, canDropInto } from '../utils/dnd'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
@@ -355,12 +355,16 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   }
   const results = skipped.map((t) => ({ ...t, status: '跳过' }))
   for (const t of skipped) transfers.value.push({ direction, name: t.name, src: t.src, dst: t.dst, size: 0, status: '跳过', elapsed: 0 })
+  const seq = nextTransferSeq() // 同一批共享前缀 t<seq>-，批内序号从 0 起
+  let n = -1
   for (const t of run) {
-    const rec = { direction, name: t.name, src: t.src, dst: t.dst, size: 0, status: '处理中', startedAt: Date.now() }
+    // 每个队列项一个稳定 id（Task 9）：绑定首参已从 host 变成 id，进度事件也按 id 关联。
+    // resume/partPath 这轮先给 false/''，Task 14 再接「续传」按钮；失败/取消项保留 id/partPath。
+    const rec = { id: transferID(seq, ++n), direction, name: t.name, src: t.src, dst: t.dst, size: 0, status: '处理中', startedAt: Date.now(), partPath: '', resume: false }
     transfers.value.push(rec)
     try {
-      if (direction === 'download') await (t.isDir ? SftpGetDir(host.value, '', t.src, t.dst) : SftpGet(host.value, '', t.src, t.dst))
-      else await (t.isDir ? SftpPutRecursive(host.value, '', t.src, t.dst) : SftpPut(host.value, '', t.src, t.dst))
+      if (direction === 'download') await (t.isDir ? SftpGetDir(rec.id, host.value, '', t.src, t.dst, rec.resume, rec.partPath) : SftpGet(rec.id, host.value, '', t.src, t.dst, rec.resume, rec.partPath))
+      else await (t.isDir ? SftpPutRecursive(rec.id, host.value, '', t.src, t.dst, rec.resume, rec.partPath) : SftpPut(rec.id, host.value, '', t.src, t.dst, rec.resume, rec.partPath))
       rec.status = '完成'
     } catch (e) {
       rec.status = '失败'
@@ -468,10 +472,11 @@ async function uploadPicked() {
     const local = await PickLocalFile()
     if (!local) return
     const name = local.split(/[\\/]/).pop()
-    t = { direction: 'upload', name, src: local, dst: posixJoin(remotePath.value, name), size: 0, status: '处理中', startedAt: Date.now() }
+    // 单文件手势同样要有 id（绑定首参已从 host 变成 id）；resume/partPath 待 Task 14 接线。
+    t = { id: transferID(nextTransferSeq(), 0), direction: 'upload', name, src: local, dst: posixJoin(remotePath.value, name), size: 0, status: '处理中', startedAt: Date.now(), partPath: '', resume: false }
     try { t.size = await StatLocal(local) } catch (e) { t.size = 0 }
     transfers.value.push(t)
-    await SftpPut(host.value, '', local, posixJoin(remotePath.value, name))
+    await SftpPut(t.id, host.value, '', local, posixJoin(remotePath.value, name), t.resume, t.partPath)
     t.status = '完成'
     t.elapsed = Math.floor((Date.now() - t.startedAt) / 1000)
     await loadRemote()

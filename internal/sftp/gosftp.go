@@ -533,3 +533,15 @@ func (g *GoBackend) Search(ctx context.Context, host, user, root, pattern string
 func (g *GoBackend) Connected(host string) bool   { return g.pool.Connected(host) }
 func (g *GoBackend) Disconnect(host string) error { return g.pool.Disconnect(host) }
 func (g *GoBackend) CloseAll()                    { g.pool.CloseAll() }
+
+// AtomicCapable：GoBackend 的新面一律走 .part + 提交（posix-rename 或 backup-swap），
+// 因此声明支持原子提交。绑定层据此把 TransferRequest.Atomic 置 true（Task 9）。
+func (g *GoBackend) AtomicCapable() bool { return true }
+
+// Cancel 关掉该传输独占的会话（库无逐请求取消）。
+//
+// Task 9 只接线绑定；真正的会话注册表（regMu/reg）由 Task 10 落地 —— 当前恒返回 false
+// 不表示「取消成功」，不表示「传输已完成」，只表示尚未接入。
+// 这里刻意不留「假成功」分支：整批语义由前端编排层落实（取消当前项 + 停止后续派发，
+// spec §6.1），前端据返回值决定是否把后续项标成已取消，返回 true 会让它撒谎。
+func (g *GoBackend) Cancel(string) bool { return false } // Task 10 接线
