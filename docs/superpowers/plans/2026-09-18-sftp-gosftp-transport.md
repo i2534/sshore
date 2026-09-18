@@ -23,6 +23,7 @@
 - 临时文件中缀固定为 `.sshore-sftppart-`（含 `bak`）；判定一律用 `strings.Contains` / JS `includes`，**不是** glob 前缀、**不是** `startsWith('.')`。
 - `Item{Name,Size,IsDir,Mode,ModTime}` 形状不变；`ModTime` 逐字保持 `2006-01-02 15:04`（watch/sync 用它做字符串相等比较）。
 - 下载提交 = 本地 `os.Rename`（Windows 亦覆盖）；上传提交 = `Client.PosixRename`（先 `HasExtension` 探测，返回 `(string,bool)`）；无扩展/失败 → backup-swap + journal，**绝不先删目标**。
+- **上传提交必须保留 backup-swap 回退**：Task 0 只观测到一次覆盖成功、零次独立失败 —— 即使 `HasExtension` 为真且 `PosixRename` 返回非 nil，也不得把「扩展可用」当作「覆盖必成」；`PosixRename` 返回错误时一律走 backup-swap（Task 0 评审 Important-1）。
 - 上传新建 = `OpenFile(O_WRONLY|O_CREATE|O_TRUNC)`；上传续传 = `OpenFile(O_WRONLY)`（**严禁 O_TRUNC**）+ `Seek(partSize)`；**不用 O_APPEND**。
 - 提交前置：`done == 开始时记录的 total`；不满足必须报错并保留 `.part`。
 - 默认后端先 `batch`；Task 16 真机验收通过后把内置默认切 `gosftp`（用户仍可配置回退）。
