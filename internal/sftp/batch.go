@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -777,19 +778,45 @@ func (c *BatchBackend) Rename(host, user, oldPath, newPath string) error {
 }
 
 // —— Backend 接口的新面方法：包装 legacy 四参实现 ——
-// batch 不产生进度、不走 .part；Atomic 字段被忽略（batch 始终直写目标）。
+// batch 不产生进度、不走 .part（始终直写目标）。Atomic=true 由 guardAtomic 显式拒绝。
+
+// errBatchAtomic 是 Atomic 守卫的错误：batch 后端没有 .part + 提交语义，
+// 新面调用方传 Atomic=true 时只能直写目标。静默退化会让调用方误以为拿到了原子提交，
+// 所以这里选择**显式报错**（评审 M4 的行为裁决）。
+var errBatchAtomic = errors.New("batch 后端不支持 Atomic 传输（无 .part/提交语义）；请改用 gosftp 后端或 Atomic=false")
+
+// guardAtomic 是 M4 守卫：Atomic=true 时绝不静默降级为直写。
+func (c *BatchBackend) guardAtomic(req TransferRequest, op string) error {
+	if req.Atomic {
+		return &TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: errBatchAtomic}
+	}
+	return nil
+}
+
 func (c *BatchBackend) TransferGet(req TransferRequest, _ func(Progress)) error {
+	if err := c.guardAtomic(req, "sftp get"); err != nil {
+		return err
+	}
 	return c.Get(req.Host, req.User, req.Remote, req.Local)
 }
 
 func (c *BatchBackend) TransferGetTree(req TransferRequest, _ func(Progress)) error {
+	if err := c.guardAtomic(req, "sftp get -r"); err != nil {
+		return err
+	}
 	return c.GetRecursive(req.Host, req.User, req.Remote, req.Local)
 }
 
 func (c *BatchBackend) TransferPut(req TransferRequest, _ func(Progress)) error {
+	if err := c.guardAtomic(req, "sftp put"); err != nil {
+		return err
+	}
 	return c.Put(req.Host, req.User, req.Local, req.Remote)
 }
 
 func (c *BatchBackend) TransferPutTree(req TransferRequest, _ func(Progress)) error {
+	if err := c.guardAtomic(req, "sftp put -r"); err != nil {
+		return err
+	}
 	return c.PutRecursive(req.Host, req.User, req.Local, req.Remote)
 }

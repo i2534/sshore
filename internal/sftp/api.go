@@ -91,3 +91,10 @@ type Backend interface {
 	Disconnect(host string) error
 	CloseAll()
 }
+
+// 编译期断言（Task 5 评审 M2）：两个后端必须始终满足新传输面 Backend 接口。
+// 后续 task 若改了接口或任一后端的方法签名，这里第一时间编译失败，而不是等到运行期。
+var (
+	_ Backend = (*BatchBackend)(nil)
+	_ Backend = (*GoBackend)(nil)
+)

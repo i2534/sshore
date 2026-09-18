@@ -2,6 +2,7 @@ package sftp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -742,7 +743,10 @@ func TestFacadeLegacyFaceUsesSelectedBackendWithAtomicFalse(t *testing.T) {
 
 // TestNewCtrlFacadeWiring 钉住两个构造：NewCtrl 只挂 batch（测试/兼容路径），
 // NewCtrlWith 额外注入懒解析选择器（生产路径）。
+// Task 5 评审 I1：这里必须**显式清掉 SSHORE_SFTP_TRANSPORT**，否则测试结果取
+// 决于外部环境；并且两条分支都要断言：默认/显式 batch 与显式 gosftp。
 func TestNewCtrlFacadeWiring(t *testing.T) {
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "")
 	c := NewCtrl(nil, nil)
 	if _, ok := c.backend().(*BatchBackend); !ok {
 		t.Fatalf("NewCtrl 的 backend() 应默认返回 *BatchBackend, got %T", c.backend())
@@ -750,12 +754,75 @@ func TestNewCtrlFacadeWiring(t *testing.T) {
 	if c.sel != nil {
 		t.Fatal("NewCtrl 不得注入 selector（保持 spec D3 两参语义）")
 	}
+	if c.TransportKind() != KindBatch {
+		t.Fatalf("默认应解析为 KindBatch, got %v", c.TransportKind())
+	}
 
 	c2 := NewCtrlWith(nil, nil, func() string { return "gosftp" })
 	if c2.sel == nil || c2.sel() != "gosftp" {
 		t.Fatalf("NewCtrlWith 应保留注入的 selector, got %v", c2.sel)
 	}
-	if _, ok := c2.backend().(*BatchBackend); !ok {
-		t.Fatalf("Task 5 尚无 GoBackend，backend() 仍应返回 batch, got %T", c2.backend())
+	if c2.TransportKind() != KindGo {
+		t.Fatalf("显式 gosftp 应解析为 KindGo, got %v", c2.TransportKind())
+	}
+	gb, ok := c2.backend().(*GoBackend)
+	if !ok {
+		t.Fatalf("显式选定 gosftp 时 backend() 应返回 *GoBackend, got %T", c2.backend())
+	}
+	if c2.backend() != Backend(gb) {
+		t.Fatal("GoBackend 必须懒构造后缓存，而不是每次新建")
+	}
+
+	// env 覆盖 config：即便 selector 说 batch，env=gosftp 也要选中 GoBackend。
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "gosftp")
+	c3 := NewCtrlWith(nil, nil, func() string { return "batch" })
+	if _, ok := c3.backend().(*GoBackend); !ok {
+		t.Fatalf("env=gosftp 必须覆盖 config=batch, got %T", c3.backend())
+	}
+
+	// 显式选 batch：即使 env 清空也走 batch 分支。
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "")
+	c4 := NewCtrlWith(nil, nil, func() string { return "batch" })
+	if _, ok := c4.backend().(*BatchBackend); !ok {
+		t.Fatalf("显式 batch 应返回 *BatchBackend, got %T", c4.backend())
+	}
+}
+
+// TestBatchRejectsAtomicTransfer 钉住评审 M4 的行为裁决：新面调用方对 batch 后端
+// 传 Atomic=true 时**显式报错**，绝不静默退化为直写目标（那会让调用方误以为
+// 拿到了 .part + 提交的原子保证）。Atomic=false 仍照旧直写。
+func TestBatchRejectsAtomicTransfer(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewBatchBackend(fr.run, nil)
+	atomic := TransferRequest{Host: "h", User: "", Remote: "/r", Local: "/l", Atomic: true}
+	cases := []struct {
+		name string
+		run  func() error
+	}{
+		{"TransferGet", func() error { return c.TransferGet(atomic, nil) }},
+		{"TransferGetTree", func() error { return c.TransferGetTree(atomic, nil) }},
+		{"TransferPut", func() error { return c.TransferPut(atomic, nil) }},
+		{"TransferPutTree", func() error { return c.TransferPutTree(atomic, nil) }},
+	}
+	for _, tc := range cases {
+		err := tc.run()
+		if err == nil {
+			t.Fatalf("%s: Atomic=true 必须报错（否则就是静默退化）", tc.name)
+		}
+		if !errors.Is(err, errBatchAtomic) {
+			t.Fatalf("%s: 错误应可判定为 errBatchAtomic, got %v", tc.name, err)
+		}
+	}
+	fr.mu.Lock()
+	calls := len(fr.calls)
+	fr.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("Atomic 守卫必须在使用 runner 之前拦下，实际发了 %d 条命令", calls)
+	}
+
+	// Atomic=false（legacy 面）必须继续可用。
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/r", lsLine("a.txt", false, 1))})
+	if err := c.TransferGet(TransferRequest{Host: "h", Remote: "/r", Local: "/l"}, nil); err != nil {
+		t.Fatalf("Atomic=false 不得被守卫拦住: %v", err)
 	}
 }
