@@ -493,6 +493,7 @@ git commit -m "feat(sftp): 传输后端开关（配置+环境变量）与 pkg/sf
 **Interfaces:**
 - Consumes: 无
 - Produces: `const PartMarker = ".sshore-sftppart-"`（len=17）；**本地**（OS 原生分隔符，用 `filepath`）：`PartName(target, id)` / `BakName(target)` / `ShortPartName(id)`；**远端 POSIX**（用 `path`，Windows 客户端上 `filepath.Join/Clean` 会把 `/` 变成 `\`）：`PartNameRemote(target, id)` / `BakNameRemote(target)`；`IsInternalTemp(name) bool`（中缀 Contains + `filepath.Base`）。
+- **远端家族的变异保护**：`path` 与 `filepath` 的差异只在 Windows 可观测，而 CI 的 **go-windows job 在 windows-latest 上跑 `go test ./... -count=1`**（`.github/workflows/ci.yml:57-59`）—— 因此「远端家族误用 filepath」的变异由 CI 自动杀死，本地 Linux 跑不出该变异是预期行为，不是缺口。
 - **两套家族的原因（Task 2 评审 Important-2）**：远端路径永远是 POSIX；若用 `filepath` 生成远端临时/备份名，Windows 客户端上的退化短名会落到别处（`\data\.sshore-sftppart-…`），破坏「同目录/rename 原子」。本地用 `filepath`、远端用 `path`，各有单测。
 
 - [ ] **Step 1: 写失败测试**
