@@ -58,6 +58,13 @@ type TransferError struct {
 	PartPath  string
 	RemoteMsg string
 	Err       error
+
+	// 目录传输的失败/取消路径回填（Task 12 修复轮 1 / I4）：已提交的文件数与字节数，
+	// 以及尚未完成的文件数。RemainingFiles < 0 表示枚举已被 D16 降级（分母未知）。
+	// 单文件任务、成功路径以及「尚未开始逐文件搬运」的失败保持零值。
+	CommittedFiles int
+	CommittedBytes int64
+	RemainingFiles int
 }
 
 func (e *TransferError) Error() string {

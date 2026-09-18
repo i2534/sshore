@@ -358,6 +358,11 @@ func scanLimitReached(files int, elapsed time.Duration) bool {
 // 「枚举中途降级」这条路径 —— 否则降级只有纯函数测试，集成路径是假覆盖。
 var scanLimit = scanLimitReached
 
+// scanCheckpoint 是「扫描阶段取消」的确定性注入点（与 copyStream/scanLimit 同思路）：
+// 生产实现是 no-op；单测把它替换成「卡住直到放行」，把扫描相取消变成确定性 —— 不需要
+// 造一个恰好很慢的枚举。scanTree 每批、scanLocalTree 每步都会调用它（Task 12 修复轮 1 / I1）。
+var scanCheckpoint = func() {}
+
 // degradedProgress 返回降级后的进度载荷：Total=-1（不定进度条）且 FilesTotal=-1
 // （UI 显示「已完成 N 个文件」而不是假装有分母）。Phase 必须是 transfer —— 降级只放弃
 // 枚举，不放弃传输。
@@ -385,6 +390,12 @@ type treeFile struct {
 func scanTree(ctx context.Context, s *Session, root string, start time.Time) (files []treeFile, subdirs []string, degraded bool, err error) {
 	queue := []string{""}
 	for len(queue) > 0 {
+		// I1：扫描相取消的确定性注入点（先钩子、后 ctx 检查）—— 单测在这里卡住枚举、
+		// 调 Cancel(id)（触发 cancel），放行后 ctx.Err() 立刻中止扫描，绝不发起下一批。
+		scanCheckpoint()
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, nil, false, cerr
+		}
 		rel := queue[0]
 		queue = queue[1:]
 		remoteDir := root
@@ -447,11 +458,12 @@ type treeProgress struct {
 	host   string
 	dir    Direction
 	name   string
-	total  int64 // <0 表示未知（降级）
-	files  int   // <0 表示未知（降级）
-	base   int64 // 已提交文件的字节总数
-	infl   int64 // 当前文件已传字节（来自逐文件帧）
-	doneF  int   // 已提交文件数
+	total  int64  // <0 表示未知（降级）
+	files  int    // <0 表示未知（降级）
+	base   int64  // 已提交文件的字节总数
+	infl   int64  // 当前文件已传字节（来自逐文件帧）
+	doneF  int    // 已提交文件数
+	part   string // 失败路径回填的重试锚点（失败末帧的 PartPath）；正常进度为空
 	report func(Progress)
 	now    func() time.Time
 	last   time.Time
@@ -470,10 +482,21 @@ func (t *treeProgress) frame(force bool) {
 		return
 	}
 	t.last = t.now()
+	// M2：分母来自枚举、分子来自**已打开句柄**的 Stat，两者在「枚举与打开之间源被改写」
+	// 时可能不一致（分子会超过分母）。这里显式把两个分子夹到各自分母内，保证进度帧永不
+	// 出现 Done>Total / FilesDone>FilesTotal 的自相矛盾。
+	done := t.base + t.infl
+	if t.total >= 0 && done > t.total {
+		done = t.total
+	}
+	filesDone := t.doneF
+	if t.files >= 0 && filesDone > t.files {
+		filesDone = t.files
+	}
 	t.report(Progress{
-		ID: t.id, Host: t.host, Direction: t.dir, Name: t.name,
-		Done: t.base + t.infl, Total: t.total,
-		FilesDone: t.doneF, FilesTotal: t.files, Phase: PhaseTransfer,
+		ID: t.id, Host: t.host, Direction: t.dir, Name: t.name, PartPath: t.part,
+		Done: done, Total: t.total,
+		FilesDone: filesDone, FilesTotal: t.files, Phase: PhaseTransfer,
 	})
 }
 
@@ -502,4 +525,22 @@ func (t *treeProgress) finishFile(size int64) {
 	t.base += size
 	t.infl = 0
 	t.doneF++
+}
+
+// fail 在失败/取消路径上补发一帧末帧，并返回「已提交/剩余」计数（Task 12 修复轮 1 / I4）。
+// 失败项自身的在飞字节（t.infl）不计入 Done —— 只有**提交成功**的文件才配上调分子，否则
+// UI 会把半截文件算成已传。失败末帧的 PartPath 填本次保留的重试锚点（part 非空时），
+// 调用方据此定位可续传的 .part。RemainingFiles<0 表示枚举已降级（分母未知）。
+func (t *treeProgress) fail(part string) (committedFiles int, committedBytes int64, remaining int) {
+	t.part = part
+	t.infl = 0
+	t.frame(true)
+	remaining = -1
+	if t.files >= 0 {
+		remaining = t.files - t.doneF
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+	return t.doneF, t.base, remaining
 }
