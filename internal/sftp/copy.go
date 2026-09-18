@@ -133,7 +133,17 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 	if part == "" {
 		part = PartName(local, req.ID)
 	}
-	f, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	// 续传（Task 11）：req.Resume + req.ResumeOffset 由 Get 的 decideResume 填好。
+	// 绝不能 O_TRUNC —— 那会把上一次留下的前缀清零，随后 Seek(offset) 写出「前 offset 字节
+	// 是 0」的静默损坏文件（事实 5）。远端也必须 Seek 到同一 offset，否则会把源的第 0 字节
+	// 写到本地 offset 处。
+	offset := int64(0)
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if req.Resume {
+		offset = req.ResumeOffset
+		flags = os.O_WRONLY | os.O_CREATE
+	}
+	f, err := os.OpenFile(part, flags, 0600)
 	if err != nil {
 		// 本地 .part 根本没建出来：**必须返回空 part**（Task 7 评审 I2）。
 		// 原先这里返回 part，Get 据此填 TransferError.PartPath 给出一个 ENOENT 的假锚点，
@@ -142,21 +152,38 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 		_ = rf.Close()
 		return "", 0, total, fmt.Errorf("%w: %w", errLocalPart, err)
 	}
+	if offset > 0 {
+		if _, serr := rf.Seek(offset, io.SeekStart); serr != nil {
+			_ = rf.Close()
+			_ = f.Close()
+			return part, 0, total, serr
+		}
+		if _, serr := f.Seek(offset, io.SeekStart); serr != nil {
+			_ = rf.Close()
+			_ = f.Close()
+			return part, 0, total, wrapLocalIO(serr)
+		}
+	}
+	// 记录源指纹（Task 11）：这份 .part 的已落盘字节对应远端源的 (size, mtime)。
+	// 续传请求带回同一个 PartPath 时用它验证「还是当初那份源吗」。
+	g.recordResumeAnchor(downloadAnchorKey(part), total, st.ModTime())
 	em := newProgressEmitter(req.ID, report)
-	cw := &countingWriter{f: f, e: em, p: Progress{Host: req.Host, Direction: DirDownload, Name: remote, PartPath: part, Total: total, Phase: PhaseTransfer}}
-	em.send(cw.p, true) // 首帧：立刻让 UI 看到 0/total 与 partPath
-	n, cerr := copyStream(cw, rf)
+	// 首帧 Done 从续传起点起算，UI 不会在续传时先看到 0/total。
+	cw := &countingWriter{f: f, e: em, p: Progress{Host: req.Host, Direction: DirDownload, Name: remote, PartPath: part, Done: offset, Total: total, Phase: PhaseTransfer}, n: offset}
+	em.send(cw.p, true) // 首帧：立刻让 UI 看到 offset/total 与 partPath
+	_, cerr := copyStream(cw, rf)
 	_ = rf.Close()
 	_ = f.Close()
+	done := cw.n
 	if cerr != nil {
-		return part, n, total, cerr
+		return part, done, total, cerr
 	}
-	if decideCommit(n, total) != commitOK {
+	if decideCommit(done, total) != commitOK {
 		// 唯一提交前置在 helper 里也拦一道：任何调用方（Task 12 的目录传输）都不能把
 		// 「字节数不完整」当成成功拿去 rename 提交。截断源不会报错（库对 EOF 返回 nil）。
-		return part, n, total, shortReadError(n, total, part)
+		return part, done, total, shortReadError(done, total, part)
 	}
-	return part, n, total, nil
+	return part, done, total, nil
 }
 
 // getNonAtomic 是 legacy 面（req.Atomic=false，internal/sync）：直写目标，
