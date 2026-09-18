@@ -105,19 +105,35 @@ type GoBackend struct {
 	connected map[string]bool
 
 	// Task 13 修复轮 1（F2）：退出静默。transferMu 把 acquireInflight 的
-	// 「检查 closing + transfersWG.Add」与 CloseAll 的「置 closing + Wait」串行化，
+	// 「检查 closing + transfersWG.Add」与 CloseAll 的「置 closing + 有界等待」串行化，
 	// 保证不会在 Wait 开始之后再 Add（Go WaitGroup 规约）。closing 一旦置位即拒绝新的
 	// 传输（应用正在退出）；transfersWG 计数在飞传输，CloseAll 先等它归零再做清理与恢复，
 	// 绝不删一条仍在提交中的 .part。
 	transferMu  sync.Mutex
 	closing     bool
 	transfersWG sync.WaitGroup
+
+	// Task 13 修复轮 2（D1）：把「静默」从无界等待改成有界等待。
+	// transferCtx 是后端级传输上下文：所有传输的取额度排队与扫描相都从它派生，
+	// 生产期从不取消；CloseAll 在宽限期耗尽时取消它，从而真正中断一个卡住的传输
+	//（排队的 select 与 scanTree/scanLocalTree 的 ctx 检查都监听它）。
+	// transferCancel 只由 CloseAll 调用（幂等）；closeGrace 是等待在飞传输静默的上限，
+	// 默认 shutdownGrace=5s（与项目其它退出等待一致），单测可调小以免每条用例真等 5 秒。
+	transferCtx    context.Context
+	transferCancel context.CancelFunc
+	closeGrace     time.Duration
 }
 
 func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
+	// D1：后端级传输上下文。派生点必须在这里唯一创建 —— CloseAll 取消的是同一个 ctx，
+	// 所有传输共享它，宽限期到点才能一次性中断全部在飞传输的排队与扫描。
+	transferCtx, transferCancel := context.WithCancel(context.Background())
 	g := &GoBackend{
-		emit: emit,
-		sel:  sel,
+		emit:           emit,
+		sel:            sel,
+		transferCtx:    transferCtx,
+		transferCancel: transferCancel,
+		closeGrace:     shutdownGrace,
 		// Task 6 评审 M2：这些 map 到 Task 10/11/13 才被写入。构造时就初始化，
 		// 后续 task 直接写字段（g.reg[id] = e 等）不会 panic: assignment to entry in nil map。
 		reg:           map[string]*regEntry{},
@@ -348,7 +364,7 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	}
 	defer release()
 
-	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
+	s, err := g.pool.AcquireTransfer(g.transferCtx, req.Host, req.User)
 	if err != nil {
 		return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: err}
 	}
@@ -478,16 +494,17 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 	}
 	defer release()
 
-	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
+	s, err := g.pool.AcquireTransfer(g.transferCtx, req.Host, req.User)
 	if err != nil {
 		return &TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: err}
 	}
 	reuse := false
 	defer func() { g.pool.Release(s, reuse) }()
-	// I1（Task 12 修复轮 1）：扫描相取消上下文。PUT 方向在扫描相不经过会话 IO，
-	// 只关会话拦不住本地 WalkDir；GET 方向的 scanTree 两处 ctx.Err() 检查原先因为传
-	// context.Background() 而是死代码。Cancel(id) 触发的 cancel 让两处检查都真正生效。
-	ctx, cancel := context.WithCancel(context.Background())
+	// I1（Task 12 修复轮 1）：扫描相取消上下文。GET 方向的 scanTree 两处 ctx.Err() 检查
+	// 原先因为传 context.Background() 而是死代码。Cancel(id) 触发的 cancel 让两处检查真正生效。
+	// D1（修复轮 2）：父上下文是后端级 g.transferCtx —— CloseAll 宽限期耗尽时取消它，
+	// 这条 cancel 让扫描相一并中止（不只是关会话能拦住的 IO 相）。
+	ctx, cancel := context.WithCancel(g.transferCtx)
 	defer cancel()
 	entry := g.register(req.ID, s, cancel)
 	defer g.unregister(req.ID, entry)
@@ -616,7 +633,7 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	// 本地源指纹（Task 11 续传用）：与 total 一起记录在远端 .part 上。
 	srcMtime := st.ModTime()
 
-	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
+	s, err := g.pool.AcquireTransfer(g.transferCtx, req.Host, req.User)
 	if err != nil {
 		return &TransferError{Op: "sftp put", Host: req.Host, Path: req.Remote, Err: err}
 	}
@@ -901,7 +918,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 			// I4：非 ENOENT（权限/被占用）必须上报，绝不当作「目标不存在」直接提交 ——
 			// 那会把失败当成功，还会绕过 journal。target 没被动，清掉已无意义的 intent。
 			if j != nil {
-				if derr := j.Done(s.Host, target); derr != nil {
+				if derr := j.Done(s.Host, s.User, target); derr != nil {
 					warn("清理 swap journal 条目失败（目标改名失败时）: %v", derr)
 				}
 			}
@@ -909,7 +926,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 		}
 		// 目标原本不存在：无旧内容可丢，直接提交；intent 已无意义，先清（清不掉只 warn）。
 		if j != nil {
-			if derr := j.Done(s.Host, target); derr != nil {
+			if derr := j.Done(s.Host, s.User, target); derr != nil {
 				warn("清理 swap journal 条目失败（目标本不存在时）: %v", derr)
 			}
 		}
@@ -923,7 +940,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 				err, bak, target, rbErr)
 		}
 		if j != nil {
-			if derr := j.Done(s.Host, target); derr != nil {
+			if derr := j.Done(s.Host, s.User, target); derr != nil {
 				return fmt.Errorf("%w（回滚成功但清理 journal 失败，条目保留）: %v", err, derr)
 			}
 		}
@@ -931,7 +948,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 	}
 	// 4) 提交成功：清理失败只 warn（见函数头错误策略）。
 	if j != nil {
-		if err := j.Done(s.Host, target); err != nil {
+		if err := j.Done(s.Host, s.User, target); err != nil {
 			warn("提交成功但清理 swap journal 条目失败: %v", err)
 		}
 	}
@@ -967,7 +984,7 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	}
 	defer release()
 
-	s, err := g.pool.AcquireTransfer(context.Background(), req.Host, req.User)
+	s, err := g.pool.AcquireTransfer(g.transferCtx, req.Host, req.User)
 	if err != nil {
 		return &TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: err}
 	}
@@ -977,7 +994,9 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	// I1（Task 12 修复轮 1）：**先登记再枚举**。本地 WalkDir 可能长时间运行，在这个窗口里
 	// Cancel(id) 必须已经能命中条目（否则用户的取消被静默吞掉、上传照旧进行）。扫描相不经过
 	// 会话 IO，光关会话拦不住 WalkDir；注册一个 Cancel 能触发的 ctx，WalkDir 每步检查它。
-	ctx, cancel := context.WithCancel(context.Background())
+	// D1（修复轮 2）：父上下文是后端级 g.transferCtx —— CloseAll 宽限期耗尽时取消它，
+	// 扫描相（本地 WalkDir）随之中止。
+	ctx, cancel := context.WithCancel(g.transferCtx)
 	defer cancel()
 	entry := g.register(req.ID, s, cancel)
 	defer g.unregister(req.ID, entry)
@@ -1429,30 +1448,72 @@ func (g *GoBackend) Disconnect(host string) error {
 	return g.pool.Disconnect(host)
 }
 
-// CloseAll 关闭全部会话并清除所有连接意图（应用退出）。顺序是硬约束（修复轮 1 / F2）：
+// CloseAll 关闭全部会话并清除所有连接意图（应用退出）。顺序是硬约束（修复轮 1 / F2，
+// 修复轮 2 / D1 给「静默」加了上界）：
 //
-//  1. **静默**：置 closing 拒绝新传输，并等待所有在飞传输结束（提交成功或失败都算结束）。
-//     绝不能先删 .part —— 在飞传输的 .part 仍要参与提交，先删会让一次正在进行的
-//     rename(target→bak)/rename(part→target) 失败，留下 target 缺失、bak 残存的现场。
-//  2. 关闭全部会话（此刻没有在途 IO）。
-//  3. 清理已知 .part —— 必须放在关会话**之后**：CleanupParts 自己会为每个 host 取会话
-//     （pool.CloseAll 之后仍可 AcquireList 新建）。此时在飞传输已被静默，登记表里剩下的
-//     .part 都属于已停止的传输，删除不会打断任何提交。
-//  4. 清连接意图（CleanupParts 取会话会重新点亮 Connected，必须在最后清）。
+//  1. **静默（有界）**：置 closing 拒绝新传输，并在 closeGrace（默认 shutdownGrace=5s）
+//     内等待所有在飞传输结束（提交成功或失败都算结束）。绝不能先删 .part —— 在飞传输的
+//     .part 仍要参与提交，先删会让一次正在进行的 rename(target→bak)/rename(part→target)
+//     失败，留下 target 缺失、bak 残存的现场。
+//  2. **宽限期耗尽 ⇒ 强停**（D1）：取消后端级 transferCtx（中断无界的取额度排队与扫描相），
+//     再关闭全部会话（中断阻塞中的网络 IO）。这些传输从此刻起是「已被强制停止」，
+//     因此第 3 步的清理不再与它们竞争 —— 这正是修复轮 2 要避免重新引入的 F2 竞态。
+//     强停前绝不清理：只要还有传输可能提交，就绝不删它的 .part。
+//  3. 关闭全部会话（正常路径：此刻没有在途 IO；强停路径：幂等重复一次）。
+//  4. 清理已知 .part —— 必须放在关会话**之后**：CleanupParts 自己会为每个 host 取会话
+//     （pool.CloseAll 之后仍可 AcquireList 新建）。此时在飞传输要么已结束、要么已被强停，
+//     登记表里剩下的 .part 都属于已停止的传输，删除不会打断任何提交。
+//  5. 清连接意图（CleanupParts 取会话会重新点亮 Connected，必须在最后清）。
 //
-// app.go 的 OnShutdown 在本方法返回后才调用 RecoverSwaps：静默保证恢复探测不会与
-// 在飞提交竞争（旧顺序下 RecoverSwaps 会把一次「target→bak 已成功、part→target 尚未」
-// 的在飞提交当成 W0，清掉条目并让回滚失败 —— target 与条目双失）。
+// app.go 的 OnShutdown 在本方法返回后才调用 RecoverSwaps：静默（或强停）保证恢复探测
+// 不会与一次仍在飞的提交竞争（旧顺序下 RecoverSwaps 会把一次「target→bak 已成功、
+// part→target 尚未」的在飞提交当成 W0，清掉条目并让回滚失败 —— target 与条目双失）。
+//
+// 为什么不能无界 Wait（D1 的 liveness 回归）：传输入口一律用「生产期从不取消」的
+// g.transferCtx 取会话，而对端活着但卡死（或本地写挂起）时在飞 IO 永远不会返回；
+// 无界 Wait 等于把退出押在 ssh 的 ServerAliveInterval×CountMax 上，最终仍可能永久挂起。
+// 有界等待 + 取消 ctx + 关会话给出确定的上界，并在放弃时发 warn（绝不静默拖延退出）。
 func (g *GoBackend) CloseAll() {
+	grace := g.closeGrace
+	if grace <= 0 {
+		grace = shutdownGrace
+	}
 	g.transferMu.Lock()
 	g.closing = true
 	g.transferMu.Unlock()
-	g.transfersWG.Wait()
+
+	if !g.waitTransfers(grace) {
+		// 宽限期耗尽：强停。顺序不可换 —— 先取消 ctx，任何「已过 closing 检查但尚未
+		// 落进池快照」的排队/建会话都会自检 ctx 失败并自我清理；再关会话中断已经在
+		// 阻塞 IO 的传输。
+		g.transferCancel()
+		g.pool.CloseAll()
+		g.warnf("", "退出静默超过 %s，已强制取消在飞传输并关闭会话后继续退出", grace)
+	}
 	g.pool.CloseAll()
 	g.CleanupParts()
 	g.connMu.Lock()
 	g.connected = map[string]bool{}
 	g.connMu.Unlock()
+}
+
+// waitTransfers 有界等待在飞传输归零：返回 true 表示已全部结束，false 表示 d 内未结束。
+// Wait 必须在独立 goroutine 里跑 —— 强停后若仍有传输（例如本地写永久挂起）不肯结束，
+// CloseAll 也不能再被它拖住（这正是 D1 要修的无界等待）。
+func (g *GoBackend) waitTransfers(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		g.transfersWG.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // AtomicCapable：GoBackend 的新面一律走 .part + 提交（posix-rename 或 backup-swap），
@@ -1856,7 +1917,7 @@ func (g *GoBackend) RecoverSwaps() (int, error) {
 			}
 			// 步骤 1：bak 不存在 ⇒ rename 尚未发生（或已被人工清理），条目已无意义。
 			if !bakExists {
-				if derr := g.journal.Done(e.Host, e.Target); derr != nil {
+				if derr := g.journal.Done(e.Host, e.User, e.Target); derr != nil {
 					g.warnf(host, "恢复 swap：清理条目 %s 失败: %v", e.Target, derr)
 					continue
 				}
@@ -1875,7 +1936,7 @@ func (g *GoBackend) RecoverSwaps() (int, error) {
 					g.warnf(host, "恢复 swap：回滚 %s → %s 失败，保留条目待下次启动: %v", e.Bak, e.Target, rerr)
 					continue
 				}
-				if derr := g.journal.Done(e.Host, e.Target); derr != nil {
+				if derr := g.journal.Done(e.Host, e.User, e.Target); derr != nil {
 					g.warnf(host, "恢复 swap：回滚成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
 					continue
 				}
@@ -1887,7 +1948,7 @@ func (g *GoBackend) RecoverSwaps() (int, error) {
 				g.warnf(host, "恢复 swap：删除孤儿备份 %s 失败，保留条目待下次启动: %v", e.Bak, rerr)
 				continue
 			}
-			if derr := g.journal.Done(e.Host, e.Target); derr != nil {
+			if derr := g.journal.Done(e.Host, e.User, e.Target); derr != nil {
 				g.warnf(host, "恢复 swap：删备份成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
 				continue
 			}

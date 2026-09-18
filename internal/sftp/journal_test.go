@@ -26,14 +26,14 @@ func TestJournalBeginDoneRecover(t *testing.T) {
 	if got[0].Host != "h1" || got[0].User != "u1" {
 		t.Fatalf("恢复条目必须带 host/user，got host=%q user=%q", got[0].Host, got[0].User)
 	}
-	if err := j.Done("h1", "/data/a.txt"); err != nil {
+	if err := j.Done("h1", "u1", "/data/a.txt"); err != nil {
 		t.Fatal(err)
 	}
 	if got := j.Recover(); len(got) != 0 {
 		t.Fatalf("完成后不应再报告，got %v", got)
 	}
 	// 幂等：done 不存在也算成功
-	if err := j.Done("h1", "/data/none.txt"); err != nil {
+	if err := j.Done("h1", "u1", "/data/none.txt"); err != nil {
 		t.Fatal(err)
 	}
 	_ = os.Remove(filepath.Join(dir, "swap-entries.json"))
@@ -83,14 +83,14 @@ func TestJournalPersistsAcrossInstances(t *testing.T) {
 		t.Fatalf("重启后应恢复出两条未完成目标，got %v", got)
 	}
 
-	// Done 只移除指定主机的指定目标，不影响其它条目。
-	if err := j2.Done("h1", "/data/a.txt"); err != nil {
+	// Done 只移除指定 (host,user) 的指定目标，不影响其它条目。
+	if err := j2.Done("h1", "u1", "/data/a.txt"); err != nil {
 		t.Fatal(err)
 	}
 	if got := newSwapJournal(dir).Recover(); len(got) != 1 || got[0].Target != "/data/b.txt" {
 		t.Fatalf("Done 后应只剩 b.txt，got %v", got)
 	}
-	if err := j2.Done("h1", "/data/b.txt"); err != nil {
+	if err := j2.Done("h1", "u1", "/data/b.txt"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "swap-entries.json")); !os.IsNotExist(err) {
@@ -140,12 +140,64 @@ func TestJournalSameTargetDifferentHostsCoexist(t *testing.T) {
 		t.Fatalf("不同主机的同名 target 必须各留一条，got %+v", got)
 	}
 	// Done 只删本主机那条。
-	if err := j.Done("hostA", "/data/a.txt"); err != nil {
+	if err := j.Done("hostA", "ua", "/data/a.txt"); err != nil {
 		t.Fatal(err)
 	}
 	got = j.Recover()
 	if len(got) != 1 || got[0].Host != "hostB" {
 		t.Fatalf("Done(hostA) 不得误删 hostB 的条目，got %+v", got)
+	}
+}
+
+// TestJournalSameTargetDifferentUsersCoexist（D2）：同一主机 + 同一 target 字符串，
+// 但登录用户不同的两条提交必须各自留一条 —— 键里没有 user 时，后一个用户的 Begin 会把
+// 前一个用户尚未完成的条目顶掉（同一数据丢失类：被顶掉那条的 bak 再无人恢复）。
+// Done 同样必须带 user，只删本用户那条。
+func TestJournalSameTargetDifferentUsersCoexist(t *testing.T) {
+	dir := t.TempDir()
+	j := newSwapJournal(dir)
+	if err := j.Begin("h1", "ua", "/data/a.txt", "/data/a.bak-a", "/data/a.part-a"); err != nil {
+		t.Fatal(err)
+	}
+	// 同一 host、同一 target、**不同 user**：绝不能顶掉 ua 的条目。
+	if err := j.Begin("h1", "ub", "/data/a.txt", "/data/a.bak-b", "/data/a.part-b"); err != nil {
+		t.Fatal(err)
+	}
+	got := j.Recover()
+	if len(got) != 2 {
+		t.Fatalf("同主机同目标但不同用户必须各留一条，got %+v", got)
+	}
+	byUser := map[string]swapEntry{}
+	for _, e := range got {
+		if e.Host != "h1" || e.Target != "/data/a.txt" {
+			t.Fatalf("归属/目标不符: %+v", e)
+		}
+		byUser[e.User] = e
+	}
+	if byUser["ua"].Bak != "/data/a.bak-a" || byUser["ub"].Bak != "/data/a.bak-b" {
+		t.Fatalf("两个用户各自的 bak/part 必须原样保留，got %+v", got)
+	}
+
+	// Done(ua) 只删 ua 那条，ub 的中断现场原样保留。
+	if err := j.Done("h1", "ua", "/data/a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	got = j.Recover()
+	if len(got) != 1 || got[0].User != "ub" || got[0].Bak != "/data/a.bak-b" {
+		t.Fatalf("Done(ua) 不得误删 ub 的条目，got %+v", got)
+	}
+	// Done(ua) 幂等重放也不能动 ub。
+	if err := j.Done("h1", "ua", "/data/a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if got = j.Recover(); len(got) != 1 || got[0].User != "ub" {
+		t.Fatalf("Done 重放后 ub 条目仍须保留，got %+v", got)
+	}
+	if err := j.Done("h1", "ub", "/data/a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if got = j.Recover(); len(got) != 0 {
+		t.Fatalf("两个用户都 Done 后应清空，got %+v", got)
 	}
 }
 

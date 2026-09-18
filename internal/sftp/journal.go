@@ -119,8 +119,12 @@ func (j *swapJournal) store(entries []swapEntry) error {
 
 // Begin 在**任何破坏性改名之前**登记一条 intent（host,user,target,bak,part）（C1 修复轮 1）。
 // 调用方契约：Begin 返回错误时不得再执行 target→bak —— 否则会进入无 journal 保护的窗口。
-// 同一 (host,target) 重复 Begin（上次失败/本次重试）替换旧条目，绝不累积重复项；
-// host 参与去重：两台主机上可能各有同名 target，按 target 去重会把另一台的条目顶掉。
+// 同一 (host,user,target) 重复 Begin（上次失败/本次重试）替换旧条目，绝不累积重复项。
+//
+// 修复轮 2（D2）：去重键必须含 **user**，不只是 host。同一主机上的不同用户看到的是不同
+// 家目录，同一个 target 字符串是两条互不相干的提交；键里没有 user 时，后一个用户的 Begin
+// 会把前一个用户尚未完成的条目顶掉（与 F1 完全同类的数据丢失：被顶掉那条的 bak 再也
+// 无人恢复）。host/user/target 三者缺一不可。
 func (j *swapJournal) Begin(host, user, target, bak, part string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -130,7 +134,7 @@ func (j *swapJournal) Begin(host, user, target, bak, part string) error {
 	}
 	out := entries[:0]
 	for _, e := range entries {
-		if e.Host != host || e.Target != target {
+		if e.Host != host || e.User != user || e.Target != target {
 			out = append(out, e)
 		}
 	}
@@ -139,9 +143,10 @@ func (j *swapJournal) Begin(host, user, target, bak, part string) error {
 }
 
 // Done 在 part → target 已完成后移除该项。目标项不存在时幂等成功。
-// host 必须传登记时用的同一台主机：Done 只删该主机的这条 target，**绝不**误删另一台
-// 主机上同名 target 的条目（恢复按 host 分组的另一半）。
-func (j *swapJournal) Done(host, target string) error {
+// 必须传登记时用的同一 (host,user)：Done 只删该用户在该主机上的这条 target，**绝不**误删
+// 同一主机其它用户（或另一台主机）上同名 target 的条目 —— 这是 F1/D2 去重键的另一半，
+// 键与删必须严格同构，否则 Begin 保留的条目会被一次 Done 顺手抹掉。
+func (j *swapJournal) Done(host, user, target string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	entries, err := j.load()
@@ -150,7 +155,7 @@ func (j *swapJournal) Done(host, target string) error {
 	}
 	out := entries[:0]
 	for _, e := range entries {
-		if e.Host != host || e.Target != target {
+		if e.Host != host || e.User != user || e.Target != target {
 			out = append(out, e)
 		}
 	}
