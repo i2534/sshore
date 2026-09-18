@@ -11,10 +11,10 @@ usage() {
   E2E_RUN  逗号分隔的**用例全名**列表（不是正则，也不接受 | 等正则元字符）。
            每个名字都必须在该后端的 go test 输出里出现 "--- PASS: <名字>"，
            少一个就判失败；防线 1/2（有 SKIP / 一个 PASS 都没有）同时生效。
-           未设置时使用脚本内置的完整期望名单：TestGoBackendE2E,TestCancelWholeBatchE2E
+           未设置时使用脚本内置的完整期望名单：TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E
            （TestSyncE2E 仍未进默认名单：它的 gosftp 迭代走 GoBackend.ListMany，
             该方法是 Task 13 的桩；Task 8 已补齐 Put，但 List 未落地前追加必红）
-           例：E2E_RUN='TestGoBackendE2E,TestCancelWholeBatchE2E' bash e2e/test_local.sh
+           例：E2E_RUN='TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E' bash e2e/test_local.sh
 USAGE
 }
 case "${1:-}" in
@@ -52,7 +52,9 @@ trap cleanup EXIT
 # List/ListMany 落地、两个后端都绿之后，再把 TestSyncE2E 追加进这一行。
 # Task 10：追加 TestCancelWholeBatchE2E —— 它取消的是 GoBackend 直连的在飞传输（与所选
 # 后端无关，两个迭代都真跑绿），并额外断言 batch 迭代下 Ctrl.Cancel 诚实返回 false。
-E2E_DEFAULT_LIST='TestGoBackendE2E,TestCancelWholeBatchE2E'
+# Task 11：追加 TestResumeE2E —— GoBackend 直连的真实 .part 续传 + 同尺寸改写拒绝 +
+# 同目标去重（两个迭代都真跑），batch 迭代额外断言其 Atomic 被硬拒（绝不冒充「batch 支持续传」）。
+E2E_DEFAULT_LIST='TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E'
 E2E_RUN="${E2E_RUN:-$E2E_DEFAULT_LIST}"
 
 # 首/尾逗号会被 read -a 折叠掉（"A," 拆成 [A]，不是 [A,""]），这里显式拒绝，
