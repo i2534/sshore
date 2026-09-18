@@ -219,9 +219,23 @@ func TestStartPipesDoesNotBlockWhenStderrUnread(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.Close()
+	// F2（Task 3 评审）：本用例必须有本地超时。drain 失效时子进程会阻塞在 stderr 写满的
+	// 管道上，下面的 stdout 读将永久挂住，只能等 go test 默认 10m panic 超时；
+	// 与 TestStartStreamNilHandlerDoesNotBlock 对齐，10s 内失败。
 	buf := make([]byte, 4)
-	if _, err := io.ReadFull(p.Stdout, buf); err != nil {
-		t.Fatal(err)
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(p.Stdout, buf)
+		readErr <- err
+	}()
+	select {
+	case err := <-readErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = p.Kill()
+		t.Fatal("stderr drain 失效：子进程写满 stderr 管道后被阻塞")
 	}
 	if string(buf) != "done" {
 		t.Fatalf("want done, got %q", buf)
@@ -268,5 +282,68 @@ func TestPipedProcessCloseKillsRunningChild(t *testing.T) {
 	}
 	if out := p.Wait(); out.ExitCode == 0 {
 		t.Fatal("被 Kill 的子进程不应以 0 退出")
+	}
+}
+
+// F1（Task 3 评审）：直接子进程退出后，后台后代仍持有 fd 2。
+// Close 若不关闭父端 stderr 读端，drain → drain.Wait() → cmd.Wait() 整条链会挂到后代结束。
+func TestPipedProcessCloseUnblocksDescendantHoldingStderr(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("缺少 sh")
+	}
+	// 直接子进程立刻退出，但后台后代仍持有 fd 2：不关父端读端时 Wait 会挂到后代结束。
+	p, err := StartPipes("sh", "-c", "sleep 30 & echo hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 必须先读到 "hi"：只有 shell 执行完 "sleep 30 &" 的 fork 才会走到 "echo hi"。
+	// 原评审用例在 StartPipes 后立刻 Close，可能赶在 fork 之前就把 sh 杀掉，此时根本没有
+	// 后代持有 fd 2，drain 直接 EOF，用例会假绿（本机实测 mutant 也能过）。这个同步点是必需的。
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(p.Stdout, buf); err != nil {
+		t.Fatalf("等待后代 fork 的同步输出失败: %v", err)
+	}
+	if string(buf) != "hi" {
+		t.Fatalf("want hi, got %q", buf)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	done := make(chan Outcome, 1)
+	go func() { done <- p.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close 后 Wait 仍被后代持有的 fd 2 阻塞（Close 未关闭父端 stderr 读端？）")
+	}
+}
+
+// F3（Task 3 评审）：有界缓冲必须 <=16KB，且只保留最近的字节（尾部）。
+// 评审给出的命令三处输出漏了 >&2，实际全写进了 stdout，而断言读的是 StderrText；
+// 且只读 4 字节 stdout 后 Wait 会因 stdout 管道写满而永久挂住。此处改为整组输出重定向到
+// stderr（stdout 只留 "done" 的 4 字节），语义与断言（HEADMARK 应被挤出、TAILMARK 应保留）一致。
+func TestStartPipesStderrBufferIsBoundedAndKeepsTail(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("缺少 sh")
+	}
+	p, err := StartPipes("sh", "-c", "{ printf HEADMARK; head -c 200000 /dev/zero | tr '\\0' 'x'; printf TAILMARK; } >&2; echo done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(p.Stdout, buf); err != nil {
+		t.Fatal(err)
+	}
+	_ = p.Wait()
+	got := p.StderrText()
+	if len(got) > 16*1024 {
+		t.Fatalf("stderr 缓冲必须有界（<=16KB），got %d", len(got))
+	}
+	if !strings.Contains(got, "TAILMARK") {
+		t.Fatalf("有界缓冲必须保留最近的字节（TAILMARK 丢失），got %q", got)
+	}
+	if strings.Contains(got, "HEADMARK") {
+		t.Fatal("有界缓冲不应保留最早的字节（HEADMARK 出现说明保留了头部）")
 	}
 }
