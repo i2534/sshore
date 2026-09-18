@@ -12,7 +12,7 @@ import (
 
 func TestSearchDepthZeroOnlyListsRoot(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/", lsLine("app.log", false, 10), lsLine("sub", true, 0))})
 	out, err := c.Search(context.Background(), "h", "", "/", "*.log", 0, 100, nil)
 	if err != nil {
@@ -25,7 +25,7 @@ func TestSearchDepthZeroOnlyListsRoot(t *testing.T) {
 
 func TestSearchDepthOneRecursesOnce(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/", lsLine("app.log", false, 10), lsLine("sub", true, 0))})
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/sub", lsLine("deep.log", false, 20))})
 	out, err := c.Search(context.Background(), "h", "", "/", "*.log", 1, 100, nil)
@@ -42,7 +42,7 @@ func TestSearchDepthOneRecursesOnce(t *testing.T) {
 
 func TestSearchTruncatesAtLimit(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/", lsLine("a.log", false, 1), lsLine("b.log", false, 2))})
 	out, err := c.Search(context.Background(), "h", "", "/", "*.log", 0, 1, nil)
 	if err != nil {
@@ -55,7 +55,7 @@ func TestSearchTruncatesAtLimit(t *testing.T) {
 
 func TestSearchMarksUnreadableWhenBlockMissing(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	// stdout 为空 ⇒ 没有任何回显块 ⇒ 根路径'未知'，必须计 Unreadable，绝不当作空目录。
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: ""})
 	out, err := c.Search(context.Background(), "h", "", "/gone", "", 0, 100, nil)
@@ -69,7 +69,7 @@ func TestSearchMarksUnreadableWhenBlockMissing(t *testing.T) {
 
 func TestSearchCancelledReturnsPartial(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	out, err := c.Search(ctx, "h", "", "/", "", 5, 100, nil)
