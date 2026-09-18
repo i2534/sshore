@@ -84,6 +84,7 @@ async function dispatchTransfer(rec) {
   rec.cancelRequested = false
   rec.cancelFailed = false
   rec.pendingCancel = false
+  rec.outcome = null // 上一轮的操作结果原文（I3 顺序 B 的修正依据）必须清掉，否则重试会误判
   rec.pending = false
   rec.hasProgress = false
   rec.done = undefined

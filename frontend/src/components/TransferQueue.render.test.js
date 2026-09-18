@@ -5,7 +5,8 @@ import { describe, it, expect } from 'vitest'
 import { createSSRApp, h } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import TransferQueue from './TransferQueue.vue'
-import { CANCELLED_LATE_TEXT, CANCELLING_TEXT, CANCEL_FAILED_TEXT, WAITING_FRAME_TEXT } from '../utils/queue'
+import { CANCELLED_LATE_TEXT, CANCELLING_TEXT, CANCEL_FAILED_TEXT, WAITING_FRAME_TEXT,
+  applyBatchCancel, applyCancelResult } from '../utils/queue'
 
 const render = (transfers) => renderToString(createSSRApp({ render: () => h(TransferQueue, { transfers, now: 1000 }) }))
 
@@ -35,8 +36,14 @@ describe('TransferQueue.vue 生产渲染（SSR）', () => {
     expect(html).not.toContain('err status')
   })
 
-  it('Cancel 返回 false：渲染「未能取消」，不再停在「取消中…」', async () => {
-    const html = await render([row({ cancelRequested: true, cancelFailed: true, pendingCancel: false })])
+  it('Cancel 返回 false：走 applyBatchCancel + applyCancelResult 的真实取消路径，渲染「未能取消」', async () => {
+    // 不注入 fixture 字段：真实调用取消落点，断言组件渲染的是这条路径产出的状态。
+    const rec = row({ pending: false })
+    applyBatchCancel([rec], rec)              // 点取消：cancelRequested/pendingCancel
+    expect(applyCancelResult(rec, false))     // Cancel 返回 false：cancelFailed
+      .toBe('failed')
+    expect(rec.cancelFailed).toBe(true)
+    const html = await render([rec])
     expect(html).toContain(CANCEL_FAILED_TEXT)
     expect(html).not.toContain(CANCELLING_TEXT)
   })

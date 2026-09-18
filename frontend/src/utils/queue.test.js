@@ -176,6 +176,58 @@ describe('终态决策 outcomeStatus / applyOutcome（SftpView.dispatchTransfer 
 })
 
 describe('取消结果 applyCancelResult（SftpTransferCancel 返回值唯一落点，I3）', () => {
+  // —— I3 修复轮 2：两个 promise 的到达顺序不确定，终态必须可被后到的 Cancel 结果修正 ——
+  it('顺序 B：无关错误先落地、Cancel 后返回 false ⇒ 必须修正为「失败」+ 原始原因，绝不标成取消', () => {
+    const rec = { id: 't1-0', status: '处理中', pending: false, partPath: '/l/a.part' }
+    // 1) 用户点了取消：置 cancelRequested/pendingCancel，终态等传输自己返回
+    const plan = applyBatchCancel([rec], rec)
+    expect(plan.inFlight).toBe(true)
+    expect(rec.status).toBe('处理中')
+    // 2) 传输的**无关**失败（磁盘满）先于 Cancel 返回值到达
+    expect(applyOutcome(rec, { ok: false, error: new Error('disk full') })).toBe('取消')
+    expect(rec.status).toBe('取消')
+    expect(rec.cancelFailed).toBe(false)
+    // 3) Cancel 的 false 后到：必须回头把「取消」修正成「失败」，并写 cancelFailed
+    expect(applyCancelResult(rec, false)).toBe('failed')
+    expect(rec.status).toBe('失败')
+    expect(rec.cancelFailed).toBe(true)
+    expect(rec.pendingCancel).toBe(false)
+    expect(rec.reason).toBe('disk full')
+    expect(rowNote(rec)).toBe('disk full')
+    expect(rowNote(rec)).not.toBe('已取消')
+    expect(rowProgressText(rec)).toBe('') // 终态行不再显示「取消中…」/「未能取消」
+  })
+  it('顺序 A（对照）：Cancel 先返回 false、无关错误后落地 ⇒ 同一个「失败」终态', () => {
+    const rec = { id: 't1-0', status: '处理中', pending: false }
+    applyBatchCancel([rec], rec)
+    expect(applyCancelResult(rec, false)).toBe('failed')
+    expect(rec.cancelFailed).toBe(true)
+    expect(rec.status).toBe('处理中') // 操作还没返回，终态未定
+    expect(applyOutcome(rec, { ok: false, error: new Error('disk full') })).toBe('失败')
+    expect(rec.status).toBe('失败')
+    expect(rec.reason).toBe('disk full')
+    expect(rowNote(rec)).toBe('disk full')
+  })
+  it('顺序 C（对照）：Cancel 返回 true、操作随后抛错 ⇒ 仍然是真「取消」，不被修正', () => {
+    const rec = { id: 't1-0', status: '处理中', pending: false }
+    applyBatchCancel([rec], rec)
+    expect(applyCancelResult(rec, true)).toBe('cancelling')
+    expect(applyOutcome(rec, { ok: false, error: new Error('context canceled') })).toBe('取消')
+    expect(rec.status).toBe('取消')
+    // 同一个 Cancel==true 的迟到场景再次调用：不得把合法取消改成失败
+    expect(applyCancelResult(rec, true)).toBe('done')
+    expect(rec.status).toBe('取消')
+    expect(rec.cancelFailed).toBe(false)
+  })
+  it('顺序 B 的「完成」对照：Cancel 后到 false 绝不改正已提交的成功结果', () => {
+    const rec = { id: 't1-0', status: '处理中', pending: false, partPath: '/l/a.part' }
+    applyBatchCancel([rec], rec)
+    expect(applyOutcome(rec, { ok: true })).toBe('完成')
+    expect(applyCancelResult(rec, false)).toBe('done')
+    expect(rec.status).toBe('完成')
+    expect(rec.partPath).toBe('')
+    expect(rowNote(rec)).toBe(CANCELLED_LATE_TEXT)
+  })
   it('返回 false：转「未能取消」，不再显示「取消中…」', () => {
     const rec = { id: 't1-0', status: '处理中', cancelRequested: true, pendingCancel: true }
     expect(applyCancelResult(rec, false)).toBe('failed')
@@ -335,8 +387,6 @@ describe('生产路径互钉：SFC 必须消费 queue.js 的纯函数（评审 I
     expect(sftpView).toContain('applyCancelResult(rec')
     expect(sftpView).toContain('applyBatchCancel(transfers.value, rec)')
     expect(sftpView).toContain('shouldDispatch(rec)')
-    // 禁止把终态三元组写回组件（那正是 I1 的变异点）
-    expect(sftpView).not.toMatch(/rec\.status\s*=\s*rec\.cancelRequested/)
   })
   it('TransferQueue 的备注/进度/进度条都来自 queue.js 纯函数', () => {
     expect(transferQueue).toContain('rowNote(t)')
@@ -351,6 +401,59 @@ describe('生产路径互钉：SFC 必须消费 queue.js 的纯函数（评审 I
     expect(queueJs).toContain('export function applyBatchCancel')
     expect(queueJs).toContain('export function rowProgressText')
     expect(queueJs).toContain('export function barModel')
+  })
+})
+
+// —— e-weak 结构性收紧（I3 修复轮 2）：终态赋值只允许发生在 queue.js ——
+//
+// 旧的互钉只是字面量 pin（断言 SftpView 里有 applyOutcome(rec…），把**成功分支**
+// rec.status = '完成' 内联回 SftpView 后仍然命中，变异存活（评审 e-weak）。这里改成
+// 结构性断言：扫描两个 SFC 的“写入赋值”，任何没被显式白名单批准的 status/partPath
+// 赋值都失败。白名单里的每一行都是**没有 id 的 legacy 路径**（removeSelected /
+// onMoveDrop / 系统拖入 copy / uploadPicked），它们根本不走 id 身份状态机，
+// 只能就地写终态；除此之外的所有终态写入都必须经由 queue.js 的 applyOutcome/
+// finalizeOutcome（脚本里 rec.status='处理中' 是重置为运行态，不是终态决策）。
+// 键 = 该行 trim 后的原文；重复项用重复条目表达（同一行两个赋值也各自一条）。
+const SFC_ASSIGN_ALLOWLIST = {
+  // SftpView.vue 的 legacy 无 id 终态写点（行号见注释，仅方便定位；断言按原文多重集）
+  'SftpView.vue': [
+    { text: "rec.status = '处理中'", why: ':81 dispatchTransfer 重置为运行态（终态决策仍交给 applyOutcome）' },
+    { text: "rec.partPath = keep", why: ':142 retryItem 保留锚点（不是终态写入）' },
+    { text: "rec.partPath = ''", why: ':161 cleanItem 清掉已删除的锚点（不是终态写入）' },
+    { text: "rec.status = '完成'", why: ':519 legacy removeSelected 无 id 记录，不走绑定（I4 白名单）' },
+    { text: "rec.status = '失败'", why: ':521 legacy removeSelected 无 id 记录，不走绑定（I4 白名单）' },
+    { text: "t.status = '失败'", why: ':587 legacy uploadPicked 的外层兜底，无 id 状态机（I4 白名单）' },
+    { text: "rec.status = '完成'", why: ':696 legacy onMoveDrop 无 id 记录，不走绑定（I4 白名单）' },
+    { text: "rec.status = '失败'", why: ':699 legacy onMoveDrop 无 id 记录，不走绑定（I4 白名单）' },
+    { text: "try { await CopyLocal(i.path, dst); rec.status = '完成' } catch (e) { rec.status = '失败'; rec.reason = String((e && e.message) || e); err(e) }", why: ':759 legacy 系统拖入 copy 无 id 记录，不走绑定（I4 白名单），两个赋值同一行' },
+    { text: "try { await CopyLocal(i.path, dst); rec.status = '完成' } catch (e) { rec.status = '失败'; rec.reason = String((e && e.message) || e); err(e) }", why: ':759 同上（同一行的第二个赋值，重复条目表达多重集）' },
+  ],
+  // TransferQueue.vue：只读渲染，任何赋值都不允许
+  'TransferQueue.vue': [],
+}
+// 匹配 `rec.status = …` / `t.partPath = …`；对象字面量里的 `status: '…'` 与
+// 模板/比较用的 `t.status === '…'`（只有一个 =）都不匹配。
+const statusAssignmentRe = /(?:^|[^=!<>])\b(?:rec|t)\.(status|partPath)\s*=\s*(?!=)/g
+
+function assignmentsIn(file, source) {
+  const out = []
+  source.split('\n').forEach((line, i) => {
+    for (const m of line.matchAll(statusAssignmentRe)) {
+      out.push({ file, line: i + 1, prop: m[1], text: line.trim() })
+    }
+  })
+  return out
+}
+
+describe('终态写入的结构性约束：status/partPath 只能在 queue.js 里被赋终态（e-weak）', () => {
+  it('SftpView.vue 的 status/partPath 赋值集合被白名单精确钉死', () => {
+    const allow = SFC_ASSIGN_ALLOWLIST['SftpView.vue'].map((a) => a.text)
+    const actual = assignmentsIn('SftpView.vue', sftpView).map((a) => a.text)
+    // 精确多重集：多一个内联终态赋值（成功分支或失败分支）都会在这里断。
+    expect(actual.sort()).toEqual(allow.sort())
+  })
+  it('TransferQueue.vue 零 status/partPath 赋值（只读渲染）', () => {
+    expect(assignmentsIn('TransferQueue.vue', transferQueue)).toEqual([])
   })
 })
 
