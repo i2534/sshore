@@ -387,8 +387,13 @@ Expected: PASS（两个包）
 - [ ] **Step 5: 升级依赖并复验双平台构建**
 
 ```bash
+# 注意（Task 1 实测绘出的计划缺陷，已裁决）：本 task 没有任何代码 import pkg/sftp（Task 6 才 import），
+# 因此 go mod tidy 会把 pkg/sftp 与 kr/fs 当未使用依赖删掉。处置：go get -> go mod tidy -> 再 go get，
+# 让依赖留在 go.mod（会标 // indirect，不影响 build/vet/test/CI）；Task 6 首次 import 后再跑一次 go mod tidy
+# 使其转正并去掉 // indirect。不要为了 tidy 稳定而加临时的空 import。
 go get github.com/pkg/sftp@v1.13.11
 go mod tidy
+go get github.com/pkg/sftp@v1.13.11
 grep -E "pkg/sftp|x/crypto|x/sys" go.mod
 GOOS=windows GOARCH=amd64 go build ./internal/... && echo "windows internal ok"
 go vet ./...
@@ -1688,6 +1693,10 @@ func (c *Ctrl) backend() Backend {
 ```
 
 （`Ctrl` 加字段 `goBackend *GoBackend`、`emit forward.EmitFunc`。）
+
+- [ ] **Step 3b: 依赖转正（Task 1 裁决的收尾）**
+
+本 task 首次 import `github.com/pkg/sftp` 之后跑一次 `go mod tidy`，确认 `go.mod` 里 `pkg/sftp` 不再是 `// indirect` 且 `go mod tidy -diff` 为空；把 `go.mod/go.sum` 一起提交。
 
 - [ ] **Step 4: 起临时 sshd 跑 e2e**
 
