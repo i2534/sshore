@@ -92,7 +92,9 @@ func (c *Ctrl) Search(ctx context.Context, host, user, root, pattern string, max
 func (c *Ctrl) SetJournalDir(dir string) {
 	c.journalDir = dir
 	if c.goBackend != nil {
-		c.goBackend.journalDir = dir
+		// 转发到 GoBackend.SetJournalDir（而不是裸写 journalDir）：这样 journal 实例
+		// 会一并建立/清空，Put 的 commitRemote 才真的能落 journal（Task 8 接线）。
+		c.goBackend.SetJournalDir(dir)
 	}
 }
 
@@ -132,7 +134,7 @@ func (c *Ctrl) backend() Backend {
 	if c.TransportKind() == KindGo {
 		if c.goBackend == nil {
 			c.goBackend = NewGoBackend(c.sel, c.emit)
-			c.goBackend.journalDir = c.journalDir
+			c.goBackend.SetJournalDir(c.journalDir)
 			if c.emit != nil {
 				c.emit(forward.Event{
 					SourceType: "sftp",

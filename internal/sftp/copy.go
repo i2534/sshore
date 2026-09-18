@@ -82,6 +82,11 @@ func (c *countingReader) Read(b []byte) (int, error) {
 	c.base += int64(n)
 	c.p.Done = c.base
 	c.e.send(c.p, false)
+	// 上传方向的本地侧是**读**：本地源读失败（EIO/EISDIR…）必须带 errLocalIO 标记，
+	// 否则 copyStream 的返回值会被判成远端错误、被 sshd stderr 盖掉真因（约束 6）。
+	if err != nil && err != io.EOF {
+		return n, wrapLocalIO(err)
+	}
 	return n, err
 }
 
@@ -99,7 +104,12 @@ func (w *countingWriter) Write(b []byte) (int, error) {
 	w.n += int64(n)
 	w.p.Done = w.n
 	w.e.send(w.p, false)
-	return n, err
+	// 下载方向的本地侧是**写**：本地目标写失败（典型 ENOSPC）必须带 errLocalIO 标记，
+	// 否则会被判成远端错误、被 sshd stderr 盖掉真因（Task 7 评审遗留，本 task 收口）。
+	if err != nil {
+		return n, wrapLocalIO(err)
+	}
+	return n, nil
 }
 
 // copyFileToLocal 把远端单个文件搬到本地，返回 .part 路径与已传字节数；
@@ -193,8 +203,28 @@ func shortReadError(done, total int64, part string) error {
 // 把「本地磁盘/权限问题」这个真正原因盖掉。
 var errLocalPart = errors.New("本地 .part 创建失败")
 
+// errLocalIO 标记「字节搬运过程中本地一侧的读写失败」（Task 8 约束 6 收口 Task 7 残留）。
+// 两个方向都可能中招：下载是本地写失败（典型 ENOSPC），上传是本地源读失败（EIO/EISDIR…）。
+// countingWriter/countingReader 在把错误往外交之前包上它，isRemoteError 因此能把这类
+// 失败判成「本地」，不附远端 stderr —— 否则生产上 stderr 非空就会盖掉真正的本地原因。
+var errLocalIO = errors.New("本地文件读写失败")
+
+// wrapLocalIO 给本地侧 IO 错误统一加盖 errLocalIO 标记（保留原始错误链，errors.Is 可穿透）。
+func wrapLocalIO(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", errLocalIO, err)
+}
+
+// isLocalError 判「这个错误确定由本地文件系统造成」。
+// errLocalPart（.part 建不出来）与 errLocalIO（搬运中的本地读写失败）都算。
+func isLocalError(err error) bool {
+	return err != nil && (errors.Is(err, errLocalPart) || errors.Is(err, errLocalIO))
+}
+
 // isRemoteError 判「这个错误该不该带远端 stderr 原文」。
-// 本地文件系统错误（errLocalPart）绝不带 RemoteMsg：它不是远端的锅。
+// 本地文件系统错误绝不带 RemoteMsg：它不是远端的锅。
 func isRemoteError(err error) bool {
-	return err != nil && !errors.Is(err, errLocalPart)
+	return err != nil && !isLocalError(err)
 }

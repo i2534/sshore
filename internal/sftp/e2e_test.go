@@ -107,4 +107,55 @@ func TestGoBackendE2E(t *testing.T) {
 		t.Fatalf("gosftp 原子下载后目录里应只有目标文件: %v", entries)
 	}
 	t.Logf("下载完成: %d 字节 sha256=%s", len(got), gotHash)
+	// —— Task 8：上传往返（两个后端各验一次）——
+	// 通过门面 TransferPut 走**当前选中的后端**：
+	//   batch 迭代：BatchBackend.TransferPut（Atomic=false，sftp put 直写）
+	//   gosftp 迭代：GoBackend.Put（Atomic=true，.part + 提交；本机 OpenSSH 支持
+	//                posix-rename ⇒ 真实走 PosixRename 覆盖已存在目标）
+	// 判据：字节 sha256 相等 + 旧内容被真正替换 + 远端目录不残留 .part/.bak。
+	// （「传输中目标名不存在 / .part 存在」是时序窗口，由 hermetic 用例
+	//   upload_test.go 的 net.Pipe 真客户端+真服务端确定性钉住。）
+	upData := bytes.Repeat([]byte("sshore-task8-e2e-"), 40960) // 680 KiB：跨多个 maxPacket（32KiB）
+	upSrc := filepath.Join(dldir, fmt.Sprintf("t8-src-%s.bin", backendTag))
+	if err := os.WriteFile(upSrc, upData, 0600); err != nil {
+		t.Fatalf("写本地上传源: %v", err)
+	}
+	dstName := fmt.Sprintf("t8-dst-%s.bin", backendTag)
+	dstRemote := filepath.Join(remote, dstName)
+	const oldContent = "OLD-CONTENT-MUST-BE-OVERWRITTEN"
+	if err := os.WriteFile(dstRemote, []byte(oldContent), 0600); err != nil {
+		t.Fatalf("预置远端旧目标: %v", err)
+	}
+	upReq := TransferRequest{
+		ID:     "t8-" + dstName,
+		Host:   host,
+		Remote: dstRemote,
+		Local:  upSrc,
+		Atomic: be == KindGo,
+	}
+	implPut := map[BackendKind]string{KindBatch: "BatchBackend.TransferPut", KindGo: "GoBackend.Put"}[be]
+	t.Logf("上传实现 = %s（backend=%v, Atomic=%v）", implPut, be, upReq.Atomic)
+	if err := ctrl.TransferPut(upReq, nil); err != nil {
+		t.Fatalf("%s 上传失败: %v", implPut, err)
+	}
+	gotUp, err := os.ReadFile(dstRemote)
+	if err != nil {
+		t.Fatalf("上传后远端目标必须存在: %v", err)
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(gotUp)) != fmt.Sprintf("%x", sha256.Sum256(upData)) {
+		t.Fatalf("上传内容 sha256 不一致: got %d bytes want %d", len(gotUp), len(upData))
+	}
+	if string(gotUp) == oldContent {
+		t.Fatal("覆盖写没生效：远端仍是旧内容")
+	}
+	rents, err := os.ReadDir(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range rents {
+		if IsInternalTemp(e.Name()) {
+			t.Fatalf("上传成功后远端不得残留 .part/.bak: %s", e.Name())
+		}
+	}
+	t.Logf("上传完成: %d 字节 sha256=%x", len(gotUp), sha256.Sum256(gotUp))
 }
