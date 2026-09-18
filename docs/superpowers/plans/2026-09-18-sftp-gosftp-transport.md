@@ -492,7 +492,8 @@ git commit -m "feat(sftp): 传输后端开关（配置+环境变量）与 pkg/sf
 
 **Interfaces:**
 - Consumes: 无
-- Produces: `const PartMarker = ".sshore-sftppart-"`；`func PartName(target, id string) string`；`func ShortPartName(id string) string`；`func BakName(target string) string`；`func IsInternalTemp(name string) bool`
+- Produces: `const PartMarker = ".sshore-sftppart-"`（len=17）；**本地**（OS 原生分隔符，用 `filepath`）：`PartName(target, id)` / `BakName(target)` / `ShortPartName(id)`；**远端 POSIX**（用 `path`，Windows 客户端上 `filepath.Join/Clean` 会把 `/` 变成 `\`）：`PartNameRemote(target, id)` / `BakNameRemote(target)`；`IsInternalTemp(name) bool`（中缀 Contains + `filepath.Base`）。
+- **两套家族的原因（Task 2 评审 Important-2）**：远端路径永远是 POSIX；若用 `filepath` 生成远端临时/备份名，Windows 客户端上的退化短名会落到别处（`\data\.sshore-sftppart-…`），破坏「同目录/rename 原子」。本地用 `filepath`、远端用 `path`，各有单测。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -2111,7 +2112,7 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	_, hasPosix := s.Conn.HasExtension("posix-rename@openssh.com")
 	part := req.PartPath
 	if part == "" {
-		part = PartName(req.Remote, req.ID)
+		part = PartNameRemote(req.Remote, req.ID) // 远端 POSIX 路径：必须用 Remote 家族（Task 2 评审 Important-2）
 	}
 	// 新建：O_WRONLY|O_CREATE|O_TRUNC；续传（Task 11）：O_WRONLY（严禁 O_TRUNC）+ Seek(partSize)
 	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
@@ -2175,7 +2176,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 	if hasPosix {
 		return s.Conn.PosixRename(part, target)
 	}
-	bak := BakName(target)
+	bak := BakNameRemote(target) // 远端路径同上
 	if err := s.Conn.Rename(target, bak); err != nil {
 		// 技术审核 M4：只有「目标本来就不存在」才退回直接提交；其它错误（权限/被占用）必须原样上报，
 		// 否则会把失败当成功、还会绕过 journal。
