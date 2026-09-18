@@ -115,7 +115,7 @@ function fmtBytes(bytes) {
   return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + units[i]
 }
 
-// hasProgressFrame：是否收到过进度帧。默认后端（batch）整批不上报进度（Task 9 评审 I2），
+// hasProgressFrame：是否收到过进度帧。回退到 batch 旧后端时整批不上报进度（Task 9 评审 I2），
 // 因此「没有帧」是常态而不是错误，UI 必须给可用性占位而不是卡在 0%。
 export function hasProgressFrame(t) {
   return !!(t && (t.hasProgress || t.phase || t.done !== undefined || t.total !== undefined))

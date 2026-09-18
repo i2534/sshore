@@ -21,7 +21,8 @@ const defaultTransport = KindGo
 // TransportSelector 由 app.go 注入，懒解析配置（避免依赖 Init/startup 的先后顺序）。
 type TransportSelector func() string
 
-// resolveTransport 的优先级：环境变量 > 配置 > 内置默认。非法值一律回落默认。
+// resolveTransport 的优先级：环境变量 > 配置 > 内置默认。非法 env 值被忽略、继续看配置；
+// 非法配置值（已由 config.Normalize 规范化为空）回落内置默认。
 func resolveTransport(sel TransportSelector) BackendKind {
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("SSHORE_SFTP_TRANSPORT"))); v != "" {
 		switch v {

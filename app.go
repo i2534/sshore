@@ -486,7 +486,8 @@ func (a *App) emitProgress(p sftp.Progress) {
 }
 
 // sftpAtomic 返回当前后端是否支持原子提交（.part + 提交）。绑定层的 Atomic 只从这里取值，
-// 绝不写死 true/false：写死 true 会让默认 batch 传输全盘失败，写死 false 会丢掉原子语义。
+// 绝不写死 true/false：写死 true 会让 batch 后端（Atomic=false 直写）的传输全盘失败，
+// 写死 false 会丢掉原子语义。
 func (a *App) sftpAtomic() bool { return a.sftp.AtomicCapable() }
 
 // SftpGet 下载单个远端文件；resume/partPath 为 Task 11 的续传参数。

@@ -1293,12 +1293,13 @@ func TestEmitProgressWithoutContextIsNoop(t *testing.T) {
 	a.emitProgress(sftp.Progress{ID: "t1", Done: 1, Total: 2, Phase: sftp.PhaseTransfer})
 }
 
-// TestSftpOutputBindingsUsableUnderDefaultBatch 钉住能力驱动的 Atomic 取值（Task 9 步骤 3）：
-// 默认后端是 batch（不 AtomicCapable，Task 6 的 M4 守卫对 Atomic=true 硬报错），四个输出
-// 绑定必须照常可用 —— 这只有在绑定层从 AtomicCapable 取 Atomic 时才成立。写死 Atomic=true
-// 会让默认传输全盘失败；写死 false 会丢掉 gosftp 的 .part + 提交语义。
+// TestSftpOutputBindingsUsableUnderBatch 钉住能力驱动的 Atomic 取值（Task 9 步骤 3）：
+// 本用例**显式钉住 batch**（appWithFakeSFTP 只应答 sftp -b，且默认已切 gosftp），batch 不
+// AtomicCapable，而 Task 6 的 M4 守卫对 Atomic=true 硬报错，所以四个输出绑定必须照常可用 ——
+// 这只有在绑定层从 AtomicCapable 取 Atomic 时才成立。写死 Atomic=true 会让 batch 传输全盘
+// 失败；写死 false 会丢掉 gosftp 的 .part + 提交语义。
 // （能力本身的来源由 internal/sftp 的 TestFacadeAtomicCapableFollowsBackend 钉住。）
-func TestSftpOutputBindingsUsableUnderDefaultBatch(t *testing.T) {
+func TestSftpOutputBindingsUsableUnderBatch(t *testing.T) {
 	// batch 的 Transfer* 是「真执行」：假 runner 对 sftp 批处理一律返回成功。
 	a := appWithFakeSFTP(t, "")
 	cases := []struct {
