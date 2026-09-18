@@ -228,8 +228,10 @@ never synced out or downloaded as new files.
   multi-user-writable / shared directories as trusted transfer targets.
 - **Tree transfers dial before enumerating**: `GetTree` / `PutTree` take the single transfer
   session (`AcquireTransfer`, i.e. one fresh handshake) *before* enumerating, so the whole scan
-  window holds the transfer concurrency slot. The scan phase issues no session IO (cancel uses
-  ctx), but **an instantly cancelled scan has already paid one handshake**, and no subsequent
+  window holds the transfer concurrency slot. The scan phase is not session-IO-free: `GetTree`
+  enumerates the remote side through `s.Conn.ReadDirContext` (`scanTree` in
+  `internal/sftp/copy.go`), cancelling via ctx; only `PutTree`'s local `WalkDir` touches no
+  session. But **an instantly cancelled scan has already paid one handshake**, and no subsequent
   transfer can start while it scans.
 - **Stale `.part` cleanup only scans the configured LocalRecent directories**: at startup only
   recently used local directories are cleaned (temp files older than 7 days); there is no
