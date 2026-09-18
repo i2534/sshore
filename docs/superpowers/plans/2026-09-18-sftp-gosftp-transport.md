@@ -813,6 +813,11 @@ func (p *PipedProcess) Signal() error { return p.proc.Signal() }
 func (p *PipedProcess) Close() error {
 	_ = p.Stdin.Close()
 	_ = p.Stdout.Close()
+	// F1（Task 3 评审）：**必须也关父端 stderr 读端**。drain 的 Read 只在写端全关后才 EOF；
+	// 若后代进程仍持有 fd 2（sleep &、ProxyCommand、ControlPersist 等），不关读端会把
+	// drain → drain.Wait() → cmd.Wait() 整条链无限挂住。关读端会让 Read 立刻返回错误、解除阻塞。
+	// 注意：本原语不保证杀死后代进程（只杀直接子进程）。
+	_ = p.Stderr.Close()
 	if err := p.proc.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return err
 	}
