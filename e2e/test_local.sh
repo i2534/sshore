@@ -225,14 +225,30 @@ cat > "$SHIM/sftp" <<SHIMSF
 exec /usr/bin/sftp -F "$HOME/.ssh/config" -o IdentitiesOnly=yes "\$@"
 SHIMSF
 chmod +x "$SHIM/ssh" "$SHIM/sftp"
-if PATH="$SHIM:$PATH" \
-   GOPATH="$REAL_GOPATH" GOMODCACHE="$REAL_GOMODCACHE" GOCACHE="$REAL_GOCACHE" \
-   SSHORE_E2E_HOST=sshore-e2e SSHORE_E2E_REMOTE="$REMOTE_DIR" \
-   HOME="$HOME" go test ./internal/sync/ -run TestSyncE2E -count=1 -v; then
-  echo "sync e2e OK"
-else
-  echo "sync e2e FAILED" >&2
-  exit 1
-fi
 
-echo "== ALL E2E TESTS PASSED =="
+# 双后端循环：每次迭代显式导出 SSHORE_SFTP_TRANSPORT，并保留 SSHORE_E2E_*、PATH 垫片、
+# GOPATH/GOMODCACHE/GOCACHE。漏掉任一项都会「别名解析不到 → 测试全 skip → 假绿」。
+E2E_RUN="${E2E_RUN:-E2E$}"   # 默认只跑以 E2E 结尾的用例（E2E$ 是正则，不是笔误）
+E2E_FAIL=0
+for backend in batch gosftp; do
+  echo "--- backend=$backend run=$E2E_RUN ---"
+  OUT="$(PATH="$SHIM:$PATH" \
+     GOPATH="$REAL_GOPATH" GOMODCACHE="$REAL_GOMODCACHE" GOCACHE="$REAL_GOCACHE" \
+     SSHORE_E2E_HOST=sshore-e2e SSHORE_E2E_REMOTE="$REMOTE_DIR" \
+     SSHORE_SFTP_TRANSPORT="$backend" \
+     HOME="$HOME" go test ./internal/sftp/ ./internal/sync/ -run "$E2E_RUN" -count=1 -v 2>&1)" || E2E_FAIL=1
+  printf '%s\n' "$OUT"
+  # 假绿防线 1：任何用例 SKIP 都说明环境没送达（缺 env / 垫片失效），必须失败。
+  if printf '%s\n' "$OUT" | grep -q '^--- SKIP'; then
+    echo "FAIL: backend=$backend 有用例被 SKIP（SSHORE_E2E_* 或 PATH 垫片没生效）—— 假绿，不接受" >&2
+    E2E_FAIL=1
+  fi
+  # 假绿防线 2：该后端必须至少真正跑过并 PASS 一个用例，否则 -run 打空/编译失败也会是 0。
+  if ! printf '%s\n' "$OUT" | grep -q '^--- PASS'; then
+    echo "FAIL: backend=$backend 没有任何用例真正通过（-run 未匹配 / 编译失败）" >&2
+    E2E_FAIL=1
+  fi
+done
+[ "$E2E_FAIL" -eq 0 ] || exit 1
+
+echo "== ALL E2E TESTS PASSED (backend matrix: batch + gosftp) =="
