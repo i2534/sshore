@@ -50,6 +50,11 @@ var removeRemote = func(c *sftp.Client, path string) error {
 	return c.Remove(path)
 }
 
+// beforeOpenLocalSource 是上传方向 I3 的确定性注入点：在 Put 已完成 os.Stat 与续传判定、
+// 但尚未 os.Open 本地源时被调用。生产实现是 no-op；单测用它模拟「判定与打开之间本地源被
+// 同尺寸改写」，验证 Put 会在已打开句柄上复核指纹并拒绝续传。
+var beforeOpenLocalSource = func(local string) {}
+
 // regEntry 是一次在飞传输在取消表里的条目。committed 在**提交成功之后、末帧进度上报
 // 之前**置位（Task 10 修复轮 1 / I2）：UI 的 emitProgress 是同步回调，若不标记，Cancel
 // 会在「文件其实已落地」的窗口里返回 true。一旦置位，Cancel 只答 false。
@@ -210,7 +215,7 @@ func (g *GoBackend) ListMany(host, user string, paths []string) (map[string][]It
 func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	// Task 11 去重：同一 (host, 方向, 目标) 只允许一条在飞传输。放在取会话之前 ——
 	// 重复触发必须立刻被拒，而不是排队等额度（排队会让「同目标并发」变成隐式串行）。
-	release, err := g.acquireInflight(req.Host, string(DirDownload), req.Local, req.ID)
+	release, err := g.acquireInflight(req.Host, req.User, string(DirDownload), req.Local, req.ID)
 	if err != nil {
 		return err
 	}
@@ -254,7 +259,10 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	if req.Resume && req.PartPath != "" {
 		kind, off, derr := g.decideDownloadResume(s, req)
 		if derr != nil {
-			return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote, Err: derr, RemoteMsg: s.Proc.StderrText()}
+			// M4：判定失败时远端源不可用，但本地 .part 可能仍在磁盘上 —— 如实带上 PartPath，
+			// 否则调用方会丢掉 Task 7/8 契约里的续传锚点（本地不存在时仍为空）。
+			return &TransferError{Op: "sftp get", Host: req.Host, Path: req.Remote,
+				PartPath: localPartIfExists(req.PartPath), Err: derr, RemoteMsg: s.Proc.StderrText()}
 		}
 		switch kind {
 		case resumeFull:
@@ -333,7 +341,7 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 // 只 Seek 远端而本地从 0 读，会把源的第 0 字节写到远端 offset 处，拼出损坏文件。
 func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	// Task 11 去重：与 Get 对称，键里的目标是远端目标路径。
-	release, err := g.acquireInflight(req.Host, string(DirUpload), req.Remote, req.ID)
+	release, err := g.acquireInflight(req.Host, req.User, string(DirUpload), req.Remote, req.ID)
 	if err != nil {
 		return err
 	}
@@ -379,7 +387,11 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	if req.Resume && req.PartPath != "" {
 		kind, off, derr := g.decideUploadResume(s, req, total, srcMtime)
 		if derr != nil {
-			return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath, Err: derr, RemoteMsg: s.Proc.StderrText()}
+			// M4：能走到这里说明远端 Stat 失败的原因**不是**「不存在」（ENOENT 会在
+			// decideUploadResume 内部直接判 full），因此 .part 很可能仍在远端保留着。
+			// 如实带上 req.PartPath，调用方不会因为一次 Stat 抖动就丢掉续传锚点。
+			return &TransferError{Op: "sftp put", Host: req.Host, Path: req.PartPath,
+				PartPath: req.PartPath, Err: derr, RemoteMsg: s.Proc.StderrText()}
 		}
 		switch kind {
 		case resumeFull:
@@ -442,14 +454,34 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 			return &TransferError{Op: "sftp put", Host: req.Host, Path: part, Err: err, RemoteMsg: s.Proc.StderrText()}
 		}
 	}
-	// 记录本地源指纹（Task 11）：这份远端 .part 的已写字节对应本地源的 (size, mtime)。
-	g.recordResumeAnchor(uploadAnchorKey(part), total, srcMtime)
+	// I3 注入点：单测在「os.Stat 判定已完成、本地源尚未打开」的窗口里改写本地源。
+	beforeOpenLocalSource(req.Local)
 	lf, err := os.Open(req.Local)
 	if err != nil {
 		_ = wf.Close()
 		// 本地源打不开：远端 .part 已建出、按约束 4 保留可续传，但不附远端 stderr（本地错误）。
 		return &TransferError{Op: "sftp put", Path: req.Local, PartPath: part, Err: wrapLocalIO(err)}
 	}
+	// I3：把指纹校验与数据读取绑定到**同一个已打开句柄**。Put 开头的 os.Stat（total/srcMtime）
+	// 与这里的 os.Open 之间存在窗口；同尺寸改写若发生在这个窗口里，继续续写既会把旧前缀
+	// 拼到新内容上，又会把**错误的指纹**写进锚点（下次续传还会再拼一次）。因此打开后立刻
+	// 用句柄自身的 Stat 复核：不符则拒绝本次传输，且绝不记锚点 —— 绝不写出静默损坏的目标。
+	lst, lerr := lf.Stat()
+	if lerr != nil {
+		_ = wf.Close()
+		_ = lf.Close()
+		return &TransferError{Op: "sftp put", Path: req.Local, PartPath: part, Err: wrapLocalIO(lerr)}
+	}
+	if lst.Size() != total || !lst.ModTime().Equal(srcMtime) {
+		_ = wf.Close()
+		_ = lf.Close()
+		return &TransferError{Op: "sftp put", Path: req.Local, PartPath: part,
+			Err: fmt.Errorf("%w: 本地源在判定与打开之间发生变化（size %d→%d）", errLocalIO, total, lst.Size())}
+	}
+	// 记录本地源指纹（Task 11）：这份远端 .part 的已写字节对应**已打开句柄**看到的本地源
+	// (身份, size, mtime)；用句柄 Stat 记录，保证锚点与真正读到的字节出自同一份元数据（I3）。
+	// 记录必须晚于上面的复核：绝不给一份会被拼错的 .part 留下「合法」锚点。
+	g.recordResumeAnchor(uploadAnchorKey(part), req.Local, lst.Size(), lst.ModTime())
 	if req.Resume && offset > 0 {
 		// 上传续传：本地源与远端 .part 必须从同一 offset 续写（见上）。offset 的选择由
 		// Task 11 的 decideResume 负责；这里只保证两侧对称，避免拼出损坏文件。
@@ -681,12 +713,15 @@ func (g *GoBackend) AtomicCapable() bool { return true }
 // 从而复现 I3 竞态：Release 已把会话放回 idle，Cancel 随后才关掉它。
 var cancelCloseSession = func(s *Session) { s.close() }
 
-// acquireInflight 是同目标去重的唯一入口（Task 11）：键 = host|方向|目标，
+// acquireInflight 是同目标去重的唯一入口（Task 11）：键 = host|user|方向|目标，
 // 下载的目标是本地路径、上传的目标是远端路径。重复触发立刻报错，绝不排队 ——
 // 排队会把「同目标并发」变成隐式串行，且第一个完成后第二个照样覆盖，用户看不到任何提示。
+//
+// **user 必须进键**（M3）：不同用户对同一 host + 同一目标路径是两条互不相干的传输
+// （远端身份不同、可访问的文件不同），按 host|方向|目标 去重会把它们误判成重复而拒绝。
 // 返回的 release 必须 defer 调用（含失败路径），否则该目标会永久被判为「在传输中」。
-func (g *GoBackend) acquireInflight(host, dir, target, id string) (func(), error) {
-	key := host + "|" + dir + "|" + target
+func (g *GoBackend) acquireInflight(host, user, dir, target, id string) (func(), error) {
+	key := host + "|" + user + "|" + dir + "|" + target
 	g.inflightMu.Lock()
 	defer g.inflightMu.Unlock()
 	if g.inflight == nil {
