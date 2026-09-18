@@ -33,6 +33,15 @@ func NewCtrlWith(r osutil.Runner, emit forward.EmitFunc, sel TransportSelector) 
 	return c
 }
 
+// NewCtrlForcedBackend 返回一个**强制使用给定后端**的门面。forced 字段不可导出，包外
+// （package main）用例只能通过它注入测试后端。
+//
+// 用途仅限测试：Task 9 评审 I1 要求有一条 hermetic 用例钉住绑定层的 Atomic 决策 ——
+// 需要一个 AtomicCapable=true 的记录型后端，才能证明完整能力链
+// Backend.AtomicCapable ⇒ Ctrl.AtomicCapable ⇒ App.sftpAtomic ⇒ 绑定的 TransferRequest.Atomic。
+// 生产装配一律走 NewCtrl（batch）或 NewCtrlWith（按选择器懒解析），绝不走这里。
+func NewCtrlForcedBackend(b Backend) *Ctrl { return &Ctrl{forced: b} }
+
 // —— legacy 四参面：签名逐字不变，但一律走 c.backend() 且 Atomic=false ——
 // 自审 S11：若把 legacy 面硬绑 batch，则开关对 internal/sync 失效、后端矩阵名不副实、
 // 且 v0.8 删掉 batch 后 sync 无处可去。Atomic=false = 直写目标（sync 自带 .part+rename）。

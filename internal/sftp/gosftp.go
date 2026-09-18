@@ -202,6 +202,8 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	}
 	reuse := false
 	defer func() { g.pool.Release(s, reuse) }()
+	// Task 10：会话一取到就登记进取消表（defer 的注销先于 Release 执行 —— LIFO）。
+	defer g.register(req.ID, s)()
 
 	if !req.Atomic {
 		// legacy 面（internal/sync）：直写目标，原子性由 sync 自己的 .part+rename 保证。
@@ -283,6 +285,8 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	}
 	reuse := false
 	defer func() { g.pool.Release(s, reuse) }()
+	// Task 10：同 Get —— 会话一取到就登记，函数返回时注销。
+	defer g.register(req.ID, s)()
 
 	if !req.Atomic {
 		// legacy 面（internal/sync / app.SftpPut）：直写目标，不建我方 .part、不提交、不登记 journal。
@@ -538,10 +542,46 @@ func (g *GoBackend) CloseAll()                    { g.pool.CloseAll() }
 // 因此声明支持原子提交。绑定层据此把 TransferRequest.Atomic 置 true（Task 9）。
 func (g *GoBackend) AtomicCapable() bool { return true }
 
-// Cancel 关掉该传输独占的会话（库无逐请求取消）。
+// register 把一次在飞传输的会话登记进取消表（id → 会话），返回注销函数。
+// 注销必须在传输返回时执行（成功/失败/取消都一样），否则注册表会残留陈旧键。
 //
-// Task 9 只接线绑定；真正的会话注册表（regMu/reg）由 Task 10 落地 —— 当前恒返回 false
-// 不表示「取消成功」，不表示「传输已完成」，只表示尚未接入。
-// 这里刻意不留「假成功」分支：整批语义由前端编排层落实（取消当前项 + 停止后续派发，
-// spec §6.1），前端据返回值决定是否把后续项标成已取消，返回 true 会让它撒谎。
-func (g *GoBackend) Cancel(string) bool { return false } // Task 10 接线
+// 为什么 id 作键是安全的（Task 10 事实 4）：注册表是**进程内**的，进程重启即空，跨重启的
+// 陈旧 id 够不到新进程；又因池的传输并发上限为 1（AcquireTransfer 先取额度再登记），任一
+// 时刻至多一条在飞条目，注销时删掉的必是本次登记的那条，不存在「旧清理抹掉新登记」的 ABA。
+func (g *GoBackend) register(id string, s *Session) func() {
+	g.regMu.Lock()
+	g.reg[id] = s
+	g.regMu.Unlock()
+	return func() {
+		g.regMu.Lock()
+		delete(g.reg, id)
+		g.regMu.Unlock()
+	}
+}
+
+// Cancel 关掉该传输独占的会话（库无逐请求取消，spec §2.3），返回是否真的取消到了一次
+// 在飞传输。整批语义（取消当前项 + 停止派发后续项）由前端编排层落实（spec §6.1）。
+//
+// 诚实契约（Task 14 依赖，绝不为了取悦 UI 返回 true）：
+//   - true 仅当注册表里确实有该 id 的在飞会话（关会话 ⇒ 在飞 read/write 立刻失败 ⇒
+//     done!=total ⇒ 绝不提交；.part 按约定保留作续传锚点）；
+//   - 未知 id / 从未开始 / 已完成（已注销）⇒ false；
+//   - 同一 id 第二次取消 ⇒ false（取消时即从注册表移除，天然幂等，不报错）；
+//   - batch 后端没有长驻会话 ⇒ 恒 false（见 BatchBackend.Cancel）。
+//
+// 并发：取条目、删除都在 regMu 下完成 —— 并发取消同一 id 恰好一个拿到会话返回 true，
+// 其余看到空条目返回 false（-race 干净）。
+func (g *GoBackend) Cancel(id string) bool {
+	g.regMu.Lock()
+	s, ok := g.reg[id]
+	if ok {
+		delete(g.reg, id)
+	}
+	g.regMu.Unlock()
+	if !ok {
+		return false
+	}
+	// 绝不持锁关会话：Session.close 要关管道并有界等待子进程退出，持锁会把清理路径一起堵住。
+	s.close()
+	return true
+}

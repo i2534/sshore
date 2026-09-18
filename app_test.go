@@ -1299,6 +1299,83 @@ func TestSftpTransferCancelDelegatesToFacade(t *testing.T) {
 	}
 }
 
+// recordingBackend 是 sftp.Backend 的**记录型**替身：只关心绑定层把什么 TransferRequest
+// 递了下来。未覆写的方法由嵌入的 sftp.Backend 接口提供 —— 用例只走 Transfer* 四个方法，
+// 若真调到了别的方法说明用例超出了观测范围（nil 接口会 panic，这是有意的，不静默通过）。
+type recordingBackend struct {
+	sftp.Backend
+	atomic bool
+	calls  []string
+	reqs   []sftp.TransferRequest
+}
+
+func (b *recordingBackend) AtomicCapable() bool { return b.atomic }
+
+func (b *recordingBackend) record(call string, req sftp.TransferRequest) {
+	b.calls = append(b.calls, call)
+	b.reqs = append(b.reqs, req)
+}
+
+func (b *recordingBackend) TransferGet(req sftp.TransferRequest, _ func(sftp.Progress)) error {
+	b.record("TransferGet", req)
+	return nil
+}
+func (b *recordingBackend) TransferGetTree(req sftp.TransferRequest, _ func(sftp.Progress)) error {
+	b.record("TransferGetTree", req)
+	return nil
+}
+func (b *recordingBackend) TransferPut(req sftp.TransferRequest, _ func(sftp.Progress)) error {
+	b.record("TransferPut", req)
+	return nil
+}
+func (b *recordingBackend) TransferPutTree(req sftp.TransferRequest, _ func(sftp.Progress)) error {
+	b.record("TransferPutTree", req)
+	return nil
+}
+
+// TestSftpBindingsPassAtomicTrueWhenBackendCapable 收口 Task 9 评审 I1：
+// 既有用例只证明 batch（AtomicCapable=false）下四个绑定可用，即「没有写死 true」；
+// 这里用记录型后端证明完整能力链 Backend.AtomicCapable=true ⇒ Ctrl.AtomicCapable=true
+// ⇒ App.sftpAtomic=true ⇒ 绑定把 TransferRequest.Atomic 传成 true。写死 false（或漏传
+// 能力）会在这里变红。完全 hermetic：不联网、不起 ssh。
+func TestSftpBindingsPassAtomicTrueWhenBackendCapable(t *testing.T) {
+	fb := &recordingBackend{atomic: true}
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
+	a.sftp = sftp.NewCtrlForcedBackend(fb)
+
+	if err := a.SftpGet("t1", "h", "u", "/r/a", "/l/a", true, "/l/a.part"); err != nil {
+		t.Fatalf("SftpGet: %v", err)
+	}
+	if err := a.SftpGetDir("t2", "h", "u", "/r/d", "/l/d", false, ""); err != nil {
+		t.Fatalf("SftpGetDir: %v", err)
+	}
+	if err := a.SftpPut("t3", "h", "u", "/l/a", "/r/a", false, ""); err != nil {
+		t.Fatalf("SftpPut: %v", err)
+	}
+	if err := a.SftpPutRecursive("t4", "h", "u", "/l/d", "/r/d", true, "/r/d.part"); err != nil {
+		t.Fatalf("SftpPutRecursive: %v", err)
+	}
+
+	wantCalls := []string{"TransferGet", "TransferGetTree", "TransferPut", "TransferPutTree"}
+	wantIDs := []string{"t1", "t2", "t3", "t4"}
+	if len(fb.calls) != len(wantCalls) {
+		t.Fatalf("四个绑定都必须委派到后端，calls=%v", fb.calls)
+	}
+	for i, call := range wantCalls {
+		if fb.calls[i] != call {
+			t.Fatalf("第 %d 次委派应为 %s，got %s", i, call, fb.calls[i])
+		}
+		if !fb.reqs[i].Atomic {
+			t.Fatalf("%s: 后端声明 AtomicCapable 时绑定必须传 Atomic=true（写死 false 会丢掉原子语义）", call)
+		}
+		if fb.reqs[i].ID != wantIDs[i] {
+			t.Fatalf("%s: id 必须原样透传，got %q want %q", call, fb.reqs[i].ID, wantIDs[i])
+		}
+	}
+}
+
 // 评审 M8：config.Preset 与 preset.Entry 是两个结构体，字段漂移没有编译期保护，
 // 用对称性（转过去再转回来逐字段相等）把它钉住。
 func TestPresetConvertersAreSymmetric(t *testing.T) {
