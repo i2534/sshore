@@ -16,8 +16,11 @@ func TestJournalBeginDoneRecover(t *testing.T) {
 	if err := j.Begin("/data/a.txt", "/data/a.txt.sshore-sftppart-bak-1", "/data/a.txt.sshore-sftppart-t1-2"); err != nil {
 		t.Fatal(err)
 	}
-	if got := j.Recover(); len(got) != 1 || got[0] != "/data/a.txt" {
-		t.Fatalf("恢复列表应含未完成的目标，got %v", got)
+	got := j.Recover()
+	// Recover 必须给出完整三元组：bak 是随机名，恢复侧无法从 target 反推（修复轮 1 M）。
+	if len(got) != 1 || got[0].Target != "/data/a.txt" ||
+		got[0].Bak != "/data/a.txt.sshore-sftppart-bak-1" || got[0].Part != "/data/a.txt.sshore-sftppart-t1-2" {
+		t.Fatalf("恢复条目应含完整 target/bak/part，got %+v", got)
 	}
 	if err := j.Done("/data/a.txt"); err != nil {
 		t.Fatal(err)
@@ -69,7 +72,7 @@ func TestJournalPersistsAcrossInstances(t *testing.T) {
 	// 模拟重启：新实例读同一目录。
 	j2 := newSwapJournal(dir)
 	got := j2.Recover()
-	if len(got) != 2 || got[0] != "/data/a.txt" || got[1] != "/data/b.txt" {
+	if len(got) != 2 || got[0].Target != "/data/a.txt" || got[1].Target != "/data/b.txt" {
 		t.Fatalf("重启后应恢复出两条未完成目标，got %v", got)
 	}
 
@@ -77,7 +80,7 @@ func TestJournalPersistsAcrossInstances(t *testing.T) {
 	if err := j2.Done("/data/a.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if got := newSwapJournal(dir).Recover(); len(got) != 1 || got[0] != "/data/b.txt" {
+	if got := newSwapJournal(dir).Recover(); len(got) != 1 || got[0].Target != "/data/b.txt" {
 		t.Fatalf("Done 后应只剩 b.txt，got %v", got)
 	}
 	if err := j2.Done("/data/b.txt"); err != nil {
@@ -99,7 +102,7 @@ func TestJournalBeginSameTargetReplaces(t *testing.T) {
 	if err := j.Begin("/data/a.txt", "/data/a.txt.bak-2", "/data/a.txt.part-2"); err != nil {
 		t.Fatal(err)
 	}
-	if got := j.Recover(); len(got) != 1 || got[0] != "/data/a.txt" {
+	if got := j.Recover(); len(got) != 1 || got[0].Target != "/data/a.txt" {
 		t.Fatalf("同目标应只有一条，got %v", got)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "swap-entries.json"))

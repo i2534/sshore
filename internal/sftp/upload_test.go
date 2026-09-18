@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -349,7 +350,7 @@ func TestCommitRemoteUsesPosixRenameWhenAvailable(t *testing.T) {
 		return c.Rename(oldname, newname) // 模拟服务端原子覆盖
 	})
 	j := newSwapJournal(t.TempDir())
-	if err := commitRemote(s, true, part, target, j); err != nil {
+	if err := commitRemote(s, true, part, target, j, nil); err != nil {
 		t.Fatalf("commitRemote: %v", err)
 	}
 	if calls != 1 {
@@ -384,7 +385,7 @@ func TestCommitRemoteFallsBackToSwapWhenPosixRenameFails(t *testing.T) {
 		return errors.New("posix-rename unsupported on this server")
 	})
 	j := newSwapJournal(t.TempDir())
-	if err := commitRemote(s, true, part, target, j); err != nil {
+	if err := commitRemote(s, true, part, target, j, nil); err != nil {
 		t.Fatalf("PosixRename 失败必须回退 backup-swap 并成功，got %v", err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(remoteRoot, target)); string(b) != "NEW" {
@@ -401,10 +402,10 @@ func TestCommitRemoteFallsBackToSwapWhenPosixRenameFails(t *testing.T) {
 	}
 }
 
-// TestCommitRemoteSwapFailureLeavesJournalEntryForRecovery：backup-swap 中途失败
-// （这里让 part 不存在，Begin 之后的第二次 rename 必失败）必须回滚目标、保留 journal 条目，
-// 且**新实例**能从磁盘恢复出这个目标（崩溃恢复契约）。
-func TestCommitRemoteSwapFailureLeavesJournalEntryForRecovery(t *testing.T) {
+// TestCommitRemoteRollbackSuccessClearsJournal（I2 修复轮 1）：第二步 rename 失败
+// （这里让 part 不存在）会回滚 bak→target；**回滚成功后必须清掉 journal 条目**，
+// 否则陈旧条目会毒化下次启动（恢复侧以为现场未处理）。目标旧内容保回，无残留 bak。
+func TestCommitRemoteRollbackSuccessClearsJournal(t *testing.T) {
 	remoteRoot := t.TempDir()
 	const target = "dst.bin"
 	missingPart := "dst.bin.sshore-sftppart-t1-dead"
@@ -414,7 +415,8 @@ func TestCommitRemoteSwapFailureLeavesJournalEntryForRecovery(t *testing.T) {
 	g := backendForTestServer(t, remoteRoot)
 	s := acquireTransferSession(t, g)
 	jdir := t.TempDir()
-	if err := commitRemote(s, false, missingPart, target, newSwapJournal(jdir)); err == nil {
+	j := newSwapJournal(jdir)
+	if err := commitRemote(s, false, missingPart, target, j, nil); err == nil {
 		t.Fatal("part 不存在时 backup-swap 必须失败并上报")
 	}
 	// 目标必须被回滚保住（绝不先删目标后丢失目标）。
@@ -424,9 +426,12 @@ func TestCommitRemoteSwapFailureLeavesJournalEntryForRecovery(t *testing.T) {
 	if temps := remoteTemps(t, remoteRoot); len(temps) != 0 {
 		t.Fatalf("回滚后不得残留 .bak: %v", temps)
 	}
-	// 崩溃恢复：新实例读磁盘 journal，必须报出这个未完成目标。
-	if got := newSwapJournal(jdir).Recover(); len(got) != 1 || got[0] != target {
-		t.Fatalf("新实例应从未完成 journal 恢复出目标 %q，got %v", target, got)
+	// I2：回滚成功 = 现场已恢复干净 ⇒ 条目必须清掉（变异「丢掉回滚后的 j.Done」会在此 FAIL）。
+	if got := j.Recover(); len(got) != 0 {
+		t.Fatalf("回滚成功后 journal 必须清空（陈旧条目会毒化下次启动），got %+v", got)
+	}
+	if got := newSwapJournal(jdir).Recover(); len(got) != 0 {
+		t.Fatalf("回滚成功后新实例也不应看到条目，got %+v", got)
 	}
 }
 
@@ -441,7 +446,7 @@ func TestCommitRemoteTargetMissingCommitsDirectly(t *testing.T) {
 	g := backendForTestServer(t, remoteRoot)
 	s := acquireTransferSession(t, g)
 	j := newSwapJournal(t.TempDir())
-	if err := commitRemote(s, false, part, target, j); err != nil {
+	if err := commitRemote(s, false, part, target, j, nil); err != nil {
 		t.Fatalf("目标不存在时应直接提交: %v", err)
 	}
 	if b, _ := os.ReadFile(filepath.Join(remoteRoot, target)); string(b) != "NEW" {
@@ -452,6 +457,274 @@ func TestCommitRemoteTargetMissingCommitsDirectly(t *testing.T) {
 	}
 	if temps := remoteTemps(t, remoteRoot); len(temps) != 0 {
 		t.Fatalf("直接提交不得残留 .bak: %v", temps)
+	}
+}
+
+// swapRenameRemote 替换 backup-swap 的远端改名注入点，返回原实现（供 hook 内部继续委托）。
+func swapRenameRemote(t *testing.T, fn func(*sftp.Client, string, string) error) func(*sftp.Client, string, string) error {
+	t.Helper()
+	orig := renameRemote
+	renameRemote = fn
+	t.Cleanup(func() { renameRemote = orig })
+	return orig
+}
+
+// swapRemoveRemote 替换 bak 清理的远端删除注入点，返回原实现。
+func swapRemoveRemote(t *testing.T, fn func(*sftp.Client, string) error) func(*sftp.Client, string) error {
+	t.Helper()
+	orig := removeRemote
+	removeRemote = fn
+	t.Cleanup(func() { removeRemote = orig })
+	return orig
+}
+
+// TestCommitRemoteIntentDurableBeforeDestructiveRename（C1 修复轮 1 核心用例）：
+// journal intent 必须在「target→bak」这条破坏性改名动手之前就已落盘，且能被**新实例**
+// 从磁盘读到完整三元组。这是 C1 的不变量：旧顺序（先改 target→bak 再 Begin）在中间崩溃会
+// 留下「target 名已消失、journal 仍空」，旧内容只剩在随机 bak 名里、无法反推 target。
+// 变异「把 Begin 移回 Rename(target,bak) 之后」会在此 FAIL（改名那一刻 journal 为空）。
+func TestCommitRemoteIntentDurableBeforeDestructiveRename(t *testing.T) {
+	remoteRoot := t.TempDir()
+	const target = "dst.bin"
+	part := PartNameRemote(target, "t1")
+	writeRemote(t, remoteRoot, target, []byte("OLD"))
+	writeRemote(t, remoteRoot, part, []byte("NEW"))
+
+	g := backendForTestServer(t, remoteRoot)
+	s := acquireTransferSession(t, g)
+	jdir := t.TempDir()
+
+	var entryAtRename []swapEntry
+	var targetExisted bool
+	var orig func(*sftp.Client, string, string) error
+	orig = swapRenameRemote(t, func(c *sftp.Client, oldname, newname string) error {
+		if oldname == target && newname != target {
+			// 破坏性改名「动手之前」：另一个实例必须已经能从磁盘读到完整 intent。
+			entryAtRename = newSwapJournal(jdir).Recover()
+			_, statErr := os.Stat(filepath.Join(remoteRoot, target))
+			targetExisted = statErr == nil
+		}
+		return orig(c, oldname, newname)
+	})
+
+	if err := commitRemote(s, false, part, target, newSwapJournal(jdir), nil); err != nil {
+		t.Fatalf("commitRemote: %v", err)
+	}
+	if !targetExisted {
+		t.Fatal("target→bak 之前旧内容必须还在原名下（destructive rename 尚未动手）")
+	}
+	if len(entryAtRename) != 1 {
+		t.Fatalf("target→bak 之前 journal 必须已落盘（C1 顺序不变量），got %+v", entryAtRename)
+	}
+	e := entryAtRename[0]
+	if e.Target != target || e.Part != part {
+		t.Fatalf("journal 条目 target/part 不对: %+v", e)
+	}
+	if e.Bak == "" || e.Bak == target || !IsInternalTemp(filepath.Base(e.Bak)) {
+		t.Fatalf("journal 必须记录随机 bak 名（恢复侧无法反推）: %+v", e)
+	}
+	if filepath.Dir(e.Bak) != filepath.Dir(target) {
+		t.Fatalf("bak 必须与 target 同目录: %q", e.Bak)
+	}
+	// 收尾：提交成功、journal 清空、无残留。
+	if b, rerr := os.ReadFile(filepath.Join(remoteRoot, target)); rerr != nil || string(b) != "NEW" {
+		t.Fatalf("提交后目标应为新内容: err=%v content=%q", rerr, string(b))
+	}
+	if got := newSwapJournal(jdir).Recover(); len(got) != 0 {
+		t.Fatalf("提交成功后 journal 必须清空: %+v", got)
+	}
+	if temps := remoteTemps(t, remoteRoot); len(temps) != 0 {
+		t.Fatalf("提交成功后不得残留 .part/.bak: %v", temps)
+	}
+}
+
+// TestCommitRemoteNonENOENTTargetRenameErrorIsReported（I4）：Rename(target,bak) 返回
+// 非 ENOENT（权限/被占用等）时必须原样上报，绝不当作「目标不存在」直接提交。
+// 变异「if !os.IsNotExist(err) → if false」会在此 FAIL（它会把 .part 改名成 target 并返回 nil）。
+func TestCommitRemoteNonENOENTTargetRenameErrorIsReported(t *testing.T) {
+	remoteRoot := t.TempDir()
+	const target = "dst.bin"
+	part := PartNameRemote(target, "t1")
+	writeRemote(t, remoteRoot, target, []byte("OLD"))
+	writeRemote(t, remoteRoot, part, []byte("NEW"))
+
+	g := backendForTestServer(t, remoteRoot)
+	s := acquireTransferSession(t, g)
+	boom := errors.New("permission denied")
+	var orig func(*sftp.Client, string, string) error
+	orig = swapRenameRemote(t, func(c *sftp.Client, oldname, newname string) error {
+		if oldname == target && newname != target {
+			return boom
+		}
+		return orig(c, oldname, newname)
+	})
+
+	j := newSwapJournal(t.TempDir())
+	err := commitRemote(s, false, part, target, j, nil)
+	if !errors.Is(err, boom) {
+		t.Fatalf("非 ENOENT 的 target 改名失败必须原样上报，got %v", err)
+	}
+	if b, rerr := os.ReadFile(filepath.Join(remoteRoot, target)); rerr != nil || string(b) != "OLD" {
+		t.Fatalf("上报错误时目标必须保持旧内容: err=%v content=%q", rerr, string(b))
+	}
+	if _, serr := os.Stat(filepath.Join(remoteRoot, part)); serr != nil {
+		t.Fatalf(".part 不得被提交（未走直接提交分支）: %v", serr)
+	}
+	if temps := remoteTemps(t, remoteRoot); len(temps) != 1 || temps[0] != filepath.Base(part) {
+		t.Fatalf("除 .part 外不得出现 .bak: %v", temps)
+	}
+	if got := j.Recover(); len(got) != 0 {
+		t.Fatalf("target 未被动时不应留下 journal 条目: %+v", got)
+	}
+}
+
+// TestCommitRemoteBeginFailureAbortsBeforeDestructiveRename（I3a）：journal 写不进去
+// （Begin 失败）时必须在**任何破坏性改名之前**中止，目标旧内容原样保留。
+// 该用例同时钉住 C1 顺序：变异「先改名再 Begin」会让 target 被改走而在此 FAIL。
+func TestCommitRemoteBeginFailureAbortsBeforeDestructiveRename(t *testing.T) {
+	remoteRoot := t.TempDir()
+	const target = "dst.bin"
+	part := PartNameRemote(target, "t1")
+	writeRemote(t, remoteRoot, target, []byte("OLD"))
+	writeRemote(t, remoteRoot, part, []byte("NEW"))
+
+	// journal 目录的父路径是普通文件 ⇒ Begin 的 load/store 必失败。
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("not-a-dir"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	j := newSwapJournal(filepath.Join(blocker, "state"))
+
+	g := backendForTestServer(t, remoteRoot)
+	s := acquireTransferSession(t, g)
+	if err := commitRemote(s, false, part, target, j, nil); err == nil {
+		t.Fatal("journal 写不进去时必须在破坏性改名之前中止")
+	}
+	if b, rerr := os.ReadFile(filepath.Join(remoteRoot, target)); rerr != nil || string(b) != "OLD" {
+		t.Fatalf("Begin 失败不得改动目标: err=%v content=%q", rerr, string(b))
+	}
+	if _, serr := os.Stat(filepath.Join(remoteRoot, part)); serr != nil {
+		t.Fatalf(".part 必须原样保留: %v", serr)
+	}
+	if temps := remoteTemps(t, remoteRoot); len(temps) != 1 || temps[0] != filepath.Base(part) {
+		t.Fatalf("除 .part 外不得出现 .bak: %v", temps)
+	}
+}
+
+// TestCommitRemoteRollbackFailureKeepsJournalAndReports（I2/I3b）：第二步 rename 失败
+// 且回滚也失败时，必须**保留完整 journal 条目**供下次启动恢复，并把回滚失败一并回报
+// （绝不 _ = Rename(bak,target) 静默丢弃）。此时旧内容落在随机 bak 里，只有 journal 能定位。
+func TestCommitRemoteRollbackFailureKeepsJournalAndReports(t *testing.T) {
+	remoteRoot := t.TempDir()
+	const target = "dst.bin"
+	part := PartNameRemote(target, "t1")
+	writeRemote(t, remoteRoot, target, []byte("OLD"))
+	writeRemote(t, remoteRoot, part, []byte("NEW"))
+
+	g := backendForTestServer(t, remoteRoot)
+	s := acquireTransferSession(t, g)
+	jdir := t.TempDir()
+	commitErr := errors.New("part -> target rename failed")
+	rbErr := errors.New("rollback failed")
+	var orig func(*sftp.Client, string, string) error
+	orig = swapRenameRemote(t, func(c *sftp.Client, oldname, newname string) error {
+		switch {
+		case oldname == target && newname != target:
+			return orig(c, oldname, newname) // target -> bak 正常
+		case oldname == part && newname == target:
+			return commitErr // 第二步提交失败
+		case newname == target:
+			return rbErr // bak -> target 回滚失败
+		}
+		return orig(c, oldname, newname)
+	})
+
+	err := commitRemote(s, false, part, target, newSwapJournal(jdir), nil)
+	if err == nil {
+		t.Fatal("第二步失败且回滚失败必须上报")
+	}
+	if !errors.Is(err, commitErr) {
+		t.Fatalf("错误必须保留提交失败原因: %v", err)
+	}
+	if !strings.Contains(err.Error(), rbErr.Error()) || !strings.Contains(err.Error(), "回滚") {
+		t.Fatalf("错误必须明说回滚也失败: %v", err)
+	}
+	got := newSwapJournal(jdir).Recover()
+	if len(got) != 1 || got[0].Target != target || got[0].Bak == "" || got[0].Part != part {
+		t.Fatalf("回滚失败必须保留完整 journal 条目，got %+v", got)
+	}
+	// 旧内容此刻在随机 bak 名里；恢复侧只能靠 journal 的 bak 字段找回。
+	if b, rerr := os.ReadFile(filepath.Join(remoteRoot, got[0].Bak)); rerr != nil || string(b) != "OLD" {
+		t.Fatalf("bak 必须保有旧内容: err=%v content=%q", rerr, string(b))
+	}
+}
+
+// TestCommitRemoteBakRemovalFailureIsLoggedNotFatal（I3c）：提交成功后删除 bak 失败
+// 只 warn，不改写「提交成功」的结论（目标已是新内容、返回 nil）。
+// 若这里返回错误，Put 会报失败并发布一个已被 rename 掉、不存在的 PartPath（假锚点）。
+func TestCommitRemoteBakRemovalFailureIsLoggedNotFatal(t *testing.T) {
+	remoteRoot := t.TempDir()
+	const target = "dst.bin"
+	part := PartNameRemote(target, "t1")
+	writeRemote(t, remoteRoot, target, []byte("OLD"))
+	writeRemote(t, remoteRoot, part, []byte("NEW"))
+
+	g := backendForTestServer(t, remoteRoot)
+	s := acquireTransferSession(t, g)
+	removeErr := errors.New("remove denied")
+	var orig func(*sftp.Client, string) error
+	orig = swapRemoveRemote(t, func(c *sftp.Client, p string) error {
+		if IsInternalTemp(filepath.Base(p)) {
+			return removeErr
+		}
+		return orig(c, p)
+	})
+
+	var logs []string
+	j := newSwapJournal(t.TempDir())
+	err := commitRemote(s, false, part, target, j, func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) })
+	if err != nil {
+		t.Fatalf("bak 删除失败不得让提交失败: %v", err)
+	}
+	if b, rerr := os.ReadFile(filepath.Join(remoteRoot, target)); rerr != nil || string(b) != "NEW" {
+		t.Fatalf("目标应已提交为新内容: err=%v content=%q", rerr, string(b))
+	}
+	if got := j.Recover(); len(got) != 0 {
+		t.Fatalf("提交成功后 journal 必须清空: %+v", got)
+	}
+	if len(logs) == 0 || !strings.Contains(strings.Join(logs, "\n"), "删除备份") {
+		t.Fatalf("Remove(bak) 失败必须 warn 上报而不是静默丢弃，logs=%v", logs)
+	}
+}
+
+// TestGoBackendPutResumeSeeksLocalSourceToo（修复轮 1 M）：上传续传必须让远端 .part 与
+// 本地源都从同一 offset 续写；只 Seek 远端而本地从 0 读会拼出损坏文件（且 n+offset 对不上总量）。
+func TestGoBackendPutResumeSeeksLocalSourceToo(t *testing.T) {
+	remoteRoot, localDir := t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("resume-"), 500) // 3500 字节
+	local := filepath.Join(localDir, "src.bin")
+	if err := os.WriteFile(local, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	g := backendForTestServer(t, remoteRoot)
+	const target = "dst.bin"
+	part := PartNameRemote(target, "r1")
+	writeRemote(t, remoteRoot, part, data[:1000]) // 上次中断留下的完整前缀
+
+	req := TransferRequest{ID: "r1", Host: "h", Remote: target, Local: local, Atomic: true,
+		Resume: true, PartPath: part, ResumeOffset: 1000}
+	if err := g.Put(req, nil); err != nil {
+		t.Fatalf("续传 Put: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(remoteRoot, target))
+	if err != nil {
+		t.Fatalf("提交后目标必须存在: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("续传结果与源不一致（本地源未按 offset 续读）: got %d bytes want %d", len(got), len(data))
+	}
+	if temps := remoteTemps(t, remoteRoot); len(temps) != 0 {
+		t.Fatalf("续传成功后不得残留 .part/.bak: %v", temps)
 	}
 }
 
