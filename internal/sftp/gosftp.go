@@ -1,0 +1,176 @@
+package sftp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+
+	"github.com/pkg/sftp"
+
+	"sshore/internal/forward"
+	"sshore/internal/osutil"
+)
+
+// 注入点（与 Task 7 的 ioCopy 同思路）：让 hermetic 单测能在不联网、不起真实 ssh 的
+// 前提下断言 dial 构造的 ssh 参数与错误路径。生产路径一律走 osutil.StartPipes /
+// sftp.NewClientPipe。
+var (
+	startSFTPPipes = osutil.StartPipes
+
+	newSFTPClientPipe = func(rd io.Reader, wr io.WriteCloser) (*sftp.Client, error) {
+		return sftp.NewClientPipe(rd, wr)
+	}
+)
+
+// GoBackend 是基于 pkg/sftp 的新传输后端（spec D1）。
+// 技术审核 S5：Go 没有 partial struct —— 后续 task 新增字段必须回来改**这一处**声明。
+// 这里一次性声明全部字段，后续 task 只实现方法，避免每个 task 都要改结构体。
+type GoBackend struct {
+	pool *Pool
+	emit forward.EmitFunc
+	sel  TransportSelector
+
+	journalDir string       // Task 8：journal 目录（app 用 stateDir() 注入）
+	journal    *swapJournal // Task 8：backup-swap 崩溃恢复
+
+	regMu sync.Mutex // Task 10：id → 会话（取消用）
+	reg   map[string]*Session
+
+	inflightMu sync.Mutex // Task 11：同目标去重
+	inflight   map[string]string
+
+	partsMu    sync.Mutex           // Task 13：已知 .part（退出清理用）
+	knownParts map[string][2]string // id → {local, remote}
+}
+
+func NewGoBackend(sel TransportSelector, emit forward.EmitFunc) *GoBackend {
+	g := &GoBackend{emit: emit, sel: sel}
+	g.pool = NewPool(g.dial)
+	return g
+}
+
+// 本文件在后续 task 里还会补：var ioCopy = io.Copy（便于测试注入）、
+// func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, local string, report func(Progress)) error
+// —— Task 12 的目录传输复用它，避免逐文件建会话。
+
+// sftpDialArgs 构造 ssh 的参数（纯函数，便于单测逐字钉顺序）。
+func sftpDialArgs(host, user string) []string {
+	args := []string{
+		"-o", "BatchMode=yes",
+		"-o", "IdentitiesOnly=yes",
+		"-o", "ConnectTimeout=10",
+		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveCountMax=3",
+	}
+	if user != "" {
+		args = append(args, "-o", "User="+user)
+	}
+	// Task 0 实测：-s 前置/后置在 Win32-OpenSSH 9.5p1 都可用；采用前置（不依赖 getopt 置换）。
+	// 另注（Task 0 的 Session 0 现象）：本函数必须在交互桌面会话里运行 ——
+	// Session 0 中 spawn 的 ssh.exe 会卡在 SFTP INIT 之后（裸 ssh 命令同样卡），属环境限制。
+	args = append(args, "-s", host, "sftp")
+	return args
+}
+
+// dial 起 ssh -s sftp，把 stdin/stdout 交给 NewClientPipe。
+// stderr 由 osutil.StartPipes 后台 drain，错误上报读 PipedProcess.StderrText()。
+func (g *GoBackend) dial(host, user string) (*Session, error) {
+	pp, err := startSFTPPipes("ssh", sftpDialArgs(host, user)...)
+	if err != nil {
+		return nil, err
+	}
+	cl, err := newSFTPClientPipe(pp.Stdout, pp.Stdin)
+	if err != nil {
+		// 绝不直接读 Proc.Stderr：会与 primitive 的 drain goroutine 竞争；StderrText 是唯一来源。
+		msg := pp.StderrText()
+		_ = pp.Close()
+		if strings.Contains(msg, "subsystem request failed") {
+			return nil, fmt.Errorf("远端未启用 sftp 子系统（检查 sshd_config 的 Subsystem sftp）: %s", msg)
+		}
+		if msg == "" {
+			// dial 失败时子进程可能尚未退出，StderrText 仍为空 —— 报通用错误，
+			// 绝不阻塞等待 stderr（那会把失败变成挂起）。
+			return nil, fmt.Errorf("建立 SFTP 会话失败: %v", err)
+		}
+		return nil, fmt.Errorf("建立 SFTP 会话失败: %v (%s)", err, msg)
+	}
+	return &Session{Host: host, User: user, Conn: cl, Proc: pp, state: sessBusy}, nil
+}
+
+// Capabilities 通过会话池真实建一次会话，探测远端 posix-rename 扩展。
+func (g *GoBackend) Capabilities(host, user string) (bool, error) {
+	s, err := g.pool.AcquireList(context.Background(), host, user)
+	if err != nil {
+		return false, err
+	}
+	if s.Conn == nil {
+		g.pool.Release(s, false)
+		return false, errors.New("会话没有 SFTP 连接")
+	}
+	_, ok := s.Conn.HasExtension("posix-rename@openssh.com")
+	g.pool.Release(s, true)
+	return ok, nil
+}
+
+// —— Task 7-13 才实现的正文；本 task 只落引导与能力探测（自审 S7）——
+
+func (g *GoBackend) Home(host, user string) (string, error) { return "", errors.New("未实现") }
+func (g *GoBackend) List(host, user, path string) ([]Item, error) {
+	return nil, errors.New("未实现")
+}
+func (g *GoBackend) ListMany(host, user string, paths []string) (map[string][]Item, error) {
+	return nil, errors.New("未实现")
+}
+
+// Get/GetTree/Put/PutTree 是 GoBackend 的正文方法（后续 task 填充）。
+// 接口方法 Transfer* 是薄适配层 —— 门面通过 Backend 接口只看到 Transfer*，
+// 与 BatchBackend（legacy 四参 Get/Put 保留、Transfer* 包一层）方向相反。
+func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
+	return errors.New("未实现")
+}
+func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
+	return errors.New("未实现")
+}
+func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
+	return errors.New("未实现")
+}
+func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
+	return errors.New("未实现")
+}
+
+func (g *GoBackend) TransferGet(req TransferRequest, report func(Progress)) error {
+	return g.Get(req, report)
+}
+func (g *GoBackend) TransferGetTree(req TransferRequest, report func(Progress)) error {
+	return g.GetTree(req, report)
+}
+func (g *GoBackend) TransferPut(req TransferRequest, report func(Progress)) error {
+	return g.Put(req, report)
+}
+func (g *GoBackend) TransferPutTree(req TransferRequest, report func(Progress)) error {
+	return g.PutTree(req, report)
+}
+
+func (g *GoBackend) Remove(host, user, path string) error             { return errors.New("未实现") }
+func (g *GoBackend) RemoveRecursive(host, user, path string) error    { return errors.New("未实现") }
+func (g *GoBackend) Mkdir(host, user, path string) error              { return errors.New("未实现") }
+func (g *GoBackend) Rename(host, user, oldPath, newPath string) error { return errors.New("未实现") }
+
+// Connect 对 GoBackend 而言就是「握手 + 探测」；建立长驻会话由池按需完成。
+func (g *GoBackend) Connect(host, user string) error {
+	_, err := g.Capabilities(host, user)
+	return err
+}
+
+// Search 的 Go 实现要等后续 task；先返回未实现，避免静默空结果。
+func (g *GoBackend) Search(ctx context.Context, host, user, root, pattern string, maxDepth, limit int,
+	onProgress func(scanned int)) (SearchOutcome, error) {
+	return SearchOutcome{}, errors.New("未实现")
+}
+
+func (g *GoBackend) Connected(host string) bool   { return false }
+func (g *GoBackend) Disconnect(host string) error { return g.pool.Disconnect(host) }
+func (g *GoBackend) CloseAll()                    { g.pool.CloseAll() }
