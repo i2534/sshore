@@ -81,10 +81,10 @@ func TestDialUsesSSHAndPropagatesStartError(t *testing.T) {
 // 「建立 SFTP 会话失败」前缀，并走 PipedProcess.StderrText()（绝不直接读 Proc.Stderr）。
 func TestDialWrapsClientPipeError(t *testing.T) {
 	origStart, origPipe := startSFTPPipes, newSFTPClientPipe
-	// 用 cat 作为真实但本地的替身：NewClientPipe 被注入为立即失败，因此不会读管道、
+	// 用跨平台替身子进程（helper_test.go）：NewClientPipe 被注入为立即失败，因此不会读管道、
 	// 不会挂住；dial 随后必须 Close() 掉它。
 	startSFTPPipes = func(string, ...string) (*osutil.PipedProcess, error) {
-		return osutil.StartPipes("cat")
+		return testHelperPipes(t, ""), nil
 	}
 	newSFTPClientPipe = func(io.Reader, io.WriteCloser) (*sftp.Client, error) {
 		return nil, errors.New("handshake failed")
@@ -163,6 +163,16 @@ func TestNewGoBackendWiresPoolAndDeclaredFields(t *testing.T) {
 // Task 10/11/13 会直接写 reg/inflight/knownParts，构造后这些 map 必须已可用，
 // 不能再由调用方手工兜底 —— 否则迟到的 task 一写就 panic: assignment to entry in nil map。
 func TestGoBackendMapsWritableAfterConstruction(t *testing.T) {
+	// 本用例只验证 map 可写。CloseAll → CleanupParts 会把登记表里所有 .part 清掉，对非空
+	// host 的那条会真的 AcquireList → dial。这里把子进程启动注入成立刻失败：既保持登记项
+	// 是真实形状（host/user/远端路径都非空），又不让用例去连一台真实主机 —— 修复前在
+	// Windows 真机上 ssh "" 会一直挂到 test timeout（10m）。
+	origStart := startSFTPPipes
+	startSFTPPipes = func(string, ...string) (*osutil.PipedProcess, error) {
+		return nil, errors.New("test: 不起真实 ssh")
+	}
+	t.Cleanup(func() { startSFTPPipes = origStart })
+
 	g := NewGoBackend(nil, nil)
 	defer g.CloseAll()
 	func() {
@@ -257,6 +267,14 @@ func TestGoBackendListAndListMany(t *testing.T) {
 }
 
 func TestGoBackendHome(t *testing.T) {
+	// Windows 下上游 pkg/sftp 的**内存服务端**把远端绝对路径（C:\…）当 POSIX 路径拼到
+	// 工作目录后（filepath.Abs(toLocalPath)），REALPATH 返回的是 "/C:/…" 这种非法形态，
+	// 这不是本产品的缺陷：生产路径是真实 OpenSSH sshd，其 pwd 语义由 e2e 与 Windows
+	// 真机验收清单 §3 覆盖（Wails 客户端本身不可能跑在这个内存服务端上）。
+	// Home 只是 s.Conn.Getwd() 的一行转发，平台无关。
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 下 pkg/sftp 内存服务端不支持绝对远端路径（REALPATH 上游限制）")
+	}
 	root := t.TempDir()
 	g := backendForTestServer(t, root)
 	home, err := g.Home("h", "")
@@ -809,11 +827,15 @@ func TestGoBackendCleanupPartsRemovesKnownParts(t *testing.T) {
 	g := backendForTestServer(t, root)
 	localDir := t.TempDir()
 	localPart := filepath.Join(localDir, "local"+PartMarker+"t13-abcd")
-	remotePart := writeRemote(t, root, "remote"+PartMarker+"t13-abcd", []byte("half"))
+	// 远端路径必须是 **POSIX 语义**（生产里 GoBackend 的远端路径一律 path 家族）。测试服务端
+	// 用 filepath.Abs(toLocalPath(p)) 解析，Windows 上喂绝对路径会被拼成非法名；登记表里
+	// 存的也是远端路径，所以这里两处都用同一个相对路径，落到 root 下。
+	remoteRel := "remote" + PartMarker + "t13-abcd"
+	remotePart := writeRemote(t, root, remoteRel, []byte("half"))
 	if err := os.WriteFile(localPart, []byte("half"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	g.recordPart("h", "u", "t13", localPart, remotePart)
+	g.recordPart("h", "u", "t13", localPart, remoteRel)
 	g.CleanupParts()
 	if _, err := os.Stat(localPart); !os.IsNotExist(err) {
 		t.Fatalf("本地已知 .part 必须被清掉, stat err=%v", err)
@@ -835,11 +857,12 @@ func TestGoBackendCloseAllCleansKnownParts(t *testing.T) {
 	g := backendForTestServer(t, root)
 	localDir := t.TempDir()
 	localPart := filepath.Join(localDir, "local"+PartMarker+"t13-cd")
-	remotePart := writeRemote(t, root, "remote"+PartMarker+"t13-cd", []byte("half"))
+	remoteRel := "remote" + PartMarker + "t13-cd"
+	remotePart := writeRemote(t, root, remoteRel, []byte("half"))
 	if err := os.WriteFile(localPart, []byte("half"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	g.recordPart("h", "u", "t13cd", localPart, remotePart)
+	g.recordPart("h", "u", "t13cd", localPart, remoteRel)
 	g.CloseAll()
 	if _, err := os.Stat(localPart); !os.IsNotExist(err) {
 		t.Fatalf("CloseAll 后本地 .part 必须消失, stat err=%v", err)
@@ -1276,10 +1299,9 @@ func backendForTestServerSniffed(t *testing.T, root string) (*GoBackend, *sftpRe
 			_ = srv.Close()
 			return nil, err
 		}
-		p, perr := osutil.StartPipes("cat")
-		if perr != nil {
-			return nil, perr
-		}
+		// 跨平台替身子进程：Session.close 会 Kill，nil Proc 会 nil panic；且带 Proc 的
+		// 会话才算「真的建立过连接」（GoBackend.Connected 的粘性置位判据）。
+		p := testHelperPipes(t, "")
 		mu.Lock()
 		servers = append(servers, srv)
 		conns = append(conns, c1, c2)
@@ -1407,11 +1429,7 @@ func TestCleanupPartsNilConnDoesNotPanic(t *testing.T) {
 	g := NewGoBackend(nil, nil)
 	defer g.CloseAll()
 	g.pool.dial = func(host, user string) (*Session, error) {
-		p, err := osutil.StartPipes("cat")
-		if err != nil {
-			return nil, err
-		}
-		return &Session{Host: host, User: user, Conn: nil, Proc: p, state: sessBusy}, nil
+		return &Session{Host: host, User: user, Conn: nil, Proc: testHelperPipes(t, ""), state: sessBusy}, nil
 	}
 	g.recordPart("h", "u", "f7", "", "remote.part")
 	g.CleanupParts() // 不得 panic
@@ -1421,6 +1439,11 @@ func TestCleanupPartsNilConnDoesNotPanic(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("清理后登记表必须清空, got %d", n)
 	}
+}
+
+// TestMain 让测试二进制可以在 helper 模式下扮演替身子进程（见 helper_test.go）。
+func TestMain(m *testing.M) {
+	os.Exit(helperTestMain(m))
 }
 
 func idxOf(xs []string, s string) int {

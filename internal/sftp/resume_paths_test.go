@@ -11,8 +11,6 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
-
-	"sshore/internal/osutil"
 )
 
 // —— Task 11 hermetic 续传路径测试 ——
@@ -37,13 +35,8 @@ func backendForResumableTestServer(t *testing.T, root string) *GoBackend {
 			_ = srv.Close()
 			return nil, err
 		}
-		pp, err := osutil.StartPipes("cat")
-		if err != nil {
-			_ = cl.Close()
-			_ = c1.Close()
-			_ = srv.Close()
-			return nil, err
-		}
+		// 跨平台替身子进程（helper_test.go）—— 修复前是 Unix-only 的 "cat"。
+		pp := testHelperPipes(t, "")
 		t.Cleanup(func() {
 			_ = cl.Close()
 			_ = srv.Close()

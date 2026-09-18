@@ -69,9 +69,11 @@ var beforeOpenLocalSource = func(local string) {}
 type regEntry struct {
 	sess      *Session
 	committed bool
-	// cancel 取消本次传输的扫描相上下文（Task 12 修复轮 1 / I1）。目录传输在扫描相
-	// （远端枚举 / 本地 WalkDir）不经过会话 IO，关会话拦不住它，必须有一个能被 Cancel
-	// 主动触发的 ctx；单文件传输传 nil。
+	// cancel 取消本次传输的扫描相上下文（Task 12 修复轮 1 / I1）。目录传输在扫描相需要
+	// 一个能被 Cancel 主动触发的 ctx：PutTree 的本地 WalkDir 不是 ctx 感知 API，扫描相
+	// 不经过会话 IO，光关会话拦不住它；GetTree 的远端枚举虽然走 s.Conn.ReadDirContext
+	// （scanTree，会发会话 IO），但它是按目录批推进的，仅靠关会话也无法在批与批之间立即
+	// 中止。两条路径都靠这个 ctx 的检查点生效；单文件传输传 nil。
 	cancel context.CancelFunc
 }
 
@@ -439,7 +441,7 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 	// 远端 → 本地 .part（Task 12 的目录传输复用同一个 helper，避免逐文件重建会话）。
 	// helper 内部已执行唯一提交前置 done==total：远端被截断（库对 EOF 返回 nil）时
 	// 返回 shortReadError，绝不能把半截文件改名成最终名（R13）。
-	part, _, total, err := g.copyFileToLocal(s, req, req.Remote, req.Local, report)
+	part, done, total, err := g.copyFileToLocal(s, req, req.Remote, req.Local, report)
 	if err != nil {
 		// 错误归属（Task 7 评审 M4）：只有**真正的远端失败**才附 s.Proc.StderrText()。
 		// 本地文件系统错误（如 .part 建不出来）保留自己的 error —— 否则 api.go 的 Error()
@@ -448,6 +450,16 @@ func (g *GoBackend) Get(req TransferRequest, report func(Progress)) error {
 		if isRemoteError(err) {
 			remoteMsg = s.Proc.StderrText()
 		}
+		// I4（Task 17 修复波）：单文件失败/取消路径也必须补发一发强制末帧，带**诚实计数**
+		// （Done=已落盘字节、Total=远端源大小），与目录失败路径 tp.fail 对称。part 为空表示
+		// .part 根本没建出来（远端 Stat/Open 失败或本地 OpenFile 失败），此时 Done/Total 都还
+		// 没有意义（helper 契约即 0/0）—— 帧仍要发（终态必达，D7），只是计数保持 0。
+		// PartPath 与成功末帧同一语义：指向目标侧路径（req.Local），失败时 .part 由 *_PartPath
+		// 契约单独上报，不在这里重复。
+		newProgressEmitter(req.ID, report).send(Progress{
+			Host: req.Host, Direction: DirDownload, Name: req.Remote, PartPath: req.Local,
+			Done: done, Total: total, Phase: PhaseTransfer,
+		}, true)
 		// part 非空 ⇔ .part 已真实存在（helper 契约）：失败/取消保留它作 Task 11 续传锚点。
 		// part 为空且错误是远端 Stat/Open → 没建任何本地文件；错误是本地 OpenFile 失败 →
 		// 同样不给 PartPath，绝不发布一个 ENOENT 的假锚点（评审 I2）。
@@ -525,6 +537,8 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 		return te
 	}
 
+	// D8：先发 scan 相首帧（「准备中…」），再开始枚举。PhaseScan 的唯一生产点。
+	tp.scan()
 	files, subdirs, degraded, serr := scanTree(ctx, s, req.Remote, time.Now())
 	if serr != nil {
 		var remoteMsg string
@@ -554,6 +568,10 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 			return fail(&TransferError{Op: op, Path: p, Err: wrapLocalIO(merr)})
 		}
 	}
+	// spec §8「失败/取消（目录项）：只提供重试 = 整项重传（先清理该子树内已知 .part）」。
+	// 枚举成功后才做：此时根目录已建出（扫描失败时它可能还不存在），且已知本次每个目标的
+	// basename —— 清理据此只删本项自己的 .part，不误伤同子树里另一条传输。
+	g.cleanupTreeParts(s, req.Local, treeFileTargets(files), req.ID)
 	tp.begin()
 
 	for _, f := range files {
@@ -776,12 +794,27 @@ func (g *GoBackend) Put(req TransferRequest, report func(Progress)) error {
 	cr := &countingReader{r: lf, e: em, p: Progress{Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: part, Done: offset, Total: total, Phase: PhaseTransfer}, base: offset}
 	em.send(cr.p, true)
 	n, cerr := copyStream(wf, cr)
+	// I4（Task 17 修复波）：单文件上传的失败/取消/短传路径也必须补发强制末帧 + 诚实计数。
+	// Done 取远端 .part 的**真实落盘大小**（不是 countingReader 的已读字节：它是超前读，会
+	// 比真正写出去的字节多算一块，虽然保守但不够诚实）。Stat 必须在 Close 之前做。
+	written := cr.base
+	if st, serr := wf.Stat(); serr == nil {
+		written = st.Size()
+	}
 	_ = wf.Close()
 	_ = lf.Close()
+	failFrame := func() {
+		em.send(Progress{
+			Host: req.Host, Direction: DirUpload, Name: req.Remote, PartPath: req.Remote,
+			Done: written, Total: total, Phase: PhaseTransfer,
+		}, true)
+	}
 	if cerr != nil {
+		failFrame()
 		return putCopyError(req, part, cerr, s.Proc.StderrText())
 	}
 	if decideCommit(n+offset, total) != commitOK {
+		failFrame()
 		return &TransferError{Op: "sftp put", Path: req.Remote, PartPath: part, Err: shortReadError(n+offset, total, part)}
 	}
 	if err := commitRemote(s, hasPosix, part, req.Remote, g.journal, func(f string, a ...any) { g.warnf(s.Host, f, a...) }); err != nil {
@@ -1030,6 +1063,8 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 
 	// D16：枚举阈值在本地遍历**过程中**评估（不是走完整棵树再判）—— 命中即停止枚举
 	// （停止发现后续条目，与下载方向「停止发起下一批」同义），返回已枚举到的子集并降级。
+	// D8：先发 scan 相首帧（「准备中…」），再开始本地枚举。与 GetTree 对称。
+	tp.scan()
 	scanStart := time.Now()
 	files, subdirs, total, degraded, werr := scanLocalTree(ctx, req.Local, scanStart)
 	if werr != nil {
@@ -1056,6 +1091,8 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 			return fail(&TransferError{Op: op, Host: req.Host, Path: p, Err: derr, RemoteMsg: s.Proc.StderrText()})
 		}
 	}
+	// spec §8 目录行的上传侧对称：重试（整项重传）前先清掉本项留在该子树里的远端 .part。
+	g.cleanupRemoteTreeParts(ctx, s, rootRemote, treeFileTargets(files), req.ID)
 	tp.begin()
 
 	for _, f := range files {
@@ -1545,6 +1582,16 @@ var cancelCloseSession = func(s *Session) { s.close() }
 //
 // **user 必须进键**（M3）：不同用户对同一 host + 同一目标路径是两条互不相干的传输
 // （远端身份不同、可访问的文件不同），按 host|方向|目标 去重会把它们误判成重复而拒绝。
+//
+// 诚实契约（Task 17 修复波 / I1）：本表**不是**并发上限的来源 —— 真正的上限是池的全局
+// 单传输额度（session.go AcquireTransfer 的容量 1 queue），它把所有传输（含不同 host/user/
+// 目标）串行化。因此本表的实际效果只有一条、并且可被观测：某目标有未完成传输时，同键的
+// 第二次触发被**立即拒绝**，而不是在额度队列里静默排队 —— 这正是「绝不把同目标并发变成
+// 隐式串行」那句话的落地。跨 user 的同目标触发**不会**命中本表（键含 user），
+// 但也到不了「并发」：TestPoolGlobalTokenSerializesAcrossUsers 用同一个池钉住
+// 「同 user 与不同 user 的第二个 AcquireTransfer 在额度被占时都不拨号、归还后才拿到会话」
+// 这一全局串行事实。
+//
 // 返回的 release 必须 defer 调用（含失败路径），否则该目标会永久被判为「在传输中」。
 func (g *GoBackend) acquireInflight(host, user, dir, target, id string) (func(), error) {
 	key := host + "|" + user + "|" + dir + "|" + target
@@ -1664,16 +1711,177 @@ func (g *GoBackend) Cancel(id string) bool {
 	// I3(b)：关闭前先把会话从 idle 摘掉 —— 竞态里 Release 可能已把它放回 idle。
 	// 注意仍留一条尾巴：RemoveIdle 之后 Release 才追加的话，会话会以 Closed 状态留在
 	// idle；由 AcquireList 出池时的 Closed 兜底拦住（I3(a)），两处缺一不可。
-	// I1（Task 12 修复轮 1）：先取消扫描相上下文再关会话。扫描相（远端枚举/本地 WalkDir）
-	// 不经过会话 IO，只关会话拦不住它；cancel 让 scanTree/scanLocalTree 的 ctx 检查立刻生效，
-	// 传输在扫描阶段就能中止。cancel 幂等，且绝不在此归还并发额度（额度仍由原传输的
-	// defer Release 恰好归还一次 —— Task 10 I1）。
+	// I1（Task 12 修复轮 1）：先取消扫描相上下文再关会话。本地 WalkDir 不经过会话 IO，
+	// 只关会话拦不住它；远端枚举走 s.Conn.ReadDirContext（scanTree）虽会发会话 IO，也需要
+	// 这个 cancel 让批与批之间的 ctx 检查立刻生效。cancel 幂等，且绝不在此归还并发额度
+	//（额度仍由原传输的 defer Release 恰好归还一次 —— Task 10 I1）。
 	if e.cancel != nil {
 		e.cancel()
 	}
 	g.pool.RemoveIdle(e.sess)
 	cancelCloseSession(e.sess)
 	return true
+}
+
+// —— Task 17 修复波：目录项重试前的子树 .part 清理（spec §8 目录行 / D10）——
+//
+// 失败或取消的**目录项只提供「重试」**（整项重传）。spec 要求重试先清理该子树内已知的
+// .part；修复前 GetTree/PutTree 只是清空 req.Resume/PartPath，遗留的 .sshore-sftppart-*
+// 既不会被下一次传输看到（枚举跳过内部临时文件，D18），也不会被重试删除 —— 只能等优雅
+// 退出（CloseAll 的登记表）或本地 7 天陈旧清理（CleanupStaleLocalParts，仅本地）。
+//
+// 这里做**有界、尽力而为**的清理：只删「名字是内部临时文件，且与本次目标同名或本次 id 的
+// 退化短名」的条目，绝不误删同一子树里另一条传输的 .part（isPartForTarget 的判据）。
+// 超出预算或删不掉都只发 warn，绝不让重试失败（清理是补偿动作，不是提交前置）。
+//
+// 调用点：GetTree / PutTree 在**扫描成功之后、第一个文件开始传送之前**（此时已知根目录真实
+// 存在，也已知本次枚举出的每个目标名）。扫描本身失败时没有已知目标，不做清理。
+const (
+	// cleanupTreeMaxEntries / cleanupTreeMaxDepth 是清理遍历的硬上限（与 removeMaxEntries
+	// 同思路，逐条目计数、命中即停）。要删的只是本次传输自己的 .part，正常远小于该值。
+	cleanupTreeMaxEntries = 100000
+	cleanupTreeMaxDepth   = 64
+)
+
+// isPartForTarget 判「basename 是不是**本次传输**留在目标 target 旁边的内部临时文件」。
+// 覆盖两种真实命名（partname.go）：<target><marker><shortID(id)>-<rand>，以及过长退化时的
+// 同目录短名 <marker><shortID(id)>-<rand>。两个条件缺一不可 —— 只看 target 会误删同一目录
+// 里别的 id 的 .part，只看 id 会误删同一传输里别的目标的 .part。
+func isPartForTarget(basename, target, id string) bool {
+	idx := strings.Index(basename, PartMarker)
+	if idx < 0 {
+		return false
+	}
+	// 命名规则（partname.go）：
+	//   常规名  <target><marker><shortID(id)>-<rand>   ⇒ marker 不在开头
+	//   退化名  <marker><shortID(id)>-<rand>            ⇒ marker 在开头（bak 同理但前缀是 bak-）
+	// marker 之后必须是本次 id 的短前缀：只比对 <target> 会把同目录里**别的 id** 的
+	// 临时文件一并算成自己的（那正是误删风险）。
+	suffix := basename[idx+len(PartMarker):]
+	if idx > 0 {
+		return target != "" &&
+			strings.HasPrefix(basename, filepath.Base(target)+PartMarker) &&
+			strings.HasPrefix(suffix, shortID(id)+"-")
+	}
+	return id != "" && strings.HasPrefix(suffix, shortID(id)+"-")
+}
+
+// cleanupTreeParts 删除本地子树里的目标 .part（下载方向的失败锚点）。
+// 返回删除数量；遍历只读目录、不跟随目录符号链接，删除失败只 warn。
+func (g *GoBackend) cleanupTreeParts(s *Session, localRoot string, targets []string, id string) int {
+	if localRoot == "" || len(targets) == 0 {
+		return 0
+	}
+	target := map[string]bool{}
+	for _, s := range targets {
+		if s != "" {
+			target[s] = true
+		}
+	}
+	removed, entries := 0, 0
+	depth := 0
+	_ = filepath.WalkDir(localRoot, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			if d != nil && d.IsDir() {
+				return fs.SkipDir // 读不了的子树跳过，继续清理其它分支
+			}
+			return nil
+		}
+		depth = strings.Count(filepath.ToSlash(p), "/") - strings.Count(filepath.ToSlash(localRoot), "/")
+		if d.IsDir() {
+			if depth >= cleanupTreeMaxDepth {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		entries++
+		if entries > cleanupTreeMaxEntries {
+			return fs.SkipAll
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		// 条目名本身带随机后缀，绝不能用「等于某个目标名」判定：必须逐目标做前缀比对。
+		matched := false
+		for t := range target {
+			if isPartForTarget(d.Name(), t, id) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil
+		}
+		if rerr := os.Remove(p); rerr == nil {
+			removed++
+		} else if !os.IsNotExist(rerr) {
+			g.warnf("", "重试前清理本地临时文件 %s 失败: %v", p, rerr)
+		}
+		return nil
+	})
+	return removed
+}
+
+// cleanupRemoteTreeParts 删除远端子树里的目标 .part（上传方向的失败锚点）。
+// 目录条目数 / 深度都有上限；任何错误（目录不可读等）都只 warn —— 尽力而为。
+func (g *GoBackend) cleanupRemoteTreeParts(ctx context.Context, s *Session, remoteRoot string, targets []string, id string) int {
+	if s.Conn == nil || remoteRoot == "" || len(targets) == 0 {
+		return 0
+	}
+	target := map[string]bool{}
+	for _, x := range targets {
+		if x != "" {
+			target[path.Base(x)] = true
+		}
+	}
+	removed, entries := 0, 0
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		if depth > cleanupTreeMaxDepth || entries > cleanupTreeMaxEntries {
+			return
+		}
+		infos, rerr := s.Conn.ReadDirContext(ctx, dir)
+		if rerr != nil {
+			// 根不存在（从没成功建过远端目录）是正常路径，不 warn。
+			if !os.IsNotExist(rerr) {
+				g.warnf(s.Host, "重试前清理远端临时文件：列目录 %s 失败: %v", dir, rerr)
+			}
+			return
+		}
+		for _, fi := range infos {
+			entries++
+			if entries > cleanupTreeMaxEntries {
+				return
+			}
+			name := fi.Name()
+			if name == "." || name == ".." {
+				continue
+			}
+			full := path.Join(dir, name)
+			if fi.IsDir() {
+				walk(full, depth+1)
+				continue
+			}
+			// 条目名带随机后缀：逐目标做前缀比对，绝不用「等于目标名」判定。
+			matched := false
+			for t := range target {
+				if isPartForTarget(name, t, id) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			if derr := removeRemote(s.Conn, full); derr == nil {
+				removed++
+			} else if !os.IsNotExist(derr) {
+				g.warnf(s.Host, "重试前清理远端临时文件 %s 失败: %v", full, derr)
+			}
+		}
+	}
+	walk(remoteRoot, 0)
+	return removed
 }
 
 // —— Task 13：已知 .part 登记与退出清理 ——

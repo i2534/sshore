@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -212,9 +213,17 @@ func (g *GoBackend) copyFileToLocal(s *Session, req TransferRequest, remote, loc
 	cw := &countingWriter{f: f, e: em, p: Progress{Host: req.Host, Direction: DirDownload, Name: remote, PartPath: part, Done: offset, Total: total, Phase: PhaseTransfer}, n: offset}
 	em.send(cw.p, true) // 首帧：立刻让 UI 看到 offset/total 与 partPath
 	_, cerr := copyStream(cw, rf)
+	// I4（Task 17 修复波）：失败/取消路径的 Done 必须取**本地 .part 的真实落盘大小**，
+	// 不能直接用 countingWriter 的计数 —— 后者按 Write 调用累加，可能把"部分写入"
+	//（n>0 且 err!=nil）整块算进去，对"已传字节"是过度声明。Stat 必须在 Close 之前做。
+	done := cw.n
+	if cerr != nil {
+		if st, serr := f.Stat(); serr == nil {
+			done = st.Size()
+		}
+	}
 	_ = rf.Close()
 	_ = f.Close()
-	done := cw.n
 	if cerr != nil {
 		return part, done, total, cerr
 	}
@@ -373,6 +382,38 @@ func degradedProgress(id, host string, d Direction, name string) Progress {
 	return Progress{ID: id, Host: host, Direction: d, Name: name, Total: -1, FilesTotal: -1, Phase: PhaseTransfer}
 }
 
+// scanProgress 返回扫描相的第一帧（D8：先 scan 再 transfer）。
+// 分母此刻必然未知（枚举还没开始），所以 Total/FilesTotal 用 -1：前端据此画不定进度条，
+// 并把文案切成「准备中…」（frontend/src/utils/queue.js 的 SCANNING_TEXT 分支，与
+// PhaseScan 字面量互钉）。它是**首帧**，必须 force 送达 —— 否则节流窗口会让 UI 在整个
+// 枚举期都停在「等待进度上报…」。
+//
+// 这是 PhaseScan 在生产里的唯一生产者：修改/删除它会让前端那条 UI 分支重新变成死代码。
+func scanProgress(id, host string, d Direction, name string) Progress {
+	return Progress{ID: id, Host: host, Direction: d, Name: name, Total: -1, FilesTotal: -1, Phase: PhaseScan}
+}
+
+// treeFileTargets 取出一次枚举出的所有**目标 basename**（去重）。清理遗留 .part 时用它
+// 与条目名做前缀比对（partname 形状是 <target>+PartMarker+…，只比 basename 就够，
+// 因为每个文件的临时文件都落在它自己的目录里）。rel 是 POSIX 相对路径，filepath.Base
+// 在两端都按平台分隔符处理，这里只需要叶子名本身。
+func treeFileTargets(files []treeFile) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		name := filepath.Base(filepath.FromSlash(f.rel))
+		if name == "" || name == "." || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
+}
+
 // treeFile 是目录枚举出的一个待传文件。rel 是相对根目录的 **POSIX** 相对路径：
 // 远端分隔符永远是 /，拼远端路径必须用 path.Join；本地侧再由 filepath.FromSlash 转换。
 type treeFile struct {
@@ -477,6 +518,16 @@ type treeProgress struct {
 
 func newTreeProgress(id, host string, d Direction, name string, total int64, files int, report func(Progress)) *treeProgress {
 	return &treeProgress{id: id, host: host, dir: d, name: name, total: total, files: files, report: report, now: time.Now}
+}
+
+// scan 发扫描相首帧（D8 的 scan 相生产点）。必须在枚举**之前**调用：枚举完成后 begin()
+// 立刻发 transfer 帧，两相顺序不可倒置（函数名与 Progress.Phase 一一对应，便于评审定位）。
+func (t *treeProgress) scan() {
+	if t.report == nil {
+		return
+	}
+	t.last = t.now()
+	t.report(scanProgress(t.id, t.host, t.dir, t.name))
 }
 
 // frame 按节流窗口上报一帧聚合进度；force=true 绕过节流（首帧/末帧必达，D7）。

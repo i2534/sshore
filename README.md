@@ -288,6 +288,15 @@ make e2e    # 等价于：bash e2e/test_local.sh
 `ssh -G` 别名解析、`-N -L` 本地转发绑定、`sftp ls -l` 输出解析。
 需要 `/usr/sbin/sshd`、`ssh-keygen` 和 `python3`。
 
+**直接在 Windows（或任意机器）上跑 e2e 用例时注意**：`internal/sftp` 与 `internal/sync` 的
+e2e 用例要求 `SSHORE_E2E_HOST` / `SSHORE_E2E_REMOTE` / `SSHORE_SFTP_TRANSPORT` **三项齐全**。
+其中：
+
+- 缺 `SSHORE_E2E_HOST` / `SSHORE_E2E_REMOTE` ⇒ **Skip**（`go test ./...` 在无网络/无 sshd 时无声通过）；
+- 已设 `SSHORE_E2E_HOST`、却缺 `SSHORE_SFTP_TRANSPORT` ⇒ **故意 `t.Fatalf`**
+  （`SSHORE_SFTP_TRANSPORT 未送达：后端身份无法证明`）—— 这是防假绿设计，不是缺陷：
+  两轮迭代都悄悄跑同一个后端会让"后端矩阵"变成假矩阵。
+
 ## CI
 
 `.github/workflows/ci.yml` 在 push/PR 时运行以下作业：

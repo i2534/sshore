@@ -5,7 +5,7 @@ import { statusClass, summarizeQueue, directionArrow, failureText,
   applyProgress, TRANSFER_PROGRESS_EVENT, PART_MARKER,
   outcomeStatus, applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch,
   rowNote, rowProgressText, barModel,
-  CANCELLED_LATE_TEXT, CANCELLING_TEXT, CANCEL_FAILED_TEXT, WAITING_FRAME_TEXT } from './queue'
+  CANCELLED_LATE_TEXT, CANCELLING_TEXT, CANCEL_FAILED_TEXT, WAITING_FRAME_TEXT, SCANNING_TEXT } from './queue'
 
 const src = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8')
 const sftpView = src('../views/SftpView.vue')
@@ -115,8 +115,17 @@ describe('行内渲染：rowNote / rowProgressText / barModel（生产路径，T
   it('取消请求在飞时显示取消中（终态仍由操作结果决定）', () => {
     expect(rowProgressText({ status: '处理中', pendingCancel: true })).toBe(CANCELLING_TEXT)
   })
-  it('scan 相显示准备中', () => {
+  it('scan 相显示准备中，且字面量与 Go 侧 PhaseScan **双向**互钉', () => {
     expect(rowProgressText({ status: '处理中', phase: 'scan', done: 3, total: 3 })).toBe('准备中…')
+    expect(rowProgressText({ status: '处理中', phase: 'scan', done: 0, total: -1 })).toBe(SCANNING_TEXT)
+    // 生产侧：GetTree/PutTree 在枚举之前发 Phase=PhaseScan 首帧（internal/sftp/copy.go 的
+    // scanProgress/treeProgress.scan）。Go 常量一旦改名，这里必须一起红 —— 否则 UI 分支
+    // 会重新变成不可达的死代码（Task 17 修复波 d）。
+    const go = src('../../../internal/sftp/api.go')
+    const m = go.match(/PhaseScan\s+Phase = "([^"]+)"/)
+    expect(m, 'internal/sftp/api.go 里找不到 PhaseScan 常量').toBeTruthy()
+    expect(m[1]).toBe('scan')
+    expect(SCANNING_TEXT).toBe('准备中…')
   })
   it('total<0（预算截断的降级扫描）显示未知/部分进度，绝不显示 100% 或以失败渲染', () => {
     const partial = { status: '处理中', done: 5, total: -1, filesDone: 2, filesTotal: -1, hasProgress: true }
