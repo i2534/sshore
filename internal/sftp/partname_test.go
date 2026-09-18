@@ -98,6 +98,12 @@ func TestMarkerLiteralIsPinned(t *testing.T) {
 	}
 }
 
+func TestPartNameMaxLiteralIsPinned(t *testing.T) {
+	if partNameMax != 200 {
+		t.Fatalf("临时名长度阈值漂移：%d（spec 与计划都写死 200 字节）", partNameMax)
+	}
+}
+
 func TestShortIDTruncationAndAnon(t *testing.T) {
 	if got := PartName("/d/a.txt", "abcdef123456"); !strings.Contains(got, "abcdef12-") {
 		t.Fatalf("id 超过 8 必须截前 8 并紧跟连字符，got %q", got)
