@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pkg/sftp"
 )
 
 // —— Task 10 hermetic 取消测试 ——
@@ -573,5 +575,75 @@ func TestGoBackendEmptyIDNeverRegisters(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("10s 内 Get 未返回")
+	}
+}
+
+// TestGoBackendPutCancelDuringBlockedCommitReturnsTrueAndFails 钉住「!committed ⇒ 可取消」这
+// 一方向（Task 10 重审 D1）。既有的 TestGoBackend(Put)CancelDuringCommittedFinalFrameReturnsFalse
+// 只钉了「committed ⇒ Cancel=false」；本用例把提交**阻塞在 part→target 这一步**（此时尚未提交
+// 成功、committed 仍为 false），在窗口里取消：Cancel 必须诚实返回 true，随后传输失败、
+// 最终目标名不存在（绝不出现「答应用户取消，文件却落地」）。
+func TestGoBackendPutCancelDuringBlockedCommitReturnsTrueAndFails(t *testing.T) {
+	remoteRoot, localDir := t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("k"), 64<<10)
+	local := filepath.Join(localDir, "src.bin")
+	if err := os.WriteFile(local, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	const target = "dst.bin"
+	// 刻意不预置目标：无论 commitRemote 走 posix-rename 还是 backup-swap，取消后目标名都不得出现。
+	g := backendForTestServer(t, remoteRoot)
+	entered := make(chan struct{})
+	hold := make(chan struct{})
+	var once sync.Once
+	block := func(oldname, newname string) {
+		// 只卡「part → target」这一步：提交尚未成功，committed 仍为 false。
+		if IsInternalTemp(filepath.Base(oldname)) && newname == target {
+			once.Do(func() {
+				close(entered)
+				<-hold
+			})
+		}
+	}
+	// 两个提交原语都挂上钩子：pkg/sftp 的服务端会宣告 posix-rename（sftp.go 的扩展列表），
+	// 但真实远端未必，两边都覆盖才能在任何分支下钉住同一条不变量。
+	var origPosix func(*sftp.Client, string, string) error
+	var origRename func(*sftp.Client, string, string) error
+	origPosix = posixRename
+	swapPosixRename(t, func(c *sftp.Client, oldname, newname string) error {
+		block(oldname, newname)
+		return origPosix(c, oldname, newname)
+	})
+	origRename = swapRenameRemote(t, func(c *sftp.Client, oldname, newname string) error {
+		block(oldname, newname)
+		return origRename(c, oldname, newname)
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		done <- g.Put(TransferRequest{ID: "t-blocked", Host: "h", Remote: target, Local: local, Atomic: true}, nil)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("10s 内未进入提交窗口（part→target 未被调用）")
+	}
+	if !g.Cancel("t-blocked") {
+		t.Fatal("提交尚未成功时 Cancel 必须诚实返回 true（!committed ⇒ 可取消）")
+	}
+	close(hold)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("提交窗口里被取消的传输必须失败")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("取消后 10s 内 Put 未返回")
+	}
+	if _, serr := os.Stat(filepath.Join(remoteRoot, target)); !os.IsNotExist(serr) {
+		t.Fatalf("取消后最终目标名不得存在，stat err=%v", serr)
+	}
+	if g.Cancel("t-blocked") {
+		t.Fatal("第二次取消必须返回 false（幂等）")
 	}
 }
