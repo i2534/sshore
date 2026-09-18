@@ -15,12 +15,14 @@ import (
 )
 
 type AppSettings struct {
-	AutoReconnectDefault bool    `toml:"auto_reconnect_default" json:"auto_reconnect_default"`
-	Theme                string  `toml:"theme" json:"theme"`                               // dark|light|system
-	FontScale            float64 `toml:"font_scale" json:"font_scale"`                     // 字号缩放系数
-	LatinFont            string  `toml:"latin_font,omitempty" json:"latin_font,omitempty"` // 英文字体（空=系统默认）
-	CJKFont              string  `toml:"cjk_font,omitempty" json:"cjk_font,omitempty"`     // 中文字体（空=系统默认）
-	AutoStartOnLaunch    bool    `toml:"auto_start_on_launch" json:"auto_start_on_launch"` // 启动后自动连接转发通道
+	AutoReconnectDefault bool `toml:"auto_reconnect_default" json:"auto_reconnect_default"`
+	// SftpTransport 选择 SFTP 传输后端："" / "auto" = 内置默认；"batch" = 旧的 sftp -b；"gosftp" = 新底座。
+	SftpTransport     string  `toml:"sftp_transport" json:"sftp_transport"`
+	Theme             string  `toml:"theme" json:"theme"`                               // dark|light|system
+	FontScale         float64 `toml:"font_scale" json:"font_scale"`                     // 字号缩放系数
+	LatinFont         string  `toml:"latin_font,omitempty" json:"latin_font,omitempty"` // 英文字体（空=系统默认）
+	CJKFont           string  `toml:"cjk_font,omitempty" json:"cjk_font,omitempty"`     // 中文字体（空=系统默认）
+	AutoStartOnLaunch bool    `toml:"auto_start_on_launch" json:"auto_start_on_launch"` // 启动后自动连接转发通道
 }
 
 // Normalize 兜底无效设置：主题缺省为跟随系统、字号系数非法时回退到 1，
@@ -37,6 +39,15 @@ func (s *AppSettings) Normalize() {
 	}
 	if s.FontScale > 2 {
 		s.FontScale = 2
+	}
+	// SFTP 传输后端开关：只认 batch / gosftp，其余（含 ""/auto/笔误）一律回落内置默认。
+	switch strings.ToLower(strings.TrimSpace(s.SftpTransport)) {
+	case "batch":
+		s.SftpTransport = "batch"
+	case "gosftp":
+		s.SftpTransport = "gosftp"
+	default:
+		s.SftpTransport = "" // "" / "auto" / 非法值都回落内置默认
 	}
 }
 
@@ -176,6 +187,7 @@ func DefaultAppConfig() *AppConfig {
 			Theme:                "system",
 			FontScale:            1,
 			AutoStartOnLaunch:    true,
+			SftpTransport:        "",
 		},
 	}
 	c.normalize()

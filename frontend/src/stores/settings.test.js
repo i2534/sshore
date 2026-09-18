@@ -121,3 +121,25 @@ describe('settings store auto_reconnect_default 往返', () => {
     expect(backend.saved[backend.saved.length - 1].auto_reconnect_default).toBe(true)
   })
 })
+
+describe('settings store sftp_transport 往返', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    backend.settings = {}
+    backend.saved.length = 0
+  })
+
+  it('save 必须带上 sftp_transport，否则 SetSettings 整结构覆盖会把它清空', async () => {
+    const store = useSettingsStore()
+    store.sftpTransport = 'gosftp'
+    await store.save()
+    expect(backend.saved.at(-1).sftp_transport).toBe('gosftp')
+  })
+
+  it('load 读回 sftp_transport', async () => {
+    backend.settings = { sftp_transport: 'batch' }
+    const store = useSettingsStore()
+    await store.load()
+    expect(store.sftpTransport).toBe('batch')
+  })
+})

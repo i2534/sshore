@@ -467,3 +467,21 @@ func TestLoadPresetsNormalizesScopeAndKeepsFileOnError(t *testing.T) {
 		t.Fatalf("LoadPresets 不得修改用户文件：\n%s", after)
 	}
 }
+
+func TestSftpTransportNormalizeAndDefault(t *testing.T) {
+	c := DefaultAppConfig()
+	if c.App.SftpTransport != "" {
+		t.Fatalf("默认应为空（= 走内置默认），got %q", c.App.SftpTransport)
+	}
+	// 注意：生效入口是导出的 AppSettings.Normalize()（store.go:28）；AppConfig.normalize() 未导出（:156）
+	c.App.SftpTransport = "  GoSftp "
+	c.App.Normalize()
+	if c.App.SftpTransport != "gosftp" {
+		t.Fatalf("应归一化为小写去空格，got %q", c.App.SftpTransport)
+	}
+	c.App.SftpTransport = "nonsense"
+	c.App.Normalize()
+	if c.App.SftpTransport != "" {
+		t.Fatalf("非法值应回落空串，got %q", c.App.SftpTransport)
+	}
+}

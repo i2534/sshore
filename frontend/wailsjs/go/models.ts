@@ -2,6 +2,7 @@ export namespace config {
 	
 	export class AppSettings {
 	    auto_reconnect_default: boolean;
+	    sftp_transport: string;
 	    theme: string;
 	    font_scale: number;
 	    latin_font?: string;
@@ -15,6 +16,7 @@ export namespace config {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.auto_reconnect_default = source["auto_reconnect_default"];
+	        this.sftp_transport = source["sftp_transport"];
 	        this.theme = source["theme"];
 	        this.font_scale = source["font_scale"];
 	        this.latin_font = source["latin_font"];
