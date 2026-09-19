@@ -14,8 +14,24 @@ export function AddRemoteRecent(arg1, arg2) {
   return window['go']['main']['App']['AddRemoteRecent'](arg1, arg2);
 }
 
+export function ApplyUpdateAndRestart() {
+  return window['go']['main']['App']['ApplyUpdateAndRestart']();
+}
+
 export function AutoStartEnabled() {
   return window['go']['main']['App']['AutoStartEnabled']();
+}
+
+export function CancelUpdateDownload() {
+  return window['go']['main']['App']['CancelUpdateDownload']();
+}
+
+export function CheckUpdate(arg1) {
+  return window['go']['main']['App']['CheckUpdate'](arg1);
+}
+
+export function ClearSkippedUpdate() {
+  return window['go']['main']['App']['ClearSkippedUpdate']();
 }
 
 export function ConfirmSyncRuleDeletes(arg1, arg2) {
@@ -50,12 +66,20 @@ export function DeleteTunnel(arg1) {
   return window['go']['main']['App']['DeleteTunnel'](arg1);
 }
 
+export function DiscardUpdateDownload() {
+  return window['go']['main']['App']['DiscardUpdateDownload']();
+}
+
 export function GetAppInfo() {
   return window['go']['main']['App']['GetAppInfo']();
 }
 
 export function GetSettings() {
   return window['go']['main']['App']['GetSettings']();
+}
+
+export function GetUpdateInfo() {
+  return window['go']['main']['App']['GetUpdateInfo']();
 }
 
 export function HomeDir() {
@@ -108,6 +132,10 @@ export function MkdirLocal(arg1) {
 
 export function OnShutdown() {
   return window['go']['main']['App']['OnShutdown']();
+}
+
+export function OpenReleasePage() {
+  return window['go']['main']['App']['OpenReleasePage']();
 }
 
 export function PickLocalDir() {
@@ -206,12 +234,20 @@ export function SftpTransferCancel(arg1) {
   return window['go']['main']['App']['SftpTransferCancel'](arg1);
 }
 
+export function SkipUpdateVersion(arg1) {
+  return window['go']['main']['App']['SkipUpdateVersion'](arg1);
+}
+
 export function StartSyncRule(arg1) {
   return window['go']['main']['App']['StartSyncRule'](arg1);
 }
 
 export function StartTunnel(arg1) {
   return window['go']['main']['App']['StartTunnel'](arg1);
+}
+
+export function StartUpdateDownload() {
+  return window['go']['main']['App']['StartUpdateDownload']();
 }
 
 export function StatLocal(arg1) {
