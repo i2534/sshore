@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +94,8 @@ type Service struct {
 	pending   Plan
 	stopCh    chan struct{}
 	stopped   bool
+	// rateReset 是限流解除时刻（来自 X-RateLimit-Reset）；在该时刻前不自动重试（spec §7.2.3）。
+	rateReset time.Time
 }
 
 // New 构造服务；零值 App 场景下也不会 panic（Info 返回 disabled 快照）。
@@ -236,12 +240,15 @@ func (s *Service) Check(ctx context.Context, manual bool) (UpdateInfo, error) {
 			if rec != nil {
 				reset = rec.Reset()
 			}
+			// 记录 reset 作为退避依据：在该时刻前不自动重试（裁定 7 / spec §7.2.3）
+			s.setRateReset(reset)
 			if reset == "" {
 				reset = "未知"
 			}
 			// 限流必须留一行日志，并带上退避依据（spec §7.2.3）
 			s.log("更新源限流（rate-limited），X-RateLimit-Reset=" + reset)
 		} else {
+			s.clearRateReset()
 			// 自动检查失败/限流都只在日志面板留一行（spec §7.2.3、§9）
 			s.log("检查更新失败：" + msg)
 		}
@@ -250,6 +257,8 @@ func (s *Service) Check(ctx context.Context, manual bool) (UpdateInfo, error) {
 		s.mu.Unlock()
 		return s.Info(), nil
 	}
+	// 拿到正常响应即清掉限流退避（否则旧的 reset 会永久挡住自动检查）。
+	s.clearRateReset()
 
 	if IsRelease(s.opts.Version) && Compare(rel.Tag, s.opts.Version) <= 0 {
 		s.mu.Lock()
@@ -322,13 +331,295 @@ func (s *Service) StartDownload(ctx context.Context) error {
 	return nil
 }
 
-// download 是本任务的最小骨架：置 downloading 后立即返回。
-// Task 9 实现完整下载流程（可写性探测 → 磁盘空间 → 流式下载 → 校验 → 解包 → sidecar → ready）。
+// lastResult 读日志末行：返回 "ok"、"fail:<step>" 或 ""（无日志/空文件）。
+func lastResult(logPath string) string {
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+	last := strings.TrimSpace(lines[len(lines)-1])
+	if strings.HasPrefix(last, "RESULT=") {
+		return strings.TrimPrefix(last, "RESULT=")
+	}
+	return ""
+}
+
+// Init 做残留自检并按配置调度（ctx 来自 startup）。
+//
+// 自检只读扫描；唯一允许的写操作是删除 RESULT=ok 的陈旧日志（spec §7.5）。
+func (s *Service) Init(ctx context.Context) {
+	dir := filepath.Dir(s.opts.ExePath)
+	if plan, ok := ResumePending(dir, s.opts.Version); ok {
+		ver, _ := ParsePendingName(filepath.Base(plan.Pending))
+		s.mu.Lock()
+		s.pending = plan
+		s.info.ReadyPath = plan.Pending
+		s.info.Latest = ver
+		s.setLocked(StateReady, "")
+		s.mu.Unlock()
+	}
+	logPath := filepath.Join(dir, "sshore-update.log")
+	switch res := lastResult(logPath); {
+	case res == "ok":
+		_ = os.Remove(logPath)
+	case strings.HasPrefix(res, "fail:"):
+		s.mu.Lock()
+		s.info.PendingLog = logPath
+		s.info.Error = "上次升级未完成（" + res + "）"
+		s.mu.Unlock()
+	}
+	go s.loop(ctx)
+}
+
+// loop 负责首次延迟 5s 检查与后续轮询。
+// 注意：stopCh 会被 Reconfigure 替换，循环里必须每次持锁读一次本地副本，避免与替换竞争。
+func (s *Service) loop(ctx context.Context) {
+	cfg := s.opts.Config()
+	if !cfg.Auto || !IsRelease(s.opts.Version) {
+		return
+	}
+	stopCh := s.currentStop() // 持锁读：Reconfigure 会替换该字段，直接读会与写竞争（-race 会报）
+	select {
+	case <-time.After(5 * time.Second):
+	case <-stopCh:
+		return
+	}
+	s.autoCheck(ctx)
+	if cfg.Interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(cfg.Interval)
+	defer ticker.Stop()
+	for {
+		stopCh := s.currentStop()
+		select {
+		case <-ticker.C:
+			s.autoCheck(ctx)
+		case <-stopCh:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// autoCheck 是调度路径上的检查：限流未解除前直接跳过，不做任何请求（spec §7.2.3）。
+func (s *Service) autoCheck(ctx context.Context) {
+	s.mu.Lock()
+	until := s.rateReset
+	s.mu.Unlock()
+	if !until.IsZero() && s.opts.Now().Before(until) {
+		s.log("更新源限流未解除，跳过本次自动检查（至 " + until.Format(time.RFC3339) + "）")
+		return
+	}
+	_, _ = s.Check(ctx, false)
+}
+
+// setRateReset 记录限流解除时刻（X-RateLimit-Reset 是 Unix 秒；无法解析时不记录）。
+func (s *Service) setRateReset(raw string) {
+	sec, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || sec <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.rateReset = time.Unix(sec, 0)
+	s.mu.Unlock()
+}
+
+// clearRateReset 在收到非限流响应后清掉退避时刻。
+func (s *Service) clearRateReset() {
+	s.mu.Lock()
+	s.rateReset = time.Time{}
+	s.mu.Unlock()
+}
+
+// Reconfigure 在设置保存后重建调度。
+func (s *Service) Reconfigure() {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	close(s.stopCh)
+	s.stopCh = make(chan struct{})
+	s.mu.Unlock()
+	go s.loop(context.Background())
+}
+
+// Shutdown 停掉调度与在飞下载。
+func (s *Service) Shutdown() {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.stopped = true
+	if s.cancelDL != nil {
+		s.cancelDL()
+	}
+	close(s.stopCh)
+	s.mu.Unlock()
+}
+
+// currentStop 在锁内读 stopCh：Reconfigure 会替换该字段，直接读会与写竞争（-race 会报）。
+func (s *Service) currentStop() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopCh
+}
+
+// download 执行下载 → 校验 → 解包 → sidecar → ready。
 func (s *Service) download(ctx context.Context) {
 	s.mu.Lock()
+	rel := s.rel
+	plan := PlanFor(s.opts.Goos, s.opts.ExePath, s.opts.Version, rel.Tag, 0, DefaultWait)
 	s.info.Progress = 0
 	s.setLocked(StateDownloading, "")
+	ctx, cancel := context.WithCancel(ctx)
+	s.cancelDL = cancel
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.cancelDL = nil
+		s.mu.Unlock()
+	}()
+
+	// 错误收敛必须在释放 s.mu 之后：failIO/failVerify 内部会再次加锁，持锁调用会自死锁。
+	archiveAsset, err := PickArchive(rel, s.opts.Goos, s.opts.Goarch)
+	if err != nil {
+		_ = s.failIO(err, "")
+		return
+	}
+	csAsset, err := PickChecksums(rel)
+	if err != nil {
+		_ = s.failVerify(err)
+		return
+	}
+
+	// 可写性探测：在 ExeDir 建一个独占临时文件再删掉（spec §7.3.1）。
+	probe, err := os.CreateTemp(plan.ExeDir, ".sshore-write-test-")
+	if err != nil {
+		_ = s.failIO(fmt.Errorf("安装目录不可写：%w", err), HintManualUpgrade)
+		return
+	}
+	probePath := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(probePath)
+
+	free, err := FreeSpace(plan.ExeDir)
+	if err != nil {
+		_ = s.failIO(err, "")
+		return
+	}
+	// spec §7.3.2 要求 ≥ 资产大小 + 64MiB；Asset（Task 3 文件，本任务不得修改）不携带
+	// 压缩包大小，因此在无法得知资产大小时退化为 64MiB 下限。
+	if free < 64<<20 {
+		_ = s.failIO(fmt.Errorf("磁盘可用空间不足：%d 字节", free), "")
+		return
+	}
+
+	client := &Client{HTTP: s.opts.Doer, UserAgent: "sshore/" + s.opts.Version}
+	part := filepath.Join(os.TempDir(), fmt.Sprintf("sshore-update-%d.part", os.Getpid()))
+	err = client.Download(ctx, archiveAsset.URL, part, DownloadOpt{
+		IdleTimeout: 30 * time.Second,
+		Throttle:    200 * time.Millisecond,
+		Progress: func(done, total int64) {
+			percent := -1
+			if total > 0 {
+				percent = int(done * 100 / total)
+			}
+			s.mu.Lock()
+			s.info.Progress = percent
+			s.mu.Unlock()
+			if s.opts.Emit != nil {
+				s.opts.Emit("update:progress", map[string]any{"done": done, "total": total, "percent": percent})
+			}
+		},
+	})
+	if err != nil {
+		_ = os.Remove(part)
+		if errors.Is(err, context.Canceled) {
+			// 用户取消：删半截文件、回 available（spec §7.3.6），不算失败
+			s.mu.Lock()
+			s.info.Progress = 0
+			s.setLocked(StateAvailable, "")
+			s.mu.Unlock()
+			return
+		}
+		_ = s.failIO(err, "")
+		return
+	}
+	defer os.Remove(part)
+
+	csBytes, err := fetchBytes(ctx, s.opts.Doer, csAsset.URL, 1<<20)
+	if err != nil {
+		_ = s.failIO(err, "")
+		return
+	}
+	all, err := ParseChecksums(strings.NewReader(string(csBytes)))
+	if err != nil {
+		_ = s.failVerify(err)
+		return
+	}
+	hash, ok := all[archiveAsset.Name]
+	if !ok {
+		_ = s.failVerify(fmt.Errorf("校验文件里没有 %s", archiveAsset.Name))
+		return
+	}
+	if err := VerifyFile(part, hash); err != nil {
+		_ = s.failVerify(err)
+		return
+	}
+	if err := ExtractBinary(part, s.opts.Goos, plan.Pending); err != nil {
+		_ = s.failIO(err, "")
+		return
+	}
+	st, err := os.Stat(plan.Pending)
+	if err != nil {
+		_ = s.failIO(err, "")
+		return
+	}
+	plan.Size = st.Size()
+	fileHash, err := FileSHA256(plan.Pending)
+	if err != nil {
+		_ = s.failIO(err, "")
+		return
+	}
+	line := fileHash + "  " + filepath.Base(plan.Pending) + "\n"
+	if err := os.WriteFile(plan.Sidecar, []byte(line), 0o600); err != nil {
+		_ = s.failIO(err, "")
+		return
+	}
+	s.mu.Lock()
+	s.pending = plan
+	s.info.ReadyPath = plan.Pending
+	s.info.Progress = 100
+	s.setLocked(StateReady, "")
+	s.mu.Unlock()
+}
+
+// fetchBytes 取小文件（校验文件），带大小上限。
+func fetchBytes(ctx context.Context, d Doer, rawURL string, limit int64) ([]byte, error) {
+	if d == nil {
+		return nil, errors.New("未配置 HTTP 客户端")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := d.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("拉取 %s 失败：HTTP %d", rawURL, resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, limit))
 }
 
 // CancelDownload 取消在飞下载（幂等）。
