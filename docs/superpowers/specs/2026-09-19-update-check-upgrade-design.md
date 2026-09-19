@@ -1,6 +1,6 @@
 # 检测更新与自升级（GitHub Release 源 + SHA256 校验 + 脚本替换）设计
 
-> 状态：v1 · 用户已逐节确认（§16 决策记录）· 尚未实施
+> 状态：v2 · 用户已逐节确认（§16 决策记录）· 已完成两阶段审核的**第一阶段**（自审，清单见 §16 末段）· 待**第二阶段**（干净 subagent）复核 · 尚未实施
 > 关联：`docs/superpowers/specs/2026-08-25-sshkit-design.md`（应用定位与设置项基线）
 > 关联：`README.md` §下载安装 / §尺寸优化（UPX 误报的既有记载）
 > 本期范围：**阶段 A** = 检查更新与提示；**阶段 B** = 应用内下载 + SHA256 校验 + 用户显式触发的一次性升级脚本
@@ -69,7 +69,7 @@
 ### 3.1 本期做
 
 - `internal/update` 新包：源访问、版本比较、资产挑选、下载、校验、解包、替换计划、脚本生成、状态机。
-- `app.go` 新增 5 个绑定 + 1 个发布页打开；进度与状态经 Wails 事件推送。
+- `app.go` 新增 8 个绑定（查询 / 检查 / 下载 / 取消 / 应用 / 删除已下载 / 跳过版本 / 取消跳过）+ 1 个发布页打开，并在 `App.Init`/`App.OnShutdown`/`App.SetSettings` 三处接线；进度与状态经 Wails 事件推送。
 - `AppSettings` 新增 4 个字段（复用现有 `GetSettings`/`SetSettings`）。
 - 前端：设置对话框「更新」区 + 侧栏角标 + 启动首查 + `stores/update.js` + `utils/update.js`。
 - CI：`release` job 生成并上传 `checksums.txt`。
@@ -105,7 +105,7 @@
 | `checksum.go` | 解析 `sha256sum` 格式并比对 | `ParseChecksums(io.Reader) (map[string]string, error)`、`Verify(path string, want string) error` |
 | `download.go` | 流式下载 + 边下边算 SHA256 + 进度回调 + ctx 取消 | `Download(ctx, url, dest string, progress func(done, total int64)) (string, error)` |
 | `extract.go` | 从 `tar.gz`/`zip` 中只取出二进制；拒绝路径遍历条目 | `ExtractBinary(archive, goos, dest string) error` |
-| `plan.go` | 计算替换计划（目标、待安装名、备份名、待清理备份） | `type Plan struct{ Target, Pending, Backup, Size, ExeDir, Launch string }`、`PlanFor(goos, exePath, fromVer, toVer string, size int64) Plan` |
+| `plan.go` | 计算替换计划（目标、待安装名、备份名、待清理的备份模式） | `type Plan struct{ Target, Pending, Backup, Size, ExeDir string }`、`PlanFor(goos, exePath, fromVer, toVer string, size int64) Plan`、`BackupPatterns(goos string) []string` |
 | `script.go` | `go:embed` 脚本 + 参数拼装（**纯函数**） | `ScriptArgs(Plan, pid int, logPath string) []string`、`ScriptName(goos string) string`、`ScriptBytes(goos string) []byte` |
 | `scripts/update.sh` | Linux 升级脚本（embed 资源，独立文件、可 shellcheck） | — |
 | `scripts/update.cmd` | Windows 升级脚本（embed 资源，纯 cmd，不含 `powershell`） | — |
@@ -119,7 +119,8 @@ type Options struct {
     Doer   Doer                                        // *http.Client；测试注入 httptest
     Launch func(script string, args []string) error     // 分离启动；测试注入假实现
     Emit   func(event string, payload any)              // update:state / update:progress
-    Config func() Settings                              // 从 config 读取（源、间隔、跳过版本）
+    Config func() Settings                              // 读配置（源、间隔、跳过版本），每次调用都重新读
+    Save   func(patch Settings) error                   // 写配置（跳过/取消跳过版本时用），由 app.go 落到 TOML
     Now    func() time.Time
 }
 
@@ -131,14 +132,16 @@ type Settings struct {
 }
 
 func New(opt Options) *Service
-func (s *Service) Init(ctx context.Context)            // 启动自检（残留检测）+ 自动检查/轮询调度
-func (s *Service) Shutdown()                            // 停止轮询
+func (s *Service) Init(ctx context.Context)             // 启动自检（残留检测）+ 自动检查/轮询调度
+func (s *Service) Shutdown()                            // 停止轮询与在飞请求（app.OnShutdown 调用）
+func (s *Service) Reconfigure()                         // 重读配置并重建轮询定时器（SetSettings 后调用）
 func (s *Service) Info() UpdateInfo                     // 当前快照，供 GetUpdateInfo 直接返回
 func (s *Service) Check(ctx context.Context, manual bool) (UpdateInfo, error)
 func (s *Service) StartDownload(ctx context.Context) error
 func (s *Service) CancelDownload() bool
 func (s *Service) ApplyAndRestart(ctx context.Context) error
 func (s *Service) DiscardPending() error                // 「删除已下载的更新」
+func (s *Service) SkipVersion(v string) error            // 「跳过此版本」：写 update_skipped_version
 func (s *Service) ClearSkipped() error                  // 「取消跳过」
 ```
 
@@ -146,6 +149,7 @@ func (s *Service) ClearSkipped() error                  // 「取消跳过」
 
 ```go
 type UpdateInfo struct {
+    Seq         int64  `json:"seq"`          // 单调递增；前端用它丢弃迟到的旧载荷（§12.2）
     State       string `json:"state"`        // §7 状态枚举
     Current     string `json:"current"`
     Latest      string `json:"latest"`
@@ -169,8 +173,13 @@ func (a *App) CheckUpdate(manual bool) (update.UpdateInfo, error)
 func (a *App) StartUpdateDownload() error
 func (a *App) CancelUpdateDownload() bool
 func (a *App) ApplyUpdateAndRestart() error
+func (a *App) DiscardUpdateDownload() error  // 删除已下载的待安装文件
+func (a *App) SkipUpdateVersion(version string) error
+func (a *App) ClearSkippedUpdate() error
 func (a *App) OpenReleasePage() error        // runtime.BrowserOpenURL(Repo + "/releases")
 ```
+
+**接线（`app.go` / `main.go`）**：`App.Init`（`app.go:143`，与 `forward`/`sftp`/`sync` 同处）里 `update.New` 并 `Service.Init(ctx)`；`App.OnShutdown`（已被 `main.go:62` 的 `OnShutdown` 回调）里 `Service.Shutdown()`；`App.SetSettings`（`app.go:260`）保存成功后调 `Service.Reconfigure()`，让更新源/间隔/开关立即生效。
 
 事件（沿用 `app.go:484` `runtime.EventsEmit` 的既有模式）：
 
@@ -207,6 +216,8 @@ func (a *App) OpenReleasePage() error        // runtime.BrowserOpenURL(Repo + "/
 
 前端「设置」页新增控件：自动检查开关、间隔下拉（6h / 12h / 24h / 关闭）、更新源文本框（含「恢复默认」）。
 
+设置保存（`SetSettings`）后由 `app.go` 调 `Service.Reconfigure()`：重读配置、按新间隔重建定时器；`update_skipped_version` 与 `update_source` 立即对下一次检查生效。
+
 ---
 
 ## 7. 状态机与数据流
@@ -220,19 +231,21 @@ func (a *App) OpenReleasePage() error        // runtime.BrowserOpenURL(Repo + "/
 ```
 idle/up-to-date/available/skipped/rate-limited/check-failed/no-asset/no-checksum
         --Check()--> checking --(结果)--> up-to-date | available | skipped | rate-limited | check-failed | no-asset | no-checksum
+available --SkipVersion()--> skipped          skipped --ClearSkipped()--> idle（下一次 Check 重判）
 available --StartDownload()--> [not-writable | downloading] --(成功)--> ready --ApplyAndRestart()--> applying
                                     |--(失败)--> verify-failed | io-failed | available(取消)
-ready     --DiscardPending()--> available
+ready     --DiscardPending()--> available     applying 为终态（进程即将退出）
+Init 残留自检：pending 存在 → ready（可直接「重试升级」，无需重新下载）
 ```
 
-并发守卫：`checking` 或 `downloading` 时忽略新的同类请求；`applying` 是终态（同一进程内不允许再次进入）。
+并发守卫（同一把锁，全部在 `Service` 内）：`checking`/`downloading` 时忽略同类新请求；`SkipVersion`/`ClearSkipped`/`DiscardPending` 在 `applying` 时一律拒绝；`ApplyAndRestart` 只允许从 `ready` 进入且不可重入。
 
 ### 7.2 阶段 A：检查
 
 1. 门卫：`IsDev(Version) && !manual` → `skipped`（**不发请求**）；`!auto && !manual` → 同样不发。
 2. `GET <source>/releases/latest`：超时 10s；`User-Agent: sshore/<version>`；`Accept: application/vnd.github+json`。
-3. HTTP 映射：`200` → 解析；`403`/`429` → `rate-limited`；其它 → `check-failed`；JSON 解析失败 → `check-failed`。
-4. 比较：`Compare(tag, Version) <= 0` → `up-to-date`。
+3. HTTP 映射：`200` → 解析；`429` → `rate-limited`；`403` **仅当** `X-RateLimit-Remaining: 0`（或响应体含 `rate limit`）才判 `rate-limited`，否则 `check-failed`（例如私有/不存在的仓库、被代理拦截）；其它状态码与 JSON 解析失败 → `check-failed`。`X-RateLimit-Remaining`/`Reset` 一律写进日志。
+4. 比较：**`IsDev(Version)` 时不做比较短路**（`dev` 与语义化版本不可比），直接进入资产挑选并判 `available`；否则 `Compare(tag, Version) <= 0` → `up-to-date`。
 5. 跳过：`Base(tag) == Base(update_skipped_version)` → `skipped`（`Skipped = true`；手动检查仍可见并可「取消跳过」）。
 6. 资产：`PickArchive` + `PickChecksums` 任一失败 → `no-asset` / `no-checksum`。
 7. 全部通过 → `available`（携带 `Notes`/`PublishedAt`）。
@@ -250,18 +263,19 @@ ready     --DiscardPending()--> available
 ### 7.4 阶段 B-2：应用（`ApplyAndRestart`）
 
 1. 前置：状态必须为 `ready`，待安装文件存在且大小等于记录值；否则返回错误（不改变状态）。
-2. 生成脚本：`Goos` 选 embed 资源写出为 `<ExeDir>/sshore-update.sh|.cmd`（Linux 0755）。
-3. 拼 argv（见 §8.2）。
-4. 分离启动：Linux `setsid`；Windows `exec.Command("cmd", "/c", scriptPath)` + `SysProcAttr{HideWindow: true}`（子进程不随父进程退出而终止）。
-5. 状态置 `applying`，发一次 `update:state`（前端显示「正在重启…」）。
-6. `runtime.Quit(ctx)`。
+2. `--size` 取待安装文件的**当前 stat 值**（进程内下载时记录的值只用于同一进程内的完整性判断；重启后重试时以磁盘为准）。
+3. 生成脚本：`Goos` 选 embed 资源写出为 `<ExeDir>/sshore-update.sh|.cmd`（Linux 0755）；写失败 → 状态 `io-failed`，不启动、不退出。
+4. 拼 argv（见 §8.2）。
+5. 分离启动：Linux `exec.Cmd` + `SysProcAttr{Setsid: true}`（不依赖系统 `setsid` 二进制）；Windows `exec.Command("cmd", "/c", scriptPath)` + `SysProcAttr{HideWindow: true, CreationFlags: CREATE_NO_WINDOW}` —— 两侧都不依赖父进程存活。
+6. 状态置 `applying`，发一次 `update:state`（前端显示「正在重启…」）。
+7. `runtime.Quit(ctx)`。
 
 时序（Windows 为例）：
 
 ```
 用户在设置页点「重启并升级」
   → Go: 校验 → 写脚本 → cmd /c 分离启动 → runtime.Quit
-  → 脚本: 等旧 PID 退出（tasklist|find 轮询，≤60s）
+  → 脚本: 等旧 PID 退出（tasklist|find 轮询，上限 --wait 默认 60s）
         → 自检 pending 存在且大小匹配
         → 清理更早备份（只留最近一份）
         → sshore.exe → sshore.v0.6.0.exe
@@ -273,11 +287,15 @@ ready     --DiscardPending()--> available
 
 ### 7.5 残留自检（`Init`）
 
-启动时如果程序目录里存在「非当前版本、非备份命名」的 `sshore.v*`/`sshore.<...>.exe`，或存在 `sshore-update.log`：
+`Init` 扫描程序目录（只读一次 stat，不做删除），按以下三条判定：
 
-- 状态置 `available`（若上方已判定可更新则保持），并把 `PendingLog` 填成日志路径；
-- 「设置 → 更新」显示「上次升级未完成」+ 日志路径 + 「重试升级」；
-- 同时向日志面板发一行说明（帮助用户定位，而不是静默残留）。
+| 磁盘事实 | 处理 |
+|---|---|
+| 存在 pending 文件（匹配 `sshore.<版本号>[.exe]` 且版本 ≠ 当前版本、名字不在备份模式内） | 状态置 **`ready`**：可直接「重试升级」（脚本重新生成、`--size` 取磁盘实际值），并把 `PendingLog` 填成日志路径（若存在） |
+| 存在 `sshore-update.log` 但**无** pending 文件 | 判为**陈旧日志**：写一行日志面板、删除该文件，**不打扰用户**（避免「上次升级未完成」误报） |
+| 存在备份文件（`sshore.v*`/`sshore.dev-*`，且非 pending） | 仅记录到日志面板（「上一版本备份：<路径>」），不影响状态 |
+
+脚本成功路径会自删脚本与日志（§8.3 第 9 步），所以「日志 + pending 同时存在」才是真正的中断升级。
 
 ---
 
@@ -306,13 +324,13 @@ ready     --DiscardPending()--> available
 |---|---|---|---|
 | 1 | 解析 argv 并校验 | `case` 循环 | `%~1` 解析 |
 | 2 | 等旧 PID 退出（上限 `--wait`，默认 60s） | `kill -0` 轮询（0.2s） | `tasklist /FI "PID eq %PID%" | find "%PID%"` 轮询（1s） |
-| 3 | 自检待安装文件存在 + 大小一致 | `[ -f ] && wc -c` | `if exist` + `%~z` |
+| 3 | 自检待安装文件存在 + 大小一致 | `[ -f "$PENDING" ]` + `wc -c < "$PENDING"` | `if exist "%PENDING%"` + `for %%A in ("%PENDING%") do set PEND_SIZE=%%~zA`（`%~z` 只对批处理参数/for 变量生效，不能直接写 `%~zVAR%`） |
 | 4 | 清理更早备份（只留最近一份） | 遍历 `sshore.v*` / `sshore.dev-*`，排除 pending 与本次 backup | `for %%f in (...) do if /i not "%%f"=="..."` 同规则 |
 | 5 | 旧二进制改名备份 | `mv -f` | `move /y` |
 | 6 | 待安装文件改名正式名 | `mv -f` | `move /y` |
 | 7 | 可执行位 | `chmod +x` | 不适用 |
-| 8 | 启动新版 | `setsid "$TARGET" >/dev/null 2>&1 &` | `start "" "%TARGET%"` |
-| 9 | 收尾 | `rm -f "$0"` | `del "%~f0"` |
+| 8 | 启动新版 | 优先 `setsid "$TARGET" >/dev/null 2>&1 &`，无 `setsid` 时退化为 `nohup "$TARGET" >/dev/null 2>&1 &` | `start "" "%TARGET%"` |
+| 9 | 收尾（成功） | `rm -f "$0"`（脚本自删）+ 删除 `sshore-update.log`（若存在） | `del "%~f0"` + `del "%LOG%"`（失败则留日志） |
 
 **明确的禁令**（同时是测试断言）：脚本内**不得出现** `powershell`、`curl`、`wget`、`certutil`、网络动作或 SH`eval`。第 5 步「改名运行中的 exe」在 Windows 上是被允许的（F3），等待退出只是为了避免新旧实例短暂并存。
 
@@ -347,8 +365,10 @@ ready     --DiscardPending()--> available
 | 下载中取消/中断 | 删 `.part`、回 `available`；断点续传不做 |
 | SHA256 不符 | `verify-failed`：删临时文件、日志记期望/实际前 12 位、程序目录零写入 |
 | 解包/落盘 IO 失败 | `io-failed`：带原始错误文本 |
-| 脚本失败（占用/权限/AV 拦截） | `sshore-update.log` 保留 + 待安装文件保留；下次启动提示「上次升级未完成」+ 重试 |
+| 脚本失败（占用/权限/AV 拦截） | `sshore-update.log` 与待安装文件都保留；下次启动由残留自检进入 `ready`，界面给「重试升级」+ 日志路径 |
 | 跳过版本 | 自动检查静默；手动可见 + 「取消跳过」；**下载新版本时清空该字段** |
+| 重启后仍存在待安装文件 | 残留自检置 `ready`，界面给「重试升级」（不必重新下载） |
+| 生成脚本时目录变只读 | `io-failed`：不启动脚本、不退出应用，文案含原因 |
 | 重复点击 / 并发 | 状态机守卫；`downloading` 期间按钮禁用；`applying` 只允许一次 |
 | 更新源配置非法 | 回退内置默认源并写日志 1 行 |
 | 代理 | 用 Go 默认传输（自动读 `HTTP_PROXY`/`HTTPS_PROXY`），不新增设置项 |
@@ -366,8 +386,8 @@ ready     --DiscardPending()--> available
 
 ### 10.2 传输
 
-- 仅 `https://`（更新源允许自定义，但要求 `http(s)://` 前缀；非 https 时在设置页给一行提示文案）。
-- 下载与校验都在内存/临时目录完成，校验通过才落程序目录。
+- 默认源为 `https://`；自定义源允许 `http://`（内网镜像、离线环境、端到端测试的本地假源都需要它），**不强制**，但设置页在非 https 时给一行风险提示。
+- 下载与校验都在临时目录完成，校验通过才落程序目录。
 
 ### 10.3 AV 与签名（已知风险，如实记录）
 
@@ -422,17 +442,19 @@ cat checksums.txt
 | 状态 | 可用动作 |
 |---|---|
 | `idle`/`up-to-date`/`check-failed`/`rate-limited`/`no-asset`/`no-checksum` | 检查更新 · 打开发布页 |
-| `available` | 下载更新 · 跳过此版本 · 检查更新 · 打开发布页 |
-| `skipped` | 取消跳过 · 检查更新 · 打开发布页 |
+| `available` | 下载更新 · 跳过此版本（写 `update_skipped_version`）· 检查更新 · 打开发布页 |
+| `skipped` | 取消跳过（清 `update_skipped_version` 并立刻重查）· 检查更新 · 打开发布页 |
 | `downloading` | 取消下载 |
 | `ready` | **重启并升级** · 删除已下载的更新 · 打开发布页 |
-| `verify-failed`/`io-failed`/`not-writable` | 重试（`not-writable` 不给重试，只给人工步骤 + 发布页） |
+| `verify-failed`/`io-failed` | 重试（重新下载）· 打开发布页 |
+| `not-writable` | **不给重试**：只给人工升级步骤 + 打开发布页 |
 | `applying` | 全部禁用，显示「正在重启…」 |
 
 ### 12.2 侧栏角标
 
 - `App.vue` 的「⚙ 设置」按钮右上角一个小圆点，条件只有一条：`state ∈ {available, ready}`。被用户跳过的版本状态是 `skipped`（不是 `available`），因此天然不亮角标。
-- 用户打开设置对话框后清除（`store.acknowledge()`，仅内存态）。
+- `store.acknowledge()`（打开设置对话框时调用）记录**已确认的版本号**，不是布尔开关：只要 `latest` 变了（换了新版本）或状态从 `available` 走到 `ready`，角标重新亮。仅内存态，不落配置。
+- **竞态**：store 先注册事件监听再取 `GetUpdateInfo()` 快照，并按 `UpdateInfo.seq` 单调递增丢弃迟到的旧载荷（`seq` 小于已应用值的事件直接忽略），避免「快照覆盖新事件」或反之。
 - 单一来源：角标只读 `stores/update.js` 的派生值，不额外拉取。
 
 ### 12.3 文案与语言
@@ -454,7 +476,7 @@ cat checksums.txt
 | `download` | 分块响应下的进度回调单调、200ms 节流、ctx 取消删 `.part`、哈希边下边算正确 |
 | `extract` | 内存构造 `tar.gz`/`zip` fixture：只取目标文件；**含 `../` 条目的包必须被拒绝** |
 | `plan`/`script` | 计划字段正确；脚本参数拼装逐项断言；**脚本文本不含 `powershell`/`curl`/`wget`/`certutil`** |
-| `service` | 状态机守卫（重复检查、重复下载、未就绪 apply、`applying` 终态）；跳过版本比对；`dev` 门卫不发请求（用假 doer 断言零调用） |
+| `service` | 状态机守卫（重复检查、重复下载、未就绪 apply、`applying` 终态、`applying` 期间拒绝 discard/skip）；跳过版本比对；`dev` 门卫不发请求（用假 doer 断言零调用）；`dev` 手动检查**不做版本比较短路**直接 `available`；`403 + X-RateLimit-Remaining: 0` → `rate-limited`、`403` 无该头 → `check-failed`；`Seq` 单调递增；`Reconfigure` 换间隔后定时器重建（注入假时钟） |
 | `app.go` | `CheckUpdate(manual)` 的门卫表测（dev / auto=false / skipped）；`GetUpdateInfo` 快照一致性 |
 
 ### 13.2 脚本真跑（Linux CI 可做）
@@ -474,7 +496,7 @@ Windows `.cmd` 的行为只能在 Windows VM 上验（§13.4）。
 | 目标 | 用例要点 |
 |---|---|
 | `utils/update.js` | 状态→文案表全枚举覆盖；按钮矩阵（每个状态可用动作集合）；字节/百分比格式化；`notes` 截断 |
-| `stores/update.js` | `update:state`/`update:progress` 归约；角标派生；`acknowledge()` 后角标消失；`skipped` 不亮角标 |
+| `stores/update.js` | `update:state`/`update:progress` 归约；角标派生；`acknowledge()` 后角标消失、**版本变化后重新亮**；`skipped` 不亮角标；**`seq` 更小的迟到事件被丢弃**；快照与事件竞态（先订阅后快照） |
 | `updateWiring.test.js`（结构性不变量，仿 `sftpDropWiring.test.js`） | 自动检查默认值来自后端（前端无硬编码 `true`）；角标单一来源；`applying` 时所有按钮禁用；`ready` 才出现「重启并升级」；设置页保存包含 4 个新字段 |
 | `stores/settings.test.js`（扩展） | 新字段读写与保存 |
 
@@ -482,7 +504,7 @@ Windows `.cmd` 的行为只能在 Windows VM 上验（§13.4）。
 
 让应用把 `update_source` 指向**本地假源**（`http://127.0.0.1:<port>`，用 `httptest` 或一次性静态服务器），源里放：
 
-- `releases/latest` 的 JSON（`tag_name` = 现场构建的更高版本号，`assets` 指向本机文件）；
+- `releases/latest` 的 JSON（`tag_name` = 现场构建的更高版本号，`assets[].browser_download_url` 指向本机 HTTP 上的产物与 `checksums.txt`）；注意源 base 就填 `http://127.0.0.1:<port>`，代码按 `<source>/releases/latest` 拼路径，因此假源只需提供这一个路径与资产文件；
 - 用**当前树现场构建**的目标平台产物 + **对应的 `checksums.txt`**。
 
 自动化链路：写配置 → 启动应用 → 等 `available` → 触发下载 → 等 `ready` → 触发「重启并升级」→ 等新进程起来 → 断言窗口标题/版本显示为新版本号、备份文件命名正确且只有一份、无残留脚本、日志无错误。
@@ -502,18 +524,20 @@ Windows `.cmd` 的行为只能在 Windows VM 上验（§13.4）。
 | assets 里没有本平台包 | `no-asset` + 发布页兜底 |
 | `checksums.txt` 里的哈希改一位 | `verify-failed`，程序目录零残留 |
 | `ExeDir` 置只读 | `not-writable`，不尝试下载/替换 |
-| 脚本人为失败（pending 大小不符） | 保留脚本 + 日志，下次启动显示「上次升级未完成」 |
+| 脚本人为失败（pending 大小不符） | 保留脚本 + 日志，下次启动进入 `ready` 并给「重试升级」 |
+| 成功升级后再次启动 | 无残留脚本、无日志；旧备份只剩一份 |
 
 ---
 
 ## 14. 验收清单（DoD）
 
 1. `make ci` 全绿（`go vet` + `go test -race` + `npx vitest run`；现有 187 个前端测试不回归）。
-2. §13.4 的端到端自升级在 **Linux** 与 **Windows VM** 各成功一次，证据含：新版本号显示、备份命名、只留一份备份、无残留脚本、日志无错误。
+2. §13.4 的端到端自升级在 **Linux** 与 **Windows VM** 各成功一次，证据含：新版本号显示、备份命名、只留一份备份、无残留脚本、日志无错误；**并额外验证「中断后重试」路径**（人为让脚本失败一次 → 下次启动处于 `ready` → 重试成功）。
 3. Windows Defender 全程无拦截/隔离（有告警则按 §10.4 切 helper 模式并重跑）。
-4. §13.5 的 6 个变体全部验证。
-5. README 增「更新与升级」一节：更新源与可配置性、SHA256 校验、隐私说明（检查请求）、人工升级步骤（Windows/Linux）、AV 注意事项与 `COMPRESS=0` 的既有退路。
-6. 所有新增测试做过变异校验（至少覆盖：状态门卫、校验失败拒装、备份只留一份、脚本禁令断言、角标条件），变异必须被杀死。
+4. §13.5 的 7 个变体全部验证。
+5. `internal/update/scripts/update.sh` 通过 `shellcheck`（环境无 shellcheck 时至少人工逐行审一次并记录结论），且断言其不含 `powershell`/`curl`/`wget`/`certutil`。
+6. README 增「更新与升级」一节：更新源与可配置性、SHA256 校验、隐私说明（检查请求）、人工升级步骤（Windows/Linux）、AV 注意事项与 `COMPRESS=0` 的既有退路。
+7. 所有新增测试做过变异校验（至少覆盖：状态门卫、校验失败拒装、备份只留一份、脚本禁令断言、角标条件），变异必须被杀死。
 
 ---
 
@@ -527,7 +551,7 @@ Windows `.cmd` 的行为只能在 Windows VM 上验（§13.4）。
 | R4 | F3（Windows 重命名运行中 exe）不成立 | 前置 spike 验证；不成立则切 helper 模式 |
 | R5 | 安装目录只读 | `not-writable` 提前拦截，不产生半状态 |
 | R6 | 脚本中途失败留下半状态 | 步骤 6 回滚 + 日志 + 下次启动「上次升级未完成」提示 |
-| R7 | 新旧实例短暂并存 | 脚本先等旧 PID 退出（≤60s） |
+| R7 | 新旧实例短暂并存 | 脚本先等旧 PID 退出（上限 `--wait`，默认 60s） |
 | R8 | `dev` 构建被误升级为 Release | 允许但备份名带时间戳；设置页明确显示「开发构建」 |
 | R9 | 误报 UPX（既有问题） | 本次不改默认值；README 保留 `COMPRESS=0` 退路；记录为独立决策 |
 
@@ -549,6 +573,27 @@ Windows `.cmd` 的行为只能在 Windows VM 上验（§13.4）。
 | 10 | UPX | 本次不改默认值（独立决策，见 R9） |
 | — | 修正 A | 脚本内不做 SHA256 二次校验，只做「存在 + 大小」自检（避免 `certutil` 与额外 AV 特征） |
 | — | 修正 B | CI 只改 `release` job：在 Linux runner 上对 artifacts 统一生成 `checksums.txt` |
+
+### 16.1 第一阶段自审（本地）修正清单
+
+| # | 问题 | 修正 |
+|---|---|---|
+| 1 | `dev` 版本与语义化版本不可比，但 §7.2 直接用 `Compare(tag, Version)` 短路 `up-to-date`，会让 dev 构建永远是「已是最新」 | 明确：`IsDev(Version)` 时不做比较短路，直接进资产挑选判 `available` |
+| 2 | 缺「跳过此版本 / 取消跳过 / 删除已下载」的绑定与写配置通路 | `Options.Save`、`Service.SkipVersion/ClearSkipped`、`App.SkipUpdateVersion/ClearSkippedUpdate/DiscardUpdateDownload` 三个绑定，§3.1 计数同步为 8+1 |
+| 3 | 设置改了更新源/间隔后不会生效（定时器不重建） | 新增 `Service.Reconfigure()`，由 `App.SetSettings` 保存后调用；并写明 `App.Init`/`App.OnShutdown` 的接线位置 |
+| 4 | 前端「先取快照后订阅事件」存在覆盖竞态 | `UpdateInfo` 增加单调递增 `Seq`，store 丢弃迟到载荷；先订阅再取快照 |
+| 5 | 角标 `acknowledge()` 语义含糊（布尔清除会让新版本也不再提示） | 改为记录「已确认的版本号」；新版本或状态变化重新亮 |
+| 6 | 残留自检把「陈旧日志」也判成「上次升级未完成」，会误报 | 三分支表：有 pending → `ready` 可重试；只有日志无 pending → 判陈旧、清日志、仅记日志面板；有备份 → 只记录 |
+| 7 | 成功升级后日志文件不会被清理，导致下次启动误判 | §8.3 第 9 步：成功时同时删除日志 |
+| 8 | §9 声称「仅 https」，与「自定义源允许 http」以及端到端假源（`http://127.0.0.1`）自相矛盾 | 改为默认 https、自定义允许 http 并给风险提示 |
+| 9 | Windows 用 `%~zVAR%` 取文件大小是错的（`%~z` 只对批处理参数/for 变量生效） | 改为 `for %%A in ("%PENDING%") do set PEND_SIZE=%%~zA` |
+| 10 | Linux 侧依赖系统 `setsid` 二进制，缺失则静默失败 | Go 侧改用 `SysProcAttr{Setsid: true}`；脚本内启动新版时 `setsid` 缺失则退化 `nohup` |
+| 11 | Windows 分离启动只写了 `HideWindow`，未说明子进程独立于父进程 | 补 `CreationFlags: CREATE_NO_WINDOW` 与「两侧都不依赖父进程存活」 |
+| 12 | `403` 一律判 `rate-limited`，但私有/不存在/被代理拦截也是 403 | 仅当 `X-RateLimit-Remaining: 0`（或响应体含 rate limit）才判限流，否则 `check-failed` |
+| 13 | `ApplyAndRestart` 的 `--size` 来源在「重启后重试」路径上不自洽 | 明确 `--size` 取磁盘 stat 值；进程内记录值仅用于同进程完整性判断 |
+| 14 | 生成脚本写盘失败没有对应状态 | 归入 `io-failed`：不启动脚本、不退出应用 |
+| 15 | `Plan` 里的 `Launch` 字段与 `Target` 重复 | 删除该字段，补 `BackupPatterns` |
+| 16 | 单测/前端测试/DoD 未覆盖新增的守卫与竞态，且 §14 编号重复 | 补 dev 短路、403 判据、`Seq`、`Reconfigure`、重试路径与 shellcheck 条目；修正编号与变体计数 |
 
 ---
 
