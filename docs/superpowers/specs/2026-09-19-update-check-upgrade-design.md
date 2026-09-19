@@ -114,10 +114,10 @@
 | source.go | 读 <source>/releases/latest | type Release struct{ Tag, Notes, PublishedAt string; Assets []Asset }、Asset{Name, URL string}、Latest(ctx, source string) (Release, error)、错误哨兵 ErrRateLimited/ErrCheckFailed |
 | asset.go | 挑本平台包与校验文件；**校验下载 URL 在受信主机集合内** | PickArchive(rel, goos, goarch) (Asset, error)、PickChecksums(rel) (Asset, error)、SameOrigin(source, rawURL string) bool（同 host；源为 api.github.com 时另允许 github.com / codeload.github.com / *.githubusercontent.com，理由见 §10.1） |
 | checksum.go | 解析 sha256sum 格式并比对 | ParseChecksums(io.Reader) (map[string]string, error)、VerifyFile(path, want string) error |
-| download.go | 流式下载 + 边下边算 SHA256 + 进度 + ctx 取消 + **超时** | Download(ctx, url, dest string, opt DownloadOpt, progress func(done, total int64)) (string, error)、FreeSpace(dir string) (int64, error) |
-| extract.go | 从 tar.gz/zip 只取出二进制 | ExtractBinary(archive, goos, dest string) error：按 filepath.Base+Clean 匹配白名单（sshore / sshore.exe）、**拒绝 symlink/hardlink**、多匹配报错、单条目 ≤ 64 MiB、拒绝路径遍历 |
-| plan.go | 计算替换计划与备份清理集 | type Plan struct{ Target, Pending, Backup, Sidecar, LogPath, ExeDir string; Size int64; Wait time.Duration }、PlanFor(goos, exePath, fromVer, toVer string, size int64) Plan、ResumePending(exeDir, current string) (Plan, bool)（内部用 backupCandidates，不导出） |
-| script.go | go:embed 脚本 + 参数/环境构造 + 分离启动 | ScriptName(goos) string、ScriptBytes(goos) []byte、ScriptArgs(Plan, pid int) []string（Linux）、ScriptEnv(Plan, pid int) []string（Windows）、StartDetached(goos, scriptPath string, args, env []string) error |
+| download.go | 流式下载（进度节流 200ms / 空闲超时 / 半截清理）；空间检查按平台拆文件 | Download(ctx, url, dest string, opt DownloadOpt) error（边下边算的哈希由调用方用 FileSHA256 复核）、DownloadOpt{IdleTimeout, Throttle time.Duration; Progress func(done, total int64)}、FreeSpace(dir string) (int64, error)（freespace_unix.go / freespace_windows.go） |
+| extract.go | 从 tar.gz/zip 只取出二进制 | ExtractBinary(archive, goos, dest string) error：**先用 unsafeEntry 显式拒绝含 .. 或绝对路径的条目**（path.Base 会把 ../sshore 洗白）、再按 filepath.Base+Clean 匹配白名单（sshore / sshore.exe）、拒绝 symlink/hardlink、多匹配报错、单条目 ≤ 64 MiB |
+| plan.go | 计算替换计划与 pending 名义判定 | type Plan struct{ Target, Pending, Backup, Sidecar, LogPath, ExeDir string; Size int64; Wait time.Duration }、PlanFor(goos, exePath, fromVer, toVer string, size int64, wait time.Duration) Plan（备份名：Clean/Describe 用 Base(fromVer)，仅 Dev/Invalid 用时间戳）、ResumePending(exeDir, current string) (Plan, bool)、IsPendingName(name, current string) bool |
+| script.go + start_unix.go / start_windows.go | go:embed 脚本 + 参数/环境构造 + 分离启动（SysProcAttr 按平台拆文件：Linux 的 syscall.SysProcAttr 没有 HideWindow 字段） | ScriptName(goos) string、ScriptBytes(goos) ([]byte, error)、ScriptArgs(Plan, pid int) []string（Linux argv）、ScriptEnv(Plan, pid int) []string（Windows 环境变量）、StartDetached(goos, scriptPath string, args, env []string) error、平台函数 setDetached(*exec.Cmd) |
 | lock.go | ExeDir 级排他锁，防两个实例同时 apply | Acquire(exeDir string) (release func(), err error)（Windows：命名互斥体；Linux：.sshore-update.lock 上的 flock） |
 | scripts/update.sh | Linux 升级脚本（embed、可 shellcheck） | — |
 | scripts/update.cmd | Windows 升级脚本（embed、纯 cmd、不含 powershell） | — |
@@ -505,7 +505,7 @@ cd artifacts
 find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
   | sort -z \
   | xargs -0 sha256sum \
-  | awk '{ n=$0; sub(/^[^ ]+  /, "", n); print $1"  "n }' > checksums.txt
+  | awk '{ n=$0; sub(/^[^ ]+  /, "", n); sub(/^.*\//, "", n); print $1"  "n }' > checksums.txt
 cat checksums.txt
 ```
 

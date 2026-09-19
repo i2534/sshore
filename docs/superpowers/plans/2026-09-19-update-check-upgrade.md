@@ -134,6 +134,22 @@ gh api repos/i2534/sshore/releases/latest --jq "{tag: .tag_name, assets: [.asset
 
 Expected: tag=v0.6.0，assets 两个（`sshore-v0.6.0-linux-amd64.tar.gz`、`sshore-v0.6.0-windows-amd64.zip`）。
 
+- [ ] **Step 5b: 顺带复核 F2 与 F4（各一次，结论并入同一文件）**
+
+```bash
+# F2：未认证配额响应头（记录当时数值，作为「默认 12h 间隔是否够用」的依据）
+curl -sSI https://api.github.com/repos/i2534/sshore/releases/latest | grep -i "^x-ratelimit"
+```
+
+Expected: 出现 `x-ratelimit-remaining` / `x-ratelimit-reset`。
+
+```powershell
+# F4：应用内下载的产物不应带 MOTW（在 Windows VM 上对下载出的 pending 文件检查）
+Get-Item <pending 文件路径> -Stream Zone.Identifier -ErrorAction SilentlyContinue
+```
+
+Expected: 无输出（不存在 Zone.Identifier），符合 spec §4 F4 的预期。
+
 - [ ] **Step 6: 记录结论到 spec（表格 F3 行补「已实测 + 日期 + 结论」）并提交**
 
 ```bash
@@ -248,7 +264,9 @@ const (
 var (
 	cleanRe    = regexp.MustCompile(`^v?[0-9]+[.][0-9]+[.][0-9]+$`)
 	describeRe = regexp.MustCompile(`^v?[0-9]+[.][0-9]+[.][0-9]+-[0-9]+-g[0-9a-f]+$`)
-	// 只接受「干净 tag / git describe 串 / dev-<时间戳>」三种版本段形态：
+	// pendingRe 只接受「干净 tag / git describe 串 / dev-<时间戳>」三种版本段形态，
+	// 因此 sshore.exe、sshore.v0.7.0.sha256、sshore-update.sh 都不会被误判为候选。
+	pendingRe = regexp.MustCompile(`^sshore[.]((?:v?[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9]+-g[0-9a-f]+)?|dev-[0-9]{8}-[0-9]{6}))([.]exe)?$`)
 )
 
 // Class 判定版本串类别；空串与 dev 都算开发态。
@@ -366,17 +384,19 @@ import (
 )
 
 func TestParseChecksums(t *testing.T) {
-	in := "abc123  sshore-v0.7.0-linux-amd64.tar.gz\r\n" +
-		"def456 *sshore-v0.7.0-windows-amd64.zip\r\n" +
+	const h1 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	const h2 = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7"
+	in := h1 + "  sshore-v0.7.0-linux-amd64.tar.gz\r\n" +
+		h2 + " *sshore-v0.7.0-windows-amd64.zip\r\n" +
 		"\r\n"
 	m, err := ParseChecksums(strings.NewReader(in))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m["sshore-v0.7.0-linux-amd64.tar.gz"] != "abc123" {
+	if m["sshore-v0.7.0-linux-amd64.tar.gz"] != h1 {
 		t.Fatalf("tar.gz 哈希解析错误: %v", m)
 	}
-	if m["sshore-v0.7.0-windows-amd64.zip"] != "def456" {
+	if m["sshore-v0.7.0-windows-amd64.zip"] != h2 {
 		t.Fatalf("二进制前缀 * 未处理: %v", m)
 	}
 }
@@ -658,6 +678,22 @@ func cleanEntry(name string) string {
 	return path.Base(path.Clean(strings.ReplaceAll(name, "\\", "/")))
 }
 
+// unsafeEntry 判断条目名是否含路径遍历或绝对路径。
+// 必须在归一之前判断：path.Base(path.Clean("../sshore")) 会得到 "sshore"，
+// 只靠归一化会把遍历条目「洗白」成合法条目（两阶段评审实测）。
+func unsafeEntry(name string) bool {
+	n := strings.ReplaceAll(name, "\\", "/")
+	if strings.HasPrefix(n, "/") || strings.Contains(n, ":") {
+		return true
+	}
+	for _, seg := range strings.Split(n, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func extractTarGz(archive, goos, dest string) error {
 	f, err := os.Open(archive)
 	if err != nil {
@@ -678,6 +714,9 @@ func extractTarGz(archive, goos, dest string) error {
 		}
 		if err != nil {
 			return err
+		}
+		if unsafeEntry(hdr.Name) {
+			return fmt.Errorf("归档条目 %q 含路径遍历，拒绝", hdr.Name)
 		}
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
 			if cleanEntry(hdr.Name) == wantName(goos) {
@@ -713,6 +752,9 @@ func extractZip(archive, goos, dest string) error {
 	defer zr.Close()
 	found := 0
 	for _, zf := range zr.File {
+		if unsafeEntry(zf.Name) {
+			return fmt.Errorf("归档条目 %q 含路径遍历，拒绝", zf.Name)
+		}
 		if cleanEntry(zf.Name) != wantName(goos) {
 			continue
 		}
@@ -1169,7 +1211,8 @@ func TestDownloadProgressIsMonotonicAndThrottled(t *testing.T) {
 			if _, err := w.Write(chunk); err != nil {
 				return
 			}
-		})
+		}
+	}))
 	defer srv.Close()
 
 	var mu sync.Mutex
@@ -1272,9 +1315,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // DownloadOpt 控制下载行为；IdleTimeout 是「连续无字节」上限，Throttle 是进度最小间隔。
@@ -1318,8 +1360,9 @@ func (c *Client) Download(ctx context.Context, url, dest string, opt DownloadOpt
 		_ = os.Remove(dest)
 		return e
 	}
-	// 空闲看门狗：每次成功读到字节就重置；触发即取消 ctx。
-	watchdog := time.AfterFunc(opt.IdleTimeout, cancel)
+	// 空闲看门狗：每次成功读到字节就重置；触发即标记原因并取消 ctx。
+	var idleHit atomic.Bool
+	watchdog := time.AfterFunc(opt.IdleTimeout, func() { idleHit.Store(true); cancel() })
 	defer watchdog.Stop()
 	total := resp.ContentLength
 	var done int64
@@ -1342,10 +1385,10 @@ func (c *Client) Download(ctx context.Context, url, dest string, opt DownloadOpt
 			if errors.Is(rerr, io.EOF) {
 				break
 			}
-			if errors.Is(rerr, context.Canceled) && ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return fail(fmt.Errorf("下载空闲超时（%s 无数据）", opt.IdleTimeout))
-			}
 			if errors.Is(rerr, context.Canceled) && ctx.Err() != nil {
+				if idleHit.Load() {
+					return fail(fmt.Errorf("下载空闲超时（%s 无数据）", opt.IdleTimeout))
+				}
 				return fail(ctx.Err())
 			}
 			return fail(rerr)
@@ -1361,7 +1404,21 @@ func (c *Client) Download(ctx context.Context, url, dest string, opt DownloadOpt
 	return nil
 }
 
-// FreeSpace 返回 dir 所在文件系统的可用字节数（Linux 用 unix.Statfs）。
+// FreeSpace 的实现按平台拆到 freespace_unix.go / freespace_windows.go（见下），
+// 这样 download.go 不引入平台专有符号，GOOS=windows 与 linux 都能编译。
+```
+
+**两平台实现**（`download.go` 不再内联 FreeSpace）：
+
+```go
+// freespace_unix.go
+//go:build !windows
+
+package update
+
+import "golang.org/x/sys/unix"
+
+// FreeSpace 返回 dir 所在文件系统的可用字节数（Linux/BSD 用 Statfs）。
 func FreeSpace(dir string) (int64, error) {
 	var st unix.Statfs_t
 	if err := unix.Statfs(dir, &st); err != nil {
@@ -1371,7 +1428,8 @@ func FreeSpace(dir string) (int64, error) {
 }
 ```
 
-**Windows 注意**：`unix.Statfs` 不可用 → 把 `FreeSpace` 拆成 `freespace_unix.go`（`//go:build !windows`，用 `unix.Statfs`）与 `freespace_windows.go`（`//go:build windows`，用 `windows.GetDiskFreeSpaceEx`，见 `golang.org/x/sys/windows`）。两文件各 20 行，签名一致：
+```go
+// freespace_windows.go
 
 ```go
 // freespace_windows.go
@@ -1580,9 +1638,12 @@ func PlanFor(goos, exePath, fromVer, toVer string, size int64, wait time.Duratio
 	}
 	pending := filepath.Join(dir, "sshore."+Base(toVer)+ext)
 	var backup string
-	if Class(fromVer) == KindClean {
+	switch Class(fromVer) {
+	case KindClean, KindDescribe:
+		// 干净 tag 与 git describe 串都能唯一标识被替换的版本（spec §8.4）
 		backup = filepath.Join(dir, "sshore."+Base(fromVer)+ext)
-	} else {
+	default:
+		// dev / 未知版本没有唯一标识，用时间戳
 		backup = filepath.Join(dir, "sshore.dev-"+time.Now().Format("20060102-150405")+ext)
 	}
 	return Plan{
@@ -1706,7 +1767,11 @@ done
 
 fail() {
   printf "STEP=%s ERR=%s\nRESULT=fail:%s\n" "$1" "$2" "$1" >> "$LOG"
-  exit 3
+  # 参数类失败按 spec §8.2 退 2，其余（0/3/5/6/launch/wait）退 3
+  case "$1" in
+    args) exit 2 ;;
+    *) exit 3 ;;
+  esac
 }
 
 [ -n "$LOG" ] || LOG=/dev/null
@@ -1802,13 +1867,17 @@ if "%LOG%"=="" set "LOG=%TEMP%\sshore-update.log"
 type nul > "%LOG%" 2>nul
 
 if "%PID%"=="" goto :args
+if "%SIZE%"=="" goto :args
+if "%WAIT%"=="" goto :args
+rem PID/SIZE/WAIT 必须是正整数（spec §8.2）：拼起来的字符串只含数字才算通过
+for %%A in (%PID%) do if "%%A"=="" goto :args
+echo %PID%%SIZE%%WAIT%| findstr /r "^[0-9][0-9]*$" >nul || goto :args
 if "%TARGET%"=="" goto :args
 if "%PENDING%"=="" goto :args
 if not exist "%TARGET%" goto :args
 if not exist "%PENDING%" goto :args
 
 cd /d "%~dp0" || goto :step0
-set "PB=%~nx%PENDING%"
 for %%A in ("%PENDING%") do set "PB=%%~nxA"
 for %%A in ("%BACKUP%") do set "BB=%%~nxA"
 
@@ -2060,11 +2129,10 @@ func StartDetached(goos, scriptPath string, args, env []string) error {
 	if goos == "windows" {
 		cmd = exec.Command("cmd", "/d", "/c", scriptPath)
 		cmd.Env = append(cmd.Environ(), env...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: creationFlagsNoWindow}
 	} else {
 		cmd = exec.Command(scriptPath, args...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	}
+	setDetached(cmd) // 平台差异（新会话 / 隐藏窗口）见 start_unix.go 与 start_windows.go
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -2073,19 +2141,44 @@ func StartDetached(goos, scriptPath string, args, env []string) error {
 }
 ```
 
-Windows 侧 `creationFlagsNoWindow` 用 `golang.org/x/sys/windows`（`syscall` 没有该常量，见 spec §4 F7），放 `procattr_windows.go`：
+**`SysProcAttr` 必须按平台拆文件**（Linux 的 `syscall.SysProcAttr` 没有 `HideWindow`/`CreationFlags` 字段，写在同一个文件里 `make ci` 的 Linux 编译会直接失败 —— 两阶段评审实测）：
 
 ```go
+// start_unix.go
+//go:build !windows
+
+package update
+
+import (
+	"os/exec"
+	"syscall"
+)
+
+// setDetached 让脚本进入新会话，主进程退出后不受影响。
+func setDetached(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+}
+```
+
+```go
+// start_windows.go
 //go:build windows
 
 package update
 
-import "golang.org/x/sys/windows"
+import (
+	"os/exec"
+	"syscall"
 
-const creationFlagsNoWindow = windows.CREATE_NO_WINDOW
+	"golang.org/x/sys/windows"
+)
+
+// setDetached 隐藏控制台窗口；子进程不随父进程退出（见 spec §8.5）。
+// 常量取自 golang.org/x/sys/windows —— syscall 包没有 CREATE_NO_WINDOW（spec §4 F7）。
+func setDetached(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
+}
 ```
-
-并在 `procattr_other.go`（`//go:build !windows`）提供 `const creationFlagsNoWindow = 0`，使 `StartDetached` 能在所有平台编译。
 
 - [ ] **Step 7: 运行测试确认通过，并检查换行符**
 
@@ -2099,7 +2192,7 @@ Expected: 测试 PASS；`git check-attr` 显示 `update.sh: text: set`、`eol: l
 - [ ] **Step 8: 提交**
 
 ```bash
-git add .gitattributes internal/update/scripts internal/update/script.go internal/update/script_test.go internal/update/procattr_windows.go internal/update/procattr_other.go
+git add .gitattributes internal/update/scripts internal/update/script.go internal/update/script_test.go internal/update/start_unix.go internal/update/start_windows.go
 git commit -m "feat(update): 嵌入式升级脚本（sh/cmd）+ 参数/环境构造 + 分离启动"
 ```
 
@@ -2205,7 +2298,7 @@ import (
 // Acquire 用命名互斥体加锁：句柄随进程关闭，脚本不需要参与。
 func Acquire(exeDir string) (func(), error) {
 	sum := sha1.Sum([]byte(strings.ToLower(exeDir)))
-	name, err := windows.UTF16PtrFromString("Global" + "\" + "sshore-update-" + hex.EncodeToString(sum[:8]))
+	name, err := windows.UTF16PtrFromString("Global\\sshore-update-" + hex.EncodeToString(sum[:8]))
 	if err != nil {
 		return nil, err
 	}
@@ -2318,6 +2411,13 @@ func TestCheckRejectedWhileDownloadingOrReady(t *testing.T) {
 	if _, err := svc.Check(context.Background(), true); !errors.Is(err, ErrBusy) {
 		t.Fatalf("ready 期间必须拒绝检查（否则会抹掉 ReadyPath）")
 	}
+	// applying 是终态；DoD#10 变异 ④ 就是删掉这条守卫，必须有测试抓住
+	svc.mu.Lock()
+	svc.info.State = StateApplying
+	svc.mu.Unlock()
+	if _, err := svc.Check(context.Background(), true); !errors.Is(err, ErrBusy) {
+		t.Fatalf("applying 期间必须拒绝检查")
+	}
 }
 
 func TestApplyRequiresReadyAndIsNotReentrant(t *testing.T) {
@@ -2346,8 +2446,8 @@ func TestSkipAndClearSkippedTransitions(t *testing.T) {
 	if err := svc.SkipVersion("v0.7.0"); err != nil {
 		t.Fatal(err)
 	}
-	if saved.Skipped != "v0.7.0" {
-		t.Fatalf("跳过版本未持久化: %+v", saved)
+	if saved.Skipped != "0.7.0" {
+		t.Fatalf("跳过版本必须存 Base 形式（与 Check 的 Base(tag)==Base(Skipped) 对齐）: %+v", saved)
 	}
 	if got := svc.Info().State; got != StateSkipped {
 		t.Fatalf("跳过后的状态应为 skipped, got %s", got)
@@ -2430,6 +2530,7 @@ type Options struct {
 	Launch                         func(goos, path string, args, env []string) error
 	Acquire                        func(exeDir string) (func(), error)
 	Emit                           func(event string, payload any)
+	Log                            func(msg string) // 诊断日志（门卫原因 / X-RateLimit / 自动检查失败）→ 前端日志面板
 	Config                         func() Settings
 	Save                           func(Settings) error
 	Now                            func() time.Time
@@ -2531,6 +2632,9 @@ func (s *Service) Check(ctx context.Context, manual bool) (UpdateInfo, error) {
 
 	cfg := s.opts.Config()
 	if !manual && (!cfg.Auto || !IsRelease(s.opts.Version)) {
+		if s.opts.Log != nil {
+			s.opts.Log("未自动检查更新（非 release 构建或已关闭自动检查）")
+		}
 		s.mu.Lock()
 		s.info.State = StateDisabled
 		s.info.Manual = false
@@ -2549,12 +2653,19 @@ func (s *Service) Check(ctx context.Context, manual bool) (UpdateInfo, error) {
 	s.setLocked(StateChecking, warn)
 	s.mu.Unlock()
 
+	// 检查请求总超时 10s（spec §7.2.2）
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	client := &Client{HTTP: s.opts.Doer, UserAgent: "sshore/" + s.opts.Version}
 	rel, err := client.Latest(ctx, src)
 	if err != nil {
 		state, msg := StateCheckFailed, err.Error()
 		if errors.Is(err, ErrRateLimited) {
 			state = StateRateLimited
+		}
+		// 自动检查失败/限流都只在日志面板留一行（spec §7.2.3、§9）
+		if s.opts.Log != nil {
+			s.opts.Log("检查更新失败：" + msg)
 		}
 		s.mu.Lock()
 		s.setLocked(state, msg)
@@ -2941,6 +3052,58 @@ func TestReconfigureRebuildsTickerWithNewInterval(t *testing.T) {
 	svc.Reconfigure()  // 只断言不 panic；调度本身由人工/端到端覆盖
 	svc.Shutdown()
 }
+
+func TestApplyRejectsTamperedPendingSidecar(t *testing.T) {
+	// spec §10.1 的第二道校验，也是 DoD#10 变异 ③ 的对应测试：
+	// 只要把 ApplyAndRestart 里的 VerifyFile 去掉，本测试就必须失败。
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "sshore")
+	if err := os.WriteFile(exe, []byte("OLD\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plan := PlanFor("linux", exe, "v0.6.0", "v0.7.0", 0, DefaultWait)
+	if err := os.WriteFile(plan.Pending, []byte("NEW\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := os.Stat(plan.Pending)
+	plan.Size = st.Size()
+	launched := false
+	svc := New(Options{
+		Goos: "linux", Goarch: "amd64", Version: "v0.6.0", ExePath: exe,
+		Acquire: func(string) (func(), error) { return func() {}, nil },
+		Launch:  func(string, string, []string, []string) error { launched = true; return nil },
+		Config:  func() Settings { return Settings{} },
+		Emit:    func(string, any) {},
+	})
+	svc.mu.Lock()
+	svc.info.State = StateReady
+	svc.info.ReadyPath = plan.Pending
+	svc.pending = plan
+	svc.mu.Unlock()
+
+	if err := svc.ApplyAndRestart(context.Background()); err == nil {
+		t.Fatal("sidecar 缺失必须拒绝 apply")
+	}
+	if launched {
+		t.Fatal("被拒时不得启动脚本")
+	}
+	sidecar := strings.Repeat("0", 64) + "  " + filepath.Base(plan.Pending) + "\n"
+	if err := os.WriteFile(plan.Sidecar, []byte(sidecar), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc.mu.Lock()
+	svc.info.State = StateReady
+	svc.mu.Unlock()
+	if err := svc.ApplyAndRestart(context.Background()); err == nil {
+		t.Fatal("哈希不符必须拒绝 apply")
+	}
+	if got := svc.Info().State; got != StateVerifyFailed {
+		t.Fatalf("state = %s, want verify-failed", got)
+	}
+	if launched {
+		t.Fatal("校验失败时不得启动脚本")
+	}
+}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -3003,9 +3166,10 @@ func (s *Service) loop(ctx context.Context) {
 	if !cfg.Auto || !IsRelease(s.opts.Version) {
 		return
 	}
+	stopCh := s.currentStop() // 持锁读：Reconfigure 会替换该字段，直接读会与写竞争（-race 会报）
 	select {
 	case <-time.After(5 * time.Second):
-	case <-s.stopCh:
+	case <-stopCh:
 		return
 	}
 	_, _ = s.Check(ctx, false)
@@ -3015,10 +3179,11 @@ func (s *Service) loop(ctx context.Context) {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
+		stopCh := s.currentStop()
 		select {
 		case <-ticker.C:
 			_, _ = s.Check(ctx, false)
-		case <-s.stopCh:
+		case <-stopCh:
 			return
 		case <-ctx.Done():
 			return
@@ -3054,21 +3219,18 @@ func (s *Service) Shutdown() {
 	s.mu.Unlock()
 }
 
+// currentStop 在锁内读 stopCh：Reconfigure 会替换该字段，直接读会与写竞争（-race 会报）。
+func (s *Service) currentStop() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopCh
+}
+
 // download 执行下载 → 校验 → 解包 → sidecar → ready。
 func (s *Service) download(ctx context.Context) {
 	s.mu.Lock()
 	rel := s.rel
 	plan := PlanFor(s.opts.Goos, s.opts.ExePath, s.opts.Version, rel.Tag, 0, DefaultWait)
-	archiveAsset, err := PickArchive(rel, s.opts.Goos, s.opts.Goarch)
-	if err != nil {
-		_ = s.failIO(err, "")
-		return
-	}
-	csAsset, err := PickChecksums(rel)
-	if err != nil {
-		_ = s.failVerify(err)
-		return
-	}
 	s.info.Progress = 0
 	s.setLocked(StateDownloading, "")
 	ctx, cancel := context.WithCancel(ctx)
@@ -3079,6 +3241,18 @@ func (s *Service) download(ctx context.Context) {
 		s.cancelDL = nil
 		s.mu.Unlock()
 	}()
+
+	// 错误收敛必须在释放 s.mu 之后：failIO/failVerify 内部会再次加锁，持锁调用会自死锁。
+	archiveAsset, err := PickArchive(rel, s.opts.Goos, s.opts.Goarch)
+	if err != nil {
+		_ = s.failIO(err, "")
+		return
+	}
+	csAsset, err := PickChecksums(rel)
+	if err != nil {
+		_ = s.failVerify(err)
+		return
+	}
 
 	probe := filepath.Join(plan.ExeDir, ".sshore-write-test")
 	if err := os.WriteFile(probe, []byte("x"), 0o600); err != nil {
@@ -3228,26 +3402,33 @@ package config
 
 import "testing"
 
+// 只比较本任务新增的四个字段：既有 Normalize 还会把 Theme 置 system、FontScale 置 1，
+// 对完整结构体做 == 会让这些用例全部失败（两阶段评审实测）。
+// 区间语义：Normalize 只把 <0 归一为 12；「缺键」的默认值由 DefaultAppConfig/LoadConfig 给，
+// 因此 0 表示用户显式关闭轮询（配置文件写了 update_check_interval_hours = 0）。
 func TestUpdateSettingsNormalize(t *testing.T) {
 	cases := []struct {
-		name string
-		in   AppSettings
-		want AppSettings
+		name                       string
+		in                         AppSettings
+		wantInterval               int
+		wantSource, wantSkipVer    string
 	}{
-		{"缺省间隔补 12", AppSettings{}, AppSettings{UpdateCheckIntervalHours: 12}},
-		{"负间隔回 12", AppSettings{UpdateCheckIntervalHours: -3}, AppSettings{UpdateCheckIntervalHours: 12}},
-		{"上限 168", AppSettings{UpdateCheckIntervalHours: 999}, AppSettings{UpdateCheckIntervalHours: 168}},
-		{"0 表关闭轮询", AppSettings{UpdateCheckIntervalHours: 0}, AppSettings{UpdateCheckIntervalHours: 0}},
-		{"非法源清空", AppSettings{UpdateSource: " ftp://x ", UpdateCheckIntervalHours: 12}, AppSettings{UpdateCheckIntervalHours: 12}},
-		{"合法源保留", AppSettings{UpdateSource: " https://mirror.corp/api ", UpdateCheckIntervalHours: 12}, AppSettings{UpdateSource: "https://mirror.corp/api", UpdateCheckIntervalHours: 12}},
-		{"跳过版本去 v 与空白", AppSettings{UpdateSkippedVersion: " v0.7.0 ", UpdateCheckIntervalHours: 12}, AppSettings{UpdateSkippedVersion: "0.7.0", UpdateCheckIntervalHours: 12}},
+		{"负间隔回 12", AppSettings{UpdateCheckIntervalHours: -3}, 12, "", ""},
+		{"上限 168", AppSettings{UpdateCheckIntervalHours: 999}, 168, "", ""},
+		{"0 表显式关闭轮询", AppSettings{UpdateCheckIntervalHours: 0}, 0, "", ""},
+		{"非法源清空", AppSettings{UpdateSource: " ftp://x ", UpdateCheckIntervalHours: 12}, 12, "", ""},
+		{"合法源去空白保留", AppSettings{UpdateSource: " https://mirror.corp/api ", UpdateCheckIntervalHours: 12}, 12, "https://mirror.corp/api", ""},
+		{"跳过版本去 v 与空白", AppSettings{UpdateSkippedVersion: " v0.7.0 ", UpdateCheckIntervalHours: 12}, 12, "", "0.7.0"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s := c.in
 			s.Normalize()
-			if s != c.want {
-				t.Fatalf("got %+v want %+v", s, c.want)
+			if s.UpdateCheckIntervalHours != c.wantInterval || s.UpdateSource != c.wantSource || s.UpdateSkippedVersion != c.wantSkipVer {
+				t.Fatalf("新字段归一错误: interval=%d source=%q skipped=%q", s.UpdateCheckIntervalHours, s.UpdateSource, s.UpdateSkippedVersion)
+			}
+			if s.Theme != "system" || s.FontScale != 1 {
+				t.Fatalf("既有字段归一被破坏: theme=%q fontScale=%v", s.Theme, s.FontScale)
 			}
 		})
 	}
@@ -3322,7 +3503,7 @@ git commit -m "feat(config): 更新检查开关/间隔/跳过版本/更新源字
 
 **Files:**
 - Modify: `app.go`（字段、`startup`、`OnShutdown`、`SetSettings`、9 个绑定）
-- Modify: `frontend/wailsjs/go/main/App.js`、`App.d.ts`、`models.ts`（**用 wails 重新生成，不要手改**）
+- Modify: `frontend/wailsjs/go/main/App.js`、`frontend/wailsjs/go/main/App.d.ts`、`frontend/wailsjs/go/models.ts`（**用 wails 重新生成，不要手改**；`models.ts` 在 `go/` 下，不在 `go/main/` 下 —— 两阶段评审核对过生成物布局）
 - Test: `app_update_test.go`（新建）
 
 **Interfaces:**
@@ -3383,6 +3564,7 @@ Expected: FAIL —— `a.GetUpdateInfo undefined`。
 		Launch:  update.StartDetached,
 		Acquire: update.Acquire,
 		Emit:    func(event string, payload any) { runtime.EventsEmit(a.ctx, event, payload) },
+		Log:     a.logUpdate,
 		Config:  a.updateSettings,
 		Save:    a.saveUpdateSettings,
 	})
@@ -3398,7 +3580,21 @@ Expected: FAIL —— `a.GetUpdateInfo undefined`。
 		a.updater.Reconfigure()
 	}
 
-// ⑤ 配置读写与可执行文件路径（必须直读 a.cfg，避免前端快照回写）
+// ⑤ 配置读写、诊断日志与可执行文件路径（必须直读 a.cfg，避免前端快照回写）
+
+// logUpdate 把更新服务的诊断信息转发到前端日志面板（复用既有 log 事件）。
+func (a *App) logUpdate(msg string) {
+	if a.emit == nil {
+		return
+	}
+	a.emit(forward.Event{
+		SourceType: "system",
+		SourceID:   "update",
+		TS:         time.Now().Format(time.RFC3339),
+		Level:      "info",
+		Message:    msg,
+	})
+}
 func (a *App) updateSettings() update.Settings {
 	if a.cfg == nil {
 		return update.Settings{Auto: true, Interval: 12 * time.Hour}
@@ -3497,7 +3693,7 @@ func (a *App) OpenReleasePage() error {
 
 **导入与守卫（否则编译不过）**：
 
-- 新增导入：`gosruntime "runtime"`（**必须起别名**，因为 app.go 已导入 Wails 的 `runtime`）、`net/http`、`os`、`time`、`"sshore/internal/update"`（`errors`/`config` 已在）。
+- 只新增三个导入：`gosruntime "runtime"`（**必须起别名**，因为 app.go 已导入 Wails 的 `runtime`）、`net/http`、`"sshore/internal/update"`。**`os`、`time`、`errors`、`config` 在 app.go 里已经导入**，再加会编译失败（两阶段评审指出）。
 - `a.ctx` 在测试里可能为 nil：`Check`/`StartDownload` 内部只用 ctx 做取消，nil 会 panic —— 所有绑定统一用 `if a.updater == nil || a.ctx == nil { return ... }` 双守卫。
 
 - [ ] **Step 4: 重新生成并提交 wailsjs 绑定**
@@ -3505,10 +3701,13 @@ func (a *App) OpenReleasePage() error {
 ```bash
 wails generate module
 git status --short frontend/wailsjs
-grep -c "GetUpdateInfo\|CheckUpdate\|ApplyUpdateAndRestart" frontend/wailsjs/go/main/App.d.ts
+for f in GetUpdateInfo CheckUpdate StartUpdateDownload CancelUpdateDownload ApplyUpdateAndRestart DiscardUpdateDownload SkipUpdateVersion ClearSkippedUpdate OpenReleasePage; do
+  grep -q "$f" frontend/wailsjs/go/main/App.d.ts || { echo "绑定缺失: $f"; exit 1; }
+done
+grep -q "UpdateInfo" frontend/wailsjs/go/models.ts && echo "models.ts 已含 UpdateInfo"
 ```
 
-Expected: `wails generate module` 成功；`App.d.ts` / `App.js` 出现 9 个新函数（grep 计数 ≥ 3 行命中）；`models.ts` 出现 `update.UpdateInfo`。
+Expected: `wails generate module` 成功；上面的循环对 9 个函数逐一校验（缺任一就退出 1），并确认 `frontend/wailsjs/go/models.ts` 里出现 `UpdateInfo`。
 
 - [ ] **Step 5: 运行测试确认通过**
 
@@ -3547,9 +3746,11 @@ git commit -m "feat(app): 更新检查绑定与 startup/OnShutdown/SetSettings �
 package update
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -3574,20 +3775,38 @@ func runScript(t *testing.T, plan Plan, pid int) (string, error) {
 }
 
 // newFixture 造出旧二进制 + 待安装文件 + 一份更早的备份。
+// fakeBinary 是「可执行且能存活 >3s」的假二进制：脚本第 8 步会做 3 秒存活探测，
+// 用不可执行的字面量会让脚本走回滚分支（两阶段评审实测）。它把 PID 写进 fake.pid，
+// 由 t.Cleanup 杀掉，避免测试留下孤儿进程。
+const fakeBinary = "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/fake.pid\"\nsleep 30\n"
+
 func newFixture(t *testing.T) Plan {
 	t.Helper()
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "sshore")
-	if err := os.WriteFile(exe, []byte("OLD"), 0o755); err != nil {
+	if err := os.WriteFile(exe, []byte("OLD\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	p := PlanFor("linux", exe, "v0.6.0", "v0.7.0", 0, DefaultWait)
-	if err := os.WriteFile(p.Pending, []byte("NEW"), 0o755); err != nil {
+	if err := os.WriteFile(p.Pending, []byte(fakeBinary), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "sshore.v0.5.0"), []byte("OLDER"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "sshore.v0.5.0"), []byte("OLDER\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		raw, err := os.ReadFile(filepath.Join(dir, "fake.pid"))
+		if err != nil {
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if err != nil {
+			return
+		}
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Kill()
+		}
+	})
 	return p
 }
 
@@ -3606,15 +3825,12 @@ func TestScriptSuccessPath(t *testing.T) {
 	p := newFixture(t)
 	st, _ := os.Stat(p.Pending)
 	p.Size = st.Size()
-	log, err := runScript(t, p, exitedChild(t))
-	if err != nil {
-		t.Fatalf("脚本应成功: %v\nlog=%s", err, log)
+	if _, err := runScript(t, p, exitedChild(t)); err != nil {
+		t.Fatalf("脚本应成功: %v", err)
 	}
-	if !strings.Contains(log, "RESULT=ok") {
-		t.Fatalf("日志缺少 RESULT=ok: %s", log)
-	}
-	if got, _ := os.ReadFile(p.Target); string(got) != "NEW" {
-		t.Fatalf("正式二进制内容错误: %q", got)
+	got, readErr := os.ReadFile(p.Target)
+	if readErr != nil || !strings.HasPrefix(string(got), "#!/bin/sh") {
+		t.Fatalf("正式二进制内容错误: %q %v", got, readErr)
 	}
 	if _, err := os.Stat(p.Pending); !os.IsNotExist(err) {
 		t.Fatal("成功路径 pending 必须已被消费")
@@ -3627,6 +3843,10 @@ func TestScriptSuccessPath(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(p.ExeDir, "sshore-update.sh")); !os.IsNotExist(err) {
 		t.Fatal("成功路径脚本必须自删")
+	}
+	// 成功路径会删除日志（spec §8.3 第 9 步），所以只能断言它不存在，不能断言内容
+	if _, err := os.Stat(p.LogPath); !os.IsNotExist(err) {
+		t.Fatal("成功路径日志必须被删除")
 	}
 }
 
@@ -3679,7 +3899,7 @@ func TestScriptWaitTimeoutKeepsEverything(t *testing.T) {
 func TestScriptLaunchFailureRollsBack(t *testing.T) {
 	// 新版起不来（用立刻退出的假二进制模拟）：脚本必须回滚并保留 pending（spec §8.3）。
 	p := newFixture(t)
-	if err := os.WriteFile(p.Pending, []byte("#!/bin/sh«BS»nexit 0«BS»n"), 0o755); err != nil {
+	if err := os.WriteFile(p.Pending, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	st, _ := os.Stat(p.Pending)
@@ -3704,7 +3924,7 @@ func TestScriptLaunchFailureRollsBack(t *testing.T) {
 
 func TestScriptSelfDeletesWhenInvokedByRelativePath(t *testing.T) {
 	// 计划里的脚本会在替换前 cd 到目标目录；若 $0 是相对路径，朴素的 rm -f "$0" 会静默失败，
-	// 留下一个陈旧的 shshore-update.sh（本计划实测过这个 bug），所以脚本必须用 $SELF 绝对路径自删。
+	// 留下一个陈旧的 sshore-update.sh（本计划实测过这个 bug），所以脚本必须用 $SELF 绝对路径自删。
 	p := newFixture(t)
 	st, _ := os.Stat(p.Pending)
 	p.Size = st.Size()
@@ -3712,32 +3932,36 @@ func TestScriptSelfDeletesWhenInvokedByRelativePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(p.ExeDir, "shshore-update.sh"), body, 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(p.ExeDir, "sshore-update.sh"), body, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	// 用相对文件名 + cmd.Dir 调用，模拟「相对路径」场景
-	cmd := exec.Command("sh", "shshore-update.sh", ScriptArgs(p, exitedChild(t))...)
+	cmd := exec.Command("sh", "sshore-update.sh", ScriptArgs(p, exitedChild(t))...)
 	cmd.Dir = p.ExeDir
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("脚本应成功: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(p.ExeDir, "shshore-update.sh")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(p.ExeDir, "sshore-update.sh")); !os.IsNotExist(err) {
 		t.Fatal("相对路径调用时脚本也必须自删（用 $SELF）")
 	}
 }
 
 func TestScriptArgsValidation(t *testing.T) {
 	p := newFixture(t)
-	// --target 不存在 → 参数校验失败（RESULT=fail:args）；--backup 的父目录不存在则应在第 5 步失败
+	// --target 不存在 → 参数校验失败：必须写 RESULT=fail:args 并按 spec §8.2 退 2
 	p.Target = filepath.Join(p.ExeDir, "not-there")
 	st, _ := os.Stat(p.Pending)
 	p.Size = st.Size()
 	log, err := runScript(t, p, exitedChild(t))
 	if err == nil {
-		t.Fatalf("备份目录不存在必须失败, log=%s", log)
+		t.Fatalf("target 不存在必须失败, log=%s", log)
 	}
-	if !strings.HasPrefix(log, "STEP=") && !strings.Contains(log, "RESULT=fail:") {
-		t.Fatalf("失败必须写日志协议: %s", log)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("参数类失败必须退 2，实际 %v（log=%s）", err, log)
+	}
+	if !strings.Contains(log, "RESULT=fail:args") {
+		t.Fatalf("参数类失败必须写 RESULT=fail:args: %s", log)
 	}
 }
 
@@ -3749,7 +3973,7 @@ func TestScriptArgsValidation(t *testing.T) {
 go test ./internal/update/ -run TestScript -v
 ```
 
-Expected: 4 个测试 PASS。**若 `TestScriptCleanupKeepsPending` 失败，说明脚本第 4 步在删 pending —— 回到 Task 6 第 4 步修 cd + basename 比较。**
+Expected: 6 个测试 PASS（成功 / 清理保留 pending / 相对路径自删 / 等待超时 / 参数非法 / 新版起不来回滚）。**若 `TestScriptCleanupKeepsPending` 失败，说明脚本第 4 步在删 pending —— 回到 Task 6 第 4 步修 cd + basename 比较。**
 
 - [ ] **Step 3: 提交**
 
@@ -4010,6 +4234,15 @@ describe("update store", () => {
     expect(s.badgeVisible).toBe(true);
   });
 
+  it("available 已确认后进入 ready 会重新亮（spec §12.2）", () => {
+    const s = useUpdateStore();
+    s.applyState(info({ seq: 1, state: "available", latest: "v0.7.0" }));
+    s.acknowledge();
+    expect(s.badgeVisible).toBe(false);
+    s.applyState(info({ seq: 2, state: "ready", latest: "v0.7.0" }));
+    expect(s.badgeVisible).toBe(true);
+  });
+
   it("skipped / disabled 不亮角标", () => {
     const s = useUpdateStore();
     s.applyState(info({ seq: 1, state: "skipped", latest: "v0.7.0", skipped: true }));
@@ -4149,7 +4382,7 @@ git commit -m "feat(web): 更新状态 store（seq 归约、角标派生、动�
 
 - [ ] **Step 2: 写测试（含「跳过 → 改主题 → 保存 → 跳过仍在」）**
 
-沿用仓库既有做法（`stores/settings.test.js` 的 `vi.hoisted` + `vi.mock("../../wailsjs/go/main/App")`，把绑定挡在测试之外）：
+沿用仓库既有做法（`stores/settings.test.js` 的 `vi.hoisted` + `vi.mock("../../wailsjs/go/main/App")`，把绑定挡在测试之外）。**注意：下面两个用例要放进文件里已有的 `describe`（其 `beforeEach` 调用 `setActivePinia(createPinia())`），否则 `useSettingsStore()` 会因没有活动 pinia 而报错**：
 
 ```js
 // stores/settings.test.js：扩展 backend 假后端，并在测试里模拟「后端先写跳过版本、前端再重读」
@@ -4194,6 +4427,11 @@ const acts = computed(() => actions(update.info));
 const label = computed(() => stateLabel(update.info));
 const message = computed(() => statusMessage(update.info));
 const percent = computed(() => progressPercent(update.info));
+// 更新说明可能很长：截断到 2000 字符（spec §12.1）
+const notesExcerpt = computed(() => {
+  const n = update.info.notes || "";
+  return n.length > 2000 ? n.slice(0, 2000) + "…" : n;
+});
 
 onMounted(() => { update.hydrate(); });
 
@@ -4216,7 +4454,7 @@ async function applyNow() {
       <div class="fill" :style="{ width: (percent ?? 5) + '%' }" />
       <span v-if="percent !== null">{{ percent }}%</span>
     </div>
-    <details v-if="update.info.notes"><summary>更新说明</summary><pre>{{ update.info.notes }}</pre></details>
+    <details v-if="notesExcerpt"><summary>更新说明</summary><pre>{{ notesExcerpt }}</pre></details>
     <div class="btns">
       <button v-if="acts.check" :disabled="update.info.state === 'checking'" @click="update.check()">检查更新</button>
       <button v-if="acts.download" class="primary" @click="update.download()">下载更新</button>
@@ -4240,16 +4478,17 @@ async function applyNow() {
     <div class="field">
       <label for="update-source">更新源</label>
       <input id="update-source" v-model="settings.updateSource" placeholder="默认 GitHub（可填镜像 API 地址）" />
+      <button class="link" @click="settings.updateSource = ''">恢复默认</button>
     </div>
     <p v-if="customSource && !settings.updateSource.startsWith('https://')" class="warn">非本机地址必须使用 https。</p>
   </section>
 </template>
 ```
 
-- [ ] **Step 4: 挂到 SettingsDialog（帮助段上方）并加 SSR 渲染测试**
+- [ ] **Step 4: 挂到 SettingsDialog（**帮助段下方**，见 spec §5.4）并加 SSR 渲染测试**
 
 ```vue
-<!-- SettingsDialog.vue：import UpdateSection from "./UpdateSection.vue"，在 <section class="group help"> 之前插入： -->
+<!-- SettingsDialog.vue：import UpdateSection from "./UpdateSection.vue"，在 <section class="group help"> 之后插入： -->
 <UpdateSection />
 ```
 
@@ -4367,7 +4606,7 @@ describe("更新功能的结构性不变量", () => {
 cd frontend && npx vitest run
 ```
 
-Expected: 全部 PASS（新增用例 + 既有 187 个不回归）。
+Expected: 全部 PASS（新增用例 + 既有用例不回归；**以 `npx vitest` 实际输出为准**，spec §14.1 明确不写死数字）。
 
 - [ ] **Step 4: 提交**
 
@@ -4399,37 +4638,60 @@ git commit -m "feat(web): 设置按钮更新角标 + 结构性不变量测试"
 - [ ] **Step 2: 在 go-windows job 加「真实 cmd.exe 跑脚本」**
 
 ```yaml
-      # 断言「新版起不来 → 回滚」这条分支：CI 里没有可长期运行的真 exe，
-      # 成功路径由 Linux 的脚本真跑测试（Task 12）与 Windows 真机验收（Task 19）覆盖。
-      - name: 真实 cmd.exe 跑 update.cmd（回滚路径）
+      # 用真实 PE 覆盖「成功」与「回滚」两条路径（spec §11.3/§13.2、DoD #4）：
+      #   · 成功：把一个长期存活的真 exe（cmd.exe）当「新版本」，存活探测通过 → RESULT=ok
+      #   · 回滚：把一个立刻退出的真 exe（whoami.exe）当「新版本」，探测失败 → RESULT=fail:launch
+      - name: 真实 cmd.exe 跑 update.cmd（成功路径）
         shell: pwsh
         run: |
-          $dir = Join-Path $env:RUNNER_TEMP "upd"
+          $dir = Join-Path $env:RUNNER_TEMP "upd-ok"
           New-Item -ItemType Directory -Force $dir | Out-Null
-          Set-Content -Path (Join-Path $dir "sshore.exe") -Value "OLD" -NoNewline
-          # 假「新版本」是文本文件：start 必然失败 → 存活探测失败 → 回滚
-          Set-Content -Path (Join-Path $dir "sshore.v0.7.0.exe") -Value "NEW" -NoNewline
+          Copy-Item "$env:SystemRoot\System32\whoami.exe" (Join-Path $dir "sshore.exe")
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" (Join-Path $dir "sshore.v0.7.0.exe")
           Copy-Item internal/update/scripts/update.cmd (Join-Path $dir "sshore-update.cmd")
           $size = (Get-Item (Join-Path $dir "sshore.v0.7.0.exe")).Length
-          $env:SSHORE_PID = "1"   # PID 1 不存在 → 等待循环立即通过
+          $env:SSHORE_PID = "1"
           $env:SSHORE_TARGET = Join-Path $dir "sshore.exe"
           $env:SSHORE_PENDING = Join-Path $dir "sshore.v0.7.0.exe"
           $env:SSHORE_BACKUP = Join-Path $dir "sshore.v0.6.0.exe"
           $env:SSHORE_SIZE = "$size"
           $env:SSHORE_LOG = Join-Path $dir "sshore-update.log"
-          $env:SSHORE_WAIT = "5"
-          Push-Location $dir
-          cmd /d /c "sshore-update.cmd"
-          $code = $LASTEXITCODE
-          Pop-Location
+          $env:SSHORE_WAIT = "10"
+          Push-Location $dir; cmd /d /c "sshore-update.cmd"; $code = $LASTEXITCODE; Pop-Location
+          if ($code -ne 0) { throw "成功路径应退 0，实际 $code" }
+          if (-not (Test-Path (Join-Path $dir "sshore.v0.6.0.exe"))) { throw "缺少备份" }
+          if ((Get-Item (Join-Path $dir "sshore.exe")).Length -ne $size) { throw "未替换为新版本" }
+          if (Test-Path (Join-Path $dir "sshore.v0.7.0.exe")) { throw "pending 未被消费" }
+          if (Test-Path (Join-Path $dir "sshore-update.cmd")) { throw "脚本未自删" }
+          if (Test-Path (Join-Path $dir "sshore-update.log")) { throw "日志未删除" }
+          taskkill /IM sshore.exe /F 2>$null | Out-Null   # 收掉存活探测留下的 cmd.exe
+
+      - name: 真实 cmd.exe 跑 update.cmd（存活探测失败 → 回滚）
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "upd-fail"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" (Join-Path $dir "sshore.exe")
+          $oldSize = (Get-Item (Join-Path $dir "sshore.exe")).Length
+          Copy-Item "$env:SystemRoot\System32\whoami.exe" (Join-Path $dir "sshore.v0.7.0.exe")
+          Copy-Item internal/update/scripts/update.cmd (Join-Path $dir "sshore-update.cmd")
+          $size = (Get-Item (Join-Path $dir "sshore.v0.7.0.exe")).Length
+          $env:SSHORE_PID = "1"
+          $env:SSHORE_TARGET = Join-Path $dir "sshore.exe"
+          $env:SSHORE_PENDING = Join-Path $dir "sshore.v0.7.0.exe"
+          $env:SSHORE_BACKUP = Join-Path $dir "sshore.v0.6.0.exe"
+          $env:SSHORE_SIZE = "$size"
+          $env:SSHORE_LOG = Join-Path $dir "sshore-update.log"
+          $env:SSHORE_WAIT = "10"
+          Push-Location $dir; cmd /d /c "sshore-update.cmd"; $code = $LASTEXITCODE; Pop-Location
           $log = Get-Content (Join-Path $dir "sshore-update.log") -Raw
           if ($code -eq 0) { throw "新版起不来时脚本必须非 0 退出" }
           if ($log -notmatch "RESULT=fail:launch") { throw "日志应记录 RESULT=fail:launch，实际：$log" }
-          if ((Get-Content (Join-Path $dir "sshore.exe") -Raw) -notmatch "OLD") { throw "回滚后必须是旧版本" }
+          if ((Get-Item (Join-Path $dir "sshore.exe")).Length -ne $oldSize) { throw "回滚后必须是旧版本" }
           if (-not (Test-Path (Join-Path $dir "sshore.v0.7.0.exe"))) { throw "回滚后 pending 必须保留" }
 ```
 
-（脚本第 8 步会 `start` 一个假 exe 并做存活探测——用 `sshore.exe` 内容为 `NEW` 的文本文件会启动失败，因此这里只验证到替换为止：把 `SSHORE_WAIT` 之外的步骤当作契约，**存活探测的失败回滚**由 Linux 的 Task 12 覆盖，Windows 全链路由 Task 19 的真机验收覆盖。）
+这样 Windows CI 就覆盖了 spec §13.2 要求的 1/2/3/4 与「存活探测失败回滚」：成功路径用长期存活的真 PE（`cmd.exe`，探测通过后由 `taskkill` 收掉），回滚路径用立刻退出的真 PE（`whoami.exe`）。**不再依赖「文本文件当 exe」这种不确定行为**（两阶段评审指出它会 flaky 并自相矛盾）。
 
 - [ ] **Step 3: release job 生成并上传 checksums.txt**
 
@@ -4440,7 +4702,7 @@ git commit -m "feat(web): 设置按钮更新角标 + 结构性不变量测试"
           find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -print0 \
             | sort -z \
             | xargs -0 sha256sum \
-            | awk '{ n=$0; sub(/^[^ ]+  /, "", n); print $1"  "n }' > checksums.txt
+            | awk '{ n=$0; sub(/^[^ ]+  /, "", n); sub(/^.*\//, "", n); print $1"  "n }' > checksums.txt
           cat checksums.txt
 
       - name: Publish binaries to GitHub Release
@@ -4456,11 +4718,20 @@ git commit -m "feat(web): 设置按钮更新角标 + 结构性不变量测试"
 
 ```bash
 mkdir -p /tmp/ck && cd /tmp/ck && printf x > sshore-v0.7.0-linux-amd64.tar.gz && printf y > sshore-v0.7.0-windows-amd64.zip
-find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -print0 | sort -z | xargs -0 sha256sum | awk '{ n=$0; sub(/^[^ ]+  /, "", n); print $1"  "n }' > checksums.txt
+find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -print0 | sort -z | xargs -0 sha256sum | awk '{ n=$0; sub(/^[^ ]+  /, "", n); sub(/^.*\\/, "", n); print $1"  "n }' > checksums.txt
 cat checksums.txt
 ```
 
-Expected: 两行 `<hash>  <文件名>`，与 `sha256sum <file>` 的哈希一致。
+Expected: 两行 `<hash>  <文件名>`（**只含 basename，不含目录**），且哈希与 `sha256sum <file>` 一致。
+
+**必须按 CI 的真实布局验证**（`actions/download-artifact` 不带 `name` 时会把每个 artifact 放进 `artifacts/<artifact 名>/` 子目录）：
+
+```bash
+mkdir -p /tmp/ck/sshore-linux && cd /tmp/ck && printf x > sshore-linux/sshore-v0.7.0-linux-amd64.tar.gz
+find . -type f -name "*.tar.gz" -print0 | sort -z | xargs -0 sha256sum | awk '{ n=$0; sub(/^[^ ]+  /, "", n); sub(/^.*\\/, "", n); print $1"  "n }'
+```
+
+Expected: 输出是 `hash  sshore-v0.7.0-linux-amd64.tar.gz`（**不是** `hash  ./sshore-linux/...`）；否则应用按 basename 查表会永远 verify-failed。
 
 - [ ] **Step 5: 提交**
 
@@ -4533,7 +4804,7 @@ git commit -m "docs: README 增「更新与升级」一节（源/校验/隐私/�
 ### Task 19: 端到端验收、DoD 与变异校验
 
 **Files:**
-- Create（不入库）: `.superpowers/update-2026-09-19/acceptance.md`（证据清单 + 结论）
+- Create（**入库**）: `docs/superpowers/reports/2026-09-19-update-check-upgrade-acceptance.md`（证据清单 + 结论；DoD #5/#6/#7/#10 的可复核依据）。原始截图/日志可放 `.superpowers/update-2026-09-19/`（gitignore），但报告里要写清每个证据文件的路径
 - Create: `e2e/fake_update_source.py`（把假源与「现场构建产物」的用法固化成可复现脚本，入库）
 
 - [ ] **Step 1: 写假源脚本（本地 HTTP，提供 /releases/latest 与资产）**
@@ -4542,8 +4813,9 @@ git commit -m "docs: README 增「更新与升级」一节（源/校验/隐私/�
 #!/usr/bin/env python3
 """为更新功能提供本地假源：/releases/latest 的 JSON + 资产 + checksums.txt。
 
-用法：fake_update_source.py <端口> <目录>；目录里放：
+用法：fake_update_source.py <端口> <目录> <tag>；目录里放：
   sshore-v<tag>-linux-amd64.tar.gz / -windows-amd64.zip、checksums.txt
+（三个参数都必填：代码从 sys.argv[1..3] 读 PORT/ROOT/TAG）
 """
 import hashlib
 import json
@@ -4592,21 +4864,27 @@ HTTPServer(("127.0.0.1", PORT), H).serve_forever()
 ```bash
 rm -rf /tmp/upd-src && git clone --depth 1 . /tmp/upd-src && cd /tmp/upd-src
 # 用当前工作树构建：版本号抬高到 v9.9.9（只要 > 当前版本即可）
+# ① 先构建「升级前」的旧二进制：必须是**干净 tag** 版本的 release 构建，
+#    否则 Task 9 的门卫（!IsRelease → disabled）或版本比较（Compare<=0 → up-to-date）会让自动检查不产生 available。
+make linux COMPRESS=0 VERSION=v0.6.0 2>/dev/null || wails build -platform linux/amd64 -skipbindings -ldflags "-X main.Version=v0.6.0" -trimpath
+cp build/bin/sshore /tmp/sshore-old-v0.6.0
+# ② 再构建「新版本」产物（版本号只要大于 v0.6.0 即可）
 make linux COMPRESS=0 VERSION=v9.9.9 2>/dev/null || wails build -platform linux/amd64 -skipbindings -ldflags "-X main.Version=v9.9.9" -trimpath
 mkdir -p /tmp/upd-www && tar -czf /tmp/upd-www/sshore-v9.9.9-linux-amd64.tar.gz -C build/bin sshore
 cd /tmp/upd-www && sha256sum sshore-v9.9.9-linux-amd64.tar.gz | awk '{print $1"  "$2}' > checksums.txt
-python3 e2e/fake_update_source.py 8799 /tmp/upd-www v9.9.9 &
+# ③ 启动假源（注意：假源脚本在 /tmp/upd-src 里，且 git clone 只含**已提交**内容 —— 若脚本还没入库，用仓库工作区的绝对路径）
+python3 /home/lan/workspace/scripts/sshkit/e2e/fake_update_source.py 8799 /tmp/upd-www v9.9.9 &
 ```
 
 Expected: 假源在 `http://127.0.0.1:8799` 提供 JSON、资产与校验文件。
 
 - [ ] **Step 3: Linux 端到端（自动化到 ready；升级那一步允许人工点击并如实记录）**
 
-1. 用**独立目录**放一份旧版本二进制（例如 `cp build/bin/sshore /tmp/upd-live/sshore`）；
+1. 用**独立目录**放一份「升级前」的二进制：`mkdir -p /tmp/upd-live && cp /tmp/sshore-old-v0.6.0 /tmp/upd-live/sshore`（**必须**是 Step 2 ① 里那个 `VERSION=v0.6.0` 的 Clean 版本构建）；
 2. 把配置写进 `config.DefaultConfigPath()` 指向的文件（Linux `~/.config/sshore/sshore.toml`、Windows `%AppData%\\sshore\\sshore.toml`；**先把它备份成 `sshore.toml.bak`，验收结束原样还原**）：`update_source = "http://127.0.0.1:8799"`、`update_check_auto = true`、`update_check_interval_hours = 0`（关轮询，只留首查）；
 3. 启动应用（Xvfb :9 或当前桌面），等 5s 首查，断言界面出现 `available` 与角标；
 4. 点「下载更新」（合成点击或人工），等状态 `ready`，检查磁盘：`sshore.v9.9.9` 与 `sshore.v9.9.9.sha256` 存在；
-5. 点「重启并升级」；脚本会替换二进制并启动新版；**断言**：`sshore` 内容 = 新构建（比对 sha256）、`sshore.<旧版本>` 备份存在、脚本与日志消失、窗口标题显示 `SSHORE v9.9.9`。
+5. 点「重启并升级」；脚本会替换二进制并启动新版；**断言**：`sshore` 内容 = 新构建（比对 sha256）、`sshore.<旧版本>` 备份存在、脚本与日志消失、窗口标题显示 `SSHore v9.9.9`（app.go:56 的 appTitle 是 `"SSHore " + Version`，注意大小写）。
 
 - [ ] **Step 4: Windows VM 端到端 + Defender 证据**
 
@@ -4637,11 +4915,12 @@ go test ./internal/update/ -run TestIsPendingName -count=1
 #    期望：TestScriptCleanupKeepsPending 失败
 go test ./internal/update/ -run TestScriptCleanup -count=1
 
-# ③ 去掉 sidecar 重算：把 ApplyAndRestart 的 VerifyFile 调用删掉，用篡改过的 pending
-#    期望：TestInitSelfCheck* 或 service 的 apply 测试失败（若暂无 apply 测试，先补一条）
-go test ./internal/update/ -run "TestApply|TestSelfCheck" -count=1
+# ③ 去掉 sidecar 重算：删掉 ApplyAndRestart 里的 VerifyFile 调用
+#    期望：TestApplyRejectsTamperedPendingSidecar 失败
+go test ./internal/update/ -run "TestApplyRejectsTamperedPendingSidecar" -count=1
 
 # ④ 去掉 Check 在 applying 的守卫：把 StateApplying 从拒绝分支移除
+#    期望：TestCheckRejectedWhileDownloadingOrReady 的 applying 断言失败
 go test ./internal/update/ -run TestCheckRejected -count=1
 
 # ⑤ 脚本第 8 步去掉存活探测：删掉 if ! kill -0 分支
@@ -4691,6 +4970,40 @@ Expected: `make ci` 全绿；既有 `e2e/test_local.sh` 不回归。
 **2. 占位符扫描**：全文无 TBD/TODO；每个代码步骤都给了可直接落盘的内容；命令都带期望输出。
 
 **3. 类型与命名一致性**：`Plan`/`UpdateInfo`/`Settings`/`Options` 的字段在 Task 5、8、9、11、13、14 之间一致；`ScriptArgs`/`ScriptEnv`/`ScriptName`/`ScriptBytes`/`StartDetached` 在 Task 6 定义、Task 11 使用；`StateXxx` 常量只在 Task 8 定义；前端 `actions()` 的键名（check/download/cancel/apply/discard/skip/clearSkip/openPage）在 Task 13、15、16 一致。
+
+
+---
+
+## 两阶段审核记录（对**计划本身**）
+
+第一阶段（本地自审，已提交 `486aad3`）修正 13 处；第二阶段委托两个**全新上下文、只读**的 subagent 独立评审：
+A 负责 Task 0–12（Go 后端 + 脚本 + CI 里的 Windows 脚本），B 负责 Task 13–19（前端 + CI + 端到端/DoD）。
+两份结论共 **17 条 Blocking、20 条 Important、21 条 Minor**，逐条在本地复核后处置如下。
+
+### 已修（按主题）
+
+| 主题 | 具体问题 |
+|---|---|
+| 不能编译 | `pendingRe` 定义丢失；`StartDetached` 在非 build-tag 文件里用了 Windows 专属 `SysProcAttr` 字段（Linux 编译失败）；`lock_windows.go` 的 `"Global" + "\"` 非法字面量；`download_test.go` 缺 `}))` |
+| 测试与实现互相矛盾 | `checksum_test.go` 用 6 位哈希 vs 实现要求 64 位；`extract_test.go` 期望拒绝 `../` 但 `path.Base` 把它洗白；`plan_test.go` 期望 describe 备份名而实现走了时间戳；`service_test.go` 期望 `v0.7.0` 而实现存 `0.7.0`；`store_test.go` 对完整结构体做 `==`（被既有 Theme/FontScale 默认值打破）；脚本夹具用不可执行的 `NEW` 导致成功路径必然回滚且日志已被删除 |
+| 端到端必然失败 | checksums.txt 写成 `./<artifact 名>/<文件>`（应用按 basename 查表 → 永远 verify-failed）；假源脚本用相对路径调用；旧二进制不是 Clean release 版本（门卫/版本比较会让 `available` 永不出现） |
+| DoD 抓不住变异 | 变异 ③（sidecar 重算）与 ④（applying 守卫）没有对应测试 → 补 `TestApplyRejectsTamperedPendingSidecar`、给 Check 拒绝用例加 applying；`-run` 模式写错（`TestSelfCheck` 不匹配） |
+| Windows CI 与 DoD 不一致 | 原方案只断言回滚且用「文本文件当 exe」（flaky）；改为**真实 PE**：成功路径用长期存活的 `cmd.exe`（探测通过后 `taskkill`），回滚路径用立刻退出的 `whoami.exe` |
+| 并发/健壮性 | `download` 持锁调用 `failIO/failVerify` 会自死锁；空闲超时与用户取消不可区分（改用 `atomic.Bool` 看门狗标志）；`loop` 无锁读 `stopCh`（`-race` 会报）；Task 11 重复导入 `os`/`time`；cmd 缺 PID/SIZE/WAIT 正整数校验且有一行无效赋值；sh 的 `args` 失败按 spec 应退 2 |
+| spec ↔ 计划不一致 | spec §5.1 的 `Download`/`PlanFor`/`script.go` 签名、§11.4 的 awk 目录剥除同步到与计划一致；`models.ts` 路径更正为 `frontend/wailsjs/go/models.ts` |
+| 缺失能力 | 更新服务没有诊断日志通道（X-RateLimit、门卫原因、自动检查失败）→ `Options.Log` + `App.logUpdate` 接到日志面板；检查请求补 10s 总超时；设置页补「恢复默认」与 notes 2000 字符截断；验收报告改为**入库**到 `docs/superpowers/reports/` |
+
+### 审核之外：我实际跑过的东西（证据）
+
+- **脚本真跑**：把 Task 6 的 `update.sh` 抽出来在临时目录执行 → 抓到「`$0` 为相对路径 + `cd` 后 `rm -f "$0"` 静默失败、升级成功后残留脚本」这个真 bug（已修并用 `$SELF` + 相对路径调用测试锁住）。
+- **正则**：`pendingRe` 对 9 个真实文件名逐一验证（含 `sshore.exe`、`*.sha256`、describe 串）。
+- **Go 编译**：把 Task 1 的 `version.go` 从计划里抽出来放进临时模块，`gofmt`/`go vet`/`go test` 全绿（覆盖计划里那 3 个测试与 9 个 `ParsePendingName` 用例）。
+
+### 尚未做（诚实记录）
+
+- 计划里其余 Go 代码块**没有整体编译过**（只有 Task 1 的片段做了真实编译）；编译闸门是计划自身的 Task 1–11 各 Step 4/5，执行时逐任务触发。
+- Task 12 的脚本真跑测试在本机没有跑过（计划里的脚本片段已跑过，Go 测试代码未跑）。
+- 真机（Windows VM / Defender、Linux GUI 端到端）属 Task 19，尚未执行。
 
 **4. 已知的刻意简化**（不是遗漏）：
 
