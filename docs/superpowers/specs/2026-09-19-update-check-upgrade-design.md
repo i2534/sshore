@@ -112,7 +112,7 @@
 |---|---|---|
 | version.go | 版本**分类**与比较 | type Kind int（Clean/Describe/Dev/Invalid）、Class(v string) Kind、IsRelease(v) bool、Compare(a, b string) int、Base(v string) string、ParsePendingName(name string) (ver string, ok bool) |
 | source.go | 读 <source>/releases/latest | type Release struct{ Tag, Notes, PublishedAt string; Assets []Asset }、Asset{Name, URL string}、Latest(ctx, source string) (Release, error)、错误哨兵 ErrRateLimited/ErrCheckFailed |
-| asset.go | 挑本平台包与校验文件；**校验下载 URL 与源同源** | PickArchive(rel, goos, goarch) (Asset, error)、PickChecksums(rel) (Asset, error)、SameOrigin(source, rawURL string) bool |
+| asset.go | 挑本平台包与校验文件；**校验下载 URL 在受信主机集合内** | PickArchive(rel, goos, goarch) (Asset, error)、PickChecksums(rel) (Asset, error)、SameOrigin(source, rawURL string) bool（同 host；源为 api.github.com 时另允许 github.com / codeload.github.com / *.githubusercontent.com，理由见 §10.1） |
 | checksum.go | 解析 sha256sum 格式并比对 | ParseChecksums(io.Reader) (map[string]string, error)、VerifyFile(path, want string) error |
 | download.go | 流式下载 + 边下边算 SHA256 + 进度 + ctx 取消 + **超时** | Download(ctx, url, dest string, opt DownloadOpt, progress func(done, total int64)) (string, error)、FreeSpace(dir string) (int64, error) |
 | extract.go | 从 tar.gz/zip 只取出二进制 | ExtractBinary(archive, goos, dest string) error：按 filepath.Base+Clean 匹配白名单（sshore / sshore.exe）、**拒绝 symlink/hardlink**、多匹配报错、单条目 ≤ 64 MiB、拒绝路径遍历 |
@@ -462,7 +462,7 @@ applying 为终态（进程即将退出）
 
 - **信任根 = HTTPS + GitHub（i2534/sshore）账户与 GitHub 自身**。checksums.txt 与压缩包同源同主机，它能发现的是：**传输损坏、半包、资产错发/错配**；它**不能**防：更新源被攻破、GitHub 账户被盗后发布的被篡改 Release、自定义源被伪造。
 - 因此额外加两道：
-  1. **同源约束**：所有下载 URL（资产与 checksums.txt）必须与 update_source 同 host，否则 check-failed；
+  1. **下载来源白名单**：默认源是 `api.github.com`，但资产的 `browser_download_url` 在 `github.com`/`*.githubusercontent.com` 上——所以「同源」必须按**受信下载主机集合**实现，而不是字面 host 相等：同 host 通过；源为 `api.github.com` 时额外允许 `github.com`、`codeload.github.com`、`*.githubusercontent.com`；其它 host 一律 `check-failed`（`SameOrigin`，见 §5.1）；
   2. **pending 完整性持久化**：解包后写 sidecar <pending>.sha256，**apply 前（含重启后由残留自检进入的路径）重算比对**——补上「落盘后到 apply 之间被替换」的窗口。
 - 校验失败一律拒绝安装，程序目录不留残留（verify-failed 时连 pending 一起删）。
 
