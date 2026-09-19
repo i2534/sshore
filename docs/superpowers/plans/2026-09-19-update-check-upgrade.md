@@ -1430,9 +1430,6 @@ func FreeSpace(dir string) (int64, error) {
 
 ```go
 // freespace_windows.go
-
-```go
-// freespace_windows.go
 //go:build windows
 
 package update
