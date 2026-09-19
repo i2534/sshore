@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -177,8 +178,13 @@ func (s *Service) resolveSource() (string, string) {
 	if !strings.HasPrefix(src, "https://") && !strings.HasPrefix(src, "http://") {
 		return DefaultSource, "更新源非法，已回退默认源"
 	}
-	if strings.HasPrefix(src, "http://") && !strings.Contains(src, "127.0.0.1") && !strings.Contains(src, "localhost") {
-		return DefaultSource, "非 loopback 的更新源必须使用 https，已回退默认源"
+	if strings.HasPrefix(src, "http://") {
+		// fix round 1：必须对 Hostname() 做精确比较。用 strings.Contains 会被
+		// http://127.0.0.1.evil.com / http://localhost.evil.com 绕过（spec §10.2）。
+		u, err := url.Parse(src)
+		if err != nil || !isLoopbackHost(u.Hostname()) {
+			return DefaultSource, "非 loopback 的更新源必须使用 https，已回退默认源"
+		}
 	}
 	return src, ""
 }

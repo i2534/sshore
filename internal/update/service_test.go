@@ -348,3 +348,39 @@ func TestDiscardPendingKeepsExclusiveLockFile(t *testing.T) {
 		t.Fatalf("state = %s, want available", got)
 	}
 }
+
+// fix round 1：loopback 判定必须精确到 Hostname()，不能用 strings.Contains ——
+// 否则 http://127.0.0.1.evil.com / http://localhost.evil.com 会绕过
+// 「非 loopback 必须 https」（spec §10.2），把明文源指向攻击者主机。
+func TestResolveSourceLoopbackIsExact(t *testing.T) {
+	cases := []struct {
+		name     string
+		source   string
+		want     string
+		wantWarn bool
+	}{
+		{"恶意后缀 127.0.0.1 回退", "http://127.0.0.1.evil.com", DefaultSource, true},
+		{"恶意后缀 localhost 回退", "http://localhost.evil.com", DefaultSource, true},
+		{"loopback IPv4 带端口保留", "http://127.0.0.1:8799", "http://127.0.0.1:8799", false},
+		{"loopback localhost 带端口保留", "http://localhost:8799", "http://localhost:8799", false},
+		{"loopback 大小写归一保留", "http://LocalHost:8799", "http://LocalHost:8799", false},
+		{"loopback IPv6 保留", "http://[::1]:8799", "http://[::1]:8799", false},
+		{"非 loopback https 保留", "https://mirror.corp/api", "https://mirror.corp/api", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, _ := newSvc(t, "v0.6.0", func(o *Options) {
+				o.Config = func() Settings {
+					return Settings{Auto: true, Interval: time.Hour, Source: c.source}
+				}
+			})
+			got, warn := svc.resolveSource()
+			if got != c.want {
+				t.Fatalf("resolveSource(%q) = %q, want %q", c.source, got, c.want)
+			}
+			if (warn != "") != c.wantWarn {
+				t.Fatalf("resolveSource(%q) warn = %q, wantWarn=%v", c.source, warn, c.wantWarn)
+			}
+		})
+	}
+}
