@@ -18,7 +18,7 @@ watch(() => props.visible, (v) => { if (v) { err.value = ''; loadAppInfo() } })
 
 // 任一设置变更：立即应用（根节点）+ 落盘。忽略初次挂载/关闭时的赋值。
 watch(
-  () => [store.theme, store.fontScale, store.latinFont, store.cjkFont, store.autoStartOnLaunch],
+  () => [store.theme, store.fontScale, store.latinFont, store.cjkFont, store.autoStartOnLaunch, store.sftpTransport],
   async () => {
     if (!props.visible) return
     store.apply()
@@ -79,6 +79,18 @@ watch(
           <input type="checkbox" v-model="store.autoStartOnLaunch" />
           <span>启动后自动连接转发通道</span>
         </label>
+      </section>
+
+      <section class="group">
+        <h3>传输</h3>
+        <div class="field">
+          <label for="sftp-transport">SFTP 传输后端</label>
+          <select id="sftp-transport" v-model="store.sftpTransport">
+            <option value="">自动（跟随内置默认）</option>
+            <option value="gosftp">新实现 gosftp（当前默认）</option>
+            <option value="batch">旧实现 batch（兼容回退）</option>
+          </select>
+        </div>
       </section>
 
       <section class="group help">

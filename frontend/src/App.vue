@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted } from 'vue'
-import { EventsOn } from '../wailsjs/runtime/runtime'
+import { EventsOn, OnFileDrop, OnFileDropOff } from '../wailsjs/runtime/runtime'
+import { dispatchSystemDrop } from './utils/systemDrop'
 import { GetAppInfo } from '../wailsjs/go/main/App'
 import { useLogStore } from './stores/logs'
 import { useSettingsStore } from './stores/settings'
@@ -18,7 +19,15 @@ const fatal = ref('')
 function onErr(evt) { fatal.value = evt.detail }
 function dismissFatal() { fatal.value = '' }
 let offLog = null
+// 系统文件拖入：必须由前端调用 Wails 的 **JS 版** OnFileDrop 才会注册 webview 的
+// dragover/dragleave/drop 监听（Go 版 runtime.OnFileDrop 只订阅 wails:file-drop 事件，
+// 单用它收不到任何拖入）。挂载点放应用级：监听常驻，才不会有「切到别的标签后拖入文件
+// 被 webview 直接导航走」的窗口；useDropTarget=false 表示不依赖 --wails-drop-target 样式，
+// 由各视图自己按落点坐标判定目标面板。
+// 注意：Linux/WebKitGTK 上 Wails 拿不到真实路径（CanResolveFilePaths=false），外部拖入
+// 只有 Windows/WebView2 生效；监听仍在，至少保证 drop 被 preventDefault 不会导航。
 onMounted(() => {
+  OnFileDrop((x, y, paths) => dispatchSystemDrop({ x, y, paths }), false)
   // EventsOn 返回退订函数：不保存并在卸载时调用的话，dev 模式 HMR 重挂载会
   // 叠加注册，导致每条日志重复入 store（M6b）。
   offLog = EventsOn('log', (evt) => logStore.add(evt))
@@ -40,6 +49,7 @@ onMounted(() => {
 })
 onUnmounted(() => {
   if (offLog) offLog()
+  OnFileDropOff()
   window.removeEventListener('sshore:error', onErr)
 })
 </script>

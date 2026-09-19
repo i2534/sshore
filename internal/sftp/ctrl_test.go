@@ -1,6 +1,8 @@
 package sftp
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -76,7 +78,7 @@ func hasArg(args []string, want string) bool {
 }
 
 func TestBuildBatchAndWrite(t *testing.T) {
-	c := NewCtrl(nil, nil)
+	c := NewBatchBackend(nil, nil)
 	dir := t.TempDir()
 	b, err := c.buildBatch("get", "/remote/path", "/local/path")
 	if err != nil {
@@ -104,7 +106,7 @@ func TestBuildBatchAndWrite(t *testing.T) {
 }
 
 func TestBuildBatchQuoting(t *testing.T) {
-	c := NewCtrl(nil, nil)
+	c := NewBatchBackend(nil, nil)
 	cases := []struct {
 		op, remote, local, want string
 	}{
@@ -128,7 +130,7 @@ func TestBuildBatchQuoting(t *testing.T) {
 }
 
 func TestBuildBatchRejectsControlChars(t *testing.T) {
-	c := NewCtrl(nil, nil)
+	c := NewBatchBackend(nil, nil)
 	bad := []string{"/remote/evil\n!calc", "/remote/evil\r!calc", "/remote/evil\x00x"}
 	ops := []struct {
 		op, remote, local string
@@ -176,7 +178,7 @@ func TestConnectArgsIncludeConnectTimeout(t *testing.T) {
 		t.Skip("ControlMaster connect path is unix-only")
 	}
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	if err := c.Connect("myhost", ""); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -193,7 +195,7 @@ func TestConnectArgsIncludeConnectTimeout(t *testing.T) {
 
 func TestRunArgsIncludeConnectTimeout(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	if _, err := c.run("myhost", "", []byte("ls -l \"/\"\n")); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -213,7 +215,7 @@ func TestDisconnectArgsIncludeConnectTimeout(t *testing.T) {
 		t.Skip("Windows is per-command mode; no ssh -O exit call")
 	}
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	if err := c.Disconnect("myhost"); err != nil {
 		t.Fatalf("disconnect: %v", err)
 	}
@@ -253,7 +255,7 @@ func TestGetSurfacesStderr(t *testing.T) {
 		// Simulate `sftp` exiting 1 with a diagnostic on stderr.
 		return osutil.Outcome{Stderr: `File "/remote/nope.txt" not found.`, ExitCode: 1}, nil
 	}
-	c := NewCtrl(failRunner, nil)
+	c := NewBatchBackend(failRunner, nil)
 	err := c.Get("myhost", "", "/remote/nope.txt", "/local/nope.txt")
 	if err == nil {
 		t.Fatal("expected error for failed get")
@@ -281,7 +283,7 @@ func TestSftpEventsEmitted(t *testing.T) {
 	var mu sync.Mutex
 	var events []forward.Event
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, func(e forward.Event) {
+	c := NewBatchBackend(fr.run, func(e forward.Event) {
 		mu.Lock()
 		events = append(events, e)
 		mu.Unlock()
@@ -309,7 +311,7 @@ func TestSftpEventsEmitted(t *testing.T) {
 // 而不是裸退出码。
 func TestSftpFailedEventCarriesStderr(t *testing.T) {
 	var events []forward.Event
-	c := NewCtrl(func(name string, args ...string) (osutil.Outcome, error) {
+	c := NewBatchBackend(func(name string, args ...string) (osutil.Outcome, error) {
 		return osutil.Outcome{ExitCode: 1, Stderr: "Permission denied (publickey)"}, nil
 	}, func(e forward.Event) { events = append(events, e) })
 	if err := c.Get("ai", "", "/r/f", "/l/f"); err == nil {
@@ -349,7 +351,7 @@ func TestPutLogsCarrySize(t *testing.T) {
 		t.Fatal(err)
 	}
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, func(e forward.Event) { events = append(events, e) })
+	c := NewBatchBackend(fr.run, func(e forward.Event) { events = append(events, e) })
 	if err := c.Put("ai", "", local, "/remote/upload.bin"); err != nil {
 		t.Fatalf("put: %v", err)
 	}
@@ -367,7 +369,7 @@ func TestPutLogsCarrySize(t *testing.T) {
 
 // socket 路径必须随 user 变化：同 host 异 user 绝不能共用 master。
 func TestControlPathKeyedByUser(t *testing.T) {
-	c := NewCtrl(func(string, ...string) (osutil.Outcome, error) { return osutil.Outcome{}, nil }, nil)
+	c := NewBatchBackend(func(string, ...string) (osutil.Outcome, error) { return osutil.Outcome{}, nil }, nil)
 	a := c.controlPathFor("prod-01", "")
 	b := c.controlPathFor("prod-01", "alice")
 	if a == b {
@@ -377,7 +379,7 @@ func TestControlPathKeyedByUser(t *testing.T) {
 
 // Disconnect/Connected 只拿到 host，必须用内部记住的 user 反查同一个 socket。
 func TestRememberedUserUsedByHostOnlyAPI(t *testing.T) {
-	c := NewCtrl(func(string, ...string) (osutil.Outcome, error) { return osutil.Outcome{}, nil }, nil)
+	c := NewBatchBackend(func(string, ...string) (osutil.Outcome, error) { return osutil.Outcome{}, nil }, nil)
 	c.rememberUser("prod-01", "alice")
 	if got, want := c.controlPathFor("prod-01", c.userFor("prod-01")), c.controlPathFor("prod-01", "alice"); got != want {
 		t.Fatalf("host-only API 未复用记住的 user: %q vs %q", got, want)
@@ -387,7 +389,7 @@ func TestRememberedUserUsedByHostOnlyAPI(t *testing.T) {
 // socket 路径必须与 sshconn 的唯一来源逐字一致：两包各算一遍必然漂移，
 // 一旦漂移 sftp 就永远复用不到 sshconn 建的 master。
 func TestControlPathMatchesSSHConn(t *testing.T) {
-	c := NewCtrl(nil, nil)
+	c := NewBatchBackend(nil, nil)
 	cases := []struct{ host, user string }{
 		{"prod-01", ""},
 		{"prod-01", "alice"},
@@ -409,7 +411,7 @@ func TestHostOnlyAPIsUseRememberedUserSocket(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TMPDIR", dir)
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	host, user := "prod-01", "alice"
 	if err := os.WriteFile(sshconn.ControlPath(host, user), nil, 0600); err != nil {
 		t.Fatalf("预置 socket 失败: %v", err)
@@ -455,7 +457,7 @@ func lsLine(name string, isDir bool, size int64) string {
 
 func TestRemoveRecursiveBuildsDashPrefixedBatch(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	// 第 1 批：列 /root → 1 个文件 + 1 个子目录
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("a.txt", false, 10), lsLine("sub", true, 0))})
 	// 第 2 批：列 /root/sub → 回显在场、内容为空 ⇒ 存在但为空的目录
@@ -480,7 +482,7 @@ func TestRemoveRecursiveBuildsDashPrefixedBatch(t *testing.T) {
 
 func TestRemoveRecursiveSingleFileOnlyRm(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	// sftp ls -l <file> 返回它自己，且 Item.Name 可能是完整路径。
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root/a.txt", lsLine("/root/a.txt", false, 10))})
 	fr.push(osutil.Outcome{ExitCode: 0})
@@ -496,7 +498,7 @@ func TestRemoveRecursiveSingleFileOnlyRm(t *testing.T) {
 
 func TestRemoveRecursiveEmptyDirOnlyRmdir(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/empty")})
 	fr.push(osutil.Outcome{ExitCode: 0})
 	if err := c.RemoveRecursive("h", "", "/empty"); err != nil {
@@ -514,7 +516,7 @@ func TestRemoveRecursiveEmptyDirOnlyRmdir(t *testing.T) {
 // （旧夹具喂的 Can't rm: "<path>": ... 在实测中并不存在，已替换。）
 func TestRemoveRecursiveRmFailureIsReported(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("a.txt", false, 10))})
 	fr.push(osutil.Outcome{ExitCode: 0, Stderr: "remote delete /root/a.txt: Permission denied\r\n"})
 	err := c.RemoveRecursive("h", "", "/root")
@@ -529,7 +531,7 @@ func TestRemoveRecursiveRmFailureIsReported(t *testing.T) {
 // 实测形状 2：'-rmdir' 失败**自带双引号**： remote rmdir "<path>": Failure
 func TestRemoveRecursiveRmdirFailureIsReported(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("sub", true, 0))})
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root/sub")})
 	fr.push(osutil.Outcome{ExitCode: 0, Stderr: "remote rmdir \"/root/sub\": Failure\r\n"})
@@ -543,7 +545,7 @@ func TestRemoveRecursiveRmdirFailureIsReported(t *testing.T) {
 // （/root/a.txt 不得命中 /root/a.txt.bak 或 "/root/a.txtX"）。
 func TestRemoveRecursiveFailureMatchingIsPathExact(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("a.txt", false, 10))})
 	fr.push(osutil.Outcome{ExitCode: 0, Stderr: "remote delete /root/a.txt.bak: Permission denied\r\n" +
 		"remote rmdir \"/root/a.txtX\": Failure\r\n"})
@@ -556,7 +558,7 @@ func TestRemoveRecursiveFailureMatchingIsPathExact(t *testing.T) {
 // 因此不得走单文件特判（否则只发 -rm 目录、漏删整棵子树），必须正常 BFS。
 func TestRemoveRecursiveSameNameChildIsNotSingleFile(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root/foo", lsLine("foo", false, 1))})
 	fr.push(osutil.Outcome{ExitCode: 0})
 	if err := c.RemoveRecursive("h", "", "/root/foo"); err != nil {
@@ -573,7 +575,7 @@ func TestRemoveRecursiveSameNameChildIsNotSingleFile(t *testing.T) {
 // 与上面同名子项用例成对，锁死 items[0].Name == path 这一判别依据。
 func TestRemoveRecursiveFileTargetUsesFullPath(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root/a.txt", lsLine("/root/a.txt", false, 10))})
 	fr.push(osutil.Outcome{ExitCode: 0})
 	if err := c.RemoveRecursive("h", "", "/root/a.txt"); err != nil {
@@ -591,7 +593,7 @@ func TestRemoveRecursiveFileTargetUsesFullPath(t *testing.T) {
 
 func TestRemoveRecursivePathWithSpace(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/my dir", lsLine("a b.txt", false, 1))})
 	fr.push(osutil.Outcome{ExitCode: 0})
 	if err := c.RemoveRecursive("h", "", "/my dir"); err != nil {
@@ -606,7 +608,7 @@ func TestRemoveRecursivePathWithSpace(t *testing.T) {
 
 func TestRemoveRecursiveRejectsGlobInChild(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/root", lsLine("lit*name.txt", false, 1))})
 	if err := c.RemoveRecursive("h", "", "/root"); err == nil {
 		t.Fatal("子项名含通配符必须拒绝整次递归删除")
@@ -618,7 +620,7 @@ func TestRemoveRecursiveRejectsGlobInChild(t *testing.T) {
 
 func TestRemoveRecursiveRejectsGlobPaths(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	if err := c.RemoveRecursive("h", "", "/root/lit*name.txt"); err == nil {
 		t.Fatal("expected error for glob metachar path")
 	}
@@ -628,7 +630,7 @@ func TestRemoveRecursiveRejectsGlobPaths(t *testing.T) {
 }
 
 func TestBuildBatchPutRecursive(t *testing.T) {
-	c := NewCtrl(nil, nil)
+	c := NewBatchBackend(nil, nil)
 	b, err := c.buildBatch("putr", "/remote/dir", "/local/dir")
 	if err != nil {
 		t.Fatal(err)
@@ -640,11 +642,242 @@ func TestBuildBatchPutRecursive(t *testing.T) {
 
 func TestPutRecursiveRunsSftp(t *testing.T) {
 	fr := &fakeRunner{}
-	c := NewCtrl(fr.run, nil)
+	c := NewBatchBackend(fr.run, nil)
 	if err := c.PutRecursive("h", "", "/local/dir", "/remote/dir"); err != nil {
 		t.Fatalf("PutRecursive: %v", err)
 	}
 	if len(fr.calls) != 1 || fr.calls[0].name != "sftp" {
 		t.Fatalf("calls = %+v", fr.calls)
+	}
+}
+
+// —— Task 5 门面委派（自审 S11 的回归护栏）——
+
+// fakeBackend 是 Backend 的测试替身：只记录门面是否把调用委派进来、
+// 以及委派时的 TransferRequest 取值（尤其是 Atomic）。
+type fakeBackend struct {
+	lastReq TransferRequest
+	called  string
+
+	// Task 9：Cancel/AtomicCapable 的委派观测点。
+	lastCancelID string
+	cancelOK     bool
+	atomicOK     bool
+}
+
+func (f *fakeBackend) List(string, string, string) ([]Item, error) {
+	f.called = "List"
+	return nil, nil
+}
+func (f *fakeBackend) ListMany(string, string, []string) (map[string][]Item, error) {
+	f.called = "ListMany"
+	return nil, nil
+}
+func (f *fakeBackend) Home(string, string) (string, error) { f.called = "Home"; return "", nil }
+func (f *fakeBackend) TransferGet(req TransferRequest, _ func(Progress)) error {
+	f.called, f.lastReq = "TransferGet", req
+	return nil
+}
+func (f *fakeBackend) TransferGetTree(TransferRequest, func(Progress)) error {
+	f.called = "TransferGetTree"
+	return nil
+}
+func (f *fakeBackend) TransferPut(req TransferRequest, _ func(Progress)) error {
+	f.called, f.lastReq = "TransferPut", req
+	return nil
+}
+func (f *fakeBackend) TransferPutTree(TransferRequest, func(Progress)) error {
+	f.called = "TransferPutTree"
+	return nil
+}
+func (f *fakeBackend) Remove(string, string, string) error { f.called = "Remove"; return nil }
+func (f *fakeBackend) RemoveRecursive(string, string, string) error {
+	f.called = "RemoveRecursive"
+	return nil
+}
+func (f *fakeBackend) Mkdir(string, string, string) error          { f.called = "Mkdir"; return nil }
+func (f *fakeBackend) Rename(string, string, string, string) error { f.called = "Rename"; return nil }
+func (f *fakeBackend) Connect(string, string) error                { f.called = "Connect"; return nil }
+func (f *fakeBackend) Search(context.Context, string, string, string, string, int, int, func(int)) (SearchOutcome, error) {
+	f.called = "Search"
+	return SearchOutcome{}, nil
+}
+func (f *fakeBackend) Connected(string) bool   { f.called = "Connected"; return true }
+func (f *fakeBackend) Disconnect(string) error { f.called = "Disconnect"; return nil }
+func (f *fakeBackend) CloseAll()               { f.called = "CloseAll" }
+func (f *fakeBackend) Cancel(id string) bool {
+	f.called, f.lastCancelID = "Cancel", id
+	return f.cancelOK
+}
+func (f *fakeBackend) AtomicCapable() bool { return f.atomicOK }
+
+// TestFacadeLegacyFaceUsesSelectedBackendWithAtomicFalse 钉住门面契约：
+// legacy 四参面必须经 backend() 委派（而不是硬绑 batch），且 Atomic=false（直写目标，
+// sync 自带 .part+rename）。这样 Task 6 接上 resolveTransport 后，
+// SSHORE_SFTP_TRANSPORT=gosftp 才能真正改变 internal/sync 走的后端。
+func TestFacadeLegacyFaceUsesSelectedBackendWithAtomicFalse(t *testing.T) {
+	fb := &fakeBackend{}
+	c := &Ctrl{sel: func() string { return "gosftp" }, forced: fb}
+
+	if err := c.Get("h", "u", "/r", "/l"); err != nil {
+		t.Fatal(err)
+	}
+	if fb.called != "TransferGet" || fb.lastReq.Atomic {
+		t.Fatalf("legacy Get 必须走 backend() 且 Atomic=false, called=%q atomic=%v", fb.called, fb.lastReq.Atomic)
+	}
+	if fb.lastReq.Host != "h" || fb.lastReq.User != "u" || fb.lastReq.Remote != "/r" || fb.lastReq.Local != "/l" {
+		t.Fatalf("legacy 四参应逐字映射进 TransferRequest, got %+v", fb.lastReq)
+	}
+
+	// Put 的参数序与 Get 不同（local,remote），单独钉一次。
+	if err := c.Put("h", "u", "/loc", "/rem"); err != nil {
+		t.Fatal(err)
+	}
+	if fb.called != "TransferPut" || fb.lastReq.Local != "/loc" || fb.lastReq.Remote != "/rem" {
+		t.Fatalf("Put 应映射为 TransferPut{Local:/loc, Remote:/rem}, called=%q req=%+v", fb.called, fb.lastReq)
+	}
+
+	if err := c.GetRecursive("h", "u", "/r", "/l"); err != nil {
+		t.Fatal(err)
+	}
+	if fb.called != "TransferGetTree" {
+		t.Fatalf("GetRecursive 应委派 TransferGetTree, called=%q", fb.called)
+	}
+	if err := c.PutRecursive("h", "u", "/loc", "/rdir"); err != nil {
+		t.Fatal(err)
+	}
+	if fb.called != "TransferPutTree" {
+		t.Fatalf("PutRecursive 应委派 TransferPutTree, called=%q", fb.called)
+	}
+}
+
+// TestFacadeCancelDelegatesTheID 钉住门面 Cancel（Task 9）：必须把 id 原样转给后端，
+// 并把后端的 bool 结果原样上抛（未知/已完成 id ⇒ false）。绝不能在门面里吞掉。
+func TestFacadeCancelDelegatesTheID(t *testing.T) {
+	fb := &fakeBackend{cancelOK: true}
+	c := &Ctrl{forced: fb}
+	if !c.Cancel("t-9") {
+		t.Fatal("后端说取消成功时门面必须返回 true")
+	}
+	if fb.called != "Cancel" || fb.lastCancelID != "t-9" {
+		t.Fatalf("Cancel 必须把 id 原样转给后端: called=%q id=%q", fb.called, fb.lastCancelID)
+	}
+
+	fb2 := &fakeBackend{cancelOK: false}
+	c2 := &Ctrl{forced: fb2}
+	if c2.Cancel("t-unknown") {
+		t.Fatal("后端说未知 id 时门面必须返回 false（幂等语义）")
+	}
+}
+
+// TestFacadeAtomicCapableFollowsBackend 钉住能力访问器：门面必须回答「当前选中的后端
+// 是否支持原子提交」，而不是写死。绑定层据此决定 TransferRequest.Atomic。
+func TestFacadeAtomicCapableFollowsBackend(t *testing.T) {
+	if (&Ctrl{forced: &fakeBackend{atomicOK: false}}).AtomicCapable() {
+		t.Fatal("后端声明不支持时门面必须返回 false")
+	}
+	if !(&Ctrl{forced: &fakeBackend{atomicOK: true}}).AtomicCapable() {
+		t.Fatal("后端声明支持时门面必须返回 true")
+	}
+}
+
+// TestNewCtrlFacadeWiring 钉住两个构造：NewCtrl 不注入 selector（测试/兼容路径），
+// NewCtrlWith 额外注入懒解析选择器（生产路径）。
+// Task 5 评审 I1：这里必须**显式清掉 SSHORE_SFTP_TRANSPORT**，否则测试结果取
+// 决于外部环境；并且各条分支都要断言：内置默认（Task 16 起为 gosftp）、显式 batch、
+// 显式 gosftp，以及 env 覆盖 config。
+//
+// Task 16：内置默认已从 batch 切到 gosftp，因此「NewCtrl 默认拿到 batch」不再是事实 ——
+// 这里改成先显式钉住内置默认，再显式选 batch 验证兼容路径。
+func TestNewCtrlFacadeWiring(t *testing.T) {
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "")
+	c := NewCtrl(nil, nil)
+	if c.sel != nil {
+		t.Fatal("NewCtrl 不得注入 selector（保持 spec D3 两参语义）")
+	}
+	if c.TransportKind() != KindGo {
+		t.Fatalf("Task 16 内置默认应解析为 KindGo, got %v", c.TransportKind())
+	}
+	if _, ok := c.backend().(*GoBackend); !ok {
+		t.Fatalf("NewCtrl 的 backend() 应与内置默认一致（*GoBackend）, got %T", c.backend())
+	}
+
+	// 显式选 batch（回退路径）：env 覆盖内置默认。
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "batch")
+	cb := NewCtrl(nil, nil)
+	if _, ok := cb.backend().(*BatchBackend); !ok {
+		t.Fatalf("env=batch 应返回 *BatchBackend, got %T", cb.backend())
+	}
+	if cb.TransportKind() != KindBatch {
+		t.Fatalf("env=batch 应解析为 KindBatch, got %v", cb.TransportKind())
+	}
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "")
+
+	c2 := NewCtrlWith(nil, nil, func() string { return "gosftp" })
+	if c2.sel == nil || c2.sel() != "gosftp" {
+		t.Fatalf("NewCtrlWith 应保留注入的 selector, got %v", c2.sel)
+	}
+	if c2.TransportKind() != KindGo {
+		t.Fatalf("显式 gosftp 应解析为 KindGo, got %v", c2.TransportKind())
+	}
+	gb, ok := c2.backend().(*GoBackend)
+	if !ok {
+		t.Fatalf("显式选定 gosftp 时 backend() 应返回 *GoBackend, got %T", c2.backend())
+	}
+	if c2.backend() != Backend(gb) {
+		t.Fatal("GoBackend 必须懒构造后缓存，而不是每次新建")
+	}
+
+	// env 覆盖 config：即便 selector 说 batch，env=gosftp 也要选中 GoBackend。
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "gosftp")
+	c3 := NewCtrlWith(nil, nil, func() string { return "batch" })
+	if _, ok := c3.backend().(*GoBackend); !ok {
+		t.Fatalf("env=gosftp 必须覆盖 config=batch, got %T", c3.backend())
+	}
+
+	// 显式选 batch：即使 env 清空也走 batch 分支。
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "")
+	c4 := NewCtrlWith(nil, nil, func() string { return "batch" })
+	if _, ok := c4.backend().(*BatchBackend); !ok {
+		t.Fatalf("显式 batch 应返回 *BatchBackend, got %T", c4.backend())
+	}
+}
+
+// TestBatchRejectsAtomicTransfer 钉住评审 M4 的行为裁决：新面调用方对 batch 后端
+// 传 Atomic=true 时**显式报错**，绝不静默退化为直写目标（那会让调用方误以为
+// 拿到了 .part + 提交的原子保证）。Atomic=false 仍照旧直写。
+func TestBatchRejectsAtomicTransfer(t *testing.T) {
+	fr := &fakeRunner{}
+	c := NewBatchBackend(fr.run, nil)
+	atomic := TransferRequest{Host: "h", User: "", Remote: "/r", Local: "/l", Atomic: true}
+	cases := []struct {
+		name string
+		run  func() error
+	}{
+		{"TransferGet", func() error { return c.TransferGet(atomic, nil) }},
+		{"TransferGetTree", func() error { return c.TransferGetTree(atomic, nil) }},
+		{"TransferPut", func() error { return c.TransferPut(atomic, nil) }},
+		{"TransferPutTree", func() error { return c.TransferPutTree(atomic, nil) }},
+	}
+	for _, tc := range cases {
+		err := tc.run()
+		if err == nil {
+			t.Fatalf("%s: Atomic=true 必须报错（否则就是静默退化）", tc.name)
+		}
+		if !errors.Is(err, errBatchAtomic) {
+			t.Fatalf("%s: 错误应可判定为 errBatchAtomic, got %v", tc.name, err)
+		}
+	}
+	fr.mu.Lock()
+	calls := len(fr.calls)
+	fr.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("Atomic 守卫必须在使用 runner 之前拦下，实际发了 %d 条命令", calls)
+	}
+
+	// Atomic=false（legacy 面）必须继续可用。
+	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/r", lsLine("a.txt", false, 1))})
+	if err := c.TransferGet(TransferRequest{Host: "h", Remote: "/r", Local: "/l"}, nil); err != nil {
+		t.Fatalf("Atomic=false 不得被守卫拦住: %v", err)
 	}
 }

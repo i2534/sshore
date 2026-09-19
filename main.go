@@ -37,13 +37,12 @@ func main() {
 			app.Init(func(e forward.Event) {
 				runtime.EventsEmit(ctx, "log", e)
 			})
-			// 系统文件拖入：Wails 只提供拖入 API（无拖出）。这里把 (x, y, paths)
-			// 转给前端，由前端按落点坐标决定目标面板（本地面板=复制，远程面板=上传）。
-			runtime.OnFileDrop(ctx, func(x, y int, paths []string) {
-				runtime.EventsEmit(ctx, "files:dropped", map[string]any{
-					"x": x, "y": y, "paths": paths,
-				})
-			})
+			// 系统文件拖入走前端：App.vue 调用 JS 版 runtime.OnFileDrop 注册 webview 的
+			// dragover/drop 监听，再由系统拖入分发器交给当前视图。
+			// 不要改回 Go 版 runtime.OnFileDrop(ctx, cb) —— 它只订阅 wails:file-drop 事件、
+			// 不注册任何 webview 监听，而该事件正是由前端 postMessage 触发的，
+			// 单用 Go 版会形成死环：真机上从资源管理器拖文件进来什么都不发生。
+			// （2026-09-19 真机复现：面板 drop 只弹 dataTransfer TypeError 红条。）
 			runtime.EventsEmit(ctx, "log", forward.Event{
 				SourceType: "system",
 				SourceID:   "app",

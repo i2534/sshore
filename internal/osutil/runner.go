@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -215,4 +216,110 @@ func execResult(err error) int {
 		return ee.ExitCode()
 	}
 	return -1
+}
+
+// PipedProcess 是长驻子进程的裸管道句柄（供二进制协议使用，例如 ssh -s sftp）。
+type PipedProcess struct {
+	Stdin  io.WriteCloser
+	Stdout io.ReadCloser
+	Stderr io.ReadCloser
+
+	proc *Process
+
+	mu     sync.Mutex
+	errBuf []byte // 有界 stderr 环形缓冲（最近 16KB）
+}
+
+const pipedStderrKeep = 16 * 1024
+
+// StartPipes 起一个长驻子进程并交出三路裸管道。
+// stderr 必须由本原语自己 drain —— 调用方不读也不会把 64KB 管道写满而假死。
+func StartPipes(name string, args ...string) (*PipedProcess, error) {
+	cmd := exec.Command(name, args...)
+	procAttrHideConsole(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		_ = stderr.Close()
+		return nil, err
+	}
+	p := &PipedProcess{Stdin: stdin, Stdout: stdout, Stderr: stderr, proc: &Process{cmd: cmd, done: make(chan Outcome, 1)}}
+	var drain sync.WaitGroup
+	drain.Add(1)
+	go func() {
+		defer drain.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := stderr.Read(buf)
+			if n > 0 {
+				p.mu.Lock()
+				p.errBuf = append(p.errBuf, buf[:n]...)
+				if len(p.errBuf) > pipedStderrKeep {
+					p.errBuf = p.errBuf[len(p.errBuf)-pipedStderrKeep:]
+				}
+				p.mu.Unlock()
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		_ = stderr.Close()
+	}()
+	// 与 StartStream 同序：先等 stderr drain 到 EOF，再 cmd.Wait()。
+	// 反过来会让 Wait 关闭父端管道、截断 stderr，且与读取并发（-race 会抓）。
+	go func() {
+		drain.Wait()
+		err := cmd.Wait()
+		p.proc.done <- Outcome{ExitCode: execResult(err)}
+		close(p.proc.done)
+	}()
+	return p, nil
+}
+
+// StderrText 返回后台 drain 到的 stderr 尾部（错误上报的唯一来源）。
+func (p *PipedProcess) StderrText() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return strings.TrimSpace(string(p.errBuf))
+}
+
+// Wait 返回子进程的退出结果；按契约只应调用一次，重复调用返回零值 Outcome。
+func (p *PipedProcess) Wait() Outcome { return p.proc.Wait() }
+
+func (p *PipedProcess) Kill() error { return p.proc.Kill() }
+
+// Signal 发送优雅中断（SIGINT/CTRL_BREAK），与 Process.Signal 同语义（spec §12.3 g）。
+func (p *PipedProcess) Signal() error { return p.proc.Signal() }
+
+// Close 关闭管道并终止子进程；调用方在传输结束后必须调用，避免长驻 ssh 泄漏。
+// 幂等：子进程已正常退出时 Kill 返回 os.ErrProcessDone，这不是错误。
+//
+// F1（Task 3 评审）：**必须也关父端 stderr 读端**。drain 的 Read 只在 stderr 写端
+// 全部关闭后才 EOF；若后代进程仍持有 fd 2（sleep &、ProxyCommand、ControlPersist 等），
+// 不关读端会把 drain → drain.Wait() → cmd.Wait() 整条链无限挂住，Close/Kill 都解不开。
+// 关父端读端会让 Read 立刻返回错误，从而解除阻塞。
+// 注意：本原语**不保证杀死后代进程**（只杀直接子进程）。
+func (p *PipedProcess) Close() error {
+	_ = p.Stdin.Close()
+	_ = p.Stdout.Close()
+	_ = p.Stderr.Close()
+	if err := p.proc.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return err
+	}
+	return nil
 }

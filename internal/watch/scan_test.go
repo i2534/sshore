@@ -112,6 +112,61 @@ func TestScanTreeHonoursContext(t *testing.T) {
 	}
 }
 
+// TestIsInternalTemp 钉住内部临时文件的唯一判定（Task 2 的中缀规则）：常规名
+// （<name>.sshore-sftppart-…）与退化短名（.sshore-sftppart-…）都必须命中，
+// 而普通业务文件名绝不命中 —— 这套判定是 sync/watch 的内置忽略（D18）的依据。
+func TestIsInternalTemp(t *testing.T) {
+	cases := map[string]bool{
+		"a/b.txt.sshore-sftppart-t1-ab": true,
+		"b.txt.sshore-sftppart-bak-9f":  true,
+		".sshore-sftppart-anon-abcdef":  true,
+		"a/b.txt":                       false,
+		"b.txt.bak":                     false,
+		"":                              false,
+	}
+	for rel, want := range cases {
+		if got := IsInternalTemp(rel); got != want {
+			t.Fatalf("IsInternalTemp(%q) = %v want %v", rel, got, want)
+		}
+	}
+}
+
+// TestMatchExcludeAlwaysDropsInternalTemp 钉住 D18：sshore 自己的传输临时文件是
+// **内置忽略**，与规则里的 excludes 无关 —— 用户的 excludes 表再空、再改，.part/.bak
+// 都不能被当成业务文件。
+func TestMatchExcludeAlwaysDropsInternalTemp(t *testing.T) {
+	for _, ex := range [][]string{nil, {}, {"*.log"}} {
+		for _, rel := range []string{"a.txt.sshore-sftppart-t1-ab", "deep/x.sshore-sftppart-bak-9"} {
+			if !MatchExclude(rel, ex) {
+				t.Fatalf("excludes=%v 时内部临时文件 %q 必须被排除", ex, rel)
+			}
+		}
+		if MatchExclude("a.txt", ex) {
+			t.Fatalf("excludes=%v 不得误伤业务文件", ex)
+		}
+	}
+}
+
+// TestScanTreeDropsInternalTemp 钉住面板/快照路径：ScanTree 看到的内部临时文件
+// 绝不进入 Entries（否则 .part 会在面板上闪成业务文件，sync 也会把它当远端文件）。
+func TestScanTreeDropsInternalTemp(t *testing.T) {
+	tree := map[string][]sftp.Item{
+		"/r": {file("a.txt"), file("a.txt.sshore-sftppart-t1-ab"), dir("d")},
+	}
+	snap, err := ScanTree(context.Background(), fakeList(tree), "h", "", "/r", -1, nil)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if _, ok := snap.Entries["a.txt"]; !ok {
+		t.Fatalf("业务文件必须保留，得到 %#v", snap.Entries)
+	}
+	for rel := range snap.Entries {
+		if IsInternalTemp(rel) {
+			t.Fatalf("内部临时文件不得进入快照: %#v", snap.Entries)
+		}
+	}
+}
+
 func TestMatchExclude(t *testing.T) {
 	ex := []string{".git/", "node_modules/", "build*/", "*.swp", "*~"}
 	cases := map[string]bool{

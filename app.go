@@ -116,6 +116,26 @@ func (a *App) startup(ctx context.Context) {
 		// 坏文件：只记录、只降级，绝不覆盖用户文件
 		a.presetsErr = lerr
 	}
+	// Task 13（spec D14）：清理 >7 天且名字含 PartMarker 的本地传输临时文件。
+	// 进程崩溃后登记的 knownParts 随进程消失，这些 .part 只能靠陈旧清理兜底。
+	a.cleanupStaleParts()
+}
+
+// cleanupStaleParts 在启动时清理最近用过的本地目录下的陈旧临时文件（>7 天）。
+// 只扫配置里记录的本地目录（用户机器上没有可枚举「我们写过的所有目标目录」的全局索引）；
+// 不可读/不存在的目录静默跳过，绝不阻断启动。
+func (a *App) cleanupStaleParts() {
+	if a.cfg == nil {
+		return
+	}
+	seen := map[string]bool{}
+	for _, r := range a.cfg.LocalRecent {
+		if r.Path == "" || seen[r.Path] {
+			continue
+		}
+		seen[r.Path] = true
+		_, _ = sftp.CleanupStaleLocalParts(r.Path, time.Now())
+	}
 }
 
 // Init wires controllers. emit forwards subsystem events to the frontend.
@@ -123,7 +143,17 @@ func (a *App) startup(ctx context.Context) {
 func (a *App) Init(emit func(forward.Event)) {
 	a.emit = emit
 	a.forward = forward.NewCtrl(osutil.NewSpawner(), emit, nil)
-	a.sftp = sftp.NewCtrl(osutil.NewRunner(), emit)
+	// 选择器懒解析配置（Task 5）：app_test 直接构造时 a.cfg 可能为 nil，
+	// 闭包必须回退内置默认而不是 panic（三审 R11）。
+	a.sftp = sftp.NewCtrlWith(osutil.NewRunner(), emit, func() string {
+		if a.cfg == nil {
+			return ""
+		}
+		return a.cfg.App.SftpTransport
+	})
+	if dir := stateDir(); dir != "" {
+		a.sftp.SetJournalDir(dir) // Task 8 的 backup-swap journal（S6）
+	}
 	transfer, lister := sync.NewSftpAdapter(a.sftp)
 	a.sync = sync.NewCtrl(sync.Deps{
 		Spawner:  osutil.NewStreamer(),
@@ -422,8 +452,47 @@ func (a *App) findTunnel(id string) (config.Tunnel, bool) {
 func (a *App) SftpList(host, user, path string) ([]sftp.Item, error) {
 	return a.sftp.List(host, user, path)
 }
-func (a *App) SftpGet(host, user, remote, local string) error {
-	if err := a.sftp.Get(host, user, remote, local); err != nil {
+
+// —— Task 9：新传输面绑定（id + resume/partPath + 进度事件 + 取消）——
+//
+// id 由前端生成（runBatch 的 t<seq>-<n>），是取消与续传唯一的关联键；每次调用的 Progress
+// 帧都带它。resume/partPath 这轮由前端传 false/""，Task 14 的「续传」按钮才填真实锚点。
+// Atomic 一律能力驱动（见 sftpAtomic）：batch 不支持 .part + 提交，传 true 会被后端硬拒。
+//
+// 调用是阻塞的：Wails 绑定 + sftp:transfer-progress 事件回推（spec §6.1）。
+
+// progressToEvent 把 Progress 翻成前端事件载荷。字段名是前后端唯一契约（spec §6.3）：
+// 这里用显式 map 而不是直接序列化 struct —— 前端读 camelCase，且 Done/Total 保持 int64。
+func progressToEvent(p sftp.Progress) map[string]any {
+	return map[string]any{
+		"id": p.ID, "host": p.Host, "direction": string(p.Direction), "name": p.Name,
+		"partPath": p.PartPath, "done": p.Done, "total": p.Total,
+		"filesDone": p.FilesDone, "filesTotal": p.FilesTotal, "phase": string(p.Phase),
+	}
+}
+
+// progressEventName 是进度事件名的唯一来源：前端把同一个字面量放在
+// frontend/src/utils/queue.js 的 TRANSFER_PROGRESS_EVENT（vitest 钉死），本包测试
+// TestTransferProgressEventNamePinnedWithFrontend 断言两边逐字相等 —— 只在一侧改名
+// 不会让任何东西编译失败，只会让订阅静默失效。
+const progressEventName = "sftp:transfer-progress"
+
+// emitProgress 转发一帧进度到前端。a.ctx 为空（startup 之前）时静默：绝不对 nil context
+// 调 runtime.EventsEmit。
+func (a *App) emitProgress(p sftp.Progress) {
+	if a.ctx != nil {
+		runtime.EventsEmit(a.ctx, progressEventName, progressToEvent(p))
+	}
+}
+
+// sftpAtomic 返回当前后端是否支持原子提交（.part + 提交）。绑定层的 Atomic 只从这里取值，
+// 绝不写死 true/false：写死 true 会让 batch 后端（Atomic=false 直写）的传输全盘失败，
+// 写死 false 会丢掉原子语义。
+func (a *App) sftpAtomic() bool { return a.sftp.AtomicCapable() }
+
+// SftpGet 下载单个远端文件；resume/partPath 为 Task 11 的续传参数。
+func (a *App) SftpGet(id, host, user, remote, local string, resume bool, partPath string) error {
+	if err := a.sftp.TransferGet(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
@@ -431,15 +500,17 @@ func (a *App) SftpGet(host, user, remote, local string) error {
 }
 
 // SftpGetDir recursively downloads a remote directory tree (`sftp get -r`).
-func (a *App) SftpGetDir(host, user, remote, local string) error {
-	if err := a.sftp.GetRecursive(host, user, remote, local); err != nil {
+func (a *App) SftpGetDir(id, host, user, remote, local string, resume bool, partPath string) error {
+	if err := a.sftp.TransferGetTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
 	return nil
 }
-func (a *App) SftpPut(host, user, local, remote string) error {
-	if err := a.sftp.Put(host, user, local, remote); err != nil {
+
+// SftpPut 上传单个本地文件；resume/partPath 为 Task 11 的续传参数。
+func (a *App) SftpPut(id, host, user, local, remote string, resume bool, partPath string) error {
+	if err := a.sftp.TransferPut(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
@@ -462,15 +533,20 @@ func (a *App) SftpRemoveRecursive(host, user, path string) error {
 }
 
 // SftpPutRecursive 递归上传本地目录到远端目录。
-// 透传 sftp.PutRecursive：put -r 在远端同名目录已存在时是**并入**（同名文件被本地内容覆盖），
-// 本绑定不加"整树替换"补偿；需要整树替换的调用方须先自行删除远端同名目录。
-func (a *App) SftpPutRecursive(host, user, local, remoteDir string) error {
-	if err := a.sftp.PutRecursive(host, user, local, remoteDir); err != nil {
+// put -r 在远端同名目录已存在时是**并入**（同名文件被本地内容覆盖），本绑定不加"整树替换"
+// 补偿；需要整树替换的调用方须先自行删除远端同名目录（语义与门面 TransferPutTree 一致）。
+func (a *App) SftpPutRecursive(id, host, user, local, remoteDir string, resume bool, partPath string) error {
+	if err := a.sftp.TransferPutTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remoteDir, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remoteDir), filepath.Dir(local))
 	return nil
 }
+
+// SftpTransferCancel 取消指定 id 的传输，返回是否真的取消到了正在跑的传输。
+// Task 9 只接线到门面；整批语义（取消当前项 + 停止派发后续项）由前端编排层落实（spec §6.1），
+// 真实的「关该传输会话」由 Task 10 的后端注册表提供（batch 恒 false，幂等）。
+func (a *App) SftpTransferCancel(id string) bool { return a.sftp.Cancel(id) }
 
 // SftpMove 语义等于远端 Rename（跨目录移动）。
 func (a *App) SftpMove(host, user, oldPath, newPath string) error {
@@ -977,13 +1053,48 @@ func (a *App) OnShutdown() {
 	if a.forward != nil {
 		a.forward.OnShutdown()
 	}
-	// 2. 最后才关 SFTP 的 ControlMaster（它会 RemoveAll 整个 socket 目录）
+	// 2. SFTP 生命周期：**顺序是硬约束**（Task 13 / 技术审核 M5，修复轮 1 / F2），
+	//    但静默是**有界**的（修复轮 2 / D1）——GoBackend.CloseAll 内部按固定顺序收尾：
+	//    先置 closing 拒绝新传输、并在 closeGrace（默认 5s）内等在飞传输自然结束；
+	//    宽限期内未结束就强停：取消后端级 transferCtx（中断无界的取额度排队/扫描相）
+	//    并关闭全部会话（中断阻塞中的网络 IO）；最后清掉已知 .part（CleanupParts 在关
+	//    会话之后自己取新会话）。有界等待是退出 liveness 的硬要求：对端活着但卡死时
+	//    传输可能永不返回，无界 Wait 会把退出押在 ssh 的 ServerAlive 超时上。
+	//
+	//    CloseAll 返回后做 journal 恢复，但**只在正常路径上**才保证没有在飞提交了：
+	//    强停路径下某次提交可能恰好停在 rename(target→bak) 与 rename(part→target)
+	//    之间，于是恢复探测仍可能撞上这次被强停的提交 —— 这正是有界退出换来的取舍。
+	//    RecoverSwaps 因此只按 journal 条目与两端实际存在情况收敛（W0 只删"两端都不
+	//    存在/都回滚干净"的条目，能回滚就回滚），绝不把这种条目当成"从未发生"清掉。
+	//    顺序颠倒（有传输在飞时先删 .part，或不等静默就恢复）会留下 target 缺失、
+	//    bak 残存、journal 条目被清的现场。
 	if a.sftp != nil {
 		a.sftp.CloseAll()
+		// journal 条目自带 host/user；恢复按 (host,user) 分组、只探条目自己的主机。
+		// 归属为空的旧条目跳过；主机不可达的那组条目原样保留（下次再试），绝不误清。
+		if n, err := a.sftp.RecoverSwaps(); err != nil {
+			a.logf("恢复 swap journal 失败: %v", err)
+		} else if n > 0 {
+			a.logf("恢复了 %d 处中断提交", n)
+		}
 	}
 	if a.cfg != nil {
 		_ = a.saveConfig()
 	}
+}
+
+// logf 发一条 system 事件（emit 未接线时静默），供生命周期路径上报不阻断启动/退出的异常。
+func (a *App) logf(format string, args ...any) {
+	if a.emit == nil {
+		return
+	}
+	a.emit(forward.Event{
+		SourceType: "system",
+		SourceID:   "app",
+		TS:         time.Now().Format(time.RFC3339),
+		Level:      "warn",
+		Message:    fmt.Sprintf(format, args...),
+	})
 }
 
 // 适配器只有一处定义：internal/sync/adapters.go 的 NewSftpAdapter（见 Task 10）。

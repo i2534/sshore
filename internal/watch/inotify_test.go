@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,11 @@ type fakeStreamer struct {
 func (f *fakeStreamer) StartStream(name string, args []string, h osutil.StreamHandlers) (*osutil.Process, error) {
 	f.handlers = h
 	sp := osutil.NewSpawner()
-	p, err := sp.Start("sleep", []string{"30"}, nil)
+	// 跨平台长命进程：这些用例只是要一个「活着的子进程」供 Close/Kill，事件全部由
+	// f.handlers 手工注入。原先固定 sleep 30，Windows 上没有 sleep ⇒ 9 条红。
+	// 与 osutil 的 aliveCmd 同思路：Windows 用系统 ping，Unix 用 sleep。
+	name, args = aliveCmdForTest()
+	p, err := sp.Start(name, args, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -28,6 +33,14 @@ func (f *fakeStreamer) StartStream(name string, args []string, h osutil.StreamHa
 		close(f.started)
 	}
 	return p, nil
+}
+
+// aliveCmdForTest 返回一个不依赖 Git-for-Windows 自带 coreutils 的长命命令。
+func aliveCmdForTest() (string, []string) {
+	if runtime.GOOS == "windows" {
+		return "ping", []string{"-n", "31", "127.0.0.1"}
+	}
+	return "sleep", []string{"30"}
 }
 
 // pty 下的真实输出（含 CR、噪声行、token 列表、目录事件）必须被正确归一。

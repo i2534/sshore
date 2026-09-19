@@ -30,6 +30,15 @@ type ListManyFunc func(host, user string, paths []string) (map[string][]sftp.Ite
 
 const scanBatch = 64
 
+// IsInternalTemp 判定 sshore 自己的临时文件；sync 的 align/ScanTree 与面板都不该把它
+// 当业务文件。**直接引用 internal/sftp.PartMarker**，不再抄第三份字面量（Task 14 评审 M2）：
+// 改 sftp.PartMarker 时这里跟着变，而前后端互钉用例（partname_test.go）会拦住只改一侧。
+// 用中缀（Contains）而不是前缀：常规名是 <name>.sshore-sftppart-…，退化短名才是
+// .sshore-sftppart-… 开头；两种都要命中，且备份名复用同一中缀 ⇒ 一条规则全覆盖。
+func IsInternalTemp(rel string) bool {
+	return strings.Contains(path.Base(rel), sftp.PartMarker)
+}
+
 // MatchExclude 判定相对路径是否命中忽略规则。
 //
 // 以 "/" 结尾的模式表示"该目录名在**任意深度**都忽略"（ruling 1）：
@@ -37,6 +46,12 @@ const scanBatch = 64
 // 与 "x/.git/config" 都会被 ".git/"、"node_modules/" 排除，而不只是根层。
 // 其余模式按 path.Match 同时匹配 basename 与完整相对路径。
 func MatchExclude(rel string, excludes []string) bool {
+	// D18 内置忽略：sshore 自己的传输临时文件（中缀 .sshore-sftppart-）永远不是业务文件，
+	// 与用户配置的 excludes 无关 —— 用户删改规则也不会让 .part/.bak 泄漏进面板或同步清单。
+	// 这也是中缀判定与「一套规则覆盖备份」的设计用意（见 internal/sftp.PartMarker）。
+	if IsInternalTemp(rel) {
+		return true
+	}
 	base := path.Base(rel)
 	for _, pat := range excludes {
 		if pat == "" {
