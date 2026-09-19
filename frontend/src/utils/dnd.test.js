@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { payloadFor, parsePayload, hitPane, isSubPath, canDropInto, isSystemDrop } from './dnd'
+import { payloadFor, parsePayload, payloadFromDragEvent, DRAG_MIME, hitPane, pickDropPane, DROP_PANE_TTL_MS, isSubPath, canDropInto, isSystemDrop } from './dnd'
 
 const rects = {
   local: { left: 0, top: 100, right: 400, bottom: 600 },
@@ -48,5 +48,42 @@ describe('dnd', () => {
   it('系统拖入靠 dataTransfer.types 判定', () => {
     expect(isSystemDrop(['Files'])).toBe(true)
     expect(isSystemDrop(['text/plain'])).toBe(false)
+  })
+
+  // 真机事故（2026-09-19）：模板把原生 DragEvent 直接传给期望 { event } 的处理器，
+  // 解构出 undefined ⇒ 读 dataTransfer 抛 TypeError ⇒ 顶部「界面错误」红条。
+  // 这三条同时钉住"缺事件不得抛错"和"系统拖入不得被当成应用内载荷"。
+  it('payloadFromDragEvent：原生 DragEvent 形状取到应用内载荷', () => {
+    const ev = { dataTransfer: { getData: (t) => (t === DRAG_MIME ? payloadFor('remote', ['a']) : '') } }
+    expect(payloadFromDragEvent(ev)).toEqual({ pane: 'remote', names: ['a'] })
+  })
+  it('payloadFromDragEvent：event 缺失/None 形状一律返回 null，绝不抛 TypeError', () => {
+    expect(payloadFromDragEvent(undefined)).toBe(null)
+    expect(() => payloadFromDragEvent(undefined)).not.toThrow()
+    expect(payloadFromDragEvent({ event: undefined })).toBe(null) // 老的错误参数形状
+    expect(payloadFromDragEvent({ dataTransfer: null })).toBe(null)
+    expect(payloadFromDragEvent({ dataTransfer: {} })).toBe(null)  // getData 不是函数
+  })
+  it('payloadFromDragEvent：系统拖入（Files 类型、无应用 MIME）返回 null', () => {
+    const ev = { dataTransfer: { types: ['Files'], getData: () => '' } }
+    expect(isSystemDrop(ev.dataTransfer.types)).toBe(true)
+    expect(payloadFromDragEvent(ev)).toBe(null)
+  })
+
+  // 真机事故（2026-09-19）：Wails 传来的拖入坐标按屏幕像素给，而面板矩形是页面坐标，
+  // 于是「拖到本地面板正中央」被判成落点无效。spec R3 的降级就是这一条。
+  it('pickDropPane：坐标命中优先（回退记录不参与）', () => {
+    expect(pickDropPane({ x: 200, y: 300 }, rects, { pane: 'remote', ts: 1000 }, 1000)).toBe('local')
+    expect(pickDropPane({ x: 500, y: 300 }, rects, null, 1000)).toBe('remote')
+  })
+  it('pickDropPane：坐标不可信时用 DOM drop 记录的面板（不许猜、不许丢）', () => {
+    expect(pickDropPane({ x: 900, y: 500 }, rects, { pane: 'local', ts: 1000 }, 1000)).toBe('local')
+    expect(pickDropPane({ x: 900, y: 500 }, rects, { pane: 'remote', ts: 1000 }, 1000 + DROP_PANE_TTL_MS)).toBe('remote')
+  })
+  it('pickDropPane：陈旧记录（超 TTL）与非法值一律 null（调用方据此提示落点无效）', () => {
+    expect(pickDropPane({ x: 900, y: 500 }, rects, null, 1000)).toBe(null)
+    expect(pickDropPane({ x: 900, y: 500 }, rects, { pane: 'local', ts: 1000 }, 1000 + DROP_PANE_TTL_MS + 1)).toBe(null)
+    expect(pickDropPane({ x: 900, y: 500 }, rects, { pane: 'bogus', ts: 1000 }, 1000)).toBe(null)
+    expect(pickDropPane({ x: 900, y: 500 }, rects, { pane: 'local' }, 1000)).toBe(null)
   })
 })
