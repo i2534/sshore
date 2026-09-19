@@ -33,6 +33,12 @@ type App struct {
 	cfg     *config.AppConfig
 	cfgPath string
 	sync    *sync.Ctrl
+
+	// cfgMu 保护 cfg.App：更新服务 goroutine（Config/Save 回调）读、
+	// Wails 调用线程（GetSettings/SetSettings）写。两侧都必须经由
+	// appSettings / setAppSettings 访问，否则是数据竞争（Task 11 fix round 1）。
+	cfgMu stdsync.RWMutex
+
 	// H2: startup 早于 Init 注入 emit，加载错误先记录于此，Init 时补发事件
 	emit       func(forward.Event)
 	cfgLoadErr error
@@ -339,26 +345,48 @@ func (a *App) OpenReleasePage() error {
 	return nil
 }
 
-// updateSettings 直读 a.cfg（不经前端快照），供更新服务读取配置子集。
-func (a *App) updateSettings() update.Settings {
+// appSettings 在读锁下返回 a.cfg.App 的副本；cfg 尚未加载时回退到默认设置。
+// 更新服务 goroutine 与 Wails 调用线程共用此入口，避免无同步读写 cfg.App。
+func (a *App) appSettings() config.AppSettings {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
 	if a.cfg == nil {
-		return update.Settings{Auto: true, Interval: 12 * time.Hour}
+		return config.DefaultAppConfig().App
 	}
+	return a.cfg.App
+}
+
+// setAppSettings 在写锁下整体替换 a.cfg.App；锁内不做 IO，落盘由调用方在解锁后完成。
+func (a *App) setAppSettings(s config.AppSettings) {
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	a.cfg.App = s
+}
+
+// updateSettings 经 appSettings 直读配置子集（不经前端快照），供更新服务读取。
+func (a *App) updateSettings() update.Settings {
+	s := a.appSettings()
 	return update.Settings{
-		Auto:     a.cfg.App.UpdateCheckAuto,
-		Interval: time.Duration(a.cfg.App.UpdateCheckIntervalHours) * time.Hour,
-		Source:   a.cfg.App.UpdateSource,
-		Skipped:  a.cfg.App.UpdateSkippedVersion,
+		Auto:     s.UpdateCheckAuto,
+		Interval: time.Duration(s.UpdateCheckIntervalHours) * time.Hour,
+		Source:   s.UpdateSource,
+		Skipped:  s.UpdateSkippedVersion,
 	}
 }
 
 // saveUpdateSettings 只写 UpdateSkippedVersion 并落盘：跳过版本只由后端读写，
-// 前端快照全量回写绝不能把它清掉（Task 10 裁定 5）。
+// 前端快照全量回写绝不能把它清掉（Task 10 裁定 5）。加锁改字段、解锁后落盘，
+// 避免在持锁期间做磁盘 IO。
 func (a *App) saveUpdateSettings(s update.Settings) error {
+	a.cfgMu.Lock()
 	if a.cfg == nil {
 		a.cfg = config.DefaultAppConfig()
 	}
 	a.cfg.App.UpdateSkippedVersion = s.Skipped
+	a.cfgMu.Unlock()
 	return a.saveConfig()
 }
 
@@ -400,12 +428,10 @@ func (a *App) SyncWindowBackground(theme string) {
 }
 
 // GetSettings returns the persisted app settings (theme/font/auto-start),
-// normalized so callers never receive empty/invalid values.
+// normalized so callers never receive empty/invalid values. 经 appSettings 读锁读取，
+// 因为更新服务 goroutine 会写 a.cfg.App.UpdateSkippedVersion。
 func (a *App) GetSettings() config.AppSettings {
-	if a.cfg == nil {
-		return config.DefaultAppConfig().App
-	}
-	return a.cfg.App
+	return a.appSettings()
 }
 
 // SetSettings validates and persists app settings. Invalid theme falls back to
@@ -415,10 +441,8 @@ func (a *App) SetSettings(s config.AppSettings) error {
 	if s.Theme != "dark" && s.Theme != "light" {
 		s.Theme = "system"
 	}
-	if a.cfg == nil {
-		a.cfg = &config.AppConfig{}
-	}
-	a.cfg.App = s
+	a.setAppSettings(s)
+	// 落盘在锁外：避免在持锁期间做磁盘 IO。
 	if err := a.saveConfig(); err != nil {
 		return err
 	}
