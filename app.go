@@ -560,6 +560,20 @@ func (a *App) StopTunnel(id string) error {
 	return nil
 }
 
+// snapshotConfig 在读锁下复制一份 a.cfg 供锁外序列化/落盘使用。
+// 锁内只做结构体复制、绝不做 IO；cfg 尚未加载时返回 nil（与旧行为一致）。
+// 存在意义：saveConfig 与 setAppSettings/saveUpdateSettings 的整结构写并发时，
+// 若直接序列化 a.cfg，toml 编码器会与另一侧的写竞争（Task 11 fix round 2）。
+func (a *App) snapshotConfig() *config.AppConfig {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if a.cfg == nil {
+		return nil
+	}
+	cp := *a.cfg
+	return &cp
+}
+
 func (a *App) saveConfig() error {
 	if a.cfgPath == "" {
 		p, err := config.DefaultConfigPath()
@@ -568,7 +582,9 @@ func (a *App) saveConfig() error {
 		}
 		a.cfgPath = p
 	}
-	return config.SaveConfig(a.cfgPath, a.cfg)
+	// 先在读锁下取快照，再用副本落盘：避免与 setAppSettings/saveUpdateSettings
+	// 的整结构写并发读写 a.cfg（Task 11 fix round 2）。锁内不做 IO。
+	return config.SaveConfig(a.cfgPath, a.snapshotConfig())
 }
 
 func (a *App) updateTunnel(u config.Tunnel) {
