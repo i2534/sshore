@@ -365,7 +365,11 @@ func (s *Service) SkipVersion(v string) error {
 	return nil
 }
 
-// ClearSkipped 清掉跳过并立刻重查（状态落 checking，保持与 UI 文案一致）。
+// ClearSkipped 清掉「跳过此版本」并立刻重查（spec §7.1/§12.1）。
+//
+// 这里不得预置 checking：Check 自身会置 checking 并落到终态；若先置 checking，
+// Check 开头的 checking 守卫会直接短路返回，导致这次取消跳过既不发请求、
+// 状态又永久停在 checking。
 func (s *Service) ClearSkipped() error {
 	cfg := s.opts.Config()
 	cfg.Skipped = ""
@@ -376,7 +380,6 @@ func (s *Service) ClearSkipped() error {
 	}
 	s.mu.Lock()
 	s.info.Skipped = false
-	s.setLocked(StateChecking, "")
 	s.mu.Unlock()
 	_, err := s.Check(context.Background(), true)
 	return err
