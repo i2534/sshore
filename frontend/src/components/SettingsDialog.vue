@@ -2,6 +2,7 @@
 import { ref, watch } from 'vue'
 import { GetAppInfo } from '../../wailsjs/go/main/App'
 import { useSettingsStore, THEMES, FONT_SCALES, LATIN_FONTS, CJK_FONTS } from '../stores/settings'
+import UpdateSection from './UpdateSection.vue'
 
 const props = defineProps({ visible: Boolean })
 const emit = defineEmits(['close'])
@@ -17,8 +18,11 @@ async function loadAppInfo() {
 watch(() => props.visible, (v) => { if (v) { err.value = ''; loadAppInfo() } })
 
 // 任一设置变更：立即应用（根节点）+ 落盘。忽略初次挂载/关闭时的赋值。
+// 注意：更新源是自由文本，**不得**放进这里 —— 逐键落盘会产生并发 save（无序号）丢输入；
+// 它由 UpdateSection 单独做 ~500ms 防抖，失焦/回车立即 flush（fix round 1 A）。
 watch(
-  () => [store.theme, store.fontScale, store.latinFont, store.cjkFont, store.autoStartOnLaunch, store.sftpTransport],
+  () => [store.theme, store.fontScale, store.latinFont, store.cjkFont, store.autoStartOnLaunch, store.sftpTransport,
+    store.updateCheckAuto, store.updateCheckIntervalHours],
   async () => {
     if (!props.visible) return
     store.apply()
@@ -103,6 +107,8 @@ watch(
           <a href="https://github.com/i2534/sshore/blob/master/README.md" target="_blank" rel="noopener">在线帮助文档 →</a>
         </p>
       </section>
+
+      <UpdateSection />
 
       <p v-if="err" class="err">保存失败: {{ err }}</p>
       <div class="dbtns">
