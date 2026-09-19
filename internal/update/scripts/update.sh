@@ -44,6 +44,8 @@ case "$WAIT" in ""|*[!0-9]*) fail args "wait 非法" ;; esac
 # BACKUP/LOG 本次运行才创建，只要求父目录存在且可写（spec §8.2）
 [ -d "$(dirname "$BACKUP")" ] || fail args "backup 父目录不存在"
 [ -d "$(dirname "$LOG")" ] || fail args "log 父目录不存在"
+# BACKUP 必须是文件路径：指向已存在目录时 mv 会把 TARGET 移进该目录，正式名随即消失
+if [ -d "$BACKUP" ]; then fail args "backup 指向已存在目录"; fi
 
 DIR=$(dirname "$TARGET")
 cd "$DIR" || fail 0 "无法进入目标目录"

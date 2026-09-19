@@ -158,6 +158,16 @@ func TestScriptArgsValidation(t *testing.T) {
 			},
 		},
 		{
+			// 顺手项④：BACKUP 指向已存在目录时 mv 会把 TARGET 移进该目录、正式名消失，
+			// 属参数类失败（退 2 + RESULT=fail:args）。
+			name:    "backup 指向已存在目录",
+			wantErr: "ERR=backup 指向已存在目录",
+			args: func(t *testing.T, p Plan) []string {
+				p.Backup = p.ExeDir
+				return ScriptArgs(p, deadPID(t))
+			},
+		},
+		{
 			name:    "pid 非数字",
 			wantErr: "ERR=pid 非法",
 			args: func(t *testing.T, p Plan) []string {

@@ -5,7 +5,6 @@
   sshore-v<tag>-linux-amd64.tar.gz / -windows-amd64.zip、checksums.txt
 （三个参数都必填：代码从 sys.argv[1..3] 读 PORT/ROOT/TAG）
 """
-import hashlib
 import json
 import pathlib
 import sys
