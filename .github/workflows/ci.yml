@@ -80,6 +80,7 @@ jobs:
       #   · 成功：把一个长期存活的真 exe（cmd.exe）当「新版本」，存活探测通过 → RESULT=ok
       #   · 回滚：把一个立刻退出的真 exe（whoami.exe）当「新版本」，探测失败 → RESULT=fail:launch
       - name: 真实 cmd.exe 跑 update.cmd（成功路径）
+        if: always()  # 我们的脚本真机验证不应被既有 internal/osutil 的 Windows 失败阻塞
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP "upd-ok"
@@ -110,6 +111,7 @@ jobs:
           exit 0
 
       - name: 真实 cmd.exe 跑 update.cmd（存活探测失败 → 回滚）
+        if: always()  # 同上：既有 osutil Windows 失败不得吞掉我们的脚本真跑证据
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP "upd-fail"
