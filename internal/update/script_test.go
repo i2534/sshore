@@ -193,3 +193,87 @@ func TestScriptArgsValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestScriptBackupNotWritable 覆盖 spec §8.3 的「应用不得消失」保证：--backup 的父目录
+// 存在但不可写（chmod 0500）时，第 5 步改名备份必定失败，脚本必须退 3、日志末行
+// RESULT=fail:5，且正式名仍是旧二进制、pending 原封不动 —— 三者缺一即为回归。
+func TestScriptBackupNotWritable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("update.sh 只能在类 Unix 上真跑")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root 有 CAP_DAC_OVERRIDE，0500 构造不出只读目录")
+	}
+	p := scriptFixture(t)
+	roDir := filepath.Join(p.ExeDir, "ro-backup")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	// 先恢复写权限，t.TempDir 的递归清理才能删掉这个目录（Cleanup 为 LIFO，早于它执行）。
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) })
+	p.Backup = filepath.Join(roDir, "sshore.v0.6.0")
+
+	log, err := runScriptArgs(t, p, ScriptArgs(p, deadPID(t))...)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+		t.Fatalf("备份失败必须退 3，实际 %v（log=%s）", err, log)
+	}
+	if !strings.Contains(log, "备份旧二进制失败") {
+		t.Fatalf("日志应含第 5 步备份失败原因: %s", log)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(log), "RESULT=fail:5") {
+		t.Fatalf("日志末行必须是 RESULT=fail:5: %q", log)
+	}
+	got, err := os.ReadFile(p.Target)
+	if err != nil {
+		t.Fatalf("备份失败后正式名必须仍在: %v", err)
+	}
+	if string(got) != "OLD\n" {
+		t.Fatalf("正式名必须仍是旧二进制内容，实际 %q", got)
+	}
+	pend, err := os.ReadFile(p.Pending)
+	if err != nil {
+		t.Fatalf("备份失败后 pending 必须仍在: %v", err)
+	}
+	if string(pend) != "PENDING\n" {
+		t.Fatalf("pending 必须原封不动，实际 %q", pend)
+	}
+}
+
+// TestScriptPendingVanishesBeforeReplace 覆盖新增的第 6 步前置检查。契约里 pending 是常规
+// 文件，无法在不引入竞态的前提下让它「恰好」在步骤 3 与步骤 5 之间消失；这里用确定性代理：
+// pending 是指向正式名的符号链接，第 5 步把正式名改名备份后链接即悬空 —— 对
+// [ -f "$PENDING" ] 而言等价于「pending 在替换前消失」。断言只针对脚本的显式检查
+// （退 3 + RESULT=fail:3），不把悬空链接这类越界输入的最终磁盘形态固化成期望。
+func TestScriptPendingVanishesBeforeReplace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("update.sh 只能在类 Unix 上真跑")
+	}
+	p := scriptFixture(t)
+	if err := os.Remove(p.Pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(p.Target, p.Pending); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(p.Pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Size = st.Size()
+
+	log, err := runScriptArgs(t, p, ScriptArgs(p, deadPID(t))...)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+		t.Fatalf("pending 消失必须退 3，实际 %v（log=%s）", err, log)
+	}
+	if !strings.Contains(log, "pending 在替换前消失") {
+		t.Fatalf("日志应含 pending 在替换前消失: %s", log)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(log), "RESULT=fail:3") {
+		t.Fatalf("日志末行必须是 RESULT=fail:3: %q", log)
+	}
+}

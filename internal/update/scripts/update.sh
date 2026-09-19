@@ -60,7 +60,7 @@ done
 
 # 3) 自检 pending 存在且大小一致
 [ -f "$PENDING" ] || fail 3 "pending 已消失"
-actual=$(wc -c < "$PENDING" | tr -d " ")
+actual=$(wc -c < "$PENDING")
 [ "$actual" = "$SIZE" ] || fail 3 "pending 大小不符：$actual != $SIZE"
 
 # 4) 清理更早备份（只留最近一份；绝不删 pending、sidecar、脚本、日志）
@@ -73,16 +73,27 @@ for f in "$DIR"/sshore.v* "$DIR"/sshore.dev-*; do
   rm -f "$f" || true
 done
 
-# 5) 旧二进制改名备份
+# 5) 旧二进制改名备份；改完立刻确认备份确实就位（spec §8.3：任何一步失败都不得让应用消失）
 mv -f "$TARGET" "$BACKUP" || fail 5 "备份旧二进制失败"
+[ -f "$BACKUP" ] || fail 5 "备份不完整"
 # 6) 待安装文件改名正式名（失败则把备份改回去，避免应用消失）
+[ -f "$PENDING" ] || fail 3 "pending 在替换前消失"
 if ! mv -f "$PENDING" "$TARGET"; then
   mv -f "$BACKUP" "$TARGET" 2>/dev/null || true
+  [ -f "$TARGET" ] || fail 6 "替换失败且回滚未恢复正式名"
   fail 6 "替换正式名失败"
 fi
 chmod +x "$TARGET" 2>/dev/null || true
 
 # 8) 启动新版并做 3 秒存活探测；失败则回滚
+#
+# 存活探测的前提（重要）：这里依赖 util-linux setsid 的「非 fork exec」语义 —— 当脚本
+# 自身不是进程组首进程时，setsid 直接 exec 目标而不 fork，故 $! 就是新版进程的 PID，
+# kill -0 才能真实反映它是否还活着。
+# sysvinit/busybox 的 setsid 变体、或脚本自身恰好已是进程组首进程时，setsid 会先 fork
+# 再 exec：$! 变成那个转瞬即逝的中间父进程，探测会误判「新版已退出」。正是这类误判
+# （以及新版自身启动即崩）让下面的失败回滚分支必须存在：探测失败也要把正式名恢复成
+# 旧二进制，绝不让应用消失。
 if command -v setsid >/dev/null 2>&1; then
   setsid "$TARGET" >/dev/null 2>&1 &
 else
