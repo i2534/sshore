@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { EventsOn, EventsOff } from "../../wailsjs/runtime/runtime";
+import { EventsOn } from "../../wailsjs/runtime/runtime";
 import {
   GetUpdateInfo, CheckUpdate, StartUpdateDownload, CancelUpdateDownload,
   ApplyUpdateAndRestart, DiscardUpdateDownload, SkipUpdateVersion, ClearSkippedUpdate, OpenReleasePage,
@@ -56,7 +56,8 @@ export const useUpdateStore = defineStore("update", {
     ensureSubscribed() {
       this.ensureListening();
     },
-    // 退订：EventsOn 返回退订函数（仓库 App.vue 的既有约定）；EventsOff 兜底清同名事件。
+    // 退订：只用 EventsOn 返回的退订函数（仓库 App.vue 的既有约定）。
+    // 不再用 EventsOff 兜底（Task 14 评审 M3 判定安全：每个订阅都保存了自己的退订函数）。
     stopListening() {
       for (const off of [this.offState, this.offProgress]) {
         if (typeof off !== "function") continue;
@@ -64,7 +65,6 @@ export const useUpdateStore = defineStore("update", {
       }
       this.offState = null;
       this.offProgress = null;
-      try { EventsOff(UPDATE_STATE_EVENT, UPDATE_PROGRESS_EVENT); } catch (e) { /* 非浏览器运行时忽略 */ }
       this.listening = false;
     },
     // 自动/挂载路径：失败落 error 字段供设置页与调用方读取，不抛（应用启动不应因取快照失败而崩）。
