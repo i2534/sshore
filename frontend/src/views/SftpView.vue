@@ -874,9 +874,9 @@ onUnmounted(() => {
       </label>
     </div>
     <div class="panes">
-      <!-- 不是装饰：WebKitGTK 上只有 @dragover.prevent 时，面板级 drop 根本不会派发
+      <!-- @dragenter.prevent 不是装饰：WebKitGTK 上只有 @dragover.prevent 时，面板级 drop 根本不会派发
            （Linux 真机实测：面板内行拖拽能成、跨面板拖拽完全无反应）；Chromium/WebView2 两者都行。 -->
-      <div class="pane-wrap" data-pane="local" :class="{ 'drop-hover': hoverPane === 'local' }" @dragover.prevent="onPaneDragOver('local')" @drop.prevent="onPaneDrop('local', { event: $event })">
+      <div class="pane-wrap" data-pane="local" :class="{ 'drop-hover': hoverPane === 'local' }" @dragenter.prevent @dragover.prevent="onPaneDragOver('local')" @drop.prevent="onPaneDrop('local', { event: $event })">
         <FilePane title="本地" pane="local" host="" :path="localPath || '/'" :items="visibleLocalItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
           :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
           :presets="locations.presetsForPane('local', '')" :disks="locations.disksForPane('local')"
