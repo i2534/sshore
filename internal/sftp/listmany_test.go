@@ -132,7 +132,7 @@ func TestListManyStderrMarksPathUnknown(t *testing.T) {
 	run := func(name string, args ...string) (osutil.Outcome, error) {
 		return osutil.Outcome{Stdout: stdout, Stderr: stderr}, nil
 	}
-	c := NewCtrl(run, func(e forward.Event) { events = append(events, e) })
+	c := NewBatchBackend(run, func(e forward.Event) { events = append(events, e) })
 	got, err := c.ListMany("ai", "", []string{"/x"})
 	if err != nil {
 		t.Fatalf("ListMany: %v", err)
@@ -165,7 +165,7 @@ func TestListManyBuildsDashPrefixedBatchAndLogs(t *testing.T) {
 		}
 		return osutil.Outcome{Stdout: listManyFixture, Stderr: listManyStderr}, nil
 	}
-	c := NewCtrl(run, func(e forward.Event) { events = append(events, e) })
+	c := NewBatchBackend(run, func(e forward.Event) { events = append(events, e) })
 	paths := []string{"/tmp/ldm/a", "/tmp/ldm/nope", "/tmp/ldm/empty"}
 	got, err := c.ListMany("ai", "", paths)
 	if err != nil {
@@ -205,7 +205,7 @@ func TestListManyBuildsDashPrefixedBatchAndLogs(t *testing.T) {
 // 空请求不应调用 runner，也不应报错。
 func TestListManyEmptyPathsIsNoop(t *testing.T) {
 	called := false
-	c := NewCtrl(func(name string, args ...string) (osutil.Outcome, error) {
+	c := NewBatchBackend(func(name string, args ...string) (osutil.Outcome, error) {
 		called = true
 		return osutil.Outcome{}, nil
 	}, nil)
@@ -224,7 +224,7 @@ func TestListManyEmptyPathsIsNoop(t *testing.T) {
 // 进程失败时必须发 error 事件并返回错误(不能吞掉)。
 func TestListManyFailureLogsError(t *testing.T) {
 	var events []forward.Event
-	c := NewCtrl(func(name string, args ...string) (osutil.Outcome, error) {
+	c := NewBatchBackend(func(name string, args ...string) (osutil.Outcome, error) {
 		return osutil.Outcome{ExitCode: 1, Stderr: "Permission denied (publickey)"}, nil
 	}, func(e forward.Event) { events = append(events, e) })
 	if _, err := c.ListMany("ai", "", []string{"/x"}); err == nil {

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -48,6 +49,11 @@ func TestMain(m *testing.M) {
 // 所有 sftp 调用成功，stdout 为给定的固定输出（不启动真实进程）。
 func appWithFakeSFTP(t *testing.T, stdout string) *App {
 	t.Helper()
+	// 这些用例的假 runner 只会应答 `sftp -b` 进程，因此**必须显式钉住 batch 后端**：
+	// Task 16 把内置默认切到 gosftp 后，NewCtrl 会按内置默认去起真实 `ssh -s sftp`，
+	// 让本组用例（本意是验最近位置记录等绑定层行为）在 CI 里真连 DNS/网络而失败。
+	// 显式设置也让本组用例不再随内置默认漂移。
+	t.Setenv("SSHORE_SFTP_TRANSPORT", "batch")
 	a := NewApp()
 	a.Init(func(forward.Event) {})
 	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
@@ -580,7 +586,7 @@ func TestStartupMigratesLegacyRecentsToDisk(t *testing.T) {
 // LocalRecent，且持久化落盘；旧 recent_sftp 不再被写入（spec §10.2）。
 func TestSftpGetRecordsRecent(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
-	if err := a.SftpGet("prod-db", "alice", "/var/log/app.log", "/tmp/dl/app.log"); err != nil {
+	if err := a.SftpGet("t-recent-get", "prod-db", "alice", "/var/log/app.log", "/tmp/dl/app.log", false, ""); err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	cfg, err := config.LoadConfig(a.cfgPath)
@@ -611,7 +617,7 @@ func TestSftpGetRecordsRecent(t *testing.T) {
 // P2: SftpPut 成功后同样写双侧新字段（remote/local 目录与 Get 对称）。
 func TestSftpPutRecordsRecent(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
-	if err := a.SftpPut("prod-db", "alice", "/tmp/dl/app.log", "/var/log/app.log"); err != nil {
+	if err := a.SftpPut("t-recent-put", "prod-db", "alice", "/tmp/dl/app.log", "/var/log/app.log", false, ""); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	cfg, err := config.LoadConfig(a.cfgPath)
@@ -663,13 +669,13 @@ func TestSftpHomeRecordsRecent(t *testing.T) {
 // P2: 重复记录同一 (host, path) 时旧条目被移除、新条目置顶；本地侧同理按 path 去重。
 func TestRecordRecentSFTPDedupMovesToFront(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
-	if err := a.SftpGet("h1", "", "/a/x", "/l1/x"); err != nil {
+	if err := a.SftpGet("t-h1", "h1", "", "/a/x", "/l1/x", false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.SftpGet("h2", "", "/b/y", "/l2/y"); err != nil {
+	if err := a.SftpGet("t-h2", "h2", "", "/b/y", "/l2/y", false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.SftpGet("h1", "", "/a/x", "/l1/x"); err != nil {
+	if err := a.SftpGet("t-h1", "h1", "", "/a/x", "/l1/x", false, ""); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := config.LoadConfig(a.cfgPath)
@@ -697,7 +703,7 @@ func TestRecordRecentSFTPDedupMovesToFront(t *testing.T) {
 // 所以这条在 Linux 是"恒真"的护栏，真正的判别力在 Windows。
 func TestRemoteRecentNeverContainsBackslash(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
-	if err := a.SftpGet("prod", "", "/a/b/c.txt", "/l/c.txt"); err != nil {
+	if err := a.SftpGet("t-prod", "prod", "", "/a/b/c.txt", "/l/c.txt", false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(a.cfg.RemoteRecent) != 1 {
@@ -716,7 +722,7 @@ func TestRecordRecentSFTPCapsAtTwenty(t *testing.T) {
 	a := appWithFakeSFTP(t, "")
 	for i := 0; i < 25; i++ {
 		host := "host" + string(rune('a'+i))
-		if err := a.SftpGet(host, "", "/r"+string(rune('0'+i)), "/local"); err != nil {
+		if err := a.SftpGet("t-"+host, host, "", "/r"+string(rune('0'+i)), "/local", false, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -744,7 +750,7 @@ func TestRecordRecentSFTPCapsAtTwenty(t *testing.T) {
 func TestRecordRecentWritesNewFieldsOnly(t *testing.T) {
 	a3 := appWithFakeSFTP(t, "")
 	for _, host := range []string{"h1", "h2", "h3"} {
-		if err := a3.SftpGet(host, "", "/r/"+host, "/l/"+host); err != nil {
+		if err := a3.SftpGet("t3-"+host, host, "", "/r/"+host, "/l/"+host, false, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1226,6 +1232,176 @@ func TestStartupSeedsPresetsFileOnce(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(pp); string(after) != bad {
 		t.Fatal("坏文件不得被覆盖")
+	}
+}
+
+// —— Task 9：进度事件载荷 + 绑定层（id / Atomic 能力 / Cancel）——
+
+// TestSftpTransferProgressEventShape 钉住 sftp:transfer-progress 的载荷字段名与取值：
+// 字段名是前端（Task 14）与后端的唯一契约，改名/漏字段必须在这里变红。
+func TestSftpTransferProgressEventShape(t *testing.T) {
+	got := progressToEvent(sftp.Progress{ID: "t1", Done: 5, Total: 10, Phase: sftp.PhaseTransfer})
+	if got["id"] != "t1" || got["done"] != int64(5) || got["total"] != int64(10) || got["phase"] != "transfer" {
+		t.Fatalf("事件字段不符: %#v", got)
+	}
+	// 全部字段都必须存在：缺键会让前端静默读到 undefined（Task 14 的进度条/速度会算错）。
+	full := progressToEvent(sftp.Progress{
+		ID: "t2", Host: "h", Direction: sftp.DirDownload, Name: "/r/a.bin", PartPath: "/l/a.bin.part",
+		Done: 3, Total: 9, FilesDone: 0, FilesTotal: 0, Phase: sftp.PhaseTransfer,
+	})
+	want := map[string]any{
+		"id": "t2", "host": "h", "direction": "download", "name": "/r/a.bin",
+		"partPath": "/l/a.bin.part", "done": int64(3), "total": int64(9),
+		"filesDone": 0, "filesTotal": 0, "phase": "transfer",
+	}
+	if len(full) != len(want) {
+		t.Fatalf("事件字段数不符（多/漏字段）: got %d want %d: %#v", len(full), len(want), full)
+	}
+	for k, v := range want {
+		if full[k] != v {
+			t.Fatalf("字段 %s = %#v, want %#v", k, full[k], v)
+		}
+	}
+}
+
+// TestTransferProgressEventNamePinnedWithFrontend（Task 14 / Task 9 M1）：事件名是前后端唯一的
+// 关联点，改名不会让任何一侧编译失败，只会让前端订阅静默失效（永远没有进度帧）。前端把名字
+// 放在 frontend/src/utils/queue.js 的 TRANSFER_PROGRESS_EVENT 常量里并由 vitest 钉死，
+// 这里再断言 Go 侧 emit 的名字与前端常量**逐字相等**——两边分开改名就会在这里变红。
+func TestTransferProgressEventNamePinnedWithFrontend(t *testing.T) {
+	const want = "sftp:transfer-progress"
+	if progressEventName != want {
+		t.Fatalf("事件名 = %q, want %q", progressEventName, want)
+	}
+	b, err := os.ReadFile(filepath.Join("frontend", "src", "utils", "queue.js"))
+	if err != nil {
+		t.Fatalf("读前端事件名常量失败: %v", err)
+	}
+	m := regexp.MustCompile(`export const TRANSFER_PROGRESS_EVENT\s*=\s*'([^']+)'`).FindSubmatch(b)
+	if m == nil {
+		t.Fatal("frontend/src/utils/queue.js 里找不到 TRANSFER_PROGRESS_EVENT = '…'")
+	}
+	if string(m[1]) != want {
+		t.Fatalf("前后端事件名不一致：Go %q，前端 %q", want, string(m[1]))
+	}
+}
+
+// TestEmitProgressWithoutContextIsNoop：startup 之前（a.ctx == nil）emit 必须静默，
+// 绝不在后台 goroutine 里对 nil context 调 runtime.EventsEmit（会 panic）。
+func TestEmitProgressWithoutContextIsNoop(t *testing.T) {
+	a := NewApp() // 不调 startup ⇒ a.ctx 为 nil
+	a.emitProgress(sftp.Progress{ID: "t1", Done: 1, Total: 2, Phase: sftp.PhaseTransfer})
+}
+
+// TestSftpOutputBindingsUsableUnderBatch 钉住能力驱动的 Atomic 取值（Task 9 步骤 3）：
+// 本用例**显式钉住 batch**（appWithFakeSFTP 只应答 sftp -b，且默认已切 gosftp），batch 不
+// AtomicCapable，而 Task 6 的 M4 守卫对 Atomic=true 硬报错，所以四个输出绑定必须照常可用 ——
+// 这只有在绑定层从 AtomicCapable 取 Atomic 时才成立。写死 Atomic=true 会让 batch 传输全盘
+// 失败；写死 false 会丢掉 gosftp 的 .part + 提交语义。
+// （能力本身的来源由 internal/sftp 的 TestFacadeAtomicCapableFollowsBackend 钉住。）
+func TestSftpOutputBindingsUsableUnderBatch(t *testing.T) {
+	// batch 的 Transfer* 是「真执行」：假 runner 对 sftp 批处理一律返回成功。
+	a := appWithFakeSFTP(t, "")
+	cases := []struct {
+		name string
+		run  func() error
+	}{
+		{"SftpGet", func() error { return a.SftpGet("t1", "h", "u", "/r/a", "/l/a", true, "/l/a.part") }},
+		{"SftpGetDir", func() error { return a.SftpGetDir("t2", "h", "u", "/r/d", "/l/d", false, "") }},
+		{"SftpPut", func() error { return a.SftpPut("t3", "h", "u", "/l/a", "/r/a", false, "") }},
+		{"SftpPutRecursive", func() error { return a.SftpPutRecursive("t4", "h", "u", "/l/d", "/r/d", true, "/r/d.part") }},
+	}
+	for _, tc := range cases {
+		if err := tc.run(); err != nil {
+			t.Fatalf("%s: batch 后端下必须成功（Atomic=false 直写）: %v", tc.name, err)
+		}
+	}
+}
+
+// TestSftpTransferCancelDelegatesToFacade 钉住 SftpTransferCancel 绑定：
+// 必须把 id 原样转给门面（Cancel），返回值也原样上抛（未知 id ⇒ false）。
+// 真实取消（整批）由 Task 10 实现；本 task 只要求不吞错、不错位。
+func TestSftpTransferCancelDelegatesToFacade(t *testing.T) {
+	a := appWithFakeSFTP(t, "")
+	if a.SftpTransferCancel("t-unknown") {
+		t.Fatal("未知 id 必须返回 false（batch 门面当前恒 false）")
+	}
+}
+
+// recordingBackend 是 sftp.Backend 的**记录型**替身：只关心绑定层把什么 TransferRequest
+// 递了下来。未覆写的方法由嵌入的 sftp.Backend 接口提供 —— 用例只走 Transfer* 四个方法，
+// 若真调到了别的方法说明用例超出了观测范围（nil 接口会 panic，这是有意的，不静默通过）。
+type recordingBackend struct {
+	sftp.Backend
+	atomic bool
+	calls  []string
+	reqs   []sftp.TransferRequest
+}
+
+func (b *recordingBackend) AtomicCapable() bool { return b.atomic }
+
+func (b *recordingBackend) record(call string, req sftp.TransferRequest) {
+	b.calls = append(b.calls, call)
+	b.reqs = append(b.reqs, req)
+}
+
+func (b *recordingBackend) TransferGet(req sftp.TransferRequest, _ func(sftp.Progress)) error {
+	b.record("TransferGet", req)
+	return nil
+}
+func (b *recordingBackend) TransferGetTree(req sftp.TransferRequest, _ func(sftp.Progress)) error {
+	b.record("TransferGetTree", req)
+	return nil
+}
+func (b *recordingBackend) TransferPut(req sftp.TransferRequest, _ func(sftp.Progress)) error {
+	b.record("TransferPut", req)
+	return nil
+}
+func (b *recordingBackend) TransferPutTree(req sftp.TransferRequest, _ func(sftp.Progress)) error {
+	b.record("TransferPutTree", req)
+	return nil
+}
+
+// TestSftpBindingsPassAtomicTrueWhenBackendCapable 收口 Task 9 评审 I1：
+// 既有用例只证明 batch（AtomicCapable=false）下四个绑定可用，即「没有写死 true」；
+// 这里用记录型后端证明完整能力链 Backend.AtomicCapable=true ⇒ Ctrl.AtomicCapable=true
+// ⇒ App.sftpAtomic=true ⇒ 绑定把 TransferRequest.Atomic 传成 true。写死 false（或漏传
+// 能力）会在这里变红。完全 hermetic：不联网、不起 ssh。
+func TestSftpBindingsPassAtomicTrueWhenBackendCapable(t *testing.T) {
+	fb := &recordingBackend{atomic: true}
+	a := NewApp()
+	a.Init(func(forward.Event) {})
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
+	a.sftp = sftp.NewCtrlForcedBackend(fb)
+
+	if err := a.SftpGet("t1", "h", "u", "/r/a", "/l/a", true, "/l/a.part"); err != nil {
+		t.Fatalf("SftpGet: %v", err)
+	}
+	if err := a.SftpGetDir("t2", "h", "u", "/r/d", "/l/d", false, ""); err != nil {
+		t.Fatalf("SftpGetDir: %v", err)
+	}
+	if err := a.SftpPut("t3", "h", "u", "/l/a", "/r/a", false, ""); err != nil {
+		t.Fatalf("SftpPut: %v", err)
+	}
+	if err := a.SftpPutRecursive("t4", "h", "u", "/l/d", "/r/d", true, "/r/d.part"); err != nil {
+		t.Fatalf("SftpPutRecursive: %v", err)
+	}
+
+	wantCalls := []string{"TransferGet", "TransferGetTree", "TransferPut", "TransferPutTree"}
+	wantIDs := []string{"t1", "t2", "t3", "t4"}
+	if len(fb.calls) != len(wantCalls) {
+		t.Fatalf("四个绑定都必须委派到后端，calls=%v", fb.calls)
+	}
+	for i, call := range wantCalls {
+		if fb.calls[i] != call {
+			t.Fatalf("第 %d 次委派应为 %s，got %s", i, call, fb.calls[i])
+		}
+		if !fb.reqs[i].Atomic {
+			t.Fatalf("%s: 后端声明 AtomicCapable 时绑定必须传 Atomic=true（写死 false 会丢掉原子语义）", call)
+		}
+		if fb.reqs[i].ID != wantIDs[i] {
+			t.Fatalf("%s: id 必须原样透传，got %q want %q", call, fb.reqs[i].ID, wantIDs[i])
+		}
 	}
 }
 

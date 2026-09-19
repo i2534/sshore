@@ -81,9 +81,9 @@ export function SftpConnected(arg1:string):Promise<boolean>;
 
 export function SftpDisconnect(arg1:string):Promise<void>;
 
-export function SftpGet(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+export function SftpGet(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:boolean,arg7:string):Promise<void>;
 
-export function SftpGetDir(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+export function SftpGetDir(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:boolean,arg7:string):Promise<void>;
 
 export function SftpHome(arg1:string):Promise<string>;
 
@@ -93,9 +93,9 @@ export function SftpMkdir(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function SftpMove(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
-export function SftpPut(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+export function SftpPut(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:boolean,arg7:string):Promise<void>;
 
-export function SftpPutRecursive(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+export function SftpPutRecursive(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:boolean,arg7:string):Promise<void>;
 
 export function SftpRemove(arg1:string,arg2:string,arg3:string):Promise<void>;
 
@@ -104,6 +104,8 @@ export function SftpRemoveRecursive(arg1:string,arg2:string,arg3:string):Promise
 export function SftpRename(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
 export function SftpSearch(arg1:main.RemoteSearchRequest):Promise<sftp.SearchOutcome>;
+
+export function SftpTransferCancel(arg1:string):Promise<boolean>;
 
 export function StartSyncRule(arg1:string):Promise<void>;
 

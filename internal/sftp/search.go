@@ -33,7 +33,17 @@ type SearchOutcome struct {
 // 深度语义与仓库一致：0=仅本层，N=N 层，-1=无限（spec §3 决策 17）。
 // ctx 在**批次之间**检查；取消时返回已扫描部分 + ctx.Err()，调用方应转成
 // Cancelled=true 的正常返回（见 app.go 的 SftpSearch）。
-func (c *Ctrl) Search(ctx context.Context, host, user, root, pattern string, maxDepth, limit int,
+func (c *BatchBackend) Search(ctx context.Context, host, user, root, pattern string, maxDepth, limit int,
+	onProgress func(scanned int)) (SearchOutcome, error) {
+	return searchBFS(ctx, c.ListMany, host, user, root, pattern, maxDepth, limit, onProgress)
+}
+
+// searchBFS 是两个后端共用的 BFS 主体：lister 只负责"列一批目录"，
+// BatchBackend 传 batch.ListMany，GoBackend（Task 13）传自己的 ListMany。
+// 返回 map 缺失 key 的语义在此处解释为"不可读"（Unreadable++）。
+func searchBFS(ctx context.Context,
+	lister func(host, user string, paths []string) (map[string][]Item, error),
+	host, user, root, pattern string, maxDepth, limit int,
 	onProgress func(scanned int)) (SearchOutcome, error) {
 	if limit <= 0 {
 		limit = 500
@@ -63,7 +73,7 @@ func (c *Ctrl) Search(ctx context.Context, host, user, root, pattern string, max
 		for _, n := range batch {
 			paths = append(paths, n.dir)
 		}
-		res, err := c.ListMany(host, user, paths)
+		res, err := lister(host, user, paths)
 		if err != nil {
 			return out, err
 		}
