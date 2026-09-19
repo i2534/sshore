@@ -52,9 +52,11 @@ rem 4) 清理更早备份（保留 pending 与本次 backup，且跳过 sidecar/
 for %%f in ("%CD%\sshore.v*") do call :maybe_del "%%~nxf"
 for %%f in ("%CD%\sshore.dev-*") do call :maybe_del "%%~nxf"
 
-rem 5) 备份旧二进制
+rem 5) 备份旧二进制；改完立刻确认备份确实就位（spec §8.3：任何一步失败都不得让应用消失）
 move /y "%TARGET%" "%BACKUP%" >nul || goto :step5
+if not exist "%BACKUP%" goto :step5
 rem 6) 换成新版本（失败则回滚）
+if not exist "%PENDING%" goto :step3
 move /y "%PENDING%" "%TARGET%" >nul || goto :rollback_replace
 
 rem 8) 启动并做 3 秒存活探测
@@ -82,6 +84,7 @@ exit /b 0
 
 :rollback_replace
 move /y "%BACKUP%" "%TARGET%" >nul 2>nul
+if not exist "%TARGET%" goto :fail6
 goto :fail6
 
 :rollback_launch
