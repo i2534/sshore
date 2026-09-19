@@ -68,8 +68,29 @@ func (s *AppSettings) Normalize() {
 	if s.UpdateSource != "" && !strings.HasPrefix(s.UpdateSource, "http://") && !strings.HasPrefix(s.UpdateSource, "https://") {
 		s.UpdateSource = ""
 	}
-	// 跳过版本存 Base 形式（去空白与 v 前缀），与 update.Base(rel.Tag)==update.Base(cfg.Skipped) 对齐。
+	// 跳过版本存 Base 形式（去空白与 v 前缀），与 update.Base(rel.Tag)==update.Base(cfg.Skipped) 对齐；
+	// spec §6：只允许 [0-9A-Za-z.+-] 字符集，含其它字符（空格/分号/中文等）一律清空，
+	// 避免把任意用户输入带到与 tag 的比较里。
 	s.UpdateSkippedVersion = strings.TrimPrefix(strings.TrimSpace(s.UpdateSkippedVersion), "v")
+	if strings.ContainsFunc(s.UpdateSkippedVersion, invalidSkippedVersionRune) {
+		s.UpdateSkippedVersion = ""
+	}
+}
+
+// invalidSkippedVersionRune 判定 update_skipped_version 的非法字符（spec §6 白名单
+// 为 [0-9A-Za-z.+-]）。白名单用正列举而非取反区间，避免把非 ASCII 字母误判为合法。
+func invalidSkippedVersionRune(r rune) bool {
+	switch {
+	case r >= '0' && r <= '9':
+		return false
+	case r >= 'A' && r <= 'Z':
+		return false
+	case r >= 'a' && r <= 'z':
+		return false
+	case r == '.' || r == '+' || r == '-':
+		return false
+	}
+	return true
 }
 
 type Tunnel struct {
