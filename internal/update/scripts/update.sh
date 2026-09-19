@@ -73,14 +73,21 @@ for f in "$DIR"/sshore.v* "$DIR"/sshore.dev-*; do
   rm -f "$f" || true
 done
 
-# 5) 旧二进制改名备份；改完立刻确认备份确实就位（spec §8.3：任何一步失败都不得让应用消失）
-mv -f "$TARGET" "$BACKUP" || fail 5 "备份旧二进制失败"
-[ -f "$BACKUP" ] || fail 5 "备份不完整"
-# 6) 待安装文件改名正式名（失败则把备份改回去，避免应用消失）
-[ -f "$PENDING" ] || fail 3 "pending 在替换前消失"
-if ! mv -f "$PENDING" "$TARGET"; then
+# 第 5 步之后 TARGET 可能已被改名到 BACKUP：任何失败都必须先把正式名恢复，避免应用消失。
+rollback_target() {
+  [ -f "$TARGET" ] && return 0
+  [ -f "$BACKUP" ] || return 0
   mv -f "$BACKUP" "$TARGET" 2>/dev/null || true
-  [ -f "$TARGET" ] || fail 6 "替换失败且回滚未恢复正式名"
+}
+
+# 5) 旧二进制改名备份；改完立刻确认备份确实就位（spec §8.3：任何一步失败都不得让应用消失）
+mv -f "$TARGET" "$BACKUP" || { rollback_target; fail 5 "备份旧二进制失败"; }
+[ -f "$BACKUP" ] || { rollback_target; fail 5 "备份不完整"; }
+# 6) 待安装文件改名正式名（失败则把备份改回去，避免应用消失）
+[ -f "$PENDING" ] || { rollback_target; fail 3 "pending 在替换前消失"; }
+if ! mv -f "$PENDING" "$TARGET"; then
+  rollback_target
+  [ -f "$TARGET" ] || { rollback_target; fail 6 "替换失败且回滚未恢复正式名"; }
   fail 6 "替换正式名失败"
 fi
 chmod +x "$TARGET" 2>/dev/null || true
