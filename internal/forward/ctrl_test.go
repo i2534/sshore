@@ -165,7 +165,16 @@ func freePort(t *testing.T) int {
 func TestStartMonitorsProcessExit(t *testing.T) {
 	var mu sync.Mutex
 	var emitted []Event
-	ctrl := NewCtrl(
+	tr := base()
+	// stateAtConnected 在 Start 发出 connected 事件的那一刻读取。Start 的同步顺序是
+	// 「置 StateConnected → 发 connected 事件 → 启动 watchExit」，所以该回调里没有
+	// 并发写者，读到的必然是 Start 写入的最终状态——这正是原断言想验证的契约。
+	// 原写法（Start 返回后立刻读 State 并要求 == connected）对一个被设计成「立刻退出」
+	// 的子进程是对调度顺序的过强假设：watchExit 可能在 Start 返回前就把状态改成 error
+	// （CI 上偶发 state right after start: error），因此改为在无并发写者的时刻取值。
+	var stateAtConnected State
+	var ctrl *Ctrl
+	ctrl = NewCtrl(
 		&fakeSpawner{startFunc: func(name string, args ...string) (*osutil.Process, error) {
 			return exitProcess(t, 1)
 		}},
@@ -173,32 +182,48 @@ func TestStartMonitorsProcessExit(t *testing.T) {
 			mu.Lock()
 			emitted = append(emitted, e)
 			mu.Unlock()
+			if e.SourceID == tr.ID && e.Message == string(StateConnected) {
+				stateAtConnected = ctrl.State(e.SourceID)
+			}
 		},
 		nil,
 	)
-	tr := base()
 	tr.ListenPort = freePort(t)
 	if err := ctrl.Start(tr); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if got := ctrl.State(tr.ID); got != StateConnected {
-		t.Fatalf("state right after start: %s", got)
+	if stateAtConnected != StateConnected {
+		t.Fatalf("state when Start reports connected: %q", stateAtConnected)
 	}
+	// watchExit 先写 StateError、后发 error 事件，两者之间同样有窗口：必须把
+	// 「状态已是 error」与「error 事件已入列」放在同一个轮询里等，否则会在事件
+	// 入列之前提前退出（CI 上偶发的 no error event emitted）。
+	var errEvent bool
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && ctrl.State(tr.ID) != StateError {
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		errEvent = false
+		for _, e := range emitted {
+			if e.SourceID == tr.ID && e.Level == "error" {
+				errEvent = true
+				break
+			}
+		}
+		mu.Unlock()
+		if errEvent && ctrl.State(tr.ID) == StateError {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if got := ctrl.State(tr.ID); got != StateError {
 		t.Fatalf("state should be error after process exit, got %s", got)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	for _, e := range emitted {
-		if e.SourceID == tr.ID && e.Level == "error" {
-			return
-		}
+	if !errEvent {
+		mu.Lock()
+		ev := append([]Event(nil), emitted...)
+		mu.Unlock()
+		t.Fatalf("no error event emitted: %v", ev)
 	}
-	t.Fatalf("no error event emitted: %v", emitted)
 }
 
 // H4: 对已在运行的隧道再次 Start 必须直接报错且不动 map 条目——
