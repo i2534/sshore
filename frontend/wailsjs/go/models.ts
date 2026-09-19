@@ -8,6 +8,10 @@ export namespace config {
 	    latin_font?: string;
 	    cjk_font?: string;
 	    auto_start_on_launch: boolean;
+	    update_check_auto: boolean;
+	    update_check_interval_hours: number;
+	    update_skipped_version: string;
+	    update_source: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new AppSettings(source);
@@ -22,6 +26,10 @@ export namespace config {
 	        this.latin_font = source["latin_font"];
 	        this.cjk_font = source["cjk_font"];
 	        this.auto_start_on_launch = source["auto_start_on_launch"];
+	        this.update_check_auto = source["update_check_auto"];
+	        this.update_check_interval_hours = source["update_check_interval_hours"];
+	        this.update_skipped_version = source["update_skipped_version"];
+	        this.update_source = source["update_source"];
 	    }
 	}
 	export class Bookmark {
@@ -509,6 +517,49 @@ export namespace sync {
 	        this.local_size = source["local_size"];
 	        this.local_mtime = source["local_mtime"];
 	        this.detected_at = source["detected_at"];
+	    }
+	}
+
+}
+
+export namespace update {
+	
+	export class UpdateInfo {
+	    seq: number;
+	    state: string;
+	    current: string;
+	    latest: string;
+	    notes: string;
+	    published_at: string;
+	    source: string;
+	    progress: number;
+	    ready_path: string;
+	    skipped: boolean;
+	    manual: boolean;
+	    hint: string;
+	    error: string;
+	    pending_log: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new UpdateInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.seq = source["seq"];
+	        this.state = source["state"];
+	        this.current = source["current"];
+	        this.latest = source["latest"];
+	        this.notes = source["notes"];
+	        this.published_at = source["published_at"];
+	        this.source = source["source"];
+	        this.progress = source["progress"];
+	        this.ready_path = source["ready_path"];
+	        this.skipped = source["skipped"];
+	        this.manual = source["manual"];
+	        this.hint = source["hint"];
+	        this.error = source["error"];
+	        this.pending_log = source["pending_log"];
 	    }
 	}
 
