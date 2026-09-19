@@ -39,10 +39,12 @@
 | `internal/update/scripts/update.sh`、`update.cmd` | 升级脚本（embed 资源，纯 sh / 纯 cmd） | 6 |
 | `internal/update/script.go` | 脚本写出、参数/环境构造、分离启动 | 6 |
 | `internal/update/lock.go` | ExeDir 排他锁（flock / 命名互斥体） | 7 |
-| `internal/update/service.go` | 状态机、轮询、残留自检、事件发射 | 8 |
-| `internal/config/store.go` | 4 个新配置字段与 Normalize | 9 |
-| `app.go` | 9 个绑定 + startup/OnShutdown/SetSettings 接线 | 10 |
-| `frontend/wailsjs/**` | 重新生成的绑定（提交进仓库） | 11 |
+| `internal/update/service.go` | 状态机、并发守卫 | 8 |
+| `internal/update/service.go` | 下载全流程、残留自检、轮询调度 | 9 |
+| `internal/config/store.go` | 4 个新配置字段与 Normalize | 10 |
+| `app.go` | 9 个绑定 + startup/OnShutdown/SetSettings 接线 | 11 |
+| `frontend/wailsjs/**` | 重新生成的绑定（提交进仓库） | 11（同任务内生成） |
+| `internal/update/script_run_test.go` | 脚本真跑（成功/超时/回滚） | 12 |
 | `frontend/src/utils/update.js` | 状态→文案、按钮矩阵、格式化（纯函数） | 13 |
 | `frontend/src/stores/update.js` | 事件归约（seq）、角标派生、动作封装 | 14 |
 | `frontend/src/components/UpdateSection.vue` | 更新区 UI | 15 |
@@ -51,10 +53,11 @@
 | `.gitattributes` | `*.sh` LF / `*.cmd` CRLF | 6 |
 | `.github/workflows/ci.yml` | checksums + shellcheck + Windows 真跑脚本 | 17 |
 | `README.md` | 「更新与升级」一节 | 18 |
+| `e2e/fake_update_source.py` | 端到端假源 | 19 |
 
 ---
 
-## 阶段 A（可独立交付：检测 + 提示）
+## 前置门禁
 
 ### Task 0: 前置门禁 —— F3（Windows 重命名运行中的 exe）+ F1 复核
 
@@ -139,6 +142,8 @@ git commit -m "docs(spec): F3 门禁实测结论（go/no-go）"
 ```
 
 ---
+
+## 阶段 A（可独立交付：检测 + 提示）
 
 ### Task 1: version.go —— 版本类判定、比较、pending 名解析
 
@@ -243,7 +248,7 @@ const (
 var (
 	cleanRe    = regexp.MustCompile(`^v?[0-9]+[.][0-9]+[.][0-9]+$`)
 	describeRe = regexp.MustCompile(`^v?[0-9]+[.][0-9]+[.][0-9]+-[0-9]+-g[0-9a-f]+$`)
-	pendingRe  = regexp.MustCompile(`^sshore[.]((?:v?[0-9]|dev-)[A-Za-z0-9.+-]*?)([.]exe)?$`)
+	// 只接受「干净 tag / git describe 串 / dev-<时间戳>」三种版本段形态：
 )
 
 // Class 判定版本串类别；空串与 dev 都算开发态。
@@ -2989,6 +2994,7 @@ func (s *Service) Init(ctx context.Context) {
 }
 
 // loop 负责首次延迟 5s 检查与后续轮询。
+// 注意：stopCh 会被 Reconfigure 替换，循环里必须每次持锁读一次本地副本，避免与替换竞争。
 func (s *Service) loop(ctx context.Context) {
 	cfg := s.opts.Config()
 	if !cfg.Auto || !IsRelease(s.opts.Version) {
@@ -3050,8 +3056,16 @@ func (s *Service) download(ctx context.Context) {
 	s.mu.Lock()
 	rel := s.rel
 	plan := PlanFor(s.opts.Goos, s.opts.ExePath, s.opts.Version, rel.Tag, 0, DefaultWait)
-	archiveAsset, _ := PickArchive(rel, s.opts.Goos, s.opts.Goarch)
-	csAsset, _ := PickChecksums(rel)
+	archiveAsset, err := PickArchive(rel, s.opts.Goos, s.opts.Goarch)
+	if err != nil {
+		_ = s.failIO(err, "")
+		return
+	}
+	csAsset, err := PickChecksums(rel)
+	if err != nil {
+		_ = s.failVerify(err)
+		return
+	}
 	s.info.Progress = 0
 	s.setLocked(StateDownloading, "")
 	ctx, cancel := context.WithCancel(ctx)
@@ -3098,6 +3112,14 @@ func (s *Service) download(ctx context.Context) {
 		},
 	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			// 用户取消：删半截文件、回 available（spec §7.3.6），不算失败
+			s.mu.Lock()
+			s.info.Progress = 0
+			s.setLocked(StateAvailable, "")
+			s.mu.Unlock()
+			return
+		}
 		_ = s.failIO(err, "")
 		return
 	}
@@ -3270,30 +3292,11 @@ Expected: FAIL —— 字段不存在（编译错误）。
 			UpdateCheckIntervalHours: 12,
 ```
 
-- [ ] **Step 4: 后端把新字段接到 Service（同任务的第二半：**避免前端全量回写清掉跳过版本**）**
+- [ ] **Step 4: 后端把新字段接到 Service（保证「跳过版本」只由后端读写）**
 
-在 `app.go`（Task 11 会写绑定）里，`Service` 的 `Config`/`Save` 必须**直接读写 `a.cfg.App`**，不走前端：
-
-```go
-	Config: func() update.Settings {
-		if a.cfg == nil {
-			return update.Settings{Auto: true, Interval: 12 * time.Hour}
-		}
-		return update.Settings{
-			Auto:     a.cfg.App.UpdateCheckAuto,
-			Interval: time.Duration(a.cfg.App.UpdateCheckIntervalHours) * time.Hour,
-			Source:   a.cfg.App.UpdateSource,
-			Skipped:  a.cfg.App.UpdateSkippedVersion,
-		}
-	},
-	Save: func(s update.Settings) error {
-		if a.cfg == nil {
-			a.cfg = config.DefaultAppConfig()
-		}
-		a.cfg.App.UpdateSkippedVersion = s.Skipped
-		return a.saveConfig()
-	},
-```
+`Service` 的 `Config`/`Save` 必须**直接读写 `a.cfg.App`、不走前端**（前端 `save()` 是挂载时的字段快照，用它回写会把「跳过版本」清掉）。
+具体实现是 `app.go` 的两个方法 `a.updateSettings` / `a.saveUpdateSettings`，代码在 **Task 11 Step 3**（那里同时是绑定的接线处）。
+本任务只负责配置字段与 `Normalize`。
 
 - [ ] **Step 5: 运行测试确认通过**
 
@@ -3368,7 +3371,7 @@ Expected: FAIL —— `a.GetUpdateInfo undefined`。
 
 // ② startup(ctx) 末尾（app.go:90，a.ctx 赋值之后）
 	a.updater = update.New(update.Options{
-		Goos: runtime.GOOS, Goarch: runtime.GOARCH,
+		Goos: gosruntime.GOOS, Goarch: gosruntime.GOARCH,
 		Version: Version, ExePath: exePath(), // exePath() = os.Executable() 包一层，失败返回 ""
 		Doer: &http.Client{Transport: &http.Transport{
 			ResponseHeaderTimeout: 15 * time.Second,
@@ -3392,7 +3395,37 @@ Expected: FAIL —— `a.GetUpdateInfo undefined`。
 		a.updater.Reconfigure()
 	}
 
-// ⑤ 9 个绑定（nil 安全 + 中文注释）
+// ⑤ 配置读写与可执行文件路径（必须直读 a.cfg，避免前端快照回写）
+func (a *App) updateSettings() update.Settings {
+	if a.cfg == nil {
+		return update.Settings{Auto: true, Interval: 12 * time.Hour}
+	}
+	return update.Settings{
+		Auto:     a.cfg.App.UpdateCheckAuto,
+		Interval: time.Duration(a.cfg.App.UpdateCheckIntervalHours) * time.Hour,
+		Source:   a.cfg.App.UpdateSource,
+		Skipped:  a.cfg.App.UpdateSkippedVersion,
+	}
+}
+
+func (a *App) saveUpdateSettings(s update.Settings) error {
+	if a.cfg == nil {
+		a.cfg = config.DefaultAppConfig()
+	}
+	a.cfg.App.UpdateSkippedVersion = s.Skipped
+	return a.saveConfig()
+}
+
+// exePath 返回当前可执行文件绝对路径；失败返回空串（调用方按 nil 路径处理）。
+func exePath() string {
+	p, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
+// ⑥ 9 个绑定（nil 安全 + 中文注释）
 func (a *App) GetUpdateInfo() update.UpdateInfo {
 	if a.updater == nil {
 		return update.UpdateInfo{State: update.StateDisabled, Current: Version, Source: update.DefaultSource}
@@ -3459,7 +3492,10 @@ func (a *App) OpenReleasePage() error {
 }
 ```
 
-（`a.ctx` 在测试里可能为 nil；`Check`/`StartDownload` 内部只用 ctx 做取消，nil 会 panic —— 因此在 `a.updater != nil && a.ctx == nil` 时也要返回错误，或统一在 startup 里保证非 nil。实现时用 `if a.updater == nil || a.ctx == nil` 双守卫。）
+**导入与守卫（否则编译不过）**：
+
+- 新增导入：`gosruntime "runtime"`（**必须起别名**，因为 app.go 已导入 Wails 的 `runtime`）、`net/http`、`os`、`time`、`"sshore/internal/update"`（`errors`/`config` 已在）。
+- `a.ctx` 在测试里可能为 nil：`Check`/`StartDownload` 内部只用 ctx 做取消，nil 会 panic —— 所有绑定统一用 `if a.updater == nil || a.ctx == nil { return ... }` 双守卫。
 
 - [ ] **Step 4: 重新生成并提交 wailsjs 绑定**
 
@@ -3489,6 +3525,8 @@ git commit -m "feat(app): 更新检查绑定与 startup/OnShutdown/SetSettings �
 
 ---
 
+## 阶段 B（下载自升级；依赖 Task 0 的 go 结论）
+
 ### Task 12: 脚本真跑（Linux）—— 成功/超时/参数非法/回滚四条路径
 
 **Files:**
@@ -3510,7 +3548,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -3593,11 +3630,13 @@ func TestScriptSuccessPath(t *testing.T) {
 func TestScriptCleanupKeepsPending(t *testing.T) {
 	// 这条专门挡住「比较绝对路径与 glob 裸名恒为假 → 删掉 pending」的缺陷（spec §16.2 B2）。
 	p := newFixture(t)
-	// 让第 3 步失败（大小不符）：此时第 4 步已完成清理，pending 必须还在。
-	p.Size = 999999
+	// 做法：让第 4 步清理照常执行，但第 5 步（备份）必然失败 —— backup 指向不存在的目录。
+	st, _ := os.Stat(p.Pending)
+	p.Size = st.Size()
+	p.Backup = filepath.Join(t.TempDir(), "missing-dir", "sshore.v0.6.0")
 	log, err := runScript(t, p, exitedChild(t))
 	if err == nil {
-		t.Fatalf("大小不符必须失败, log=%s", log)
+		t.Fatalf("备份失败必须报错, log=%s", log)
 	}
 	if _, err := os.Stat(p.Pending); err != nil {
 		t.Fatalf("pending 不能被清理掉: %v", err)
@@ -3634,10 +3673,36 @@ func TestScriptWaitTimeoutKeepsEverything(t *testing.T) {
 	}
 }
 
+func TestScriptLaunchFailureRollsBack(t *testing.T) {
+	// 新版起不来（用立刻退出的假二进制模拟）：脚本必须回滚并保留 pending（spec §8.3）。
+	p := newFixture(t)
+	if err := os.WriteFile(p.Pending, []byte("#!/bin/sh«BS»nexit 0«BS»n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := os.Stat(p.Pending)
+	p.Size = st.Size()
+	log, err := runScript(t, p, exitedChild(t))
+	if err == nil {
+		t.Fatalf("新版起不来必须失败, log=%s", log)
+	}
+	if !strings.Contains(log, "RESULT=fail:launch") {
+		t.Fatalf("日志应含 RESULT=fail:launch: %s", log)
+	}
+	if got, _ := os.ReadFile(p.Target); string(got) != "OLD" {
+		t.Fatalf("回滚后正式二进制必须是旧内容: %q", got)
+	}
+	if _, err := os.Stat(p.Pending); err != nil {
+		t.Fatalf("回滚后 pending 必须保留（供重试）: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(p.ExeDir, "sshore.v0.6.0")); !os.IsNotExist(err) {
+		t.Fatal("回滚后备份必须已改回正式名")
+	}
+}
+
 func TestScriptArgsValidation(t *testing.T) {
 	p := newFixture(t)
-	// --backup 的父目录不存在 → 参数校验必须在替换之前失败，而不是先动文件
-	p.Backup = filepath.Join(t.TempDir(), "missing-dir", "sshore.v0.6.0")
+	// --target 不存在 → 参数校验失败（RESULT=fail:args）；--backup 的父目录不存在则应在第 5 步失败
+	p.Target = filepath.Join(p.ExeDir, "not-there")
 	st, _ := os.Stat(p.Pending)
 	p.Size = st.Size()
 	log, err := runScript(t, p, exitedChild(t))
@@ -3649,7 +3714,6 @@ func TestScriptArgsValidation(t *testing.T) {
 	}
 }
 
-var _ = syscall.Getpid // 保持 syscall 导入（真机上可能用它取 PID）；实现时可删
 ```
 
 - [ ] **Step 2: 运行测试，逐条确认行为**
@@ -3677,7 +3741,7 @@ git commit -m "test(update): 脚本真跑 —— 成功/超时/参数非法/清�
 
 **Interfaces:**
 - Consumes: 后端 `UpdateInfo` JSON（`state`/`latest`/`hint`/`pending_log`/`skipped`/`progress`/`manual`/`current`）
-- Produces: `export const STATES`（常量表）；`export function stateLabel(info)`；`export function statusMessage(info)`；`export function actions(info, { hasPending })`（返回 `{check, download, cancel, apply, discard, skip, clearSkip, openPage}` 布尔）; `export function formatBytes(n)`；`export function progressPercent(info)`
+- Produces: `export const STATES`（常量表）；`export function stateLabel(info)`；`export function statusMessage(info)`；`export function actions(info)`（返回 `{check, download, cancel, apply, discard, skip, clearSkip, openPage}` 布尔）; `export function formatBytes(n)`；`export function progressPercent(info)`
 
 - [ ] **Step 1: 写失败测试（先钉死按钮矩阵——这是评审发现的缺边所在）**
 
@@ -4058,21 +4122,30 @@ git commit -m "feat(web): 更新状态 store（seq 归约、角标派生、动�
 
 - [ ] **Step 2: 写测试（含「跳过 → 改主题 → 保存 → 跳过仍在」）**
 
+沿用仓库既有做法（`stores/settings.test.js` 的 `vi.hoisted` + `vi.mock("../../wailsjs/go/main/App")`，把绑定挡在测试之外）：
+
 ```js
+// stores/settings.test.js：扩展 backend 假后端，并在测试里模拟「后端先写跳过版本、前端再重读」
 it("跳过版本不会被后续的主题保存清掉（评审发现的真实缺陷）", async () => {
-  const saved = [];
-  globalThis.SetSettings = async (s) => { saved.push(s); };
-  globalThis.GetSettings = async () => ({
-    theme: "system", font_scale: 1, update_check_auto: true,
-    update_check_interval_hours: 12, update_skipped_version: "0.7.0", update_source: "",
-  });
+  backend.settings = {
+    theme: "system", font_scale: 1,
+    update_check_auto: true, update_check_interval_hours: 12,
+    update_skipped_version: "0.7.0", update_source: "",
+  };
+  const s = useSettingsStore();
+  await s.load();          // 前端拿到含 0.7.0 的快照
+  s.theme = "dark";
+  await s.save();          // 全量回写
+  expect(backend.saved.at(-1).update_skipped_version).toBe("0.7.0");
+});
+
+it("跳过版本会在动作后被重读进前端快照", async () => {
+  backend.settings = { update_skipped_version: "" };
   const s = useSettingsStore();
   await s.load();
-  // 模拟后端「跳过版本」写入后再重读（UpdateSection 的动作会这么做）
+  backend.settings = { update_skipped_version: "0.8.0" };  // 后端被 SkipeVersion 直接改了
   await s.load();
-  s.theme = "dark";
-  await s.save();
-  expect(saved.at(-1).update_skipped_version).toBe("0.7.0");
+  expect(s.updateSkippedVersion).toBe("0.8.0");
 });
 ```
 
@@ -4114,7 +4187,7 @@ async function applyNow() {
     <p v-if="update.info.pending_log" class="warn">日志：{{ update.info.pending_log }}</p>
     <div v-if="update.info.state === 'downloading'" class="bar">
       <div class="fill" :style="{ width: (percent ?? 5) + '%' }" />
-      <span v-if="percent === null">已下载 {{ formatBytes(update.info.progress_done || 0) }}</span>
+      <span v-if="percent !== null">{{ percent }}%</span>
     </div>
     <details v-if="update.info.notes"><summary>更新说明</summary><pre>{{ update.info.notes }}</pre></details>
     <div class="btns">
@@ -4299,16 +4372,19 @@ git commit -m "feat(web): 设置按钮更新角标 + 结构性不变量测试"
 - [ ] **Step 2: 在 go-windows job 加「真实 cmd.exe 跑脚本」**
 
 ```yaml
-      - name: 真实 cmd.exe 跑 update.cmd
+      # 断言「新版起不来 → 回滚」这条分支：CI 里没有可长期运行的真 exe，
+      # 成功路径由 Linux 的脚本真跑测试（Task 12）与 Windows 真机验收（Task 19）覆盖。
+      - name: 真实 cmd.exe 跑 update.cmd（回滚路径）
         shell: pwsh
         run: |
           $dir = Join-Path $env:RUNNER_TEMP "upd"
           New-Item -ItemType Directory -Force $dir | Out-Null
           Set-Content -Path (Join-Path $dir "sshore.exe") -Value "OLD" -NoNewline
+          # 假「新版本」是文本文件：start 必然失败 → 存活探测失败 → 回滚
           Set-Content -Path (Join-Path $dir "sshore.v0.7.0.exe") -Value "NEW" -NoNewline
           Copy-Item internal/update/scripts/update.cmd (Join-Path $dir "sshore-update.cmd")
           $size = (Get-Item (Join-Path $dir "sshore.v0.7.0.exe")).Length
-          $env:SSHORE_PID = "1"   # PID 1 必然不存在 → 等待循环立即通过
+          $env:SSHORE_PID = "1"   # PID 1 不存在 → 等待循环立即通过
           $env:SSHORE_TARGET = Join-Path $dir "sshore.exe"
           $env:SSHORE_PENDING = Join-Path $dir "sshore.v0.7.0.exe"
           $env:SSHORE_BACKUP = Join-Path $dir "sshore.v0.6.0.exe"
@@ -4319,10 +4395,11 @@ git commit -m "feat(web): 设置按钮更新角标 + 结构性不变量测试"
           cmd /d /c "sshore-update.cmd"
           $code = $LASTEXITCODE
           Pop-Location
-          if ($code -ne 0) { throw "update.cmd 退出码 $code" }
-          if (-not (Test-Path (Join-Path $dir "sshore.v0.6.0.exe"))) { throw "缺少备份" }
-          if ((Get-Content (Join-Path $dir "sshore.exe") -Raw) -notmatch "NEW") { throw "未替换为新版本" }
-          if (Test-Path (Join-Path $dir "sshore.v0.7.0.exe")) { throw "pending 未被消费" }
+          $log = Get-Content (Join-Path $dir "sshore-update.log") -Raw
+          if ($code -eq 0) { throw "新版起不来时脚本必须非 0 退出" }
+          if ($log -notmatch "RESULT=fail:launch") { throw "日志应记录 RESULT=fail:launch，实际：$log" }
+          if ((Get-Content (Join-Path $dir "sshore.exe") -Raw) -notmatch "OLD") { throw "回滚后必须是旧版本" }
+          if (-not (Test-Path (Join-Path $dir "sshore.v0.7.0.exe"))) { throw "回滚后 pending 必须保留" }
 ```
 
 （脚本第 8 步会 `start` 一个假 exe 并做存活探测——用 `sshore.exe` 内容为 `NEW` 的文本文件会启动失败，因此这里只验证到替换为止：把 `SSHORE_WAIT` 之外的步骤当作契约，**存活探测的失败回滚**由 Linux 的 Task 12 覆盖，Windows 全链路由 Task 19 的真机验收覆盖。）
@@ -4499,7 +4576,7 @@ Expected: 假源在 `http://127.0.0.1:8799` 提供 JSON、资产与校验文件�
 - [ ] **Step 3: Linux 端到端（自动化到 ready；升级那一步允许人工点击并如实记录）**
 
 1. 用**独立目录**放一份旧版本二进制（例如 `cp build/bin/sshore /tmp/upd-live/sshore`）；
-2. 把配置 `update_source = "http://127.0.0.1:8799"`、`update_check_auto = true` 写进该目录的配置（用 `SSHORE_CONFIG` 或应用当前支持的配置路径）；
+2. 把配置写进 `config.DefaultConfigPath()` 指向的文件（Linux `~/.config/sshore/sshore.toml`、Windows `%AppData%\\sshore\\sshore.toml`；**先把它备份成 `sshore.toml.bak`，验收结束原样还原**）：`update_source = "http://127.0.0.1:8799"`、`update_check_auto = true`、`update_check_interval_hours = 0`（关轮询，只留首查）；
 3. 启动应用（Xvfb :9 或当前桌面），等 5s 首查，断言界面出现 `available` 与角标；
 4. 点「下载更新」（合成点击或人工），等状态 `ready`，检查磁盘：`sshore.v9.9.9` 与 `sshore.v9.9.9.sha256` 存在；
 5. 点「重启并升级」；脚本会替换二进制并启动新版；**断言**：`sshore` 内容 = 新构建（比对 sha256）、`sshore.<旧版本>` 备份存在、脚本与日志消失、窗口标题显示 `SSHORE v9.9.9`。
