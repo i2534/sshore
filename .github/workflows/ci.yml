@@ -42,6 +42,7 @@ jobs:
       # 脚本静态检查是门禁（spec §11.1 / §14.8）：runner 未预装则 apt 安装，
       # 安装失败必须让本步失败，不得静默跳过。
       - name: shellcheck 升级脚本
+        if: always()  # 门禁结论不应被既有 internal/forward 的 flake（TestStartMonitorsProcessExit）阻塞
         run: |
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get update || { echo "::error::apt-get update 失败，无法安装 shellcheck"; exit 1; }
