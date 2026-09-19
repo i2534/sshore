@@ -52,8 +52,11 @@ func runScriptArgv(t *testing.T, plan Plan, args ...string) (string, error) {
 // newFixture 造出旧二进制 + 待安装文件 + 一份更早的备份。
 // fakeBinary 是「可执行且能存活 >3s」的假二进制：脚本第 8 步会做 3 秒存活探测，
 // 用不可执行的字面量会让脚本走回滚分支（两阶段评审实测）。它把 PID 写进 fake.pid，
-// 由 t.Cleanup 杀掉，避免测试留下孤儿进程。
-const fakeBinary = "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/fake.pid\"\nsleep 30\n"
+// 由 t.Cleanup 杀掉，避免测试留下孤儿进程。末行必须是「exec sleep 30」：sh 被 sleep
+// 直接替换（PID 不变，脚本的「kill -0」存活探测仍成立），t.Cleanup 杀掉的正是 sleep
+// 本身；若写成裸「sleep 30」，kill 掉 sh 后 sleep 子进程会存活（fix round 1 评审实测
+// pgrep -f "sleep 30" 有残留）。
+const fakeBinary = "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/fake.pid\"\nexec sleep 30\n"
 
 // lockName 是 Linux 侧的升级锁文件名（spec §7.6/§8.4）：加锁是主程序的职责，
 // 脚本本身不得创建、改动或删除它（Task 12 裁定 3）。
@@ -181,11 +184,11 @@ func TestScriptRunSuccessPath(t *testing.T) {
 }
 
 func TestScriptRunCleanupKeepsPending(t *testing.T) {
-	// 这条专门挡住「比较绝对路径与 glob 裸名恒为假 → 删掉 pending」的缺陷（spec §16.2 B2）。
-	// 注意（Task 6 fix round 1 之后的行为变更）：--backup 父目录不存在现在会在参数预检被判为
-	// args 类失败（退 2），因此本用例不会到达第 4 步。「第 4 步之后 pending 仍存在」的覆盖由
-	// TestScriptRunCleanupKeepsPendingAfterStep4 与 script_test.go 的 TestScriptBackupNotWritable 承担；
-	// 本用例保留以固化「失败路径不得删 pending / 不得动 TARGET」这一不变量。
+	// 说明（fix round 1 更正旧注释）：本用例用「--backup 父目录不存在」构造失败，脚本在参数
+	// 预检即写 RESULT=fail:args 并退 2，根本到不了第 4 步清理，因此它并不覆盖 spec §16.2 B2
+	// （「比较绝对路径与 glob 裸名恒为假 → 删掉 pending」）。本用例只固化「失败路径不得删
+	// pending / 不得动 TARGET」这一不变量；「第 4 步清理执行后 pending 仍在」的真正覆盖在
+	// TestScriptRunCleanupKeepsPendingAfterStep4 与 script_test.go 的 TestScriptBackupNotWritable。
 	p := newFixture(t)
 	st, _ := os.Stat(p.Pending)
 	p.Size = st.Size()
@@ -308,6 +311,10 @@ func TestScriptRunWaitTimeoutKeepsEverything(t *testing.T) {
 	if readErr != nil || string(got) != "OLD\n" {
 		t.Fatalf("超时后 TARGET 必须是旧二进制: %q %v", got, readErr)
 	}
+	// spec §13.2 第 3 条「保留现场」：等待超时早于第 4 步清理，更早的备份 sshore.v0.5.0 必须仍在。
+	if _, err := os.Stat(filepath.Join(p.ExeDir, "sshore.v0.5.0")); err != nil {
+		t.Fatalf("超时必须保留更早的备份 sshore.v0.5.0: %v", err)
+	}
 	assertLockKept(t, p)
 }
 
@@ -355,17 +362,23 @@ func TestScriptRunSelfDeletesWhenInvokedByRelativePath(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(p.ExeDir, "sshore-update.sh"), body, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// 用相对文件名 + cmd.Dir 调用，模拟「相对路径」场景。
+	// 关键：cwd 设成脚本目录的父目录，argv 用跨目录的相对路径（<ExeDir 的基名>/sshore-update.sh）。
+	// 脚本第 49 行会 cd 到 dirname(TARGET)（= 脚本所在目录），此后 $0 这个相对路径就再也指不到
+	// 脚本本身 —— 只有第 9 行行首算好的 $SELF 绝对路径能删掉自己。
+	// 因此本用例只有在 cwd 与脚本目录不同时才有区分力：若把 cmd.Dir 设成脚本目录、argv 只给
+	// 裸文件名，脚本 cd 回同一目录后 rm -f "$0" 照样成功，回退成 $0 也不会红（fix round 1 评审实测）。
 	// 注：Go 不允许「固定实参 + 切片展开」混用在同一个可变参数上（brief 原文
 	// exec.Command("sh", "sshore-update.sh", ScriptArgs(...)...) 无法编译），故先拼 argv。
-	argv := append([]string{"sshore-update.sh"}, ScriptArgs(p, exitedChild(t))...)
+	scriptRel := filepath.Join(filepath.Base(p.ExeDir), "sshore-update.sh")
+	argv := append([]string{scriptRel}, ScriptArgs(p, exitedChild(t))...)
 	cmd := exec.Command("sh", argv...)
-	cmd.Dir = p.ExeDir
+	cmd.Dir = filepath.Dir(p.ExeDir)
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("脚本应成功: %v", err)
 	}
+	// 断言脚本文件确实已被删除：这正是 $SELF 版本的期望行为，也是 $0 版本会失败的判别点。
 	if _, err := os.Stat(filepath.Join(p.ExeDir, "sshore-update.sh")); !os.IsNotExist(err) {
-		t.Fatal("相对路径调用时脚本也必须自删（用 $SELF）")
+		t.Fatal("cwd 与脚本目录不同时，脚本也必须自删（用 $SELF 绝对路径）")
 	}
 	assertLockKept(t, p)
 }
