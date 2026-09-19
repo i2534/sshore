@@ -29,9 +29,12 @@ func TestPlanForNaming(t *testing.T) {
 }
 
 func TestPlanForDescribeAndDevBackupNames(t *testing.T) {
-	exe := "/opt/sshore/sshore"
+	// 目录与期望值都用 filepath.Join 构造：Windows 上测试二进制的路径分隔符是反斜杠，
+	// 硬编码 POSIX 字面量会让这条例在 CI 的 go-windows job 变红（Task 19 真机发现）。
+	dir := filepath.Join("/opt/sshore")
+	exe := filepath.Join(dir, "sshore")
 	describe := PlanFor("linux", exe, "v0.6.0-80-gc2d2a36", "v0.7.0", 1, 5*time.Second)
-	if describe.Backup != "/opt/sshore/sshore.v0.6.0-80-gc2d2a36" {
+	if describe.Backup != filepath.Join(dir, "sshore.v0.6.0-80-gc2d2a36") {
 		t.Fatalf("describe 备份名错误: %s", describe.Backup)
 	}
 	if describe.Wait != 5*time.Second {

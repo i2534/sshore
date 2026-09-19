@@ -69,8 +69,9 @@ if errorlevel 1 goto :rollback_launch
 rem 9) 成功
 >> "%LOG%" echo RESULT=ok
 del "%LOG%" >nul 2>nul
-del "%~f0" >nul 2>nul
-exit /b 0
+rem 自删必须用 (goto) 惯用法：cmd.exe 一旦发现批处理删掉了自己就会立即中止，
+rem 后面的 exit /b 0 根本不会执行（Task 19 真机实测退 1）；(goto) 让本行先被完整解析。
+(goto) 2>nul & del "%~f0" >nul 2>nul & exit /b 0
 
 :maybe_del
 set "N=%~1"
