@@ -2,13 +2,14 @@
 
 - 特性：检测更新（阶段 A）+ 应用内下载自升级（阶段 B）
 - spec / plan：`docs/superpowers/specs/2026-09-19-update-check-upgrade-design.md`（v3）/ `docs/superpowers/plans/2026-09-19-update-check-upgrade.md`
-- 分支：`feat/update-check-upgrade`（BASE `bfe486b`）
-- 验收提交：`3c4a068`（真机修复）、`9d88a9c`（假源脚本）、`70e6a6a`（doc 批次）、本报告（验收报告）
-- 原始证据目录（gitignored）：`.superpowers/update-2026-09-19/`（截图 shot1–shot6、make ci 日志、Windows 夹具）
+- 分支：`feat/update-check-upgrade`（BASE `bfe486b`；HEAD `bd55c10`）
+- 验收提交：`3c4a068`（真机修复）、`9d88a9c`（假源脚本）、`70e6a6a`（doc 批次）、`a0e5b8c`/`bd55c10`（两处既有缺陷前置修复，见 §H）、本报告（验收收尾）
+- CI（最终全绿）：https://github.com/i2534/sshore/actions/runs/35439077707 （head `bd55c10`，event `pull_request`，5 个 job 全 success，`release` skipped；见 §A2）
+- 原始证据目录（gitignored）：`.superpowers/update-2026-09-19/`（截图 shot1–shot6、make ci 日志、Windows 夹具）；`.superpowers/sdd/2026-09-19-update-check-upgrade/`（Task/修复/CI 报告与 `evidence/`）
 
 ## 结论
 
-**DONE_WITH_CONCERNS** —— A/B/D/E/F 全部完成；C（真机）Linux 全链路完成、Windows 完成「脚本层真机 + go-windows 等价 + Defender 取证」，**Windows GUI 全链路（真窗口从 available 点升级）未做**（原因见 §C2.4）。
+**DONE_WITH_CONCERNS** —— A/B/D/E/F 全部完成；C（真机）Linux 全链路完成、Windows 完成「脚本层真机 + Defender 取证」，并已由 CI 真实 `go-windows` job（全量 `go test ./...` + 真实 cmd.exe 脚本成功/回滚）全绿覆盖（§A2）；**唯一未做项仍是 Windows GUI 全链路（真窗口从 available 点升级）**（原因见 §C2.4）。两处既有缺陷（`internal/forward` 时序 flake、`internal/osutil` Windows `Close` 幂等）已前置修复并随最终 CI 验证，见 §H；`release` job 尚未验证，本次打 `v0.7.0` tag 后为其首次执行（§A2）。
 
 ---
 
@@ -49,6 +50,26 @@ Test Files  20 passed (20)
 **诚实记录一次失败**：首次 `make ci`（`bash-347`）在 `internal/osutil` 出现
 `--- FAIL: TestStartPipesDoesNotBlockWhenStderrUnread ... runner_test.go:259: read |0: file already closed`。
 判定为**既有并发 flake，与本特性无关**（该测试不在本次改动面内，master 已存在）：单独 `-run` 连跑 8 次全 ok，全量闸门重跑 3 次全绿。按「只修必要、不改既有语义」原则**未改动该测试**，在此记账。
+
+---
+
+## A2. CI 全绿（GitHub Actions run 35439077707）
+
+最终 run：**https://github.com/i2534/sshore/actions/runs/35439077707**
+（run id `35439077707`，event `pull_request`，head `bd55c10`，状态 `completed` / 结论 `success`，2026-09-19T11:03:50Z → 11:06:32Z）
+
+| job | 结论 | 说明 |
+|---|---|---|
+| `go` | ✅ success | `Vet`、`go test ./... -race -count=1`（含此前偶发的 `internal/forward` flake）全绿；**step「shellcheck 升级脚本」实际执行且 success**（无告警输出） |
+| `go-windows` | ✅ success | `Vet (windows)`、全量 `go test ./... -count=1`、两条真实 cmd.exe 脚本 step（成功路径 + 回滚路径）全绿；此前红的两条 `internal/osutil` 用例通过 |
+| `frontend` | ✅ success | `npm ci` / `npx vitest run` / `npm run build` |
+| `build-linux` | ✅ success | 含 `Build linux/amd64`、`Package linux/amd64`、`Upload linux artifact` |
+| `build-windows` | ✅ success | 含 `Build windows/amd64`、`Package windows/amd64`、`Upload windows artifact` |
+| `release` | ⏭️ skipped | 预期：`if: startsWith(github.ref, 'refs/tags/v')`，PR run 不满足；**本次随 `v0.7.0` tag 首次执行（尚未验证）** |
+
+即：DoD #2（`go-windows` job 全绿）与 DoD #8（shellcheck 门禁）**已由该 run 满足**（此前版本报告标 ⚠️）。
+
+逐 step 明细与包级 `ok` 摘录见 `.superpowers/sdd/2026-09-19-update-check-upgrade/ci-after-fixes-report.md`。
 
 ---
 
@@ -107,7 +128,7 @@ VM：VirtualBox `win10`（Windows 10 22H2 19045.6466），`ssh -p 2222 lan@127.0
 2. `internal/update/plan_test.go` 的 `TestPlanForDescribeAndDevBackupNames` 硬编码 POSIX 字面量，Windows 下 `filepath.Join` 产出反斜杠 → 该用例必红（同样会让 `go-windows` 红）。已改为用 `filepath.Join` 构造输入与期望。
 
 修复后 VM 复跑：`internal/update` PASS、root PASS、config PASS。
-（未逐一在 VM 重跑其余既有包；完整 `go test ./...` 由 CI 的 `go-windows` job 覆盖 —— 本次分支未 push，CI 未实际跑。）
+（未逐一在 VM 重跑其余既有包；完整 `go test ./...` 已由 CI 的 `go-windows` job 覆盖 —— run 35439077707 全绿，见 §A2。）
 
 **C2.2 update.cmd 真实 cmd.exe 成功/回滚（修复后复跑）**
 
@@ -190,13 +211,13 @@ CI-style       CI_STYLE_LASTEXITCODE=0；backup=True；newsize==size；pending_l
 | # | 要求 | 结论 |
 |---|---|---|
 | 1 | `make ci` 全绿 | ✅（vet 静默、13 包 ok、vitest 285 passed；一次 osutil 既有 flake 已记账） |
-| 2 | `go-windows` job 全绿 | ⚠️ 等价验证通过（VM 上 update/root/config 三包 PASS + scripts 真跑）；**完整 CI job 未实际运行**（分支未 push），且真机抓到并修掉两处会让它变红的缺陷 |
+| 2 | `go-windows` job 全绿 | ✅ run 35439077707 `go-windows` success（全量 `go test ./... -count=1` + 两条真实 cmd.exe 脚本 step 全绿）；真机抓到并修掉的两处缺陷见 §C2.1 与 §H2 |
 | 3 | Wails 绑定重新生成/构建/vitest | ✅（Task 11；`make ci` 的 `npm run build` 与 vitest 通过） |
 | 4 | §13.2 脚本真跑（Linux + Windows） | ✅ Linux 全绿；Windows 真实 cmd.exe 成功/回滚均验证 |
 | 5 | §13.4 端到端（Linux + Windows VM） | ⚠️ Linux 全链路 ✅；**Windows GUI 全链路未做**（§C2.4） |
 | 6 | Defender 无拦截 | ✅ 默认配置一次观察：扫描 no threats、无检测、无 1006/1007/1116/1117 事件 |
 | 7 | §13.5 10 变体 | ✅ 见 §C3（1 条用 overlay 临时测试验证，未入库） |
-| 8 | shellcheck + 脚本禁忌串 + 无 `\r` | ⚠️ 禁忌串/CRLF 由 `TestScriptBytesAreSafeAndLFOnly` 与人工检查通过；**本机未装 shellcheck，未本地执行**（CI 强制门禁） |
+| 8 | shellcheck + 脚本禁忌串 + 无 `\r` | ✅ 禁忌串/CRLF 由 `TestScriptBytesAreSafeAndLFOnly` 与人工检查通过；**shellcheck 门禁在 run 35439077707 的 `go` job step「shellcheck 升级脚本」实际执行且 success**（本机未装 shellcheck，本地未执行） |
 | 9 | README 中英「更新与升级」 | ✅ |
 | 10 | 6 条变异校验 | ✅ 6/6（另加 2 条，共 8/8，见 §B） |
 
@@ -208,8 +229,37 @@ CI-style       CI_STYLE_LASTEXITCODE=0；backup=True；newsize==size；pending_l
 2. **非 release 不自动检查**：`Version` 为 `dev`/describe 串时自动检查被门卫跳过（设计如此，手动可用）；本报告用 `VERSION=v0.6.0` 的干净构建才让自动检查发生。
 3. **checksums 只防损坏不防篡改**：`checksums.txt` 与压缩包同源，挡不住源被攻破 / 上游账户被盗（spec §10.1）。
 4. **Windows GUI 全链路未做**：见 §C2.4（无 amd64 mingw、Session 0/WebView2 限制、不得覆盖用户 exe）。
-5. **`internal/osutil` 一个既有 flake**：`TestStartPipesDoesNotBlockWhenStderrUnread` 在高并发全量跑时偶发 `read |0: file already closed`；非本次改动面，未修。
+5. **`internal/osutil` 一个既有 flake**：`TestStartPipesDoesNotBlockWhenStderrUnread` 在高并发全量跑时偶发 `read |0: file already closed`；非本次改动面，未修（与 §H2 修复的 `TestPipedProcessClose*` 是不同用例）。最终 run 35439077707 未复现。
 6. **脚本存活探测依赖 util-linux `setsid` 的非 fork exec 语义**（spec §13.2/README）；busybox/sysvinit 变体可能误判，已在脚本注释与 spec 写明。
 7. **§13.5 变体 5（ExeDir 只读）** 用 `go test -overlay` 临时测试验证，未把该测试入库（前端 Hint 文案有单测）。
-8. **Windows 其余包的测试**未在 VM 逐一重跑（只跑了改动相关的 update/root/config）；完整矩阵依赖 CI 的 `go-windows` job。
-9. **本机 shellcheck 未安装**，DoD #8 的静态检查只在 CI 执行。
+8. **Windows 其余包的测试**未在 VM 逐一重跑（只跑了改动相关的 update/root/config）；完整矩阵已由 CI 的 `go-windows` job（run 35439077707）全绿覆盖。
+9. **本机 shellcheck 未安装**，DoD #8 的静态检查只在 CI 执行（run 35439077707 已执行通过，见 §A2）。
+
+---
+
+## H. 两处既有缺陷前置修复（本次一并收口）
+
+两处缺陷均为 master 上既有、与更新/升级特性无关，但会让本 PR 的 CI 误红（`go` job 的 forward flake、`go-windows` job 的 osutil 用例），因此作为前置修复一并收口，均已 push 并随最终 CI run 35439077707 验证。
+
+### H1. `internal/forward`：`TestStartMonitorsProcessExit` 启动时序 flake —— `a0e5b8c`
+
+- 范围：**仅测试** `internal/forward/ctrl_test.go`（+37/-12）；生产实现 `ctrl.go` 零改动。
+- 根因：测试对「进程刚启动的瞬时状态」做了过强时序假设。`Start` 先置 `StateConnected`、同步发 `connected` 事件、再 `go watchExit`；被测子进程被刻意设计成立刻退出，`watchExit` 可在 `Start` 返回后的任意时刻把状态合法地覆盖成 `StateError`。原断言在 `Start` 返回后立刻读状态，等于与监控 goroutine 抢调度。另有一处同类问题：`watchExit` 先写状态、后发 error 事件，原代码在状态变 error 后立刻查事件列表，事件可能尚未入列。
+- 修法：把观测点钉到 `connected` 事件回调（此时 `watchExit` 尚未启动、无并发写者）；状态与 error 事件纳入同一轮询。两个断言均未删除，并经变异测试证明仍能捕获对应回归。
+- 复现/验证（`evidence/forward-flake-before.log`）：200 个忙循环加压 + `-count=3000 -race`，修复前 **46/3000 失败（1.53%）**，同一条件修复后 **0/3000**；`-count=200 -race`、`go test ./... -race -count=1`、`go vet ./...`、`gofmt -l` 均通过。
+- CI 验证：最终 run 35439077707 的 `go` job 中 `internal/forward` `ok`（此前 run 33 曾红）。
+
+### H2. `internal/osutil` Windows：`Close` 幂等与后代管道解除 —— `bd55c10`
+
+- 范围：`internal/osutil/**`（`runner.go` + 新增 `procexit_unix.go` / `procexit_windows.go`，共 +86/-3）；**测试断言一行未动**。
+- 根因（实现缺陷）：`PipedProcess.Close()` 无条件 `os.Process.Kill()`，并以 `errors.Is(err, os.ErrProcessDone)` 判断「进程已结束」——该判据只在 Unix 成立。Windows 上 Wait 之后 `Kill` 返回 `syscall.EINVAL`（`invalid argument`）；直接子进程已退出但未 Wait 时 `TerminateProcess` 返回 `ERROR_ACCESS_DENIED`（`Access is denied.`）。真机探针（`evidence/osutil-win32-probe.log`）证明后者是「进程已退出」而非权限不足：同一句柄 `GetExitCodeProcess` 返回真实退出码 0（≠ `STILL_ACTIVE=259`）。
+- 修法：`Close` 走新的 `killIfAlive()`，先按平台预判「是否已退出」，Kill 失败后再回句柄确认一次；`procexit_windows.go` 用 `os.Process.WithHandle` + `GetExitCodeProcess` 确认非 `STILL_ACTIVE` 才吞 `ERROR_ACCESS_DENIED`/`EINVAL`，真正的权限不足照常报错。`procexit_unix.go` 与改动前逐字等价（总是 Kill、只吞 `os.ErrProcessDone`）。
+- VM 验证（Windows 10 22H2 19045.6466，临时 MinGit 夹具）：修复前 `TestPipedProcessCloseIsIdempotentAfterExit` 5/5 迭代确定性失败、`TestPipedProcessCloseUnblocksDescendantHoldingStderr` 间歇失败；修复后 `-test.run TestPipedProcessClose` 全 PASS、`-test.count=5` **15/15 PASS**、整包 **17/17 PASS**（`evidence/osutil-win-after-fix-*.log`）。Linux 保底 `go test ./internal/osutil/ -count=1` 与 `-race` 均 PASS；`gofmt`/`go vet`/双平台 `go build` 均 0。
+- CI 验证：最终 run 35439077707 的 `go-windows` job 全量 `go test ./...` 中 `internal/osutil` `ok`（此前 run 33 红），两条真实 cmd.exe 脚本 step 亦 success。
+
+---
+
+## I. 发布验证状态
+
+`release` job 在 PR run 中为 `skipped`（`if: startsWith(github.ref, 'refs/tags/v')` 不满足）；本报告定稿时**尚未验证**。本次 push tag `v0.7.0` 为其首次执行；发布 job 已具备 `permissions: contents: write`，无权限缺失。发布产物核验结果见本次随附的 `release-v0.7.0-report.md`（gitignored）。
+
