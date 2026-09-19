@@ -50,6 +50,8 @@ describe('SFTP 面板 drag/drop 接线不变量', () => {
     for (const w of wraps) {
       expect(w).toContain("@dragover.prevent=\"onPaneDragOver(")
       expect(w).toContain('drop-hover')
+      // WebKitGTK 上缺了 dragenter 的 accept，面板级 drop 不会派发（Linux 真机实测）
+      expect(w).toContain('@dragenter.prevent')
     }
     expect(sftp).toMatch(/onPaneDragOver\('local'\)/)
     expect(sftp).toMatch(/onPaneDragOver\('remote'\)/)
