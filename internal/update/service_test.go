@@ -95,6 +95,10 @@ func TestSkipAndClearSkippedTransitions(t *testing.T) {
 	var saved Settings
 	svc, _ := newSvc(t, "v0.6.0", func(o *Options) {
 		o.Save = func(s Settings) error { saved = s; return nil }
+		// fix round 1：ClearSkipped 现在会真正发起一次检查，用假 Doer 杜绝测试依赖真实网络。
+		o.Doer = doerFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("测试不访问网络")
+		})
 	})
 	svc.mu.Lock()
 	svc.info.State = StateAvailable
@@ -114,6 +118,69 @@ func TestSkipAndClearSkippedTransitions(t *testing.T) {
 	}
 	if saved.Skipped != "" {
 		t.Fatalf("取消跳过未清字段: %+v", saved)
+	}
+}
+
+// fix round 1：ClearSkipped 必须真正触发一次重查（spec §7.1/§12.1）。
+//
+// 旧实现先 setLocked(StateChecking) 再调 Check，而 Check 开头对 checking 直接
+// 短路：0 次请求、状态永久停在 checking。本测试在旧实现下必红。
+func TestClearSkippedPerformsExactlyOneCheck(t *testing.T) {
+	var calls int32
+	saved := Settings{Auto: true, Interval: time.Hour}
+	svc, _ := newSvc(t, "v0.6.0", func(o *Options) {
+		o.Config = func() Settings { return saved }
+		o.Save = func(s Settings) error { saved = s; return nil }
+		o.Doer = doerFunc(func(*http.Request) (*http.Response, error) {
+			atomic.AddInt32(&calls, 1)
+			return latestOKResponse("v0.7.0"), nil
+		})
+	})
+
+	// 完整链路：先跳过 v0.7.0（Config 里落 Base 形式），再取消跳过。
+	svc.mu.Lock()
+	svc.info.State = StateAvailable
+	svc.info.Latest = "v0.7.0"
+	svc.mu.Unlock()
+	if err := svc.SkipVersion("v0.7.0"); err != nil {
+		t.Fatal(err)
+	}
+	if saved.Skipped != "0.7.0" {
+		t.Fatalf("SkipVersion 必须存 Base 形式: %+v", saved)
+	}
+	if got := svc.Info().State; got != StateSkipped {
+		t.Fatalf("SkipVersion 后状态应为 skipped, got %s", got)
+	}
+
+	if err := svc.ClearSkipped(); err != nil {
+		t.Fatal(err)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("取消跳过必须恰好触发 1 次检查请求, calls=%d（0 说明 Check 被 checking 守卫短路）", n)
+	}
+	if got := svc.Info().State; got == StateChecking {
+		t.Fatalf("ClearSkipped 结束后不得停在 checking，说明这次重查没有发生")
+	}
+	if got := svc.Info().State; got != StateAvailable {
+		t.Fatalf("假响应最新版 v0.7.0 时应落 available, got %s", got)
+	}
+	if saved.Skipped != "" {
+		t.Fatalf("取消跳过未清字段: %+v", saved)
+	}
+	if svc.Info().Skipped {
+		t.Fatalf("取消跳过时 UpdateInfo.Skipped 必须复位")
+	}
+}
+
+// latestOKResponse 构造一次 200 的 /releases/latest 响应（含本平台产物与校验文件）。
+func latestOKResponse(tag string) *http.Response {
+	body := `{"tag_name":"` + tag + `","body":"note","published_at":"2026-09-19T00:00:00Z","assets":[` +
+		`{"name":"sshore-` + tag + `-linux-amd64.tar.gz","browser_download_url":"https://github.com/x/y/releases/download/` + tag + `/a.tar.gz"},` +
+		`{"name":"checksums.txt","browser_download_url":"https://github.com/x/y/releases/download/` + tag + `/checksums.txt"}]}`
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
 
