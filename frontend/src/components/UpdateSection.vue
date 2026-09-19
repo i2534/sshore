@@ -1,5 +1,32 @@
+<script>
+// 更新源是自由文本：放进「变更即保存」的 watch 会逐键 SetSettings（Normalize + saveConfig +
+// Reconfigure），且并发 save 无序号，晚完成的中间态（如 "htt"）可能覆盖最终值。因此给它**单独**
+// 的 ~500ms 防抖；失焦/回车（change）立即 flush，保证「敲完就走」不丢。工厂作为具名导出，
+// 便于在无 jsdom/@vue/test-utils 的环境直接单测「连续输入只落盘一次」（fix round 1 A）。
+export function createSourceCommitter(save, delay = 500) {
+  let timer = null;
+  const run = () => {
+    timer = null;
+    return Promise.resolve().then(save);
+  };
+  const commit = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(run, delay);
+  };
+  commit.flush = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    return run();
+  };
+  commit.pending = () => timer !== null;
+  return commit;
+}
+</script>
+
 <script setup>
-import { computed, onMounted } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useUpdateStore } from "../stores/update";
 import { useSettingsStore } from "../stores/settings";
 import { stateLabel, statusMessage, actions, progressPercent, progressText } from "../utils/update";
@@ -15,6 +42,56 @@ const message = computed(() => statusMessage(update.info));
 const percent = computed(() => progressPercent(update.info));
 const progressLabel = computed(() => progressText(update.info));
 const customSource = computed(() => Boolean(settings.updateSource));
+
+// —— 更新源：单独 500ms 防抖，失焦/回车立即 flush（fix round 1 A） ——
+// 它不在 SettingsDialog 的「变更即保存」watch 里；其它离散控件仍走原 watch，不加延迟。
+const commitError = ref("");
+const commitSource = createSourceCommitter(async () => {
+  commitError.value = "";
+  try {
+    settings.apply();
+    await settings.save();
+  } catch (e) {
+    commitError.value = e && e.message ? String(e.message) : String(e);
+  }
+});
+// 「恢复默认」语义不变（4 字段复位），但源字段已不在 watch 列表，需显式落盘一次。
+async function resetSource() {
+  settings.resetUpdateSettings();
+  await commitSource.flush();
+}
+
+// —— 更新说明：折叠展示 published_at + notes（spec §12.1） ——
+// 用 UTC 显式格式化，避免测试/CI 因本地时区不同而漂移。
+function formatPublishedAt(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())} UTC`;
+}
+const publishedAt = computed(() => formatPublishedAt(update.info.published_at));
+
+// —— https 提示：仅对「非 https 且非 loopback」的自定义源提示（spec §10.2/§12.1） ——
+// http:// 仅允许 127.0.0.1 / localhost / ::1（端口不影响）；精确匹配 host，
+// 避免把 loopback 假源误报为「非本机地址必须使用 https」（fix round 1 C）。
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+function isLoopbackHost(host) {
+  return LOOPBACK_HOSTS.has(String(host || "").toLowerCase());
+}
+function needsHttpsHint(source) {
+  const s = String(source || "").trim();
+  if (!s) return false;
+  if (s.toLowerCase().startsWith("https://")) return false;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== "http:") return true;
+    return !isLoopbackHost(u.hostname);
+  } catch (e) {
+    return true; // 无法解析的自定义源（缺协议等）一律提示
+  }
+}
+const httpsHint = computed(() => needsHttpsHint(settings.updateSource));
 
 // 更新说明与升级日志可能上千行：统一截断到 2000 字符（spec §12.1）。
 const EXCERPT_LIMIT = 2000;
@@ -78,7 +155,11 @@ async function applyNow() {
       <span class="pct">{{ progressLabel }}</span>
     </div>
 
-    <details v-if="notesExcerpt"><summary>更新说明</summary><pre>{{ notesExcerpt }}</pre></details>
+    <details v-if="notesExcerpt || publishedAt">
+      <summary>更新说明</summary>
+      <p v-if="publishedAt" class="meta">发布于 {{ publishedAt }}</p>
+      <pre v-if="notesExcerpt">{{ notesExcerpt }}</pre>
+    </details>
 
     <div class="btns">
       <button v-if="acts.check" :disabled="update.info.state === 'checking'" @click="run(() => update.check())">立即检查更新</button>
@@ -106,11 +187,19 @@ async function applyNow() {
     </div>
     <div class="field">
       <label for="update-source">更新源</label>
-      <input id="update-source" v-model="settings.updateSource" placeholder="默认 GitHub（可填镜像 API 地址）" />
-      <button class="link" @click="settings.resetUpdateSettings()">恢复默认</button>
+      <input
+        id="update-source"
+        v-model="settings.updateSource"
+        placeholder="默认 GitHub（可填镜像 API 地址）"
+        @input="commitSource"
+        @change="commitSource.flush"
+        @keyup.enter="commitSource.flush"
+      />
+      <button class="link" @click="resetSource()">恢复默认</button>
     </div>
     <p v-if="settings.updateSkippedVersion" class="meta">已跳过版本：{{ settings.updateSkippedVersion }}（只读）</p>
-    <p v-if="customSource && !settings.updateSource.startsWith('https://')" class="warn">非本机地址必须使用 https。</p>
+    <p v-if="httpsHint" class="warn">非本机地址必须使用 https。</p>
+    <p v-if="commitError" class="warn">保存失败：{{ commitError }}</p>
   </section>
 </template>
 
@@ -123,6 +212,7 @@ async function applyNow() {
 @keyframes update-indet { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
 .update .bar .pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: var(--fs-12); color: var(--text); }
 .update details { margin: 0 0 8px; }
+.update details .meta { color: var(--text-dim); font-size: var(--fs-12); margin: 0 0 6px; }
 .update details pre { white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; font-size: var(--fs-12); }
 .update .btns { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
 .update .field { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
