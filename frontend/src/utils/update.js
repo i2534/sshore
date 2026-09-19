@@ -55,6 +55,9 @@ export function actions(info) {
     a.download = true;
     a.check = true;
     if (st === "available") a.skip = true;
+    // verify-failed / io-failed 也可能留下残留（io-failed 可能是 pending 落盘后
+    // sidecar 写失败）：给与 ready 一致的 discard 出口，消除「永远无法处理的残留」（I-2）。
+    if (st !== "available") a.discard = true;
     return a;
   }
   if (st === "skipped") {

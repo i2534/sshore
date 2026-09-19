@@ -64,17 +64,23 @@ func PlanFor(goos, exePath, fromVer, toVer string, size int64, wait time.Duratio
 // （sshore.v0.6.0）会被当成待安装文件，在残留恢复时触发降级安装。
 // Compare 返回 0 同时表示「相等」与「不可比」，因此必须先用 Class 门控，
 // 再依赖 Compare > 0，不能直接用 == 0 判断「无新版本」。
+//
+// dev 构建（I-2）没有版本序可比：任何干净 tag 都视为待安装（spec §2.8/§9
+// 「非 release 构建手动可升级」）。dev 自己的备份名是 sshore.dev-<ts>，
+// 其版本段解析为 dev-…、Class 非 Clean，因此不会被误判成 pending。
 func IsPendingName(name, current string) bool {
 	ver, ok := ParsePendingName(name)
 	if !ok || Class(ver) != KindClean {
 		return false
 	}
 	switch Class(current) {
+	case KindDev:
+		return true
 	case KindClean, KindDescribe:
+		return Compare(ver, current) > 0
 	default:
 		return false
 	}
-	return Compare(ver, current) > 0
 }
 
 // ResumePending 在启动自检时找出上次未完成的待安装文件（Size 置 0，由磁盘决定）。

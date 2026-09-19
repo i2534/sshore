@@ -134,6 +134,12 @@ func (s *Service) setLocked(state, errMsg string) {
 	s.info.Seq++
 	s.info.State = state
 	s.info.Error = errMsg
+	// 成功转移（available/ready）一并清掉上一轮失败留下的 Hint/PendingLog：
+	// 否则「安装目录不可写」提示会在用户修好权限、重新下载成功后仍然显示（最终评审顺手项③）。
+	if state == StateAvailable || state == StateReady {
+		s.info.Hint = ""
+		s.info.PendingLog = ""
+	}
 	payload := s.info
 	if s.opts.Emit != nil {
 		go s.opts.Emit("update:state", payload)
@@ -266,6 +272,18 @@ func (s *Service) Check(ctx context.Context, manual bool) (UpdateInfo, error) {
 	// 拿到正常响应即清掉限流退避（否则旧的 reset 会永久挡住自动检查）。
 	s.clearRateReset()
 
+	// I-5 硬化：tag 必须是规范版本号（vX.Y.Z），否则它会经 PlanFor 拼进文件名，
+	// 而 filepath.Join 会把 "a/../../x" 这类 tag 洗到 ExeDir 之外 —— 下载阶段
+	// 无需用户点击就已经落盘（最终评审 I-5）。非规范 tag 一律 check-failed。
+	if Class(rel.Tag) != KindClean {
+		s.log("更新源返回的 tag 非规范，已拒绝：" + rel.Tag)
+		s.mu.Lock()
+		s.info.Latest = rel.Tag
+		s.setLocked(StateCheckFailed, "更新源返回的版本号非规范")
+		s.mu.Unlock()
+		return s.Info(), nil
+	}
+
 	if IsRelease(s.opts.Version) && Compare(rel.Tag, s.opts.Version) <= 0 {
 		s.mu.Lock()
 		s.info.Latest = rel.Tag
@@ -332,6 +350,11 @@ func (s *Service) StartDownload(ctx context.Context) error {
 		s.mu.Unlock()
 		return fmt.Errorf("%w: 当前状态 %s", ErrBusy, state)
 	}
+	// 守卫与置位必须在同一临界区完成：否则两个并发调用都会通过上面的状态检查，
+	// 各自起一个 goroutine、用同一个 .part 互相 O_TRUNC（最终评审 I-1）。
+	// 置为 downloading 后重活全部交给 goroutine，失败路径由 failIO/failVerify 收敛。
+	s.info.Progress = 0
+	s.setLocked(StateDownloading, "")
 	s.mu.Unlock()
 	go s.download(ctx)
 	return nil
@@ -483,8 +506,7 @@ func (s *Service) download(ctx context.Context) {
 	s.mu.Lock()
 	rel := s.rel
 	plan := PlanFor(s.opts.Goos, s.opts.ExePath, s.opts.Version, rel.Tag, 0, DefaultWait)
-	s.info.Progress = 0
-	s.setLocked(StateDownloading, "")
+	// downloading 已由 StartDownload 在持锁状态下置好（I-1）；这里只做 IO 准备。
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancelDL = cancel
 	s.mu.Unlock()
@@ -721,7 +743,10 @@ func (s *Service) ApplyAndRestart(ctx context.Context) error {
 		s.mu.Unlock()
 		return fmt.Errorf("%w: 需 ready，当前 %s", ErrBusy, state)
 	}
+	// 守卫与置位必须在同一临界区完成：否则并发两次调用都会通过 state==ready 检查、
+	// 各自启动一次替换脚本（最终评审 I-1）。失败路径由 failIO/failVerify 覆盖。
 	plan := s.pending
+	s.setLocked(StateApplying, "")
 	s.mu.Unlock()
 
 	// ① size 守卫：Size>0 时校验，Size==0（重启后由自检进入 ready）以磁盘为准
@@ -743,9 +768,19 @@ func (s *Service) ApplyAndRestart(ctx context.Context) error {
 		return s.failVerify(err)
 	}
 
-	// ③ 与当前版本比较：绝不允许降级安装
+	// ③ 与当前版本比较：绝不允许降级安装。
+	// dev 构建（spec §2.8/§9）不与 release 做版本序比较（Compare 对 dev 恒返回 0，
+	// 旧写法会让 dev 永远无法升级）：只要求目标版本是规范 tag；
+	// dev 的备份名是 sshore.dev-<ts>，与 Clean 文件名不冲突，不会把备份误认成 pending。
 	toVer, ok := ParsePendingName(filepath.Base(plan.Pending))
-	if !ok || Compare(toVer, s.opts.Version) <= 0 {
+	if !ok {
+		return s.failVerify(fmt.Errorf("待安装文件名 %q 无法解析出版本", filepath.Base(plan.Pending)))
+	}
+	if Class(s.opts.Version) == KindDev {
+		if Class(toVer) != KindClean {
+			return s.failVerify(fmt.Errorf("待安装版本 %q 不是规范版本号，拒绝安装", toVer))
+		}
+	} else if Compare(toVer, s.opts.Version) <= 0 {
 		return s.failVerify(fmt.Errorf("待安装版本 %q 不高于当前版本 %q，拒绝安装", toVer, s.opts.Version))
 	}
 
@@ -785,10 +820,7 @@ func (s *Service) ApplyAndRestart(ctx context.Context) error {
 	if err := launch(s.opts.Goos, scriptPath, args, env); err != nil {
 		return s.failIO(err, "")
 	}
-
-	s.mu.Lock()
-	s.setLocked(StateApplying, "")
-	s.mu.Unlock()
+	// applying 已在守卫临界区置好（I-1），这里脚本已成功分离启动，直接返回。
 	return nil
 }
 
