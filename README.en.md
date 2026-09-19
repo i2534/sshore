@@ -35,6 +35,107 @@ unpack it and run the `sshore` binary.
 - Linux needs webkit2gtk-4.1 (Ubuntu/Debian: `libwebkit2gtk-4.1-0`).
 - Release binaries are already UPX-compressed; UPX is not needed at runtime.
 
+## Updates & upgrades
+
+sshore polls the **update source** for the latest Release at the configured interval and lights a
+badge on the sidebar "⚙ Settings" button when a newer version exists; checking, downloading and
+verification progress are all visible under Settings → Updates.
+
+### Update source and verification
+
+- The default source is the GitHub API: `https://api.github.com/repos/i2534/sshore/releases/latest`
+  (the configurable source is `https://api.github.com/repos/i2534/sshore`; the app requests
+  `<source>/releases/latest`).
+- Settings → Updates lets you point the source at a mirror/intranet address (`update_source`), but it
+  must expose a **GitHub-compatible API** (the same `<source>/releases/latest` JSON).
+- **Non-local addresses must use `https://`**; only loopback (`127.0.0.1` / `localhost` / `::1`) may
+  use `http://` (for offline mirrors and end-to-end self-tests). A non-loopback `http://` source falls
+  back to the default source (the service logs one line); the settings field keeps showing "Non-local
+  addresses must use https." for anything still not `https://` and not a loopback `http://`. A source
+  without an `http(s)://` prefix is normalized to empty on load and also falls back to the default.
+- Check timing: **one automatic check after launch** + "Check now" in Settings + polling every
+  `update_check_interval_hours` hours (default 12; 12/24/48/168 selectable; `0` = polling off while
+  manual checks keep working). Unchecking "Check for updates automatically" stops automatic requests.
+- **Dev / non-release builds are excluded from automatic checks**: when `Version` is `dev` or a
+  `git describe` string (e.g. `v0.6.0-80-gc2d2a36`) it is not comparable to a Release tag, so the
+  automatic check is skipped (state stays "not checked yet") and Settings labels it "local build …
+  (dev)"; manual "Check now" still works.
+- Verification strength: releases ship a `checksums.txt` (SHA256) compared after download; **a mismatch
+  refuses installation**, and temporary/partial files never land in the program directory. A verified
+  binary is written together with a hash sidecar (`sshore.<target-version>[.exe].sha256`) and re-hashed
+  once more before "Restart and upgrade".
+- What it protects against: transfer corruption, truncated downloads, mismatched assets. It does **not**
+  protect against a compromised update source, or a tampered release published after the GitHub account
+  was stolen — `checksums.txt` and the archive share the same origin, so HTTPS and upstream account
+  security are the only defence for that class.
+- If the Release has no package for this platform, the app says "no package available for this platform"
+  and offers "Open release page" for a manual download.
+
+### Upgrade flow (requires one click from you)
+
+1. When a newer version exists, click "Download update": download the archive → compare the SHA256 from
+   `checksums.txt` → unpack the pending file (same directory as the current binary, named after the
+   **target version**, e.g. `sshore.v0.7.0` / `sshore.v0.7.0.exe`) → write the matching `.sha256`.
+   Unpacking only accepts the whitelisted `sshore` / `sshore.exe` and rejects symlinks and path traversal.
+2. Click "Restart and upgrade": re-hash, write a one-shot upgrade script, start it detached, then quit.
+3. The script waits for the old process to exit → backs up the current binary as `sshore.<current-version>`
+   (**only the most recent backup is kept**) → renames the pending file into place → starts the new
+   version; if it fails to start, the script **rolls back automatically** and keeps the pending file.
+4. On success it deletes the script and log; on failure it keeps `sshore-update.log`, and the next launch
+   shows it under Settings → Updates (truncated to 2000 chars) with "last upgrade did not finish"; the
+   log's last line is `RESULT=fail:<step>`, and "Open release page" is offered for a manual replacement.
+
+Upgrade-related files all live in `<ExeDir>` (the binary's directory):
+
+| File | Naming |
+| --- | --- |
+| Pending file (with **target version**) | `sshore.<target-version>` (Windows: `sshore.<target-version>.exe`) |
+| Pending verification sidecar | `sshore.<target-version>[.exe].sha256` |
+| Backup (with **current version**, only the most recent one kept) | `sshore.<current-version>` (dev builds: `sshore.dev-<timestamp>`) |
+| Upgrade log | `sshore-update.log` |
+| Upgrade lock | `.sshore-update.lock` (Linux; Windows uses a named mutex, no file) |
+
+The lock file is only the carrier for a kernel lock and is released when the process exits — it **must
+not be deleted manually** (deleting it invites two instances upgrading at once and overwriting each
+other's binary).
+
+### Privacy
+
+A check sends exactly one HTTPS request bearing a version-string User-Agent to the update source; no
+machine information is reported. After unchecking "Check for updates automatically", a request is sent
+only when you click "Check now". With a non-default update source, "Restart and upgrade" asks for
+confirmation once more.
+
+### Manual upgrade (no script)
+
+```bash
+# Linux: unpack and overwrite in the directory holding sshore (directories are created first
+# so the block is paste-ready)
+mkdir -p /tmp/upd ~/bin
+tar -xzf sshore-v0.7.0-linux-amd64.tar.gz -C /tmp/upd
+install -m 0755 /tmp/upd/sshore ~/bin/sshore
+```
+
+```powershell
+# Windows: quit sshore, then overwrite the old sshore.exe with the unpacked one
+```
+
+If the install directory is not writable (e.g. `/usr/bin`, `Program Files`), Settings shows "install
+directory is not writable, please upgrade manually (you can open the release page to download)" — the
+exact steps are the manual commands above.
+
+### Antivirus false positives
+
+Self-upgrade "downloads an executable from the network and replaces itself", which overlaps with malware
+behaviour; releases are also UPX-compressed (see "Size optimization" — UPX itself is frequently flagged)
+and the current binaries are **not code-signed**. If your AV (Windows Defender, 360, Huorong, …) blocks
+the download, the replacement or the new version's start-up:
+
+1. allow-list just `sshore` / `sshore.exe` and the upgrade script as narrowly as your AV allows (no need
+   to allow the whole `<ExeDir>` directory, which would also allow anything later dropped there), then retry;
+2. if it is still blocked, replace the binary manually with the **manual upgrade** steps above;
+3. or build a non-UPX version yourself with `make both COMPRESS=0`.
+
 ## Build
 
 ```bash

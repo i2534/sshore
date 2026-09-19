@@ -31,8 +31,24 @@ jobs:
           go-version-file: go.mod
       - name: Vet
         run: go vet ./...
+      # 覆盖前提（勿删）：internal/update 里两条依赖「目录只读」的脚本真跑用例
+      # —— script_test.go 的 TestScriptBackupNotWritable 与 script_run_test.go 的
+      # TestScriptRunCleanupKeepsPendingAfterStep4 —— 在 root 下会因 CAP_DAC_OVERRIDE
+      # 令 chmod 0500 构造不出不可写目录而 t.Skip。GitHub 的 ubuntu runner 以非 root 的
+      # runner 用户运行，满足前提；若将来换成 root 运行的 runner，这两条覆盖会静默消失，
+      # 届时必须改用非 root 身份执行 go test。
       - name: Test
         run: go test ./... -race -count=1
+      # 脚本静态检查是门禁（spec §11.1 / §14.8）：runner 未预装则 apt 安装，
+      # 安装失败必须让本步失败，不得静默跳过。
+      - name: shellcheck 升级脚本
+        if: always()  # 门禁结论不应被既有 internal/forward 的 flake（TestStartMonitorsProcessExit）阻塞
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update || { echo "::error::apt-get update 失败，无法安装 shellcheck"; exit 1; }
+            sudo apt-get install -y shellcheck || { echo "::error::shellcheck 安装失败：升级脚本静态检查是门禁（spec §11.1/§14.8），不允许静默跳过"; exit 1; }
+          fi
+          shellcheck -s sh internal/update/scripts/update.sh
 
   # Windows 上才会执行的分支（osutil 的 CREATE_NO_WINDOW/Cancel、sftp 的 isWindows
   # 每命令模式、app.go 的卷根判断、%APPDATA% 配置路径、Windows OpenSSH 的 ls 输出形状等）
@@ -55,8 +71,74 @@ jobs:
           go-version-file: go.mod
       - name: Vet (windows)
         run: go vet ./...
+      # 必须是全量 go test ./... -count=1：windows-tagged 的排他锁用例
+      # （internal/update/lock_windows_test.go，Task 7 的覆盖）就在这里真正执行，
+      # 勿收窄成只测某个子集。
       - name: Test (windows)
         run: go test ./... -count=1
+
+      # 用真实 PE 覆盖「成功」与「回滚」两条路径（spec §11.3/§13.2、DoD #4）：
+      #   · 成功：把一个长期存活的真 exe（cmd.exe）当「新版本」，存活探测通过 → RESULT=ok
+      #   · 回滚：把一个立刻退出的真 exe（whoami.exe）当「新版本」，探测失败 → RESULT=fail:launch
+      - name: 真实 cmd.exe 跑 update.cmd（成功路径）
+        if: always()  # 我们的脚本真机验证不应被既有 internal/osutil 的 Windows 失败阻塞
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "upd-ok"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "$env:SystemRoot\System32\whoami.exe" (Join-Path $dir "sshore.exe")
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" (Join-Path $dir "sshore.v0.7.0.exe")
+          Copy-Item internal/update/scripts/update.cmd (Join-Path $dir "sshore-update.cmd")
+          $size = (Get-Item (Join-Path $dir "sshore.v0.7.0.exe")).Length
+          $env:SSHORE_PID = "1"
+          $env:SSHORE_TARGET = Join-Path $dir "sshore.exe"
+          $env:SSHORE_PENDING = Join-Path $dir "sshore.v0.7.0.exe"
+          $env:SSHORE_BACKUP = Join-Path $dir "sshore.v0.6.0.exe"
+          $env:SSHORE_SIZE = "$size"
+          $env:SSHORE_LOG = Join-Path $dir "sshore-update.log"
+          $env:SSHORE_WAIT = "10"
+          Push-Location $dir; cmd /d /c "sshore-update.cmd"; $code = $LASTEXITCODE; Pop-Location
+          if ($code -ne 0) { throw "成功路径应退 0，实际 $code" }
+          if (-not (Test-Path (Join-Path $dir "sshore.v0.6.0.exe"))) { throw "缺少备份" }
+          if ((Get-Item (Join-Path $dir "sshore.exe")).Length -ne $size) { throw "未替换为新版本" }
+          if (Test-Path (Join-Path $dir "sshore.v0.7.0.exe")) { throw "pending 未被消费" }
+          if (Test-Path (Join-Path $dir "sshore-update.cmd")) { throw "脚本未自删" }
+          if (Test-Path (Join-Path $dir "sshore-update.log")) { throw "日志未删除" }
+          taskkill /IM sshore.exe /F 2>$null | Out-Null   # 收掉存活探测留下的 cmd.exe
+          # 上面 taskkill 是本块最后一条原生 exe：GitHub runner 会在 pwsh 脚本尾部
+          # 固定追加 `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }`，
+          # 探测进程已退出时 taskkill 会退 128，若不显式退 0 本 step 会误红。
+          # 清理是 best-effort；断言失败仍由上面的 throw 终止本块（非 0）。
+          exit 0
+
+      - name: 真实 cmd.exe 跑 update.cmd（存活探测失败 → 回滚）
+        if: always()  # 同上：既有 osutil Windows 失败不得吞掉我们的脚本真跑证据
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "upd-fail"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "$env:SystemRoot\System32\cmd.exe" (Join-Path $dir "sshore.exe")
+          $oldSize = (Get-Item (Join-Path $dir "sshore.exe")).Length
+          Copy-Item "$env:SystemRoot\System32\whoami.exe" (Join-Path $dir "sshore.v0.7.0.exe")
+          Copy-Item internal/update/scripts/update.cmd (Join-Path $dir "sshore-update.cmd")
+          $size = (Get-Item (Join-Path $dir "sshore.v0.7.0.exe")).Length
+          $env:SSHORE_PID = "1"
+          $env:SSHORE_TARGET = Join-Path $dir "sshore.exe"
+          $env:SSHORE_PENDING = Join-Path $dir "sshore.v0.7.0.exe"
+          $env:SSHORE_BACKUP = Join-Path $dir "sshore.v0.6.0.exe"
+          $env:SSHORE_SIZE = "$size"
+          $env:SSHORE_LOG = Join-Path $dir "sshore-update.log"
+          $env:SSHORE_WAIT = "10"
+          Push-Location $dir; cmd /d /c "sshore-update.cmd"; $code = $LASTEXITCODE; Pop-Location
+          $log = Get-Content (Join-Path $dir "sshore-update.log") -Raw
+          if ($code -eq 0) { throw "新版起不来时脚本必须非 0 退出" }
+          if ($log -notmatch "RESULT=fail:launch") { throw "日志应记录 RESULT=fail:launch，实际：$log" }
+          if ((Get-Item (Join-Path $dir "sshore.exe")).Length -ne $oldSize) { throw "回滚后必须是旧版本" }
+          if (-not (Test-Path (Join-Path $dir "sshore.v0.7.0.exe"))) { throw "回滚后 pending 必须保留" }
+          # 回滚路径按设计 `exit /b 3`，$LASTEXITCODE 恒为 3；runner 会在 pwsh 脚本尾部
+          # 固定追加 `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }`，
+          # 若断言全过后不显式退 0，本 step 会以 3 结束导致 go-windows 误红。
+          exit 0
 
   frontend:
     runs-on: ubuntu-latest
@@ -150,6 +232,20 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
+      - name: 生成 checksums.txt（Linux runner 上统一算，避免 Windows 格式差异）
+        run: |
+          cd artifacts
+          # 每行必须是「<64 位 hex><两个空格><basename>」，且只取 basename：awk 的第二个
+          # sub 会剥掉 artifacts/<artifact 名>/ 这层目录。若第二列带目录（如
+          # ./sshore-linux/x.tar.gz），应用按 basename 查表会永远 verify-failed（见计划风险表）。
+          # 这里必须递归查找：actions/download-artifact 不带 name 时会把每个 artifact
+          # 放进 artifacts/<artifact 名>/ 子目录，-maxdepth 1 会一个文件都找不到。
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) ! -name "checksums.txt" -print0 \
+            | sort -z \
+            | xargs -0 sha256sum \
+            | awk '{ n=$0; sub(/^[^ ]+  /, "", n); sub(/^.*\//, "", n); print $1"  "n }' \
+            | sort -k2 > checksums.txt
+          cat checksums.txt
       - name: Publish binaries to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -159,9 +255,9 @@ jobs:
             echo "workflow_dispatch 需要 release_tag 输入" >&2
             exit 1
           fi
-          # 只上传打包产物（.tar.gz/.zip）：文件名自带版本与平台，且压缩包不会
-          # 触发浏览器对可执行文件的"可能有害/删除"拦截。
-          mapfile -t FILES < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort)
+          # 只上传打包产物（.tar.gz/.zip）与上一步生成的校验文件：文件名自带版本与平台，
+          # 且压缩包不会触发浏览器对可执行文件的"可能有害/删除"拦截。
+          mapfile -t FILES < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'checksums.txt' \) | sort)
           if [ "${#FILES[@]}" -eq 0 ]; then
             echo "没有找到可上传的打包产物" >&2
             exit 1

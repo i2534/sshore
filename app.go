@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	gosruntime "runtime"
 	stdsync "sync"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"sshore/internal/preset"
 	"sshore/internal/sftp"
 	"sshore/internal/sync"
+	"sshore/internal/update"
 )
 
 type App struct {
@@ -30,6 +33,14 @@ type App struct {
 	cfg     *config.AppConfig
 	cfgPath string
 	sync    *sync.Ctrl
+
+	// cfgMu 保护 cfg.App：更新服务 goroutine（Config/Save 回调）读、
+	// Wails 调用线程（GetSettings/SetSettings）写。setAppSettings 是**整结构赋值**，
+	// 因此任何对 a.cfg.App 子字段的裸读都会与它构成数据竞争 —— 所有读点都必须
+	// 经过受锁的 appSettings / autoStartOnLaunch / sftpTransport（Task 11 fix round 1；
+	// 裸读 sftpTransport / AutoStartOnLaunch 由最终评审 I-3 收口）。
+	cfgMu stdsync.RWMutex
+
 	// H2: startup 早于 Init 注入 emit，加载错误先记录于此，Init 时补发事件
 	emit       func(forward.Event)
 	cfgLoadErr error
@@ -43,6 +54,11 @@ type App struct {
 	// Init 时 emit 补发，前端日志面板可见。
 	presetsPath string
 	presetsErr  error
+
+	// updater 是更新检查/下载状态机。构造在 startup(ctx) 而不是 Init：
+	// Init 没有 ctx，且 app_test 直接调用 Init 的路径很多，在那里起后台 goroutine
+	// 会污染测试且无人 Shutdown（Task 11 裁定 1）。
+	updater *update.Service
 }
 
 var (
@@ -119,6 +135,23 @@ func (a *App) startup(ctx context.Context) {
 	// Task 13（spec D14）：清理 >7 天且名字含 PartMarker 的本地传输临时文件。
 	// 进程崩溃后登记的 knownParts 随进程消失，这些 .part 只能靠陈旧清理兜底。
 	a.cleanupStaleParts()
+	// 更新服务：注入全部外部依赖（HTTP/进程/配置读写/事件通道），Init 做残留自检
+	// 与轮询调度。必须放在 startup —— 这里才有 ctx，且 Init 会被测试直接调用。
+	a.updater = update.New(update.Options{
+		Goos: gosruntime.GOOS, Goarch: gosruntime.GOARCH,
+		Version: Version, ExePath: exePath(),
+		Doer: &http.Client{Transport: &http.Transport{
+			ResponseHeaderTimeout: 15 * time.Second,
+			Proxy:                 http.ProxyFromEnvironment,
+		}},
+		Launch:  update.StartDetached,
+		Acquire: update.Acquire,
+		Emit:    func(event string, payload any) { runtime.EventsEmit(a.ctx, event, payload) },
+		Log:     a.logUpdate,
+		Config:  a.updateSettings,
+		Save:    a.saveUpdateSettings,
+	})
+	a.updater.Init(ctx)
 }
 
 // cleanupStaleParts 在启动时清理最近用过的本地目录下的陈旧临时文件（>7 天）。
@@ -145,12 +178,7 @@ func (a *App) Init(emit func(forward.Event)) {
 	a.forward = forward.NewCtrl(osutil.NewSpawner(), emit, nil)
 	// 选择器懒解析配置（Task 5）：app_test 直接构造时 a.cfg 可能为 nil，
 	// 闭包必须回退内置默认而不是 panic（三审 R11）。
-	a.sftp = sftp.NewCtrlWith(osutil.NewRunner(), emit, func() string {
-		if a.cfg == nil {
-			return ""
-		}
-		return a.cfg.App.SftpTransport
-	})
+	a.sftp = sftp.NewCtrlWith(osutil.NewRunner(), emit, a.sftpTransport)
 	if dir := stateDir(); dir != "" {
 		a.sftp.SetJournalDir(dir) // Task 8 的 backup-swap journal（S6）
 	}
@@ -232,6 +260,179 @@ func (a *App) GetAppInfo() AppInfo {
 	return AppInfo{Name: "SSHore", Version: Version, Repo: Repo}
 }
 
+// ─── 更新检查与下载（Task 11）──────────────────────────────────────────────
+// 契约见 spec §5.2；9 个绑定全部 nil 安全：测试直接构造的 App{} 没走 startup，
+// a.updater 与 a.ctx 都可能为 nil，必须返回 disabled 快照或明确错误，绝不 panic。
+
+// GetUpdateInfo 返回当前更新状态快照（seq 供前端丢弃迟到载荷）。
+func (a *App) GetUpdateInfo() update.UpdateInfo {
+	if a.updater == nil {
+		return update.UpdateInfo{State: update.StateDisabled, Current: Version, Source: update.DefaultSource}
+	}
+	return a.updater.Info()
+}
+
+// CheckUpdate 执行一次检查；manual=true 绕过门卫与调度约束。
+func (a *App) CheckUpdate(manual bool) (update.UpdateInfo, error) {
+	if a.updater == nil || a.ctx == nil {
+		return a.GetUpdateInfo(), errors.New("更新服务未初始化")
+	}
+	return a.updater.Check(a.ctx, manual)
+}
+
+// StartUpdateDownload 在 available/verify-failed/io-failed 上启动下载。
+func (a *App) StartUpdateDownload() error {
+	if a.updater == nil || a.ctx == nil {
+		return errors.New("更新服务未初始化")
+	}
+	return a.updater.StartDownload(a.ctx)
+}
+
+// CancelUpdateDownload 取消在飞下载；没有在飞下载时返回 false（幂等）。
+func (a *App) CancelUpdateDownload() bool {
+	if a.updater == nil || a.ctx == nil {
+		return false
+	}
+	return a.updater.CancelDownload()
+}
+
+// ApplyUpdateAndRestart 拉起替换脚本并退出应用。只有脚本成功启动才退出；
+// 失败（锁被占、校验不过等）必须原样返回错误让前端展示，绝不静默退出。
+func (a *App) ApplyUpdateAndRestart() error {
+	if a.updater == nil || a.ctx == nil {
+		return errors.New("更新服务未初始化")
+	}
+	if err := a.updater.ApplyAndRestart(a.ctx); err != nil {
+		return err
+	}
+	runtime.Quit(a.ctx)
+	return nil
+}
+
+// DiscardUpdateDownload 删除待安装文件与 sidecar，回到 available / idle。
+func (a *App) DiscardUpdateDownload() error {
+	if a.updater == nil || a.ctx == nil {
+		return errors.New("更新服务未初始化")
+	}
+	return a.updater.DiscardPending()
+}
+
+// SkipUpdateVersion 记录「跳过此版本」，只经 Save 写配置（避免前端快照回写清掉它）。
+func (a *App) SkipUpdateVersion(version string) error {
+	if a.updater == nil || a.ctx == nil {
+		return errors.New("更新服务未初始化")
+	}
+	return a.updater.SkipVersion(version)
+}
+
+// ClearSkippedUpdate 清掉「跳过此版本」并立刻重查。
+func (a *App) ClearSkippedUpdate() error {
+	if a.updater == nil || a.ctx == nil {
+		return errors.New("更新服务未初始化")
+	}
+	return a.updater.ClearSkipped()
+}
+
+// OpenReleasePage 用系统浏览器打开发布页；未启动（ctx 缺失）时返回错误而不是 panic。
+func (a *App) OpenReleasePage() error {
+	if a.ctx == nil {
+		return errors.New("应用未初始化")
+	}
+	runtime.BrowserOpenURL(a.ctx, Repo+"/releases")
+	return nil
+}
+
+// appSettings 在读锁下返回 a.cfg.App 的副本；cfg 尚未加载时回退到默认设置。
+// 更新服务 goroutine 与 Wails 调用线程共用此入口，避免无同步读写 cfg.App。
+func (a *App) appSettings() config.AppSettings {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if a.cfg == nil {
+		return config.DefaultAppConfig().App
+	}
+	return a.cfg.App
+}
+
+// sftpTransport 在读锁下读 a.cfg.App.SftpTransport（cfg 未加载时回退空串 = 内置默认）。
+// 供选择器懒解析配置，避免对 a.cfg.App 的裸读（最终评审 I-3）。
+func (a *App) sftpTransport() string {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if a.cfg == nil {
+		return ""
+	}
+	return a.cfg.App.SftpTransport
+}
+
+// autoStartOnLaunch 在读锁下读 a.cfg.App.AutoStartOnLaunch（cfg 未加载时回退 false）。
+// AutoStartEnabled 由 main.go 的延迟 goroutine 调用，必须与 setAppSettings 的整结构写同步
+// （最终评审 I-3）。
+func (a *App) autoStartOnLaunch() bool {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if a.cfg == nil {
+		return false
+	}
+	return a.cfg.App.AutoStartOnLaunch
+}
+
+// setAppSettings 在写锁下整体替换 a.cfg.App；锁内不做 IO，落盘由调用方在解锁后完成。
+func (a *App) setAppSettings(s config.AppSettings) {
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	a.cfg.App = s
+}
+
+// updateSettings 经 appSettings 直读配置子集（不经前端快照），供更新服务读取。
+func (a *App) updateSettings() update.Settings {
+	s := a.appSettings()
+	return update.Settings{
+		Auto:     s.UpdateCheckAuto,
+		Interval: time.Duration(s.UpdateCheckIntervalHours) * time.Hour,
+		Source:   s.UpdateSource,
+		Skipped:  s.UpdateSkippedVersion,
+	}
+}
+
+// saveUpdateSettings 只写 UpdateSkippedVersion 并落盘：跳过版本只由后端读写，
+// 前端快照全量回写绝不能把它清掉（Task 10 裁定 5）。加锁改字段、解锁后落盘，
+// 避免在持锁期间做磁盘 IO。
+func (a *App) saveUpdateSettings(s update.Settings) error {
+	a.cfgMu.Lock()
+	if a.cfg == nil {
+		a.cfg = config.DefaultAppConfig()
+	}
+	a.cfg.App.UpdateSkippedVersion = s.Skipped
+	a.cfgMu.Unlock()
+	return a.saveConfig()
+}
+
+// logUpdate 把更新服务的诊断信息（门卫原因 / 限流 / 自动检查失败）转发到前端日志面板。
+func (a *App) logUpdate(msg string) {
+	if a.emit == nil {
+		return
+	}
+	a.emit(forward.Event{
+		SourceType: "system",
+		SourceID:   "update",
+		TS:         time.Now().Format(time.RFC3339),
+		Level:      "info",
+		Message:    msg,
+	})
+}
+
+// exePath 返回当前可执行文件绝对路径；失败返回空串（调用方按空路径降级处理）。
+func exePath() string {
+	p, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
 // SyncWindowBackground aligns the native window background with the active theme
 // so the light theme doesn't leave a dark window edge. Best-effort: no-op if the
 // startup context is missing (e.g. before OnStartup runs).
@@ -247,12 +448,10 @@ func (a *App) SyncWindowBackground(theme string) {
 }
 
 // GetSettings returns the persisted app settings (theme/font/auto-start),
-// normalized so callers never receive empty/invalid values.
+// normalized so callers never receive empty/invalid values. 经 appSettings 读锁读取，
+// 因为更新服务 goroutine 会写 a.cfg.App.UpdateSkippedVersion。
 func (a *App) GetSettings() config.AppSettings {
-	if a.cfg == nil {
-		return config.DefaultAppConfig().App
-	}
-	return a.cfg.App
+	return a.appSettings()
 }
 
 // SetSettings validates and persists app settings. Invalid theme falls back to
@@ -262,11 +461,16 @@ func (a *App) SetSettings(s config.AppSettings) error {
 	if s.Theme != "dark" && s.Theme != "light" {
 		s.Theme = "system"
 	}
-	if a.cfg == nil {
-		a.cfg = &config.AppConfig{}
+	a.setAppSettings(s)
+	// 落盘在锁外：避免在持锁期间做磁盘 IO。
+	if err := a.saveConfig(); err != nil {
+		return err
 	}
-	a.cfg.App = s
-	return a.saveConfig()
+	// 保存成功后重建调度：间隔/开关/更新源的改动立即生效（Task 11 裁定 2）。
+	if a.updater != nil {
+		a.updater.Reconfigure()
+	}
+	return nil
 }
 
 // TunnelStates 返回各隧道运行态（id → state 字符串），供前端四态圆点渲染。
@@ -376,6 +580,20 @@ func (a *App) StopTunnel(id string) error {
 	return nil
 }
 
+// snapshotConfig 在读锁下复制一份 a.cfg 供锁外序列化/落盘使用。
+// 锁内只做结构体复制、绝不做 IO；cfg 尚未加载时返回 nil（与旧行为一致）。
+// 存在意义：saveConfig 与 setAppSettings/saveUpdateSettings 的整结构写并发时，
+// 若直接序列化 a.cfg，toml 编码器会与另一侧的写竞争（Task 11 fix round 2）。
+func (a *App) snapshotConfig() *config.AppConfig {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if a.cfg == nil {
+		return nil
+	}
+	cp := *a.cfg
+	return &cp
+}
+
 func (a *App) saveConfig() error {
 	if a.cfgPath == "" {
 		p, err := config.DefaultConfigPath()
@@ -384,7 +602,9 @@ func (a *App) saveConfig() error {
 		}
 		a.cfgPath = p
 	}
-	return config.SaveConfig(a.cfgPath, a.cfg)
+	// 先在读锁下取快照，再用副本落盘：避免与 setAppSettings/saveUpdateSettings
+	// 的整结构写并发读写 a.cfg（Task 11 fix round 2）。锁内不做 IO。
+	return config.SaveConfig(a.cfgPath, a.snapshotConfig())
 }
 
 func (a *App) updateTunnel(u config.Tunnel) {
@@ -399,7 +619,7 @@ func (a *App) updateTunnel(u config.Tunnel) {
 // M10: 单个隧道失败不得中止循环——逐项收集失败、经事件管道上报，最后汇总返回。
 // 设置中的 AutoStartOnLaunch 关闭时整体跳过（用户选择"启动后不自动连接转发通道"）。
 func (a *App) AutoStartEnabled() error {
-	if a.cfg == nil || !a.cfg.App.AutoStartOnLaunch {
+	if !a.autoStartOnLaunch() {
 		return nil
 	}
 	var errs []error
@@ -1077,6 +1297,10 @@ func (a *App) OnShutdown() {
 		} else if n > 0 {
 			a.logf("恢复了 %d 处中断提交", n)
 		}
+	}
+	// 3. 更新服务：停轮询与在飞下载。OnShutdown 可能早于 startup 被调用，必须守卫。
+	if a.updater != nil {
+		a.updater.Shutdown()
 	}
 	if a.cfg != nil {
 		_ = a.saveConfig()
