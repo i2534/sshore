@@ -90,6 +90,7 @@
 | F3 | **Windows 允许重命名（同卷 move）正在运行的 exe，但不允许删除/覆盖它** | 在 Windows VM 上先做一次性 spike（复制一个 exe 到临时目录、运行并尝试 `move`） | 改用 helper 模式（§10.4）或让用户手动替换 |
 | F4 | Go 的 `net/http` 不写 Zone.Identifier（下载产物无 MOTW） | VM 上对下载产物 `Get-Item -Stream Zone.Identifier` 确认不存在 | 无需应对，仅影响 SmartScreen 预期 |
 | F5 | 产物文件名形如 `sshore-v0.6.0-linux-amd64.tar.gz` / `sshore-v0.6.0-windows-amd64.zip` | `gh release view v0.6.0 --json assets`（已核） | 资产挑选按「含 tag + 含 os + 含 arch + 后缀」宽松匹配，失败即 `no-asset` |
+| F6 | 归档内的二进制路径：tar.gz 为 **`./sshore`**（带 `./` 前缀、mode 0755、4,104,452 B）+ `./README.md` + `./LICENSE`；zip 为根目录下的 **`sshore.exe`**（4,600,320 B）+ README + LICENSE。压缩包本身 3,693,254 B / 4,429,317 B | `gh release download v0.6.0 --repo i2534/sshore --pattern 'sshore-v0.6.0-*'` 后 `tar -tvzf` / `unzip -l`（已核） | `ExtractBinary` 的条目匹配必须同时接受 `sshore` 与 `./sshore`；匹配不到即 `io-failed` |
 
 ---
 
@@ -104,7 +105,7 @@
 | `asset.go` | 从 assets 里挑本平台包与校验文件 | `PickArchive(rel Release, goos, goarch string) (Asset, error)`、`PickChecksums(rel Release) (Asset, error)` |
 | `checksum.go` | 解析 `sha256sum` 格式并比对 | `ParseChecksums(io.Reader) (map[string]string, error)`、`Verify(path string, want string) error` |
 | `download.go` | 流式下载 + 边下边算 SHA256 + 进度回调 + ctx 取消 | `Download(ctx, url, dest string, progress func(done, total int64)) (string, error)` |
-| `extract.go` | 从 `tar.gz`/`zip` 中只取出二进制；拒绝路径遍历条目 | `ExtractBinary(archive, goos, dest string) error` |
+| `extract.go` | 从 `tar.gz`/`zip` 中只取出二进制（匹配 `sshore` / `./sshore` / `sshore.exe`，见 F6）；**条目白名单 + 拒绝路径遍历 + 单条目大小上限（≤ 64 MiB）** | `ExtractBinary(archive, goos, dest string) error` |
 | `plan.go` | 计算替换计划（目标、待安装名、备份名、待清理的备份模式） | `type Plan struct{ Target, Pending, Backup, Size, ExeDir string }`、`PlanFor(goos, exePath, fromVer, toVer string, size int64) Plan`、`BackupPatterns(goos string) []string` |
 | `script.go` | `go:embed` 脚本 + 参数拼装（**纯函数**） | `ScriptArgs(Plan, pid int, logPath string) []string`、`ScriptName(goos string) string`、`ScriptBytes(goos string) []byte` |
 | `scripts/update.sh` | Linux 升级脚本（embed 资源，独立文件、可 shellcheck） | — |
@@ -304,6 +305,7 @@ Init 残留自检：pending 存在 → ready（可直接「重试升级」，无
 ### 8.1 生成与生命周期
 
 - 脚本由 **`go:embed` 静态文件**提供（`internal/update/scripts/update.sh`、`update.cmd`），按 `GOOS` 选一份写出；**不运行时拼接脚本文本**。
+- **换行符必须钉死**：`go:embed` 原样嵌入工作区文件的字节，但本仓库当前**没有 `.gitattributes`**（实测 `git ls-files --eol` 全部为 `i/lf w/lf`、`core.autocrlf=false`）。新增 `.gitattributes`：`*.sh text eol=lf`、`*.cmd text eol=crlf` —— 否则 Windows runner 上若检出 CRLF，嵌进去的 `update.sh` 会带 `\r`，Linux 用户执行时报 `#!/bin/sh\r: not found`。
 - 写在程序目录，名 `sshore-update.sh|.cmd`：与待安装文件同盘、用户可读可手动重跑。
 - 成功 → 自删（Linux `rm -f "$0"`；Windows `del "%~f0"`，若因自身占用失败则留下无害残留并记日志）。
 - 失败 → **保留**脚本与待安装文件，把步骤号与原因追加到 `<ExeDir>/sshore-update.log`。
@@ -402,9 +404,13 @@ Init 残留自检：pending 存在 → ready（可直接「重试升级」，无
 
 ---
 
-## 11. CI 变更（只动 `release` job）
+## 11. CI 变更
 
-`build-linux` / `build-windows` **不改**。`release` job 已经下载全部 artifacts，新增一步：对 artifacts 里的 `*.tar.gz`/`*.zip` 在 **Linux runner** 上统一算哈希，生成只含文件名的 `checksums.txt`：
+**11.1 脚本静态检查**：在既有的 Linux 测试步骤里加一行 `shellcheck internal/update/scripts/update.sh`（runner 未预装时先 `sudo apt-get install -y shellcheck`）。本地实测 `shellcheck` 未安装，所以这条必须有 CI 兜底，否则 §14 的 DoD 只能靠人工。
+
+**11.2 换行符**：新增的 `.gitattributes`（见 §8.1）同时覆盖 CI：Windows runner 上 `update.sh` 仍以 LF 检出、`update.cmd` 以 CRLF 检出。
+
+**11.3 发布校验文件**：`build-linux` / `build-windows` **不改**。`release` job 已经下载全部 artifacts，新增一步：对 artifacts 里的 `*.tar.gz`/`*.zip` 在 **Linux runner** 上统一算哈希，生成只含文件名的 `checksums.txt`：
 
 ```bash
 cd artifacts
@@ -535,7 +541,7 @@ Windows `.cmd` 的行为只能在 Windows VM 上验（§13.4）。
 2. §13.4 的端到端自升级在 **Linux** 与 **Windows VM** 各成功一次，证据含：新版本号显示、备份命名、只留一份备份、无残留脚本、日志无错误；**并额外验证「中断后重试」路径**（人为让脚本失败一次 → 下次启动处于 `ready` → 重试成功）。
 3. Windows Defender 全程无拦截/隔离（有告警则按 §10.4 切 helper 模式并重跑）。
 4. §13.5 的 7 个变体全部验证。
-5. `internal/update/scripts/update.sh` 通过 `shellcheck`（环境无 shellcheck 时至少人工逐行审一次并记录结论），且断言其不含 `powershell`/`curl`/`wget`/`certutil`。
+5. `internal/update/scripts/update.sh` 通过 CI 里的 `shellcheck`（§11.1），且单元测试断言两个脚本都不含 `powershell`/`curl`/`wget`/`certutil`；新增 `.gitattributes` 后 `git ls-files --eol` 显示 `update.sh` 为 `i/lf w/lf`。
 6. README 增「更新与升级」一节：更新源与可配置性、SHA256 校验、隐私说明（检查请求）、人工升级步骤（Windows/Linux）、AV 注意事项与 `COMPRESS=0` 的既有退路。
 7. 所有新增测试做过变异校验（至少覆盖：状态门卫、校验失败拒装、备份只留一份、脚本禁令断言、角标条件），变异必须被杀死。
 
