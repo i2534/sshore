@@ -1633,12 +1633,14 @@ func PlanFor(goos, exePath, fromVer, toVer string, size int64, wait time.Duratio
 	if goos == "windows" {
 		ext = ".exe"
 	}
-	pending := filepath.Join(dir, "sshore."+Base(toVer)+ext)
+	// 注意：**不要**用 Base()（它会剥掉 v 前缀，与 spec §8.4 的 sshore.v0.7.0 及各 Step 1 测试期望不符）。
+	// 保留原始版本串（只 trim 空白），使文件名与 Release tag、备份名、ParsePendingName 无损往返。
+	pending := filepath.Join(dir, "sshore."+strings.TrimSpace(toVer)+ext)
 	var backup string
 	switch Class(fromVer) {
 	case KindClean, KindDescribe:
 		// 干净 tag 与 git describe 串都能唯一标识被替换的版本（spec §8.4）
-		backup = filepath.Join(dir, "sshore."+Base(fromVer)+ext)
+		backup = filepath.Join(dir, "sshore."+strings.TrimSpace(fromVer)+ext)
 	default:
 		// dev / 未知版本没有唯一标识，用时间戳
 		backup = filepath.Join(dir, "sshore.dev-"+time.Now().Format("20060102-150405")+ext)
