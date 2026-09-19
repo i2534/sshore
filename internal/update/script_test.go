@@ -243,11 +243,11 @@ func TestScriptBackupNotWritable(t *testing.T) {
 	}
 }
 
-// TestScriptPendingVanishesBeforeReplace 覆盖新增的第 6 步前置检查。契约里 pending 是常规
+// TestScriptPendingVanishesBeforeReplace 覆盖第 6 步前置检查，并固化 spec §8.3 的回滚不变量：
+// 第 5 步之后的任何失败都必须把正式名恢复成旧二进制（应用不得消失）。契约里 pending 是常规
 // 文件，无法在不引入竞态的前提下让它「恰好」在步骤 3 与步骤 5 之间消失；这里用确定性代理：
 // pending 是指向正式名的符号链接，第 5 步把正式名改名备份后链接即悬空 —— 对
-// [ -f "$PENDING" ] 而言等价于「pending 在替换前消失」。断言只针对脚本的显式检查
-// （退 3 + RESULT=fail:3），不把悬空链接这类越界输入的最终磁盘形态固化成期望。
+// [ -f "$PENDING" ] 而言等价于「pending 在替换前消失」。
 func TestScriptPendingVanishesBeforeReplace(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("update.sh 只能在类 Unix 上真跑")
@@ -275,5 +275,16 @@ func TestScriptPendingVanishesBeforeReplace(t *testing.T) {
 	}
 	if !strings.HasSuffix(strings.TrimSpace(log), "RESULT=fail:3") {
 		t.Fatalf("日志末行必须是 RESULT=fail:3: %q", log)
+	}
+	// 不变量：第 5 步之后 TARGET 可能已被改名到 BACKUP，失败必须先恢复正式名。
+	got, err := os.ReadFile(p.Target)
+	if err != nil {
+		t.Fatalf("失败回滚后正式名必须存在: %v", err)
+	}
+	if string(got) != "OLD\n" {
+		t.Fatalf("失败回滚后正式名必须是旧二进制内容，实际 %q", got)
+	}
+	if _, err := os.Lstat(p.Pending); err != nil {
+		t.Fatalf("失败回滚不得删掉 pending: %v", err)
 	}
 }

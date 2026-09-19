@@ -53,10 +53,10 @@ for %%f in ("%CD%\sshore.v*") do call :maybe_del "%%~nxf"
 for %%f in ("%CD%\sshore.dev-*") do call :maybe_del "%%~nxf"
 
 rem 5) 备份旧二进制；改完立刻确认备份确实就位（spec §8.3：任何一步失败都不得让应用消失）
-move /y "%TARGET%" "%BACKUP%" >nul || goto :step5
-if not exist "%BACKUP%" goto :step5
+move /y "%TARGET%" "%BACKUP%" >nul || goto :rollback_step5
+if not exist "%BACKUP%" goto :rollback_step5
 rem 6) 换成新版本（失败则回滚）
-if not exist "%PENDING%" goto :step3
+if not exist "%PENDING%" goto :rollback_step3
 move /y "%PENDING%" "%TARGET%" >nul || goto :rollback_replace
 
 rem 8) 启动并做 3 秒存活探测
@@ -83,9 +83,22 @@ del "%CD%\%N%" >nul 2>nul
 exit /b 0
 
 :rollback_replace
-move /y "%BACKUP%" "%TARGET%" >nul 2>nul
+call :rollback_target
 if not exist "%TARGET%" goto :fail6
 goto :fail6
+
+:rollback_step5
+rem 第 5 步之后 TARGET 可能已被改名到 BACKUP：失败必须先恢复正式名，避免应用消失
+call :rollback_target
+goto :step5
+
+:rollback_step3
+call :rollback_target
+goto :step3
+
+:rollback_target
+move /y "%BACKUP%" "%TARGET%" >nul 2>nul
+exit /b 0
 
 :rollback_launch
 move /y "%TARGET%" "%PENDING%" >nul 2>nul
