@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 )
 
@@ -23,7 +24,10 @@ func binaryNames(goos string) []string {
 }
 
 // ExtractBinary 从 tar.gz / zip 中取出唯一的目标二进制写到 dest，并置 0755。
-// 安全约束：只接受常规文件条目、拒绝路径遍历与符号/硬链接、拒绝多份匹配、拒绝超限条目。
+// 原子性：先写 dest 同目录的独占临时文件，全部校验通过后才 rename 到 dest；
+// 任何错误路径都会删掉临时文件与 dest，绝不把半成品留在磁盘上（也不写穿预置在 dest 的符号链接）。
+// 安全约束：只接受常规文件条目、拒绝含 .. 或绝对路径的条目、拒绝「目标二进制名」的链接条目、
+// 跳过无关链接条目、拒绝多份匹配、拒绝超限条目。
 func ExtractBinary(archive, goos, dest string) error {
 	if strings.HasSuffix(archive, ".zip") {
 		return extractZip(archive, goos, dest)
@@ -57,7 +61,34 @@ func unsafeEntry(name string) bool {
 	return false
 }
 
-func extractTarGz(archive, goos, dest string) error {
+// isTargetLink 判断 tar 的链接类条目是否指向目标二进制。
+// 策略：只有「目标二进制名」的 symlink/hardlink 才整档拒绝，无关链接条目一律跳过。
+// hardlink 是 tar.TypeLink：它的条目名可能无关，但 Linkname 指向目标名时同样算目标条目。
+func isTargetLink(hdr *tar.Header, goos string) bool {
+	if cleanEntry(hdr.Name) == wantName(goos) {
+		return true
+	}
+	return hdr.Typeflag == tar.TypeLink && cleanEntry(hdr.Linkname) == wantName(goos)
+}
+
+// createTemp 在 dest 同目录创建独占临时文件（dest+".tmp-<随机>"，O_CREATE|O_EXCL，0600）。
+func createTemp(dest string) (*os.File, error) {
+	return os.CreateTemp(filepath.Dir(dest), filepath.Base(dest)+".tmp-")
+}
+
+// commit 把临时文件置 0755 后原子替换为 dest。
+// 同目录 rename 只替换目录项，不会写穿预置在 dest 路径上的符号链接。
+func commit(out *os.File, dest string) error {
+	if err := out.Chmod(0o755); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Rename(out.Name(), dest)
+}
+
+func extractTarGz(archive, goos, dest string) (err error) {
 	f, err := os.Open(archive)
 	if err != nil {
 		return err
@@ -68,6 +99,20 @@ func extractTarGz(archive, goos, dest string) error {
 		return err
 	}
 	defer gz.Close()
+
+	out, err := createTemp(dest)
+	if err != nil {
+		return err
+	}
+	// 任何非 nil 返回都清掉临时文件与 dest，保证 dest 要么是完整产物、要么不存在。
+	defer func() {
+		if err != nil {
+			_ = out.Close()
+			_ = os.Remove(out.Name())
+			_ = os.Remove(dest)
+		}
+	}()
+
 	tr := tar.NewReader(gz)
 	found := 0
 	for {
@@ -82,8 +127,8 @@ func extractTarGz(archive, goos, dest string) error {
 			return fmt.Errorf("归档条目 %q 含路径遍历，拒绝", hdr.Name)
 		}
 		if hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeRegA {
-			if cleanEntry(hdr.Name) == wantName(goos) {
-				return fmt.Errorf("归档条目 %q 不是常规文件（拒绝链接/设备）", hdr.Name)
+			if isTargetLink(hdr, goos) {
+				return fmt.Errorf("归档条目 %q 是目标二进制的链接，拒绝", hdr.Name)
 			}
 			continue
 		}
@@ -97,32 +142,46 @@ func extractTarGz(archive, goos, dest string) error {
 		if hdr.Size > maxBinarySize {
 			return fmt.Errorf("归档条目过大（%d > %d）", hdr.Size, maxBinarySize)
 		}
-		if err := writeExact(dest, tr, hdr.Size); err != nil {
+		if err := writeExact(out, tr, hdr.Size); err != nil {
 			return err
 		}
 	}
 	if found == 0 {
 		return fmt.Errorf("归档里没有找到 %s", wantName(goos))
 	}
-	return os.Chmod(dest, 0o755)
+	return commit(out, dest)
 }
 
-func extractZip(archive, goos, dest string) error {
+func extractZip(archive, goos, dest string) (err error) {
 	zr, err := zip.OpenReader(archive)
 	if err != nil {
 		return err
 	}
 	defer zr.Close()
+
+	out, err := createTemp(dest)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = out.Close()
+			_ = os.Remove(out.Name())
+			_ = os.Remove(dest)
+		}
+	}()
+
 	found := 0
 	for _, zf := range zr.File {
 		if unsafeEntry(zf.Name) {
 			return fmt.Errorf("归档条目 %q 含路径遍历，拒绝", zf.Name)
 		}
+		// 只有目标名条目才需要判定链接；其余条目（含无关 symlink）一律跳过。
 		if cleanEntry(zf.Name) != wantName(goos) {
 			continue
 		}
 		if zf.FileInfo().Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("归档条目 %q 是符号链接，拒绝", zf.Name)
+			return fmt.Errorf("归档条目 %q 是目标二进制的符号链接，拒绝", zf.Name)
 		}
 		if zf.FileInfo().IsDir() {
 			continue
@@ -138,35 +197,26 @@ func extractZip(archive, goos, dest string) error {
 		if err != nil {
 			return err
 		}
-		err = writeExact(dest, rc, int64(zf.UncompressedSize64))
+		writeErr := writeExact(out, rc, int64(zf.UncompressedSize64))
 		_ = rc.Close()
-		if err != nil {
-			return err
+		if writeErr != nil {
+			return writeErr
 		}
 	}
 	if found == 0 {
 		return fmt.Errorf("归档里没有找到 %s", wantName(goos))
 	}
-	return os.Chmod(dest, 0o755)
+	return commit(out, dest)
 }
 
-// writeExact 以 0600 写临时目标并核对字节数，写完再由调用方 chmod。
-func writeExact(dest string, r io.Reader, size int64) error {
-	out, err := os.OpenFile(dest, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
+// writeExact 把条目内容原样写入已打开的临时文件并核对字节数。
+// 失败时不做删除，清理由调用方的 defer 统一负责。
+func writeExact(out *os.File, r io.Reader, size int64) error {
 	n, err := io.Copy(out, io.LimitReader(r, size+1))
-	closeErr := out.Close()
 	if err != nil {
-		_ = os.Remove(dest)
 		return err
-	}
-	if closeErr != nil {
-		return closeErr
 	}
 	if n != size {
-		_ = os.Remove(dest)
 		return fmt.Errorf("解包字节数不符：期望 %d 实际 %d", size, n)
 	}
 	return nil

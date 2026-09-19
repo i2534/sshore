@@ -563,7 +563,7 @@ cat checksums.txt
 | asset | linux/amd64、windows/amd64 命中；386/arm64 缺失 → no-asset；checksums.txt 缺失 → no-checksum；**跨 host 的 asset URL → 拒绝** |
 | checksum | sha256sum 格式（* 前缀、CRLF、空行、缺项）、比对失败 |
 | download | 进度单调 + 200ms 节流；ctx 取消删 .part；**响应头超时与 30s 无进度 → io-failed**；哈希正确；空间不足 → io-failed |
-| extract | 内存 fixture：tar 条目带 ./ 前缀 / zip 根名；symlink / hardlink / ../ 条目 → 拒绝；多匹配 → 报错；>64 MiB 条目 → 拒绝 |
+| extract | 内存 fixture：tar 条目带 ./ 前缀 / zip 根名；**目标二进制的** symlink/hardlink 条目 → 拒绝；无关链接条目跳过；含 `..` 或绝对路径的条目 → 整档拒绝；多匹配 → 报错；>64 MiB 条目 → 拒绝 |
 | plan / script | ResumePending 命中与不命中；备份清理**不包含 pending**；ScriptArgs / ScriptEnv 逐项断言；脚本字节**不含** powershell/curl/wget/certutil；update.sh 字节里无 \\r |
 | lock | 同进程第二次 Acquire 失败（Linux flock 语义用双进程/双 fd 验证） |
 | service | 状态机守卫（重复检查、Check 在 downloading/ready/applying 被拒、重复下载、未就绪 apply、applying 终态、applying 期间拒绝 skip/discard）；disabled 门卫零请求（假 doer 断言）；非 release 不做比较短路；ClearSkipped → checking；sidecar 缺失/不符 → 拒绝 apply；自检读日志末行（ok → 删、fail → 提示）；Seq 单调；Reconfigure 重建定时器（假时钟） |

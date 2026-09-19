@@ -25,6 +25,22 @@ func TestParseChecksums(t *testing.T) {
 	}
 }
 
+// F3：哈希长度非法与空输入都必须整份拒绝。
+func TestParseChecksumsRejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"哈希长度非法", "deadbeef  x\n"},
+		{"空输入", ""},
+	}
+	for _, c := range cases {
+		if m, err := ParseChecksums(strings.NewReader(c.in)); err == nil {
+			t.Errorf("%s: 必须报错（得到 %v）", c.name, m)
+		}
+	}
+}
+
 func TestVerifyFile(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "a.txt")
 	if err := os.WriteFile(p, []byte("hello"), 0o644); err != nil {
