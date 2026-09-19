@@ -143,3 +143,87 @@ describe('settings store sftp_transport 往返', () => {
     expect(store.sftpTransport).toBe('batch')
   })
 })
+
+// Task 15：4 个更新设置字段 + 「跳过双写」修复。save() 只回传 7 个旧字段会让
+// 后端 SetSettings（整结构覆盖）把 4 个更新字段清零（spec §6 第 2/3 条）。
+describe('settings store 更新字段（Task 15）', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    backend.settings = {}
+    backend.saved.length = 0
+  })
+
+  it('load() 缺字段时按默认：auto=true / 12h / 空跳过 / 空源', async () => {
+    const s = useSettingsStore()
+    await s.load()
+    expect(s.updateCheckAuto).toBe(true)
+    expect(s.updateCheckIntervalHours).toBe(12)
+    expect(s.updateSkippedVersion).toBe('')
+    expect(s.updateSource).toBe('')
+  })
+
+  it('load() 读入显式值，update_check_auto 的 false 与 interval=0（关闭轮询）不被强转', async () => {
+    backend.settings = {
+      update_check_auto: false,
+      update_check_interval_hours: 0,
+      update_skipped_version: 'v0.7.0',
+      update_source: 'https://mirror.example.com',
+    }
+    const s = useSettingsStore()
+    await s.load()
+    expect(s.updateCheckAuto).toBe(false)
+    expect(s.updateCheckIntervalHours).toBe(0)
+    expect(s.updateSkippedVersion).toBe('v0.7.0')
+    expect(s.updateSource).toBe('https://mirror.example.com')
+  })
+
+  it('save() 必须回传全部 4 个更新字段（漏掉任一即被后端清零）', async () => {
+    const s = useSettingsStore()
+    s.updateCheckAuto = false
+    s.updateCheckIntervalHours = 48
+    s.updateSkippedVersion = '0.9.0'
+    s.updateSource = 'https://mirror.example.com'
+    await s.save()
+    expect(backend.saved.at(-1)).toMatchObject({
+      update_check_auto: false,
+      update_check_interval_hours: 48,
+      update_skipped_version: '0.9.0',
+      update_source: 'https://mirror.example.com',
+    })
+  })
+
+  it("跳过版本不会被后续的主题保存清掉（评审发现的真实缺陷）", async () => {
+    backend.settings = {
+      theme: "system", font_scale: 1,
+      update_check_auto: true, update_check_interval_hours: 12,
+      update_skipped_version: "0.7.0", update_source: "",
+    };
+    const s = useSettingsStore();
+    await s.load();          // 前端拿到含 0.7.0 的快照
+    s.theme = "dark";
+    await s.save();          // 全量回写
+    expect(backend.saved.at(-1).update_skipped_version).toBe("0.7.0");
+  });
+
+  it("跳过版本会在动作后被重读进前端快照", async () => {
+    backend.settings = { update_skipped_version: "" };
+    const s = useSettingsStore();
+    await s.load();
+    backend.settings = { update_skipped_version: "0.8.0" };  // 后端被 SkipeVersion 直接改了
+    await s.load();
+    expect(s.updateSkippedVersion).toBe("0.8.0");
+  });
+
+  it('resetUpdateSettings() 把 4 个字段复位为默认（auto=true / 12h / 空跳过 / 空源）', () => {
+    const s = useSettingsStore()
+    s.updateCheckAuto = false
+    s.updateCheckIntervalHours = 168
+    s.updateSkippedVersion = '0.9.0'
+    s.updateSource = 'https://mirror.example.com'
+    s.resetUpdateSettings()
+    expect(s.updateCheckAuto).toBe(true)
+    expect(s.updateCheckIntervalHours).toBe(12)
+    expect(s.updateSkippedVersion).toBe('')
+    expect(s.updateSource).toBe('')
+  })
+})

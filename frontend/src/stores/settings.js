@@ -76,6 +76,11 @@ export const useSettingsStore = defineStore('settings', {
     autoStartOnLaunch: true,
     autoReconnectDefault: true,
     sftpTransport: '',
+    // 更新设置（Task 15 / spec §6）：缺省 auto=true、12h、空跳过、空源。
+    updateCheckAuto: true,
+    updateCheckIntervalHours: 12,
+    updateSkippedVersion: '',
+    updateSource: '',
     loaded: false,
   }),
   actions: {
@@ -89,6 +94,11 @@ export const useSettingsStore = defineStore('settings', {
       this.autoStartOnLaunch = s.auto_start_on_launch !== false
       this.autoReconnectDefault = s.auto_reconnect_default !== false
       this.sftpTransport = s.sftp_transport || ''
+      // 更新设置：缺失键按默认；显式 false / 0 必须原样保留（0 = 关闭轮询）。
+      this.updateCheckAuto = s.update_check_auto !== false
+      this.updateCheckIntervalHours = Number.isFinite(Number(s.update_check_interval_hours)) ? Number(s.update_check_interval_hours) : 12
+      this.updateSkippedVersion = s.update_skipped_version || ''
+      this.updateSource = s.update_source || ''
       this.loaded = true
       this.apply()
       this.ensureSystemListener()
@@ -102,7 +112,19 @@ export const useSettingsStore = defineStore('settings', {
         auto_start_on_launch: this.autoStartOnLaunch,
         auto_reconnect_default: this.autoReconnectDefault,
         sftp_transport: this.sftpTransport,
+        // 显式字段清单必须齐全：SetSettings 是整结构覆盖，漏字段会把后端值清零（spec §6 跳过双写修复）。
+        update_check_auto: this.updateCheckAuto,
+        update_check_interval_hours: this.updateCheckIntervalHours,
+        update_skipped_version: this.updateSkippedVersion,
+        update_source: this.updateSource,
       })
+    },
+    // 「恢复默认」：把更新区 4 个字段复位为出厂默认（auto=true / 12h / 空跳过 / 空源）。
+    resetUpdateSettings() {
+      this.updateCheckAuto = true
+      this.updateCheckIntervalHours = 12
+      this.updateSkippedVersion = ''
+      this.updateSource = ''
     },
     // 把当前状态写到根节点（data-theme / --ui-scale / --font-latin / --font-cjk）
     apply() {
