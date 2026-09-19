@@ -95,7 +95,7 @@
 |---|---|---|---|
 | F1 | GET <api>/releases/latest 返回 tag_name / body / published_at / assets[].name / assets[].browser_download_url | **已核**（gh api repos/i2534/sshore/releases/latest：tag=v0.6.0、body 非空、assets 两个） | 调整结构体字段；必要时补 Accept: application/vnd.github+json |
 | F2 | 未认证配额约 60 次/小时/IP（文档值） | 观察 X-RateLimit-* 响应头并写日志 | 拉长默认间隔或降级为「打开发布页」 |
-| F3 | **Windows 允许重命名（同卷 move）正在运行的 exe，但不允许删除/覆盖它** | **实施前置门禁**：Windows VM 一次性 spike（复制 exe → 运行 → move） | **只退化为「人工替换 + 明确文案」**；helper 模式救不了 F3（§10.4）。不通过则不进入阶段 B |
+| F3 | **Windows 允许重命名（同卷 move）正在运行的 exe，但不允许删除/覆盖它** | **实施前置门禁 GO**（Task 0，2026-09-19）：Windows 10 22H2 VM 上 Session 0（sshd 子进程）与交互式 Session 1（schtasks /it）各验证一次，均为 `RENAME_OK` + `WRITE_ORIGINAL_OK`；改名副本与原 exe 的 SHA256 逐字节一致 | **只退化为「人工替换 + 明确文案」**；helper 模式救不了 F3（§10.4）。不通过则不进入阶段 B（本次已通过） |
 | F4 | Go 的 net/http 不写 Zone.Identifier（下载产物无 MOTW） | VM 上 Get-Item -Stream Zone.Identifier | 无应对，仅影响 SmartScreen 预期 |
 | F5 | 产物名形如 sshore-v0.6.0-linux-amd64.tar.gz / sshore-v0.6.0-windows-amd64.zip | **已核**（gh release view v0.6.0 --json assets） | 资产挑选按「含 tag + 含 os + 含 arch + 后缀」宽松匹配，失败即 no-asset |
 | F6 | 归档内二进制：tar.gz 为 **./sshore**（./ 前缀、mode 0755、4,104,452 B）+ ./README.md + ./LICENSE；zip 为根下 **sshore.exe**（4,600,320 B）。压缩包 3,693,254 B / 4,429,317 B | **已核**（gh release download + tar -tvzf / unzip -l） | ExtractBinary 用 filepath.Base+Clean 归一后匹配（裸名精确匹配会取不到） |
@@ -111,11 +111,11 @@
 | 文件 | 职责 | 关键接口 |
 |---|---|---|
 | version.go | 版本**分类**与比较 | type Kind int（Clean/Describe/Dev/Invalid）、Class(v string) Kind、IsRelease(v) bool、Compare(a, b string) int、Base(v string) string、ParsePendingName(name string) (ver string, ok bool) |
-| source.go | 读 <source>/releases/latest | type Release struct{ Tag, Notes, PublishedAt string; Assets []Asset }、Asset{Name, URL string}、Latest(ctx, source string) (Release, error)、错误哨兵 ErrRateLimited/ErrCheckFailed |
+| source.go | 读 <source>/releases/latest | type Release struct{ Tag, Notes, PublishedAt string; Assets []Asset }、Asset{Name, URL string; Size int64}（Size = 上游 assets[].size，缺失为 0）、(c *Client) Latest(ctx context.Context, source string) (Release, error)、错误哨兵 ErrRateLimited/ErrCheckFailed |
 | asset.go | 挑本平台包与校验文件；**校验下载 URL 在受信主机集合内** | PickArchive(rel, goos, goarch) (Asset, error)、PickChecksums(rel) (Asset, error)、SameOrigin(source, rawURL string) bool（同 host；源为 api.github.com 时另允许 github.com / codeload.github.com / *.githubusercontent.com，理由见 §10.1） |
 | checksum.go | 解析 sha256sum 格式并比对 | ParseChecksums(io.Reader) (map[string]string, error)、VerifyFile(path, want string) error |
-| download.go | 流式下载（进度节流 200ms / 空闲超时 / 半截清理）；空间检查按平台拆文件 | Download(ctx, url, dest string, opt DownloadOpt) error（边下边算的哈希由调用方用 FileSHA256 复核）、DownloadOpt{IdleTimeout, Throttle time.Duration; Progress func(done, total int64)}、FreeSpace(dir string) (int64, error)（freespace_unix.go / freespace_windows.go） |
-| extract.go | 从 tar.gz/zip 只取出二进制 | ExtractBinary(archive, goos, dest string) error：**先用 unsafeEntry 显式拒绝含 .. 或绝对路径的条目**（path.Base 会把 ../sshore 洗白）、再按 filepath.Base+Clean 匹配白名单（sshore / sshore.exe）、拒绝 symlink/hardlink、多匹配报错、单条目 ≤ 64 MiB |
+| download.go | 流式下载（进度节流 200ms / 空闲超时 / 半截清理）；空间检查按平台拆文件 | (c *Client) Download(ctx context.Context, url, dest string, opt DownloadOpt) error（边下边算的哈希由调用方用 FileSHA256 复核）、DownloadOpt{IdleTimeout, Throttle time.Duration; Progress func(done, total int64)}、FreeSpace(dir string) (int64, error)（freespace_unix.go / freespace_windows.go） |
+| extract.go | 从 tar.gz/zip 只取出二进制 | ExtractBinary(archive, goos, dest string) error：**先用 unsafeEntry 显式拒绝含 .. 或绝对路径的条目**（path.Base 会把 ../sshore 洗白）、再按 filepath.Base+Clean 匹配白名单（sshore / sshore.exe）、**仅目标二进制同名条目**的 symlink/hardlink 被拒绝（无关链接条目跳过）、多匹配报错、单条目 ≤ 64 MiB |
 | plan.go | 计算替换计划与 pending 名义判定 | type Plan struct{ Target, Pending, Backup, Sidecar, LogPath, ExeDir string; Size int64; Wait time.Duration }、PlanFor(goos, exePath, fromVer, toVer string, size int64, wait time.Duration) Plan（备份名：Clean/Describe 用 Base(fromVer)，仅 Dev/Invalid 用时间戳）、ResumePending(exeDir, current string) (Plan, bool)、IsPendingName(name, current string) bool |
 | script.go + start_unix.go / start_windows.go | go:embed 脚本 + 参数/环境构造 + 分离启动（SysProcAttr 按平台拆文件：Linux 的 syscall.SysProcAttr 没有 HideWindow 字段） | ScriptName(goos) string、ScriptBytes(goos) ([]byte, error)、ScriptArgs(Plan, pid int) []string（Linux argv）、ScriptEnv(Plan, pid int) []string（Windows 环境变量）、StartDetached(goos, scriptPath string, args, env []string) error、平台函数 setDetached(*exec.Cmd) |
 | lock.go | ExeDir 级排他锁，防两个实例同时 apply | Acquire(exeDir string) (release func(), err error)（Windows：命名互斥体；Linux：.sshore-update.lock 上的 flock） |
@@ -235,7 +235,7 @@ internal/config/store.go 的 AppSettings 新增（TOML / JSON 键同名）：
 
 **回退与告警移出 Normalize**：internal/config 不依赖日志（Normalize 是纯方法，被 LoadConfig 与 SetSettings 调用）。「非 loopback 必须 https、否则视为非法 → 回退默认源 + 写一行日志 + 设置页提示」由 Service 读配置时执行一次（§10.2）。
 
-前端「设置」页新增控件：自动检查开关、间隔下拉（6h / 12h / 24h / 关闭）、更新源文本框（含「恢复默认」）。保存（SetSettings）后由 app.go 调 Service.Reconfigure()。
+前端「设置」页新增控件：自动检查开关、间隔下拉（12 / 24 / 48 / 168 小时 / 关闭轮询）、更新源文本框（含「恢复默认」）。保存（SetSettings）后由 app.go 调 Service.Reconfigure()。
 
 **跳过版本的双写问题**：update_skipped_version 有两个潜在写者 —— Service.SkipVersion（经 Options.Save）与前端 stores/settings.js 的全量 save()（字段清单来自挂载时的 load() 快照）。规定：
 
@@ -383,7 +383,7 @@ applying 为终态（进程即将退出）
 |---|---|---|---|
 | 0 | 切到目标目录（原 glob 作用于继承的 CWD） | cd "$(dirname "$TARGET")" | cd /d "%~dp0" |
 | 1 | 解析参数、校验、建日志 | case 循环 + : > "$LOG" | %~ 解析 / %SSHORE_*% + type nul > "%SSHORE_LOG%" |
-| 2 | 等旧 PID 退出，上限 WAIT | kill -0 轮询 0.2s；超时 → RESULT=fail:wait 退出 3 | tasklist /FI "PID eq %SSHORE_PID%" | find "%SSHORE_PID%" >nul 轮询 1s；超时同上 |
+| 2 | 等旧 PID 退出，上限 WAIT | kill -0 轮询 1s（分数 sleep 在 busybox/sysvinit 变体上可能不支持）；超时 → RESULT=fail:wait 退出 3 | tasklist /FI "PID eq %SSHORE_PID%" | find "%SSHORE_PID%" >nul 轮询 1s；超时同上 |
 | 3 | 自检 pending 存在 + 大小一致 | [ -f "$PENDING" ] + wc -c < "$PENDING" | if exist "%SSHORE_PENDING%" + for %%A in ("%SSHORE_PENDING%") do set PEND_SIZE=%%~zA，**比较必须 setlocal enabledelayedexpansion + !PEND_SIZE!**（同一 if 块内 %PEND_SIZE% 会在解析期展开） |
 | 4 | 清理更早备份（只留最近一份），**绝不删 pending** | 遍历 "$DIR"/sshore.v* 与 "$DIR"/sshore.dev-*，取 basename 后与 pending 的 basename 比较，不等才删 | for %%f in ("%DIR%\\sshore.v*") ...，用 %%~nxf 取 basename 比较 |
 | 5 | 旧二进制改名备份 | mv -f "$TARGET" "$BACKUP" | move /y "%SSHORE_TARGET%" "%SSHORE_BACKUP%" |
@@ -524,7 +524,7 @@ cat checksums.txt
 | 更新说明 | available/ready 且有 notes | 折叠展示 published_at + body（截断 2000 字符） |
 | 进度条 | downloading | percent（总大小未知 → indeterminate + 已下载字节） |
 | 上次升级未完成 | pending_log 非空 | 日志路径 + 「重试升级」或人工步骤（§7.5/§9） |
-| 设置控件 | 常显 | 自动检查开关、间隔下拉（6h/12h/24h/关闭）、更新源输入框 + 「恢复默认」；非 https 的自定义源给一行风险提示 |
+| 设置控件 | 常显 | 自动检查开关、间隔下拉（12/24/48/168 小时 / 关闭轮询）、更新源输入框 + 「恢复默认」；非 https 的自定义源给一行风险提示 |
 
 按钮矩阵（补齐重试缺边、去掉 skipped 的错位语义）：
 
@@ -535,7 +535,7 @@ cat checksums.txt
 | available | 下载更新 · 跳过此版本 · 检查更新 · 打开发布页 |
 | skipped | 取消跳过（清字段并立即重查）· 检查更新 · 打开发布页 |
 | downloading | 取消下载 |
-| verify-failed / io-failed | 重试（重新下载；Hint="manual-upgrade" 时同时给人工步骤）· 打开发布页 |
+| verify-failed / io-failed | 检查更新 · 重试（重新下载；Hint="manual-upgrade" 时同时给人工步骤）· 打开发布页 |
 | ready | **重启并升级**（自定义源时二次确认）· 删除已下载的更新 · 打开发布页 |
 | applying | 全部禁用，显示「正在重启…」 |
 
@@ -626,7 +626,8 @@ cat checksums.txt
 5. §13.4 的端到端在 Linux 与 Windows VM 各跑一次：自动到 available（假源）→ 下载 → ready → 触发升级 → 新版本号显示；人工步骤如实记录。
 6. Windows Defender 全程无拦截/隔离（有告警则按 §10.4 切 helper 或转人工替换）。
 7. §13.5 的 10 个变体全部验证。
-8. shellcheck 通过（§11.1）；两个脚本文本不含 powershell/curl/wget/certutil；update.sh 无 \\r。
+8. shellcheck 通过（§11.1；CI 的 `go` job 用 `shellcheck -s sh internal/update/scripts/update.sh` 强制门禁，安装失败即报错、不许静默跳过）；两个脚本文本不含 powershell/curl/wget/certutil；update.sh 无 \\r。
+   （另：`go test` 里依赖「目录只读」语义的两个用例在 root 下会因 CAP_DAC_OVERRIDE 静默 skip，CI 必须以非 root 运行；前提注释见 `.github/workflows/ci.yml`，与 §13.2 的 util-linux setsid 前提并列。）
 9. README 增「更新与升级」一节：更新源与可配置性、SHA256 能防与不能防（§10.1）、隐私说明、人工升级步骤（Windows/Linux）、AV 注意事项与 COMPRESS=0 退路。
 10. **变异校验（具体化）**：手工制造以下 6 个变异，**每个都必须让至少一条测试失败** —— ① 判 pending 时不比较版本序；② 清理时按模式删除（连 pending 一起删）；③ 去掉 sidecar 重算；④ 去掉 Check 在 applying 的守卫；⑤ 脚本第 8 步去掉存活探测；⑥ 去掉角标的 ready 条件。结果记入实施报告。
 

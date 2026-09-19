@@ -839,7 +839,7 @@ git commit -m "feat(update): sha256 校验工具与白名单归档解包"
 
 **Interfaces:**
 - Consumes: 无
-- Produces: `type Doer interface { Do(*http.Request) (*http.Response, error) }`；`type Asset struct{ Name, URL string }`；`type Release struct{ Tag, Notes, PublishedAt string; Assets []Asset }`；`const DefaultSource = "https://api.github.com/repos/i2534/sshore"`；`type Client struct{ HTTP Doer; UserAgent string }`；`func (c *Client) Latest(ctx context.Context, source string) (Release, error)`；`func PickArchive(rel Release, goos, goarch string) (Asset, error)`；`func PickChecksums(rel Release) (Asset, error)`；`func SameOrigin(source, rawURL string) bool`；哨兵 `ErrRateLimited`/`ErrCheckFailed`/`ErrNoAsset`/`ErrNoChecksum`
+- Produces: `type Doer interface { Do(*http.Request) (*http.Response, error) }`；`type Asset struct{ Name, URL string; Size int64 }`（Size 取自上游 `assets[].size`，缺失为 0）；`type Release struct{ Tag, Notes, PublishedAt string; Assets []Asset }`；`const DefaultSource = "https://api.github.com/repos/i2534/sshore"`；`type Client struct{ HTTP Doer; UserAgent string }`；`func (c *Client) Latest(ctx context.Context, source string) (Release, error)`；`func PickArchive(rel Release, goos, goarch string) (Asset, error)`；`func PickChecksums(rel Release) (Asset, error)`；`func SameOrigin(source, rawURL string) bool`；哨兵 `ErrRateLimited`/`ErrCheckFailed`/`ErrNoAsset`/`ErrNoChecksum`
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1007,6 +1007,9 @@ type Doer interface {
 type Asset struct {
 	Name string
 	URL  string
+	// Size 是上游声明的资产字节数（GitHub assets[].size）；缺失为 0，
+	// 磁盘空间检查会因此退化为 64MiB 下限（spec §7.3.2）。
+	Size int64
 }
 
 // Release 是 /releases/latest 的最小投影。
@@ -1030,6 +1033,7 @@ type latestJSON struct {
 	Assets      []struct {
 		Name string `json:"name"`
 		URL  string `json:"browser_download_url"`
+		Size int64  `json:"size"`
 	} `json:"assets"`
 }
 
@@ -1079,7 +1083,7 @@ func (c *Client) Latest(ctx context.Context, source string) (Release, error) {
 		if a.Name == "" || a.URL == "" {
 			continue
 		}
-		out.Assets = append(out.Assets, Asset{Name: a.Name, URL: a.URL})
+		out.Assets = append(out.Assets, Asset{Name: a.Name, URL: a.URL, Size: a.Size})
 	}
 	return out, nil
 }
@@ -2065,7 +2069,6 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
-	"syscall"
 )
 
 //go:embed scripts/update.sh
@@ -2602,6 +2605,8 @@ func (s *Service) setLocked(state, errMsg string) {
 }
 
 // resolveSource 按配置与合法性挑源（非法/非 loopback 的 http 源回退默认并记一行日志）。
+// loopback 必须**精确比较 Hostname()**：strings.Contains 会被
+// http://127.0.0.1.evil.com、http://localhost.evil.com 绕过（spec §10.2，Task 10 评审 I-3）。
 func (s *Service) resolveSource() (string, string) {
 	src := strings.TrimSpace(s.opts.Config().Source)
 	if src == "" {
@@ -2610,8 +2615,11 @@ func (s *Service) resolveSource() (string, string) {
 	if !strings.HasPrefix(src, "https://") && !strings.HasPrefix(src, "http://") {
 		return DefaultSource, "更新源非法，已回退默认源"
 	}
-	if strings.HasPrefix(src, "http://") && !strings.Contains(src, "127.0.0.1") && !strings.Contains(src, "localhost") {
-		return DefaultSource, "非 loopback 的更新源必须使用 https，已回退默认源"
+	if strings.HasPrefix(src, "http://") {
+		u, err := url.Parse(src)
+		if err != nil || !isLoopbackHost(u.Hostname()) {
+			return DefaultSource, "非 loopback 的更新源必须使用 https，已回退默认源"
+		}
 	}
 	return src, ""
 }
@@ -2777,7 +2785,9 @@ func (s *Service) SkipVersion(v string) error {
 	return nil
 }
 
-// ClearSkipped 清掉跳过并立刻重查（状态落 checking，保持与 UI 文案一致）。
+// ClearSkipped 清掉跳过并立刻重查（由 Check 自己置 checking 并在结束时落终态）。
+// 这里不能预置 checking —— Check 对 checking 会直接短路返回，那次「取消跳过 → 立刻重查」
+// 会被吃掉、状态永久停在 checking（Task 8 评审发现，已补回归测试）。
 func (s *Service) ClearSkipped() error {
 	cfg := s.opts.Config()
 	cfg.Skipped = ""
@@ -2788,7 +2798,6 @@ func (s *Service) ClearSkipped() error {
 	}
 	s.mu.Lock()
 	s.info.Skipped = false
-	s.setLocked(StateChecking, "")
 	s.mu.Unlock()
 	_, err := s.Check(context.Background(), true)
 	return err
@@ -3469,6 +3478,12 @@ Expected: FAIL —— 字段不存在（编译错误）。
 		s.UpdateSource = ""
 	}
 	s.UpdateSkippedVersion = strings.TrimPrefix(strings.TrimSpace(s.UpdateSkippedVersion), "v")
+	// 字符集白名单（spec §6）：只保留 [0-9A-Za-z.+-]；含空格、分号、中文等一律清空。
+	if strings.IndexFunc(s.UpdateSkippedVersion, func(r rune) bool {
+		return !(r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '.' || r == '+' || r == '-')
+	}) >= 0 {
+		s.UpdateSkippedVersion = ""
+	}
 
 // ③ 追加到 DefaultAppConfig().App：
 			UpdateCheckAuto:          true,
@@ -3849,7 +3864,7 @@ func TestScriptSuccessPath(t *testing.T) {
 	}
 }
 
-func TestScriptCleanupKeepsPending(t *testing.T) {
+func TestScriptRunCleanupKeepsPendingAfterStep4(t *testing.T) {
 	// 这条专门挡住「比较绝对路径与 glob 裸名恒为假 → 删掉 pending」的缺陷（spec §16.2 B2）。
 	p := newFixture(t)
 	// 做法：让第 4 步清理照常执行，但第 5 步（备份）必然失败 —— backup 指向不存在的目录。
@@ -3863,7 +3878,7 @@ func TestScriptCleanupKeepsPending(t *testing.T) {
 	if _, err := os.Stat(p.Pending); err != nil {
 		t.Fatalf("pending 不能被清理掉: %v", err)
 	}
-	if got, _ := os.ReadFile(p.Target); string(got) != "OLD" {
+	if got, _ := os.ReadFile(p.Target); string(got) != "OLD\n" {
 		t.Fatalf("失败时正式二进制必须保持旧内容: %q", got)
 	}
 }
@@ -3910,7 +3925,7 @@ func TestScriptLaunchFailureRollsBack(t *testing.T) {
 	if !strings.Contains(log, "RESULT=fail:launch") {
 		t.Fatalf("日志应含 RESULT=fail:launch: %s", log)
 	}
-	if got, _ := os.ReadFile(p.Target); string(got) != "OLD" {
+	if got, _ := os.ReadFile(p.Target); string(got) != "OLD\n" {
 		t.Fatalf("回滚后正式二进制必须是旧内容: %q", got)
 	}
 	if _, err := os.Stat(p.Pending); err != nil {
@@ -3972,7 +3987,7 @@ func TestScriptArgsValidation(t *testing.T) {
 go test ./internal/update/ -run TestScript -v
 ```
 
-Expected: 6 个测试 PASS（成功 / 清理保留 pending / 相对路径自删 / 等待超时 / 参数非法 / 新版起不来回滚）。**若 `TestScriptCleanupKeepsPending` 失败，说明脚本第 4 步在删 pending —— 回到 Task 6 第 4 步修 cd + basename 比较。**
+Expected: 6 个测试 PASS（成功 / 清理保留 pending / 相对路径自删 / 等待超时 / 参数非法 / 新版起不来回滚）。**若 `TestScriptRunCleanupKeepsPendingAfterStep4` 失败，说明脚本第 4 步在删 pending —— 回到 Task 6 第 4 步修 cd + basename 比较。**
 
 - [ ] **Step 3: 提交**
 
@@ -4538,6 +4553,9 @@ git commit -m "feat(web): 设置页更新区 + 四个设置字段 + 跳过版本
 
 - [ ] **Step 1: App.vue 加角标（单一来源：store 派生值）**
 
+角标文案/条件**同源**：`available / ready` 的判定只写在 `stores/update.js` 的 `BADGE_STATES`（spec §12.2）里，
+由 `badgeVisible` 派生；App.vue 只读 `updateStore.badgeVisible`，不得再抄一份状态列表或版本比较（两处会漂移）。
+
 ```vue
 // script 追加
 import { useUpdateStore } from "./stores/update";
@@ -4911,8 +4929,8 @@ Get-WinEvent -LogName "Microsoft-Windows-Windows Defender/Operational" -MaxEvent
 go test ./internal/update/ -run TestIsPendingName -count=1
 
 # ② 清理时按模式删除（连 pending 一起删）：把脚本第 4 步的 PB 比较注释掉
-#    期望：TestScriptCleanupKeepsPending 失败
-go test ./internal/update/ -run TestScriptCleanup -count=1
+#    期望：TestScriptRunCleanupKeepsPendingAfterStep4 失败
+go test ./internal/update/ -run TestScriptRunCleanup -count=1
 
 # ③ 去掉 sidecar 重算：删掉 ApplyAndRestart 里的 VerifyFile 调用
 #    期望：TestApplyRejectsTamperedPendingSidecar 失败
