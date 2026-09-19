@@ -1,7 +1,7 @@
 @echo off
 rem sshore 升级脚本：由主程序按本次升级写出并用环境变量传参，不要手工修改。
 rem 变量：SSHORE_PID/SSHORE_TARGET/SSHORE_PENDING/SSHORE_BACKUP/SSHORE_SIZE/SSHORE_LOG/SSHORE_WAIT
-rem 日志协议：末行 RESULT=ok 或 RESULT=fail:<step>
+rem 日志协议：每步失败写 STEP=<n> ERR=<原因>，末行 RESULT=ok 或 RESULT=fail:<step>
 setlocal enabledelayedexpansion
 set "PID=%SSHORE_PID%"
 set "TARGET=%SSHORE_TARGET%"
@@ -13,21 +13,23 @@ set "WAIT=%SSHORE_WAIT%"
 if "%WAIT%"=="" set "WAIT=60"
 if "%LOG%"=="" set "LOG=%TEMP%\sshore-update.log"
 type nul > "%LOG%" 2>nul
-if not exist "%LOG%" goto :args
+if not exist "%LOG%" (set "ARGSERR=无法创建日志文件" & goto :args)
 
-if "%PID%"=="" goto :args
-if "%SIZE%"=="" goto :args
-if "%WAIT%"=="" goto :args
+if "%PID%"=="" (set "ARGSERR=PID 缺失" & goto :args)
+if "%SIZE%"=="" (set "ARGSERR=SIZE 缺失" & goto :args)
+if "%WAIT%"=="" (set "ARGSERR=WAIT 缺失" & goto :args)
 rem PID/SIZE/WAIT 必须是正整数（spec §8.2）：拼起来的字符串只含数字才算通过
-for %%A in (%PID%) do if "%%A"=="" goto :args
-echo %PID%%SIZE%%WAIT%| findstr /r "^[0-9][0-9]*$" >nul || goto :args
-if "%TARGET%"=="" goto :args
-if "%PENDING%"=="" goto :args
-if not exist "%TARGET%" goto :args
-if not exist "%PENDING%" goto :args
+for %%A in (%PID%) do if "%%A"=="" (set "ARGSERR=PID 非法" & goto :args)
+echo %PID%%SIZE%%WAIT%| findstr /r "^[0-9][0-9]*$" >nul || (set "ARGSERR=PID/SIZE/WAIT 非法" & goto :args)
+if "%TARGET%"=="" (set "ARGSERR=TARGET 缺失" & goto :args)
+if "%PENDING%"=="" (set "ARGSERR=PENDING 缺失" & goto :args)
+if not exist "%TARGET%" (set "ARGSERR=TARGET 不存在" & goto :args)
+if not exist "%PENDING%" (set "ARGSERR=PENDING 不存在" & goto :args)
 rem BACKUP/LOG 本次运行才创建，只要求父目录存在且可写（spec §8.2）
-for %%A in ("%BACKUP%") do if not exist "%%~dpA" goto :args
-for %%A in ("%LOG%") do if not exist "%%~dpA" goto :args
+for %%A in ("%BACKUP%") do if not exist "%%~dpA" (set "ARGSERR=BACKUP 父目录不存在" & goto :args)
+for %%A in ("%LOG%") do if not exist "%%~dpA" (set "ARGSERR=LOG 父目录不存在" & goto :args)
+rem BACKUP 必须是文件路径：指向已存在目录时 move 会把它当成目标目录，正式名会消失
+if exist "%BACKUP%\" (set "ARGSERR=BACKUP 指向已存在目录" & goto :args)
 
 cd /d "%~dp0" || goto :step0
 for %%A in ("%PENDING%") do set "PB=%%~nxA"
@@ -105,24 +107,32 @@ exit /b 0
 move /y "%TARGET%" "%PENDING%" >nul 2>nul
 move /y "%BACKUP%" "%TARGET%" >nul 2>nul
 start "" "%TARGET%"
+>> "%LOG%" echo STEP=launch ERR=新版本启动失败，已回滚到旧版本
 >> "%LOG%" echo RESULT=fail:launch
 exit /b 3
 
 :args
+if not defined ARGSERR set "ARGSERR=参数非法"
+>> "%LOG%" echo STEP=args ERR=!ARGSERR!
 >> "%LOG%" echo RESULT=fail:args
 exit /b 2
 :step0
+>> "%LOG%" echo STEP=0 ERR=无法进入目标目录
 >> "%LOG%" echo RESULT=fail:0
 exit /b 3
 :waitfail
+>> "%LOG%" echo STEP=wait ERR=等待旧进程退出超时
 >> "%LOG%" echo RESULT=fail:wait
 exit /b 3
 :step3
+>> "%LOG%" echo STEP=3 ERR=pending 不存在或大小不符
 >> "%LOG%" echo RESULT=fail:3
 exit /b 3
 :step5
+>> "%LOG%" echo STEP=5 ERR=备份旧二进制失败
 >> "%LOG%" echo RESULT=fail:5
 exit /b 3
 :fail6
+>> "%LOG%" echo STEP=6 ERR=替换正式名失败
 >> "%LOG%" echo RESULT=fail:6
 exit /b 3
