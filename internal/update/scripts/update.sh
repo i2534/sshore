@@ -32,7 +32,7 @@ fail() {
 }
 
 [ -n "$LOG" ] || LOG=/dev/null
-: > "$LOG" 2>/dev/null || true
+: > "$LOG" 2>/dev/null || fail args "无法创建日志文件"
 
 case "$PID" in ""|*[!0-9]*) fail args "pid 非法" ;; esac
 case "$SIZE" in ""|*[!0-9]*) fail args "size 非法" ;; esac
@@ -41,6 +41,9 @@ case "$WAIT" in ""|*[!0-9]*) fail args "wait 非法" ;; esac
 [ -n "$PENDING" ] || fail args "pending 缺失"
 [ -f "$TARGET" ] || fail args "target 不存在"
 [ -f "$PENDING" ] || fail args "pending 不存在"
+# BACKUP/LOG 本次运行才创建，只要求父目录存在且可写（spec §8.2）
+[ -d "$(dirname "$BACKUP")" ] || fail args "backup 父目录不存在"
+[ -d "$(dirname "$LOG")" ] || fail args "log 父目录不存在"
 
 DIR=$(dirname "$TARGET")
 cd "$DIR" || fail 0 "无法进入目标目录"

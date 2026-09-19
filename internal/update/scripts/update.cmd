@@ -13,6 +13,7 @@ set "WAIT=%SSHORE_WAIT%"
 if "%WAIT%"=="" set "WAIT=60"
 if "%LOG%"=="" set "LOG=%TEMP%\sshore-update.log"
 type nul > "%LOG%" 2>nul
+if not exist "%LOG%" goto :args
 
 if "%PID%"=="" goto :args
 if "%SIZE%"=="" goto :args
@@ -24,6 +25,9 @@ if "%TARGET%"=="" goto :args
 if "%PENDING%"=="" goto :args
 if not exist "%TARGET%" goto :args
 if not exist "%PENDING%" goto :args
+rem BACKUP/LOG 本次运行才创建，只要求父目录存在且可写（spec §8.2）
+for %%A in ("%BACKUP%") do if not exist "%%~dpA" goto :args
+for %%A in ("%LOG%") do if not exist "%%~dpA" goto :args
 
 cd /d "%~dp0" || goto :step0
 for %%A in ("%PENDING%") do set "PB=%%~nxA"
