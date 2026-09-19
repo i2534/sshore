@@ -20,6 +20,13 @@ describe("actions", () => {
     }
   });
 
+  it("verify-failed / io-failed 可丢弃残留（I-2：否则永远无法处理），available 不需要", () => {
+    for (const state of ["verify-failed", "io-failed"]) {
+      expect(actions({ ...base, state, latest: "v0.7.0" }).discard, state).toBe(true);
+    }
+    expect(actions({ ...base, state: "available", latest: "v0.7.0" }).discard).toBe(false);
+  });
+
   it("downloading 只给取消", () => {
     const a = actions({ ...base, state: "downloading" });
     expect(a.cancel).toBe(true);
@@ -181,10 +188,10 @@ describe("按钮矩阵全枚举（spec §12.1）", () => {
     expect(actions({ ...base, state: "downloading" })).toEqual({ ...NONE, cancel: true });
   });
 
-  it("verify-failed / io-failed → 重试下载 + 检查 + 发布页", () => {
+  it("verify-failed / io-failed → 重试下载 + 丢弃残留 + 检查 + 发布页", () => {
     for (const state of ["verify-failed", "io-failed"]) {
       expect(actions({ ...base, state, latest: "v0.7.0" }), state)
-        .toEqual({ ...NONE, check: true, download: true, openPage: true });
+        .toEqual({ ...NONE, check: true, download: true, discard: true, openPage: true });
     }
   });
 

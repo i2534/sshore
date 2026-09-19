@@ -81,6 +81,45 @@ func TestIsPendingNameUsesVersionOrder(t *testing.T) {
 	}
 }
 
+// TestIsPendingNameForDevBuild 覆盖最终评审 I-2：dev 构建自检必须能认出
+// 残留的干净 tag pending（spec §2.8/§9「非 release 构建手动可查、可升级」）。
+// dev 自己的备份名 sshore.dev-<ts> 不是 pending。
+func TestIsPendingNameForDevBuild(t *testing.T) {
+	cases := []struct {
+		name, current string
+		want          bool
+	}{
+		{"sshore.v0.7.0", "dev", true},
+		{"sshore.v0.6.0", "dev", true},               // dev 无版本序可比：任意 Clean tag 都算 pending
+		{"sshore.dev-20260919-101112", "dev", false}, // dev 备份不是 pending
+		{"sshore.exe", "dev", false},
+		{"sshore.v0.7.0.sha256", "dev", false},
+	}
+	for _, c := range cases {
+		if got := IsPendingName(c.name, c.current); got != c.want {
+			t.Errorf("IsPendingName(%q, %q) = %v, want %v", c.name, c.current, got, c.want)
+		}
+	}
+}
+
+// TestResumePendingForDevBuild 用真实目录固化 dev 自检：dev-<ts> 备份留在原地，
+// 干净 tag 的 pending 被识别。
+func TestResumePendingForDevBuild(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"sshore", "sshore.dev-20260919-101112", "sshore.v0.7.0"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, ok := ResumePending(dir, "dev")
+	if !ok {
+		t.Fatal("dev 构建必须能识别出 pending sshore.v0.7.0")
+	}
+	if filepath.Base(p.Pending) != "sshore.v0.7.0" {
+		t.Fatalf("恢复计划错误: %+v", p)
+	}
+}
+
 func TestResumePending(t *testing.T) {
 	dir := t.TempDir()
 	for _, n := range []string{"sshore", "sshore.v0.6.0", "sshore.v0.7.0", "sshore.v0.7.0.sha256", "sshore-update.sh"} {
