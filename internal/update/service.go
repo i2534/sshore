@@ -515,10 +515,11 @@ func (s *Service) download(ctx context.Context) {
 		_ = s.failIO(err, "")
 		return
 	}
-	// spec §7.3.2 要求 ≥ 资产大小 + 64MiB；Asset（Task 3 文件，本任务不得修改）不携带
-	// 压缩包大小，因此在无法得知资产大小时退化为 64MiB 下限。
-	if free < 64<<20 {
-		_ = s.failIO(fmt.Errorf("磁盘可用空间不足：%d 字节", free), "")
+	// spec §7.3.2：可用空间需 ≥ 资产大小 + 64MiB。Asset.Size 取自上游 assets[].size；
+	// 上游 size 缺失（Size == 0）时，该式自然退化为 64MiB 下限。
+	need := archiveAsset.Size + 64<<20
+	if free < need {
+		_ = s.failIO(fmt.Errorf("磁盘可用空间不足：需要 %d 字节（资产 %d 字节 + 预留 64MiB），可用 %d 字节", need, archiveAsset.Size, free), "")
 		return
 	}
 

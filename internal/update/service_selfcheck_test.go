@@ -298,6 +298,59 @@ func TestDownloadVerifyFailureLeavesProgramDirClean(t *testing.T) {
 	waitGone(t, partPath(), 3*time.Second)
 }
 
+// TestDownloadFailsWhenFreeSpaceBelowAssetSize 钉死 spec §7.3.2：可用空间需 ≥
+// 资产大小 + 64MiB，否则 io-failed。用一个远大于任何真实磁盘可用空间的假 Size
+// （1<<62 字节 ≈ 4 EiB）触发该分支，测试不与真实磁盘容量耦合，也无需注入 FreeSpace。
+func TestDownloadFailsWhenFreeSpaceBelowAssetSize(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "sshore")
+	if err := os.WriteFile(exe, []byte("OLD\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const archiveName = "sshore-v0.7.0-linux-amd64.tar.gz"
+	const hugeSize = int64(1) << 62
+
+	svc := New(Options{
+		Goos: "linux", Goarch: "amd64", Version: "v0.6.0", ExePath: exe,
+		Config: func() Settings { return Settings{} },
+		Emit:   func(string, any) {},
+	})
+	// 直接塞入带巨大 size 的 release（空间检查发生在任何网络请求之前）。
+	svc.mu.Lock()
+	svc.rel = Release{Tag: "v0.7.0", Assets: []Asset{
+		{Name: archiveName, URL: "https://example.com/a.tar.gz", Size: hugeSize},
+		{Name: "checksums.txt", URL: "https://example.com/checksums.txt"},
+	}}
+	svc.info.State = StateAvailable
+	svc.info.Latest = "v0.7.0"
+	svc.mu.Unlock()
+
+	if err := svc.StartDownload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	var info UpdateInfo
+	for time.Now().Before(deadline) {
+		info = svc.Info()
+		if info.State == StateIOFailed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if info.State != StateIOFailed {
+		t.Fatalf("state = %s (error=%q), want io-failed", info.State, info.Error)
+	}
+	if !strings.Contains(info.Error, "磁盘可用空间不足") {
+		t.Fatalf("Error = %q, 应含中文空间不足文案", info.Error)
+	}
+	if want := strconv.FormatInt(hugeSize+64<<20, 10); !strings.Contains(info.Error, want) {
+		t.Fatalf("Error = %q, 应含所需字节数 %s", info.Error, want)
+	}
+	if names := strings.Join(dirEntries(t, dir), ","); names != "sshore" {
+		t.Fatalf("空间不足时程序目录必须零残留: %s", names)
+	}
+}
+
 func TestDownloadCancelReturnsAvailableAndRemovesPart(t *testing.T) {
 	dir := t.TempDir()
 	exe := filepath.Join(dir, "sshore")

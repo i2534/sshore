@@ -33,6 +33,10 @@ type Doer interface {
 type Asset struct {
 	Name string
 	URL  string
+	// Size 是上游声明的资产字节数（GitHub assets[].size）。
+	// Upstream size 缺失时为 0，调用方需按 0 处理
+	//（例如 spec §7.3.2 的磁盘空间检查会退化为 64MiB 下限）。
+	Size int64
 }
 
 // Release 是 /releases/latest 的最小投影。
@@ -56,6 +60,7 @@ type latestJSON struct {
 	Assets      []struct {
 		Name string `json:"name"`
 		URL  string `json:"browser_download_url"`
+		Size int64  `json:"size"`
 	} `json:"assets"`
 }
 
@@ -105,7 +110,7 @@ func (c *Client) Latest(ctx context.Context, source string) (Release, error) {
 		if a.Name == "" || a.URL == "" {
 			continue
 		}
-		out.Assets = append(out.Assets, Asset{Name: a.Name, URL: a.URL})
+		out.Assets = append(out.Assets, Asset{Name: a.Name, URL: a.URL, Size: a.Size})
 	}
 	return out, nil
 }
