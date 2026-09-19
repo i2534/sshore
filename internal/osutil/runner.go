@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -307,7 +306,7 @@ func (p *PipedProcess) Kill() error { return p.proc.Kill() }
 func (p *PipedProcess) Signal() error { return p.proc.Signal() }
 
 // Close 关闭管道并终止子进程；调用方在传输结束后必须调用，避免长驻 ssh 泄漏。
-// 幂等：子进程已正常退出时 Kill 返回 os.ErrProcessDone，这不是错误。
+// 幂等：子进程已经退出（含已被 Wait 回收）时不再 Kill，重复调用返回 nil。
 //
 // F1（Task 3 评审）：**必须也关父端 stderr 读端**。drain 的 Read 只在 stderr 写端
 // 全部关闭后才 EOF；若后代进程仍持有 fd 2（sleep &、ProxyCommand、ControlPersist 等），
@@ -318,7 +317,17 @@ func (p *PipedProcess) Close() error {
 	_ = p.Stdin.Close()
 	_ = p.Stdout.Close()
 	_ = p.Stderr.Close()
-	if err := p.proc.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+	return p.proc.killIfAlive()
+}
+
+// killIfAlive 终止子进程；子进程已经结束时不返回错误（Close 的幂等语义要求）。
+// 与 Kill 的区别：Kill 原样抛出 os.Process 的错误，而 Close 必须把"已经没了"
+// 视为成功——Windows 上这个区分不能只看错误码（详见 procexit_windows.go）。
+func (p *Process) killIfAlive() error {
+	if p.processExitedOS() {
+		return nil
+	}
+	if err := p.Kill(); err != nil && !p.killErrorIsGone(err) {
 		return err
 	}
 	return nil
