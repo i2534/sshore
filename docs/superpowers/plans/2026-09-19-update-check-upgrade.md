@@ -1687,6 +1687,9 @@ git commit -m "feat(update): 替换计划、pending 版本序判别与残留恢�
 # 日志协议（末行由主程序残留自检读取）：RESULT=ok 或 RESULT=fail:<step>
 set -u
 
+# 解析自身绝对路径：脚本会在替换前 cd 到目标目录，$0 若是相对路径就再也删不掉自己（已实测）。
+SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
+
 PID=""; TARGET=""; PENDING=""; BACKUP=""; SIZE=""; LOG=""; WAIT=60
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1775,7 +1778,7 @@ fi
 
 # 9) 成功：写结果、清日志、自删
 printf "RESULT=ok\n" >> "$LOG"
-rm -f "$LOG" "$0"
+rm -f "$LOG" "$SELF"
 exit 0
 ```
 
@@ -3696,6 +3699,30 @@ func TestScriptLaunchFailureRollsBack(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(p.ExeDir, "sshore.v0.6.0")); !os.IsNotExist(err) {
 		t.Fatal("回滚后备份必须已改回正式名")
+	}
+}
+
+func TestScriptSelfDeletesWhenInvokedByRelativePath(t *testing.T) {
+	// 计划里的脚本会在替换前 cd 到目标目录；若 $0 是相对路径，朴素的 rm -f "$0" 会静默失败，
+	// 留下一个陈旧的 shshore-update.sh（本计划实测过这个 bug），所以脚本必须用 $SELF 绝对路径自删。
+	p := newFixture(t)
+	st, _ := os.Stat(p.Pending)
+	p.Size = st.Size()
+	body, err := ScriptBytes("linux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(p.ExeDir, "shshore-update.sh"), body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 用相对文件名 + cmd.Dir 调用，模拟「相对路径」场景
+	cmd := exec.Command("sh", "shshore-update.sh", ScriptArgs(p, exitedChild(t))...)
+	cmd.Dir = p.ExeDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("脚本应成功: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(p.ExeDir, "shshore-update.sh")); !os.IsNotExist(err) {
+		t.Fatal("相对路径调用时脚本也必须自删（用 $SELF）")
 	}
 }
 
