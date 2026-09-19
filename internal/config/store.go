@@ -23,6 +23,11 @@ type AppSettings struct {
 	LatinFont         string  `toml:"latin_font,omitempty" json:"latin_font,omitempty"` // 英文字体（空=系统默认）
 	CJKFont           string  `toml:"cjk_font,omitempty" json:"cjk_font,omitempty"`     // 中文字体（空=系统默认）
 	AutoStartOnLaunch bool    `toml:"auto_start_on_launch" json:"auto_start_on_launch"` // 启动后自动连接转发通道
+
+	UpdateCheckAuto          bool   `toml:"update_check_auto" json:"update_check_auto"`                     // 启动后自动检查更新
+	UpdateCheckIntervalHours int    `toml:"update_check_interval_hours" json:"update_check_interval_hours"` // 轮询间隔（小时）：0=用户显式关闭轮询
+	UpdateSkippedVersion     string `toml:"update_skipped_version" json:"update_skipped_version"`           // 跳过此版本（存 Base 形式，如 0.7.0）
+	UpdateSource             string `toml:"update_source" json:"update_source"`                             // 自定义更新源（仅 http(s)://）
 }
 
 // Normalize 兜底无效设置：主题缺省为跟随系统、字号系数非法时回退到 1，
@@ -49,6 +54,22 @@ func (s *AppSettings) Normalize() {
 	default:
 		s.SftpTransport = "" // "" / "auto" / 非法值都回落内置默认
 	}
+	// 轮询间隔：只把非法值（<0）归一为默认 12，上限 168（一周）。
+	// 0 是合法值 —— 表示用户显式关闭轮询；「缺键」的默认值由 DefaultAppConfig/LoadConfig 负责。
+	if s.UpdateCheckIntervalHours < 0 {
+		s.UpdateCheckIntervalHours = 12
+	}
+	if s.UpdateCheckIntervalHours > 168 {
+		s.UpdateCheckIntervalHours = 168
+	}
+	// 更新源：只做去空白 + 前缀校验，非法值仅清空（回退与告警是服务层职责，
+	// 本方法保持纯函数、不写日志）。非 loopback 强制 https 的判定也在服务层。
+	s.UpdateSource = strings.TrimSpace(s.UpdateSource)
+	if s.UpdateSource != "" && !strings.HasPrefix(s.UpdateSource, "http://") && !strings.HasPrefix(s.UpdateSource, "https://") {
+		s.UpdateSource = ""
+	}
+	// 跳过版本存 Base 形式（去空白与 v 前缀），与 update.Base(rel.Tag)==update.Base(cfg.Skipped) 对齐。
+	s.UpdateSkippedVersion = strings.TrimPrefix(strings.TrimSpace(s.UpdateSkippedVersion), "v")
 }
 
 type Tunnel struct {
@@ -190,6 +211,9 @@ func DefaultAppConfig() *AppConfig {
 			FontScale:            1,
 			AutoStartOnLaunch:    true,
 			SftpTransport:        "",
+
+			UpdateCheckAuto:          true,
+			UpdateCheckIntervalHours: 12,
 		},
 	}
 	c.normalize()
