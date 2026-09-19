@@ -68,6 +68,45 @@ func TestAppSettingsRaceWithUpdateSettings(t *testing.T) {
 	wg.Wait()
 }
 
+// TestAppSettingsSubfieldReadsAreRaceFree 覆盖最终评审 I-3：app.go 的 sftp transport
+// 懒解析（Init 的闭包现在就是 a.sftpTransport）与 AutoStartEnabled 曾裸读 a.cfg.App
+// 子字段，而 setAppSettings 是整结构赋值 ⇒ 真实数据竞争。两个读点现在都经受锁 getter；
+// 本测试与整结构写并发，-race 下不得报竞争。
+// 用 go test . -race -run TestAppSettingsSubfieldReadsAreRaceFree -count=5 验证。
+func TestAppSettingsSubfieldReadsAreRaceFree(t *testing.T) {
+	a := &App{cfg: config.DefaultAppConfig()}
+
+	var wg stdsync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(2)
+	// 写侧：模拟 Wails 线程的整结构赋值。
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 500; i++ {
+			a.setAppSettings(config.AppSettings{
+				AutoStartOnLaunch: i%2 == 0,
+				SftpTransport:     "gosftp",
+			})
+		}
+	}()
+	// 读侧：两个真实读点（以及 AutoStartEnabled 走的完整路径）。
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 500; i++ {
+			_ = a.sftpTransport()
+			_ = a.autoStartOnLaunch()
+			if err := a.AutoStartEnabled(); err != nil {
+				t.Errorf("AutoStartEnabled: %v", err)
+				return
+			}
+		}
+	}()
+	close(start)
+	wg.Wait()
+}
+
 // TestSaveConfigSnapshotRace 覆盖 fix round 2：saveConfig 必须先在读锁下复制 a.cfg，
 // 再用副本序列化落盘。否则 Wails 线程 SetSettings 的整结构写（setAppSettings 写
 // a.cfg.App）会与落盘路径对 a.cfg 的 TOML 序列化并发读写同一内存。

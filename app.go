@@ -35,8 +35,10 @@ type App struct {
 	sync    *sync.Ctrl
 
 	// cfgMu 保护 cfg.App：更新服务 goroutine（Config/Save 回调）读、
-	// Wails 调用线程（GetSettings/SetSettings）写。两侧都必须经由
-	// appSettings / setAppSettings 访问，否则是数据竞争（Task 11 fix round 1）。
+	// Wails 调用线程（GetSettings/SetSettings）写。setAppSettings 是**整结构赋值**，
+	// 因此任何对 a.cfg.App 子字段的裸读都会与它构成数据竞争 —— 所有读点都必须
+	// 经过受锁的 appSettings / autoStartOnLaunch / sftpTransport（Task 11 fix round 1；
+	// 裸读 sftpTransport / AutoStartOnLaunch 由最终评审 I-3 收口）。
 	cfgMu stdsync.RWMutex
 
 	// H2: startup 早于 Init 注入 emit，加载错误先记录于此，Init 时补发事件
@@ -176,12 +178,7 @@ func (a *App) Init(emit func(forward.Event)) {
 	a.forward = forward.NewCtrl(osutil.NewSpawner(), emit, nil)
 	// 选择器懒解析配置（Task 5）：app_test 直接构造时 a.cfg 可能为 nil，
 	// 闭包必须回退内置默认而不是 panic（三审 R11）。
-	a.sftp = sftp.NewCtrlWith(osutil.NewRunner(), emit, func() string {
-		if a.cfg == nil {
-			return ""
-		}
-		return a.cfg.App.SftpTransport
-	})
+	a.sftp = sftp.NewCtrlWith(osutil.NewRunner(), emit, a.sftpTransport)
 	if dir := stateDir(); dir != "" {
 		a.sftp.SetJournalDir(dir) // Task 8 的 backup-swap journal（S6）
 	}
@@ -354,6 +351,29 @@ func (a *App) appSettings() config.AppSettings {
 		return config.DefaultAppConfig().App
 	}
 	return a.cfg.App
+}
+
+// sftpTransport 在读锁下读 a.cfg.App.SftpTransport（cfg 未加载时回退空串 = 内置默认）。
+// 供选择器懒解析配置，避免对 a.cfg.App 的裸读（最终评审 I-3）。
+func (a *App) sftpTransport() string {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if a.cfg == nil {
+		return ""
+	}
+	return a.cfg.App.SftpTransport
+}
+
+// autoStartOnLaunch 在读锁下读 a.cfg.App.AutoStartOnLaunch（cfg 未加载时回退 false）。
+// AutoStartEnabled 由 main.go 的延迟 goroutine 调用，必须与 setAppSettings 的整结构写同步
+// （最终评审 I-3）。
+func (a *App) autoStartOnLaunch() bool {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if a.cfg == nil {
+		return false
+	}
+	return a.cfg.App.AutoStartOnLaunch
 }
 
 // setAppSettings 在写锁下整体替换 a.cfg.App；锁内不做 IO，落盘由调用方在解锁后完成。
@@ -599,7 +619,7 @@ func (a *App) updateTunnel(u config.Tunnel) {
 // M10: 单个隧道失败不得中止循环——逐项收集失败、经事件管道上报，最后汇总返回。
 // 设置中的 AutoStartOnLaunch 关闭时整体跳过（用户选择"启动后不自动连接转发通道"）。
 func (a *App) AutoStartEnabled() error {
-	if a.cfg == nil || !a.cfg.App.AutoStartOnLaunch {
+	if !a.autoStartOnLaunch() {
 		return nil
 	}
 	var errs []error
