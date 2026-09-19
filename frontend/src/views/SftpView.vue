@@ -16,7 +16,8 @@ import { actionFor } from '../utils/keys'
 import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName, nextTransferSeq, transferID } from '../utils/batch'
 import { failureText, isInternalTempName, applyProgress, TRANSFER_PROGRESS_EVENT,
   applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch } from '../utils/queue'
-import { payloadFor, parsePayload, hitPane, canDropInto } from '../utils/dnd'
+import { payloadFor, payloadFromDragEvent, DRAG_MIME, pickDropPane, canDropInto } from '../utils/dnd'
+import { setSystemDropHandler } from '../utils/systemDrop'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 // 说明：StatPaths / CopyLocal / SftpMove / ListLocal / RenameLocal 已在既有 import 行里，
 // 这里**不重复声明**（重复 import 同名标识符会让 vite build 直接 SyntaxError）。
@@ -67,7 +68,8 @@ const transfers = ref([])
 const visibleRemoteItems = computed(() => (remoteItems.value || []).filter((it) => !isInternalTempName(it.name)))
 const visibleLocalItems = computed(() => (localItems.value || []).filter((it) => !isInternalTempName(it.name)))
 
-// 进度订阅的退订函数：KeepAlive 下 setup 只跑一次，必须成对挂摘（先例 offDrop）。
+// 进度订阅的退订函数：KeepAlive 下 setup 只跑一次，必须成对挂摘
+// （系统拖入处理器走 setSystemDropHandler(null)，同样在 onDeactivated/onUnmounted 成对摘）。
 let offProgress = null
 
 // 事件按 id 落到队列项，并把 PartPath 存进该项 —— 续传/清理都靠这个锚点。
@@ -641,12 +643,18 @@ function onDragStart(pane, { item, event }) {
   const s = selectionFor(pane)
   if (!sel.isSelected(s, item.name)) sel.single(s, item.name)
   event.dataTransfer.effectAllowed = 'copyMove'
-  event.dataTransfer.setData('application/x-sshore', payloadFor(pane, [...s.keys]))
+  event.dataTransfer.setData(DRAG_MIME, payloadFor(pane, [...s.keys]))
 }
 
 // ===== 路径①②：面板互拖（落到面板空白处 = 投递到对方当前目录）=====
 async function onPaneDrop(targetPane, { event }) {
-  const payload = parsePayload(event.dataTransfer.getData('application/x-sshore'))
+  // 高亮必须随 drop 消失，否则面板会一直挂着虚线框（真机截图暴露过）。
+  hoverPane.value = null
+  // 落点回退记录：drop 命中的面板也记一次（真机上外部拖入的 drop 并不总会到达面板空白区，
+  // 主要来源仍是 dragover，见 noteDropPane）。
+  noteDropPane(targetPane)
+  // 事件形状由 dnd.test.js + sftpDropWiring.test.js 双向钉住：模板必须传 { event: $event }。
+  const payload = payloadFromDragEvent(event)
   if (!payload || payload.pane === targetPane) return
   const guard = canDropInto({ sourcePane: payload.pane, targetPane, item: { isDir: true }, connected: connected.value })
   if (!guard.ok) { err(guard.reason); return }
@@ -660,7 +668,7 @@ async function onPaneDrop(targetPane, { event }) {
 
 // ===== 路径④：面板内移动到子目录行 =====
 async function onMoveDrop(pane, { item, event }) {
-  const payload = parsePayload(event.dataTransfer.getData('application/x-sshore'))
+  const payload = payloadFromDragEvent(event)
   if (!payload || payload.pane !== pane || !payload.names.length) return
   if (!item.isDir) { err('只能放到目录上'); return }
   const base = pane === 'local' ? (localPath.value || '/') : remotePath.value
@@ -712,18 +720,39 @@ async function onMoveDrop(pane, { item, event }) {
   sel.remove(pane === 'local' ? localSelection : remoteSelection, done)
 }
 
-// ===== 路径③：系统文件管理器拖入 =====
-let offDrop = null
+// 系统拖入的落点回退记录：{pane, ts}，由 dragover（主要）与 drop 持续刷新。
+// 它与坐标（屏幕像素 vs 页面坐标，实测不可靠）互为补充，见 dnd.pickDropPane；
+// 生命周期只到「被 onFilesDropped 消费」或超过 TTL，不是视觉状态（视觉是 hoverPane）。
+const lastDropPane = ref(null)
+// 拖入期间悬停的面板：纯视觉高亮（spec R3 的「拖入期间高亮让用户确认」）。
+const hoverPane = ref(null)
+// 回退记录必须与视觉高亮分开：drop 一到就要清高亮（否则面板一直挂虚线框），
+// 而 Wails 的 wails:file-drop 事件要经 Go 解析真实路径、几毫秒后才到 —— 那时只能靠这份记录。
+function noteDropPane(pane) { lastDropPane.value = { pane, ts: Date.now() } }
+function onPaneDragOver(pane) {
+  if (hoverPane.value !== pane) hoverPane.value = pane
+  noteDropPane(pane) // 持续刷新：外拖的 dragover 一定会经过这里
+}
+// ESC 取消的拖拽不会产生 drop：靠 window 的 dragend 兜底清高亮（dragleave 不用于此，
+// 它会在面板子元素之间冒泡，频繁清会造成闪烁）。
+function clearDropHover() { hoverPane.value = null }
 
+// ===== 路径③：系统文件管理器拖入 =====
+// webview 侧的 dragover/drop 监听由 App.vue 在启动时注册一次（Wails JS 版 OnFileDrop），
+// 这里只把「落点判定 + 投递」注册为处理器：KeepAlive 下切走标签即摘除，
+// 否则「端口转发/文件同步」标签下拖入文件也会投递到 SFTP 面板。
 function onFilesDropped(payload) {
   if (!payload || !payload.paths || !payload.paths.length) return
   const localEl = document.querySelector('[data-pane="local"]')
   const remoteEl = document.querySelector('[data-pane="remote"]')
   if (!localEl || !remoteEl) return
   const rects = { local: localEl.getBoundingClientRect(), remote: remoteEl.getBoundingClientRect() }
-  // 坐标单位 / DPI 缩放需实测（spec R3）；命中失败只会提示"落点无效"，不会误操作。
-  const pane = hitPane({ x: payload.x, y: payload.y }, rects)
-  if (!pane) { err('落点无效：请拖到左侧本地或右侧远程面板'); return }
+  // 坐标单位 / DPI 缩放需实测（spec R3）：坐标命中优先，否则用刚才 DOM drop 命中的面板
+  // （TTL 3s，防陈旧）；两者都没有才提示无效，绝不猜一个面板乱投。
+  const pane = pickDropPane({ x: payload.x, y: payload.y }, rects, lastDropPane.value)
+  lastDropPane.value = null
+  hoverPane.value = null
+  if (!pane) { err('落点无效：请把文件拖到左侧本地或右侧远程面板上再松手'); return }
   handleSystemDrop(pane, payload.paths)
 }
 
@@ -806,9 +835,8 @@ async function syncConnection() {
 onActivated(() => {
   window.addEventListener('click', outsideClick)
   window.addEventListener('keydown', onKeydown)
-  // 系统拖入订阅同样成对挂摘：KeepAlive 下 setup 只跑一次，切走标签必须退订，
-  // 否则「端口转发/文件同步」标签下拖入文件也会投递到 SFTP 面板。
-  offDrop = EventsOn('files:dropped', onFilesDropped)
+  window.addEventListener('dragend', clearDropHover)
+  setSystemDropHandler(onFilesDropped)
   // 进度订阅同样成对挂摘：切走标签后仍在的订阅会把帧落到已离开的视图上。
   offProgress = EventsOn(TRANSFER_PROGRESS_EVENT, onTransferProgress)
   startClock()
@@ -817,14 +845,16 @@ onActivated(() => {
 onDeactivated(() => {
   window.removeEventListener('click', outsideClick)
   window.removeEventListener('keydown', onKeydown)
-  if (offDrop) { offDrop(); offDrop = null }
+  window.removeEventListener('dragend', clearDropHover)
+  setSystemDropHandler(null)
   if (offProgress) { offProgress(); offProgress = null }
   stopClock()
 })
 onUnmounted(() => {
   window.removeEventListener('click', outsideClick)
   window.removeEventListener('keydown', onKeydown)
-  if (offDrop) { offDrop(); offDrop = null }
+  window.removeEventListener('dragend', clearDropHover)
+  setSystemDropHandler(null)
   if (offProgress) { offProgress(); offProgress = null }
   stopClock()
 })
@@ -844,7 +874,9 @@ onUnmounted(() => {
       </label>
     </div>
     <div class="panes">
-      <div class="pane-wrap" data-pane="local" @dragover.prevent @drop.prevent="onPaneDrop('local', $event)">
+      <!-- 不是装饰：WebKitGTK 上只有 @dragover.prevent 时，面板级 drop 根本不会派发
+           （Linux 真机实测：面板内行拖拽能成、跨面板拖拽完全无反应）；Chromium/WebView2 两者都行。 -->
+      <div class="pane-wrap" data-pane="local" :class="{ 'drop-hover': hoverPane === 'local' }" @dragover.prevent="onPaneDragOver('local')" @drop.prevent="onPaneDrop('local', { event: $event })">
         <FilePane title="本地" pane="local" host="" :path="localPath || '/'" :items="visibleLocalItems" :sel-keys="[...localSelection.keys]" :anchor="localSelection.anchor"
           :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
           :presets="locations.presetsForPane('local', '')" :disks="locations.disksForPane('local')"
@@ -855,7 +887,7 @@ onUnmounted(() => {
           @context="showMenu('local', $event)" @visible="localVisible = $event" @focus="focusedPane = 'local'"
           @dragstart="onDragStart('local', $event)" @dropon="onMoveDrop('local', $event)" />
       </div>
-      <div class="pane-wrap" data-pane="remote" @dragover.prevent @drop.prevent="onPaneDrop('remote', $event)">
+      <div class="pane-wrap" data-pane="remote" :class="{ 'drop-hover': hoverPane === 'remote' }" @dragenter.prevent @dragover.prevent="onPaneDragOver('remote')" @drop.prevent="onPaneDrop('remote', { event: $event })">
         <FilePane title="远程" pane="remote" :host="host" :path="remotePath" :items="visibleRemoteItems" :sel-keys="[...remoteSelection.keys]" :anchor="remoteSelection.anchor"
           :show-hidden="showAll" :loading="remoteLoading" :actions="actionsFor('remote')" :hidden-selected="hiddenFor('remote')"
           :presets="locations.presetsForPane('remote', host)"
@@ -913,6 +945,8 @@ onUnmounted(() => {
 .panes { display: flex; gap: 8px; flex: 1; min-height: 0; }
 /* 放置区容器：承接 .panes 的伸缩；data-pane 同时是系统拖入命中测试的锚点 */
 .pane-wrap { flex: 1; display: flex; min-width: 0; }
+/* 系统拖入悬停提示（spec R3 的「拖入期间高亮，让用户确认落点」）：落点回退靠它可见 */
+.pane-wrap.drop-hover { outline: 2px dashed var(--accent); outline-offset: -2px; border-radius: 4px; }
 .logpane { height: 140px; flex-shrink: 0; padding: 12px; overflow: auto; }
 .hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: var(--fs-12); color: var(--text-dim); }
 </style>
