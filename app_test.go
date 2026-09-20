@@ -1235,6 +1235,144 @@ func TestStartupSeedsPresetsFileOnce(t *testing.T) {
 	}
 }
 
+// 回归（2026-09-20 真机定位）：startup 绝不能被本地 .part 陈旧清理挡住。
+//
+// 该清理会递归扫描 cfg.LocalRecent 里的每个历史目录，列表可能含盘根（C:\ / D:\）与
+// 失效网络盘（Z:\）；win10 真机实测这一步 13.9s。它一旦同步执行，main.go 里紧随
+// startup() 的 app.Init()（建立 a.sftp 等控制器）就被拖到十几秒后，而这段时间窗口已经
+// 渲染、按钮可点、a.sftp 仍是 nil —— 绑定调用 nil 解引用 panic，又被 Wails dispatcher
+// 的 recover 静默吞掉，用户看到的就是「点连接毫无反应、不报错、状态不变」。
+func TestStartupDoesNotBlockOnStalePartCleanup(t *testing.T) {
+	old := cleanupStaleLocalPartsAt
+	t.Cleanup(func() { cleanupStaleLocalPartsAt = old })
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	cleanupStaleLocalPartsAt = func([]string) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release // 模拟「扫描一个盘根/失效网络盘要十几秒」
+	}
+
+	a := NewApp()
+	done := make(chan struct{})
+	go func() {
+		a.startup(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startup 被本地 .part 清理阻塞：必须后台执行（否则 Init/a.sftp 被拖后，SFTP 绑定静默失败）")
+	}
+	// 清理确实被调度进了后台（不是被整段删掉）
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("陈旧 .part 清理没有被调度到后台")
+	}
+}
+
+// 回归：控制器尚未装配（main.go 的 app.Init 还没跑）时，SFTP 绑定必须返回明确错误，
+// 绝不能 nil 解引用 panic —— Wails dispatcher 会 recover 掉 panic 且前端拿不到任何反馈，
+// 表现就是「点了没反应」（见 TestStartupDoesNotBlockOnStalePartCleanup 的成因说明）。
+func TestSftpBindingsFailFastBeforeInit(t *testing.T) {
+	a := NewApp() // 故意不调用 startup/Init：a.sftp 保持 nil
+
+	if err := a.SftpConnect("prod"); err == nil {
+		t.Fatal("未就绪时 SftpConnect 必须返回明确错误，而不是 panic/静默")
+	}
+	if err := a.SftpDisconnect("prod"); err == nil {
+		t.Fatal("未就绪时 SftpDisconnect 必须返回明确错误")
+	}
+	if _, err := a.SftpList("prod", "", "/"); err == nil {
+		t.Fatal("未就绪时 SftpList 必须返回明确错误")
+	}
+	if _, err := a.SftpHome("prod"); err == nil {
+		t.Fatal("未就绪时 SftpHome 必须返回明确错误")
+	}
+	if err := a.SftpRemove("prod", "", "/x"); err == nil {
+		t.Fatal("未就绪时 SftpRemove 必须返回明确错误")
+	}
+	if err := a.SftpGet("t1", "prod", "", "/r", "/l", false, ""); err == nil {
+		t.Fatal("未就绪时 SftpGet 必须返回明确错误")
+	}
+	if _, err := a.SftpSearch(RemoteSearchRequest{ID: "s1", Host: "prod", Root: "/", Pattern: "x"}); err == nil {
+		t.Fatal("未就绪时 SftpSearch 必须返回明确错误")
+	}
+	// 布尔型绑定：未就绪只能答 false（绝不能 panic）
+	if a.SftpConnected("prod") {
+		t.Fatal("未就绪时 SftpConnected 必须为 false")
+	}
+	if a.SftpTransferCancel("t1") {
+		t.Fatal("未就绪时 SftpTransferCancel 必须为 false")
+	}
+	if a.sftpAtomic() {
+		t.Fatal("未就绪时不得声明原子提交能力")
+	}
+}
+
+// 回归：与 SFTP 同一条铁律 —— 控制器未装配（app.Init 还没跑）时 forward/sync 绑定
+// 必须 fail-fast 或给空值，绝不让 nil 解引用 panic 被 Wails dispatcher 静默 recover
+// （前端只会看到「点了没反应、也不报错」）。见 TestSftpBindingsFailFastBeforeInit。
+func TestForwardAndSyncBindingsFailFastBeforeInit(t *testing.T) {
+	a := NewApp() // 故意不调用 Init：forward/sync 保持 nil
+
+	if err := a.StartTunnel("t1"); err == nil {
+		t.Fatal("未就绪时 StartTunnel 必须返回明确错误")
+	}
+	if err := a.StopTunnel("t1"); err == nil {
+		t.Fatal("未就绪时 StopTunnel 必须返回明确错误")
+	}
+	if err := a.UpdateTunnel(config.Tunnel{ID: "t1"}); err == nil {
+		t.Fatal("未就绪时 UpdateTunnel 必须返回明确错误")
+	}
+	if err := a.DeleteTunnel("t1"); err == nil {
+		t.Fatal("未就绪时 DeleteTunnel 必须返回明确错误")
+	}
+	if got := a.TunnelStates(); got == nil {
+		t.Fatal("未就绪时 TunnelStates 必须返回空 map 而不是 nil")
+	}
+
+	if err := a.StartSyncRule("r1"); err == nil {
+		t.Fatal("未就绪时 StartSyncRule 必须返回明确错误")
+	}
+	if err := a.StopSyncRule("r1"); err == nil {
+		t.Fatal("未就绪时 StopSyncRule 必须返回明确错误")
+	}
+	if err := a.UpdateSyncRule(config.SyncRule{ID: "r1"}); err == nil {
+		t.Fatal("未就绪时 UpdateSyncRule 必须返回明确错误")
+	}
+	if err := a.DeleteSyncRule("r1"); err == nil {
+		t.Fatal("未就绪时 DeleteSyncRule 必须返回明确错误")
+	}
+	if err := a.ResolveSyncConflict("r1", "p", "local"); err == nil {
+		t.Fatal("未就绪时 ResolveSyncConflict 必须返回明确错误")
+	}
+	if err := a.ConfirmSyncRuleDeletes("r1", "fp"); err == nil {
+		t.Fatal("未就绪时 ConfirmSyncRuleDeletes 必须返回明确错误")
+	}
+	if err := a.RetrySyncRuleFailures("r1"); err == nil {
+		t.Fatal("未就绪时 RetrySyncRuleFailures 必须返回明确错误")
+	}
+	if got := a.SyncRuleStates(); got == nil {
+		t.Fatal("未就绪时 SyncRuleStates 必须返回空 map 而不是 nil")
+	}
+	if got := a.SyncRuleStats(); got == nil {
+		t.Fatal("未就绪时 SyncRuleStats 必须返回空 map 而不是 nil")
+	}
+	if got := a.SyncRuleConflicts("r1"); got == nil {
+		t.Fatal("未就绪时 SyncRuleConflicts 必须返回空切片而不是 nil")
+	}
+	// AutoStartEnabled 是 main.go 延迟 goroutine 的入口：控制器缺失时不得 panic。
+	if err := a.AutoStartEnabled(); err != nil {
+		t.Fatalf("控制器缺失时 AutoStartEnabled 不得报错: %v", err)
+	}
+}
+
 // —— Task 9：进度事件载荷 + 绑定层（id / Atomic 能力 / Cancel）——
 
 // TestSftpTransferProgressEventShape 钉住 sftp:transfer-progress 的载荷字段名与取值：

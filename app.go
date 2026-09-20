@@ -134,7 +134,16 @@ func (a *App) startup(ctx context.Context) {
 	}
 	// Task 13（spec D14）：清理 >7 天且名字含 PartMarker 的本地传输临时文件。
 	// 进程崩溃后登记的 knownParts 随进程消失，这些 .part 只能靠陈旧清理兜底。
-	a.cleanupStaleParts()
+	//
+	// ⚠️ 必须后台执行：本清理会递归扫描 cfg.LocalRecent 里的每个历史目录，而那个列表可能
+	// 含盘根（C:\ / D:\）与失效网络盘（Z:\）。win10 真机实测（最近位置含 C:\、
+	// C:\Windows\system32、C:\Users\lan、Z:\）这一步耗时 **13.9s**。它一旦同步执行，
+	// main.go 里紧随 startup() 的 app.Init()（建立 a.sftp 等控制器）就会被拖到十几秒后；
+	// 而这段时间内窗口已渲染、按钮可点、a.sftp 仍是 nil —— 绑定调用 nil 解引用 panic，
+	// 又被 Wails dispatcher 的 recover 静默吞掉，用户看到的是「点连接毫无反应、不报错、
+	// 状态不变」（2026-09-20 真机定位）。清理只是兜底动作，绝不该挡在控制器装配之前。
+	// 目录快照在此同步取出：后台 goroutine 不再触碰 a.cfg，避免与后续设置写入竞争。
+	go cleanupStaleLocalPartsAt(a.localRecentPaths())
 	// 更新服务：注入全部外部依赖（HTTP/进程/配置读写/事件通道），Init 做残留自检
 	// 与轮询调度。必须放在 startup —— 这里才有 ctx，且 Init 会被测试直接调用。
 	a.updater = update.New(update.Options{
@@ -154,20 +163,35 @@ func (a *App) startup(ctx context.Context) {
 	a.updater.Init(ctx)
 }
 
-// cleanupStaleParts 在启动时清理最近用过的本地目录下的陈旧临时文件（>7 天）。
-// 只扫配置里记录的本地目录（用户机器上没有可枚举「我们写过的所有目标目录」的全局索引）；
-// 不可读/不存在的目录静默跳过，绝不阻断启动。
-func (a *App) cleanupStaleParts() {
+// localRecentPaths 返回 cfg.LocalRecent 里去重后的本地目录快照。
+// 只在 startup 同步调用一次，之后交给后台清理，避免后台 goroutine 读 a.cfg 与
+// 用户改设置（setAppSettings/saveConfig）构成数据竞争。
+func (a *App) localRecentPaths() []string {
 	if a.cfg == nil {
-		return
+		return nil
 	}
 	seen := map[string]bool{}
+	roots := make([]string, 0, len(a.cfg.LocalRecent))
 	for _, r := range a.cfg.LocalRecent {
 		if r.Path == "" || seen[r.Path] {
 			continue
 		}
 		seen[r.Path] = true
-		_, _ = sftp.CleanupStaleLocalParts(r.Path, time.Now())
+		roots = append(roots, r.Path)
+	}
+	return roots
+}
+
+// cleanupStaleLocalPartsAt 逐个目录清理陈旧本地临时文件（>7 天，仅 IsInternalTemp 名字）。
+// 只扫配置里记录过的本地目录（用户机器上没有可枚举「我们写过的所有目标目录」的全局索引）；
+// 不可读/不存在的目录静默跳过，绝不阻断启动。
+//
+// 声明为包级变量：单测用它注入阻塞实现，钉住「startup 不被这步挡住」这条回归
+// （见 TestStartupDoesNotBlockOnStalePartCleanup）。
+var cleanupStaleLocalPartsAt = func(roots []string) {
+	now := time.Now()
+	for _, root := range roots {
+		_, _ = sftp.CleanupStaleLocalParts(root, now)
 	}
 }
 
@@ -473,9 +497,31 @@ func (a *App) SetSettings(s config.AppSettings) error {
 	return nil
 }
 
+// forwardCtrl / syncCtrl 返回已装配的控制器。与 sftpCtrl 同一成因与同一条铁律：
+// 应用启动尚未完成（main.go 的 app.Init 还没跑）时必须返回明确错误 / 空值，绝不能
+// nil 解引用 panic —— 它会被 Wails dispatcher 的 recover 静默吞掉，前端只看到
+// 「点了没反应、也没有报错」（2026-09-20 真机定位）。
+func (a *App) forwardCtrl() (*forward.Ctrl, error) {
+	if a.forward == nil {
+		return nil, errors.New("端口转发尚未就绪（应用仍在初始化），请稍后重试")
+	}
+	return a.forward, nil
+}
+
+func (a *App) syncCtrl() (*sync.Ctrl, error) {
+	if a.sync == nil {
+		return nil, errors.New("文件同步尚未就绪（应用仍在初始化），请稍后重试")
+	}
+	return a.sync, nil
+}
+
 // TunnelStates 返回各隧道运行态（id → state 字符串），供前端四态圆点渲染。
 func (a *App) TunnelStates() map[string]string {
-	return a.forward.States()
+	c, err := a.forwardCtrl()
+	if err != nil {
+		return map[string]string{}
+	}
+	return c.States()
 }
 
 func (a *App) CreateTunnel(t config.Tunnel) error {
@@ -500,6 +546,10 @@ func (a *App) CreateTunnel(t config.Tunnel) error {
 // UpdateTunnel replaces an existing tunnel (matched by ID) with updated fields.
 // If the tunnel is running, it is stopped first because the config changed.
 func (a *App) UpdateTunnel(t config.Tunnel) error {
+	fc, ferr := a.forwardCtrl()
+	if ferr != nil {
+		return ferr
+	}
 	if err := forward.ValidateTunnel(t); err != nil {
 		return err
 	}
@@ -518,7 +568,7 @@ func (a *App) UpdateTunnel(t config.Tunnel) error {
 		return err
 	}
 	if a.cfg.Tunnels[idx].Enabled {
-		_ = a.forward.Stop(t.ID)
+		_ = fc.Stop(t.ID)
 		t.Enabled = false
 	}
 	a.cfg.Tunnels[idx] = t
@@ -527,6 +577,10 @@ func (a *App) UpdateTunnel(t config.Tunnel) error {
 
 // DeleteTunnel removes a tunnel (matched by ID), stopping it if running.
 func (a *App) DeleteTunnel(id string) error {
+	fc, ferr := a.forwardCtrl()
+	if ferr != nil {
+		return ferr
+	}
 	idx := -1
 	for i, e := range a.cfg.Tunnels {
 		if e.ID == id {
@@ -538,7 +592,7 @@ func (a *App) DeleteTunnel(id string) error {
 		return errors.New("tunnel not found")
 	}
 	if a.cfg.Tunnels[idx].Enabled {
-		_ = a.forward.Stop(id)
+		_ = fc.Stop(id)
 	}
 	a.cfg.Tunnels = append(a.cfg.Tunnels[:idx], a.cfg.Tunnels[idx+1:]...)
 	return a.saveConfig()
@@ -556,11 +610,15 @@ func (a *App) ImportCommand(cmd string) ([]config.Tunnel, error) {
 }
 
 func (a *App) StartTunnel(id string) error {
+	fc, ferr := a.forwardCtrl()
+	if ferr != nil {
+		return ferr
+	}
 	t, ok := a.findTunnel(id)
 	if !ok {
 		return errors.New("tunnel not found")
 	}
-	if err := a.forward.Start(t); err != nil {
+	if err := fc.Start(t); err != nil {
 		return err
 	}
 	t.Enabled = true
@@ -569,7 +627,11 @@ func (a *App) StartTunnel(id string) error {
 }
 
 func (a *App) StopTunnel(id string) error {
-	if err := a.forward.Stop(id); err != nil {
+	fc, ferr := a.forwardCtrl()
+	if ferr != nil {
+		return ferr
+	}
+	if err := fc.Stop(id); err != nil {
 		return err
 	}
 	if t, ok := a.findTunnel(id); ok {
@@ -623,35 +685,41 @@ func (a *App) AutoStartEnabled() error {
 		return nil
 	}
 	var errs []error
-	for _, t := range a.cfg.Tunnels {
-		if !t.Enabled {
-			continue
-		}
-		if err := a.forward.Start(t); err != nil {
-			msg := fmt.Sprintf("自动启动隧道 %s 失败: %v", t.ID, err)
-			if a.emit != nil {
-				a.emit(forward.Event{
-					SourceType: "tunnel",
-					SourceID:   t.ID,
-					TS:         time.Now().Format(time.RFC3339),
-					Level:      "error",
-					Message:    msg,
-				})
+	// 控制器未装配（app.Init 还没跑）时跳过：auto-start 是尽力而为的启动动作，
+	// 绝不因生命周期时序 nil 解引用 panic（同 sftpCtrl 的成因，见其注释）。
+	if a.forward != nil {
+		for _, t := range a.cfg.Tunnels {
+			if !t.Enabled {
+				continue
 			}
-			errs = append(errs, errors.New(msg))
+			if err := a.forward.Start(t); err != nil {
+				msg := fmt.Sprintf("自动启动隧道 %s 失败: %v", t.ID, err)
+				if a.emit != nil {
+					a.emit(forward.Event{
+						SourceType: "tunnel",
+						SourceID:   t.ID,
+						TS:         time.Now().Format(time.RFC3339),
+						Level:      "error",
+						Message:    msg,
+					})
+				}
+				errs = append(errs, errors.New(msg))
+			}
 		}
 	}
-	for _, rule := range a.cfg.Syncs {
-		if !rule.Enabled {
-			continue
-		}
-		if err := a.sync.Start(rule); err != nil {
-			msg := fmt.Sprintf("自动启动同步规则 %s 失败: %v", rule.ID, err)
-			if a.emit != nil {
-				a.emit(forward.Event{SourceType: "sync", SourceID: rule.ID,
-					TS: time.Now().Format(time.RFC3339), Level: "error", Message: msg})
+	if a.sync != nil {
+		for _, rule := range a.cfg.Syncs {
+			if !rule.Enabled {
+				continue
 			}
-			errs = append(errs, errors.New(msg))
+			if err := a.sync.Start(rule); err != nil {
+				msg := fmt.Sprintf("自动启动同步规则 %s 失败: %v", rule.ID, err)
+				if a.emit != nil {
+					a.emit(forward.Event{SourceType: "sync", SourceID: rule.ID,
+						TS: time.Now().Format(time.RFC3339), Level: "error", Message: msg})
+				}
+				errs = append(errs, errors.New(msg))
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -669,8 +737,23 @@ func (a *App) findTunnel(id string) (config.Tunnel, bool) {
 	return config.Tunnel{}, false
 }
 
+// sftpCtrl 返回已装配的 SFTP 门面。应用启动尚未完成（main.go 的 app.Init 还没跑）时
+// 返回明确错误：绝不能放任 nil 解引用 panic —— 它会被 Wails dispatcher 的 recover
+// 静默吞掉，前端只看到「点了没反应、无报错」（2026-09-20 真机定位：startup 里的陈旧
+// .part 清理曾把 Init 拖到十几秒后，那段时间 a.sftp 一直是 nil）。
+func (a *App) sftpCtrl() (*sftp.Ctrl, error) {
+	if a.sftp == nil {
+		return nil, errors.New("SFTP 尚未就绪（应用仍在初始化），请稍后重试")
+	}
+	return a.sftp, nil
+}
+
 func (a *App) SftpList(host, user, path string) ([]sftp.Item, error) {
-	return a.sftp.List(host, user, path)
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return nil, err
+	}
+	return c.List(host, user, path)
 }
 
 // —— Task 9：新传输面绑定（id + resume/partPath + 进度事件 + 取消）——
@@ -708,11 +791,20 @@ func (a *App) emitProgress(p sftp.Progress) {
 // sftpAtomic 返回当前后端是否支持原子提交（.part + 提交）。绑定层的 Atomic 只从这里取值，
 // 绝不写死 true/false：写死 true 会让 batch 后端（Atomic=false 直写）的传输全盘失败，
 // 写死 false 会丢掉原子语义。
-func (a *App) sftpAtomic() bool { return a.sftp.AtomicCapable() }
+func (a *App) sftpAtomic() bool {
+	if a.sftp == nil {
+		return false
+	}
+	return a.sftp.AtomicCapable()
+}
 
 // SftpGet 下载单个远端文件；resume/partPath 为 Task 11 的续传参数。
 func (a *App) SftpGet(id, host, user, remote, local string, resume bool, partPath string) error {
-	if err := a.sftp.TransferGet(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	if err := c.TransferGet(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
@@ -721,7 +813,11 @@ func (a *App) SftpGet(id, host, user, remote, local string, resume bool, partPat
 
 // SftpGetDir recursively downloads a remote directory tree (`sftp get -r`).
 func (a *App) SftpGetDir(id, host, user, remote, local string, resume bool, partPath string) error {
-	if err := a.sftp.TransferGetTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	if err := c.TransferGetTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
@@ -730,33 +826,57 @@ func (a *App) SftpGetDir(id, host, user, remote, local string, resume bool, part
 
 // SftpPut 上传单个本地文件；resume/partPath 为 Task 11 的续传参数。
 func (a *App) SftpPut(id, host, user, local, remote string, resume bool, partPath string) error {
-	if err := a.sftp.TransferPut(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	if err := c.TransferPut(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
 	return nil
 }
 func (a *App) SftpRemove(host, user, path string) error {
-	return a.sftp.Remove(host, user, path)
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	return c.Remove(host, user, path)
 }
 func (a *App) SftpMkdir(host, user, path string) error {
-	return a.sftp.Mkdir(host, user, path)
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	return c.Mkdir(host, user, path)
 }
 func (a *App) SftpRename(host, user, oldPath, newPath string) error {
-	return a.sftp.Rename(host, user, oldPath, newPath)
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	return c.Rename(host, user, oldPath, newPath)
 }
 
 // SftpRemoveRecursive 删除远端文件或目录（目录递归）。
 // 目录语义见 sftp.RemoveRecursive：BFS 收集 + 单条 '-' 前缀批处理；含 glob 元字符的路径直接拒绝。
 func (a *App) SftpRemoveRecursive(host, user, path string) error {
-	return a.sftp.RemoveRecursive(host, user, path)
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	return c.RemoveRecursive(host, user, path)
 }
 
 // SftpPutRecursive 递归上传本地目录到远端目录。
 // put -r 在远端同名目录已存在时是**并入**（同名文件被本地内容覆盖），本绑定不加"整树替换"
 // 补偿；需要整树替换的调用方须先自行删除远端同名目录（语义与门面 TransferPutTree 一致）。
 func (a *App) SftpPutRecursive(id, host, user, local, remoteDir string, resume bool, partPath string) error {
-	if err := a.sftp.TransferPutTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remoteDir, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	if err := c.TransferPutTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remoteDir, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
 	a.recordRecentSFTP(host, path.Dir(remoteDir), filepath.Dir(local))
@@ -766,11 +886,20 @@ func (a *App) SftpPutRecursive(id, host, user, local, remoteDir string, resume b
 // SftpTransferCancel 取消指定 id 的传输，返回是否真的取消到了正在跑的传输。
 // Task 9 只接线到门面；整批语义（取消当前项 + 停止派发后续项）由前端编排层落实（spec §6.1），
 // 真实的「关该传输会话」由 Task 10 的后端注册表提供（batch 恒 false，幂等）。
-func (a *App) SftpTransferCancel(id string) bool { return a.sftp.Cancel(id) }
+func (a *App) SftpTransferCancel(id string) bool {
+	if a.sftp == nil {
+		return false
+	}
+	return a.sftp.Cancel(id)
+}
 
 // SftpMove 语义等于远端 Rename（跨目录移动）。
 func (a *App) SftpMove(host, user, oldPath, newPath string) error {
-	return a.sftp.Rename(host, user, oldPath, newPath)
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	return c.Rename(host, user, oldPath, newPath)
 }
 
 // PathInfo 描述一个本地路径（供前端处理系统拖入的文件/目录）。
@@ -838,12 +967,23 @@ func (a *App) CopyLocal(src, dst string) error {
 }
 
 func (a *App) SftpConnect(host string) error {
-	return a.sftp.Connect(host, "")
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	return c.Connect(host, "")
 }
 func (a *App) SftpDisconnect(host string) error {
-	return a.sftp.Disconnect(host)
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return err
+	}
+	return c.Disconnect(host)
 }
 func (a *App) SftpConnected(host string) bool {
+	if a.sftp == nil {
+		return false
+	}
 	return a.sftp.Connected(host)
 }
 
@@ -976,7 +1116,11 @@ func (a *App) Cwd() (string, error) {
 // running `pwd` over a fresh, reused sftp connection. Used as the initial
 // remote pane path.
 func (a *App) SftpHome(host string) (string, error) {
-	home, err := a.sftp.Home(host, "")
+	c, err := a.sftpCtrl()
+	if err != nil {
+		return "", err
+	}
+	home, err := c.Home(host, "")
 	if err != nil {
 		return "", err
 	}
@@ -1048,7 +1192,11 @@ func (a *App) SearchCancel(id string) {
 func (a *App) SftpSearch(req RemoteSearchRequest) (sftp.SearchOutcome, error) {
 	ctx, cancel := a.trackSearch(req.ID)
 	defer func() { cancel(); a.SearchCancel(req.ID) }()
-	out, err := a.sftp.Search(ctx, req.Host, "", req.Root, req.Pattern, normDepth(req.MaxDepth), req.Limit,
+	c, cerr := a.sftpCtrl()
+	if cerr != nil {
+		return sftp.SearchOutcome{}, cerr
+	}
+	out, err := c.Search(ctx, req.Host, "", req.Root, req.Pattern, normDepth(req.MaxDepth), req.Limit,
 		func(scanned int) {
 			if a.ctx != nil {
 				runtime.EventsEmit(a.ctx, "sftp:search-progress", map[string]any{"id": req.ID, "scanned": scanned})
@@ -1362,6 +1510,10 @@ func (a *App) CreateSyncRule(r config.SyncRule) (config.SyncRule, error) {
 }
 
 func (a *App) UpdateSyncRule(r config.SyncRule) error {
+	sc, serr := a.syncCtrl()
+	if serr != nil {
+		return serr
+	}
 	if err := sync.ValidateSyncRule(r); err != nil {
 		return err
 	}
@@ -1376,13 +1528,17 @@ func (a *App) UpdateSyncRule(r config.SyncRule) error {
 		return errors.New("sync rule not found")
 	}
 	// 运行中的规则先停再存（不做热更新：远端根路径可能整个换掉）。
-	_ = a.sync.Stop(r.ID)
+	_ = sc.Stop(r.ID)
 	r.Enabled = false
 	a.cfg.Syncs[idx] = r
 	return a.saveConfig()
 }
 
 func (a *App) DeleteSyncRule(id string) error {
+	sc, serr := a.syncCtrl()
+	if serr != nil {
+		return serr
+	}
 	idx := -1
 	for i, e := range a.cfg.Syncs {
 		if e.ID == id {
@@ -1394,7 +1550,7 @@ func (a *App) DeleteSyncRule(id string) error {
 		return errors.New("sync rule not found")
 	}
 	rule := a.cfg.Syncs[idx]
-	_ = a.sync.Stop(id)
+	_ = sc.Stop(id)
 	// 删除规则时一并清理状态文件与本地残留临时文件。
 	_ = os.Remove(filepath.Join(stateDir(), "sync-"+id+".json"))
 	_, _ = sync.CleanupParts(rule.LocalPath, id)
@@ -1403,11 +1559,15 @@ func (a *App) DeleteSyncRule(id string) error {
 }
 
 func (a *App) StartSyncRule(id string) error {
+	sc, serr := a.syncCtrl()
+	if serr != nil {
+		return serr
+	}
 	rule, ok := a.findSyncRule(id)
 	if !ok {
 		return errors.New("sync rule not found")
 	}
-	if err := a.sync.Start(rule); err != nil {
+	if err := sc.Start(rule); err != nil {
 		return err
 	}
 	rule.Enabled = true
@@ -1416,7 +1576,11 @@ func (a *App) StartSyncRule(id string) error {
 }
 
 func (a *App) StopSyncRule(id string) error {
-	if err := a.sync.Stop(id); err != nil {
+	sc, serr := a.syncCtrl()
+	if serr != nil {
+		return serr
+	}
+	if err := sc.Stop(id); err != nil {
 		return err
 	}
 	if rule, ok := a.findSyncRule(id); ok {
@@ -1427,25 +1591,57 @@ func (a *App) StopSyncRule(id string) error {
 	return nil
 }
 
-func (a *App) SyncRuleStates() map[string]string           { return a.sync.States() }
-func (a *App) SyncRuleStats() map[string]sync.SyncRuleStat { return a.sync.Stats() }
-func (a *App) SyncRuleConflicts(id string) []sync.Conflict { return a.sync.Conflicts(id) }
+func (a *App) SyncRuleStates() map[string]string {
+	c, err := a.syncCtrl()
+	if err != nil {
+		return map[string]string{}
+	}
+	return c.States()
+}
+
+func (a *App) SyncRuleStats() map[string]sync.SyncRuleStat {
+	c, err := a.syncCtrl()
+	if err != nil {
+		return map[string]sync.SyncRuleStat{}
+	}
+	return c.Stats()
+}
+
+func (a *App) SyncRuleConflicts(id string) []sync.Conflict {
+	c, err := a.syncCtrl()
+	if err != nil {
+		return []sync.Conflict{}
+	}
+	return c.Conflicts(id)
+}
 
 func (a *App) ResolveSyncConflict(id, relPath, action string) error {
+	c, cerr := a.syncCtrl()
+	if cerr != nil {
+		return cerr
+	}
 	local, err := localStateOf(a.cfg, id, relPath)
 	if err != nil {
 		return err
 	}
-	return a.sync.ResolveConflict(id, relPath, sync.ConflictAction(action), local)
+	return c.ResolveConflict(id, relPath, sync.ConflictAction(action), local)
 }
 
 func (a *App) ConfirmSyncRuleDeletes(id, fingerprint string) error {
-	return a.sync.ConfirmDeletes(id, fingerprint)
+	c, err := a.syncCtrl()
+	if err != nil {
+		return err
+	}
+	return c.ConfirmDeletes(id, fingerprint)
 }
 
 // RetrySyncRuleFailures 让引擎重试该规则记录在案的失败项。只入队，不在这里传输。
 func (a *App) RetrySyncRuleFailures(id string) error {
-	_, err := a.sync.RetryFailed(id)
+	c, cerr := a.syncCtrl()
+	if cerr != nil {
+		return cerr
+	}
+	_, err := c.RetryFailed(id)
 	return err
 }
 
