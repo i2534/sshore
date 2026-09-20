@@ -2006,9 +2006,22 @@ func CleanupStaleLocalParts(root string, now time.Time) (int, error) {
 	if root == "" {
 		return 0, nil
 	}
+	// 盘根（C: / D:/ / \hostshare / /）永不扫描：整盘递归既没有收益（.part 只会落在
+	// 具体目标目录里），在失效网络盘上还会把一次兜底清理变成长时间 IO 探测。真机实测：
+	// 最近位置里的 C:、C:Userslan 与一个失效的 Z: 让整轮扫描花 13.9s。
+	if isVolumeRootDir(root) {
+		return 0, nil
+	}
 	cutoff := now.Add(-stalePartAge)
+	deadline := time.Now().Add(cleanupStaleBudget)
 	n := 0
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		// 超预算立刻放弃枚举剩余目录树（WalkDir 收到 SkipAll 后返回 nil，不报错）。
+		// 注意：这只能打断「还在推进」的扫描；单个卡死的网络文件系统调用打断不了，
+		// 但调用方已在后台 goroutine 里执行，不挡 UI（见 app.go startup）。
+		if !time.Now().Before(deadline) {
+			return fs.SkipAll
+		}
 		if werr != nil {
 			// 不可读的子树跳过，不阻断其它清理（与 internal/sync.CleanupParts 同策略）。
 			if d != nil && d.IsDir() {
@@ -2045,6 +2058,21 @@ func CleanupStaleLocalParts(root string, now time.Time) (int, error) {
 
 // stalePartAge 是启动时清理本地临时文件的年龄阈值（spec D14 / 计划 Task 13）。
 const stalePartAge = 7 * 24 * time.Hour
+
+// cleanupStaleBudget 是单次清理的时间预算。清理只是兜底动作，走的是配置里记录过的历史
+// 目录（可能含大盘或失效网络盘）；某个目录异常慢时宁可这一轮放弃，也不让它长时间占着
+// 磁盘 IO。声明为变量：单测把它调成 0/负数即可确定性地验证「超预算立即放弃」分支。
+var cleanupStaleBudget = 2 * time.Second
+
+// isVolumeRootDir 报告 p 是不是「盘根」——该卷/该共享的顶层目录。
+// Windows："C:"、"D:/"、"\\host\share"；Unix："/"。这类目录绝不递归扫描。
+func isVolumeRootDir(p string) bool {
+	c := filepath.Clean(p)
+	if c == "" {
+		return true
+	}
+	return filepath.Dir(c) == c
+}
 
 // —— Task 13：journal 恢复决策表（Task 8 重审 D1）——
 

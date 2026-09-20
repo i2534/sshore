@@ -911,6 +911,60 @@ func TestCleanupStaleLocalPartsOlderThan7Days(t *testing.T) {
 	}
 }
 
+// TestCleanupStaleLocalPartsSkipsVolumeRoot：盘根永不递归扫描。
+// 整盘递归既没有收益（.part 只会落在具体目标目录里），在失效网络盘上还会把一次兜底清理
+// 变成长时间 IO（真机实测：最近位置里的 C:\ 与失效 Z:\ 让整轮扫描花 13.9s）。
+// 判据：立刻返回 (0, nil)，绝不去真的走整盘。
+func TestCleanupStaleLocalPartsSkipsVolumeRoot(t *testing.T) {
+	root := "/"
+	if runtime.GOOS == "windows" {
+		root = filepath.VolumeName(os.TempDir()) + string(filepath.Separator)
+	}
+	if !isVolumeRootDir(root) {
+		t.Fatalf("测试前提不成立：%q 应被判定为盘根", root)
+	}
+	done := make(chan struct{})
+	var n int
+	var err error
+	go func() {
+		n, err = CleanupStaleLocalParts(root, time.Now())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("盘根必须在 WalkDir 之前返回，不得真的去递归整盘")
+	}
+	if n != 0 || err != nil {
+		t.Fatalf("盘根应为 no-op: n=%d err=%v", n, err)
+	}
+}
+
+// TestCleanupStaleLocalPartsHonoursBudget：时间预算耗尽必须立刻放弃枚举剩余目录树，
+// 而不是继续扫下去（语义是「本轮放弃」，不是「删一部分」）。
+func TestCleanupStaleLocalPartsHonoursBudget(t *testing.T) {
+	oldBudget := cleanupStaleBudget
+	t.Cleanup(func() { cleanupStaleBudget = oldBudget })
+	cleanupStaleBudget = 0 // 预算为 0：第一次回调就应放弃
+
+	root := t.TempDir()
+	stale := filepath.Join(root, "stale.txt"+PartMarker+"old-aaaa")
+	if err := os.WriteFile(stale, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	n, err := CleanupStaleLocalParts(root, time.Now())
+	if err != nil || n != 0 {
+		t.Fatalf("预算耗尽必须放弃清理: n=%d err=%v", n, err)
+	}
+	if _, serr := os.Stat(stale); serr != nil {
+		t.Fatalf("超预算不得删除任何文件: %v", serr)
+	}
+}
+
 // TestCtrlDelegatesLifecycleToGoBackend 钉住门面的两个生命周期转发
 // （app.go OnShutdown 走它们）。
 func TestCtrlDelegatesLifecycleToGoBackend(t *testing.T) {
