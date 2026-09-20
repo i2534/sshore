@@ -217,3 +217,38 @@ describe("UpdateSection SSR", () => {
     }
   });
 });
+
+// —— 设置页排版回归（2026-09-20 真机截图定位）——
+// 根因：style.css 的 html/#app 是全局 text-align: center；ConflictDialog / SearchOverlay
+// 都显式抵消，SettingsDialog 漏了 → 标题/单选组/复选/帮助段全部居中，与 .field 的 flex
+// 左对齐混在一起，就是「设置页排版杂乱」。这几条用例把当时查明的四件事钉住。
+describe("设置页排版回归", () => {
+  it("状态文案已包含的错误不再重复渲染「错误：…」（同一句话出现两次纯属噪声）", async () => {
+    const html = await render(({ update }) => {
+      update.info = info({ state: "rate-limited", error: "更新源限流" });
+    });
+    expect(html).toContain("更新源限流，请稍后再试或手动下载");
+    expect(html).not.toContain("错误：更新源限流");
+    expect(html, "按钮矩阵按原始 error 判定，不受展示层去重影响").toContain("打开发布页");
+  });
+
+  it("SettingsDialog 的 .dialog 必须显式 text-align: left（否则继承全局居中）", () => {
+    const src = source("./SettingsDialog.vue");
+    const rule = src.match(/\.dialog\s*\{[^}]*\}/s);
+    expect(rule, ".dialog 规则必须存在").toBeTruthy();
+    expect(rule[0]).toMatch(/text-align:\s*left/);
+  });
+
+  it("头/脚固定、主体滚动：设置项变多后「完成」仍常驻可见", () => {
+    const src = source("./SettingsDialog.vue");
+    expect(src).toMatch(/\.dbody\s*\{[^}]*overflow-y:\s*auto/s);
+    expect(src).toMatch(/\.dbtns\s*\{[^}]*border-top/s);
+    expect(src).toContain('class="dbtns"');
+    expect(src).toContain('class="dbody"');
+  });
+
+  it("设置行用固定标签列（84px）：长标签不再把控件推右、两列错开", () => {
+    expect(source("./SettingsDialog.vue")).toMatch(/\.field label\s*\{[^}]*flex:\s*0 0 84px/s);
+    expect(source("./UpdateSection.vue")).toMatch(/\.field > label\[for\]\s*\{[^}]*flex:\s*0 0 84px/s);
+  });
+});
