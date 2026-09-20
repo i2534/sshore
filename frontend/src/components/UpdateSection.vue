@@ -103,8 +103,16 @@ const notesExcerpt = computed(() => excerpt(update.info.notes));
 const logExcerpt = computed(() => excerpt(update.info.pending_log));
 
 // 失败详情：动作失败落 store.error，或后端快照带 error / pending_log / 人工升级提示。
-const errorText = computed(() => update.error || update.info.error || "");
-const failure = computed(() => Boolean(errorText.value || update.info.pending_log || update.info.hint === "manual-upgrade"));
+// rawError 保留原始值供按钮矩阵判定；errorText 只用于展示 —— 状态文案已经把同一个错误讲清楚
+// 时（rate-limited 的「更新源限流」、check-failed 的「检查失败：X」都整段包含它）不再重复
+// 渲染一行「错误：X」，那只是视觉噪声；真正额外的细节（如 io-failed 的 "disk full"）照常显示。
+const rawError = computed(() => update.error || update.info.error || "");
+const errorText = computed(() => {
+  const raw = rawError.value;
+  if (!raw) return "";
+  return message.value.includes(raw) ? "" : raw;
+});
+const failure = computed(() => Boolean(rawError.value || update.info.pending_log || update.info.hint === "manual-upgrade"));
 // 失败时始终给「打开发布页」（可选动作矩阵之外的人工出路）。
 const showOpenPage = computed(() => acts.value.openPage || failure.value);
 
@@ -204,19 +212,29 @@ async function applyNow() {
 </template>
 
 <style scoped>
-.update .status { color: var(--text); font-size: var(--fs-13); margin: 0 0 8px; }
-.update .warn { color: var(--text-dim); font-size: var(--fs-12); margin: 0 0 8px; word-break: break-all; max-height: 160px; overflow: auto; }
+/* 「更新」是子组件，父组件 SettingsDialog 的 scoped `.group h3` 不会命中它内部的 h3
+   （只有子组件根元素带父作用域 id），必须自己写一份 —— 否则本标题会退回浏览器默认 h3
+   （更大、非大写、颜色不同），与其它分组标题不一致。 */
+.update h3 { margin: 0 0 10px; font-size: var(--fs-13); color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
+.update .status { color: var(--text); font-size: var(--fs-14); margin: 0 0 6px; }
+.update .warn { color: var(--warning); font-size: var(--fs-12); margin: 0 0 8px; word-break: break-all; max-height: 160px; overflow: auto; }
 .update .bar { position: relative; height: 18px; background: var(--surface-hover); border-radius: 4px; overflow: hidden; margin: 0 0 8px; }
 .update .bar .fill { height: 100%; background: var(--accent); transition: width 200ms linear; }
 .update .bar.indet .fill { width: 30%; animation: update-indet 1.2s ease-in-out infinite; }
 @keyframes update-indet { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
 .update .bar .pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: var(--fs-12); color: var(--text); }
 .update details { margin: 0 0 8px; }
-.update details .meta { color: var(--text-dim); font-size: var(--fs-12); margin: 0 0 6px; }
+.update details summary { cursor: pointer; color: var(--text-dim); font-size: var(--fs-13); }
+.update details .meta { color: var(--text-dim); font-size: var(--fs-12); margin: 8px 0 6px; }
 .update details pre { white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; font-size: var(--fs-12); }
-.update .btns { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+.update .btns { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+/* 与 SettingsDialog 的 .field 同一套列宽：标签列固定 84px，所有控件左边界对齐。
+   选择器用 label[for] 限定，否则「自动检查更新」那个复选框 label 也会被撑到 84px 而换行。 */
 .update .field { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-.update .field label { color: var(--text-dim); font-size: var(--fs-13); min-width: 60px; }
-.update .field input[type="text"], .update .field input:not([type]) { flex: 1; }
+.update .field:last-child { margin-bottom: 0; }
+.update .field > label[for] { flex: 0 0 84px; color: var(--text-dim); font-size: var(--fs-13); }
+.update .field select, .update .field input[type="text"], .update .field input:not([type]) { flex: 1 1 auto; min-width: 0; }
+/* 子组件里没有父作用域的 .check 规则，这里补一份，让复选框行与其它设置行同字号 */
+.update .field .check { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-size: var(--fs-14); cursor: pointer; }
 .update .link { background: none; border: none; color: var(--accent); cursor: pointer; font-size: var(--fs-13); padding: 0; }
 </style>
