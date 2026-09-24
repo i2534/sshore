@@ -16,7 +16,7 @@ import (
 
 // RemoteHomeToken 是远程「主目录」预设的占位路径：远端 home 必须先连上主机、
 // 执行 pwd 才能得到，所以下拉里放一个 sentinel，由前端在选中时解析。
-// 前端对应常量：SftpView.vue 的 REMOTE_HOME。
+// 前端对应常量：frontend/src/utils/pathbar.js 的 REMOTE_HOME。
 const RemoteHomeToken = "~"
 
 // Preset 是位置下拉里的一项。
