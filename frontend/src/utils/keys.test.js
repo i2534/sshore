@@ -33,4 +33,14 @@ describe('keys 键盘分派', () => {
   it('其他按键不处理', () => {
     expect(actionFor(ev('x'))).toBe(null)
   })
+  it('Shift+↑/↓ 映射为区间扩展', () => {
+    expect(actionFor({ ...ev('ArrowUp'), shiftKey: true })).toBe('extend-up')
+    expect(actionFor({ ...ev('ArrowDown'), shiftKey: true })).toBe('extend-down')
+  })
+  it('不带 Shift 的方向键不产生动作（交给浏览器滚动）', () => {
+    expect(actionFor(ev('ArrowDown'))).toBe(null)
+  })
+  it('焦点在输入框时 Shift+↑/↓ 不处理', () => {
+    expect(actionFor({ ...ev('ArrowDown', { target: input() }), shiftKey: true })).toBe(null)
+  })
 })

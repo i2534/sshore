@@ -179,5 +179,21 @@ describe('面板四段结构与列共轨', () => {
   })
 })
 
+describe('过滤栏的多选入口', () => {
+  it('三个按钮都在过滤栏里，且都 emit(action, ...)', () => {
+    const bar = filePane.split('data-role="filterbar"')[1]
+    expect(bar).toContain('data-role="select-all"')
+    expect(bar).toContain('data-role="invert"')
+    expect(bar).toContain('data-role="clear"')
+    expect(bar).toMatch(/emit\('action', 'invert'\)/)
+  })
+  it('SftpView 分派 invert 与 extend-up/extend-down', () => {
+    // sftp 是本文件顶部既有的 readFileSync(new URL('../views/SftpView.vue', import.meta.url)) 常量
+    expect(sftp).toContain("name === 'invert'")
+    expect(sftp).toContain("action === 'extend-up'")
+    expect(sftp).toContain("action === 'extend-down'")
+  })
+})
+
 
 

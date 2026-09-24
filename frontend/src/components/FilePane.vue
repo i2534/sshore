@@ -256,6 +256,10 @@ function fmtSize(bytes) {
         <input class="filter" data-role="filter" v-model="filterText" :placeholder="EMPTY_FILTER_HINT" />
         <button v-if="filterClearVisible(filterText)" class="fx" data-role="filter-clear" title="清空过滤" @click="filterText = ''">✕</button>
       </span>
+      <!-- 可见的多选入口：Ctrl/Shift 点击之外的低门槛入口（原先只有批量菜单里的全选/清空） -->
+      <button class="mini" data-role="select-all" :disabled="!shown.length" title="全选当前可见项" @click="emit('action', 'select-all')">全选</button>
+      <button class="mini" data-role="invert" :disabled="!shown.length" title="反选当前可见项" @click="emit('action', 'invert')">反选</button>
+      <button class="mini" data-role="clear" :disabled="!selKeys.length" title="清空选择" @click="emit('action', 'clear')">清空</button>
       <span class="selinfo" data-role="selinfo">{{ selLabel }}</span>
       <div v-if="selKeys.length" class="batch" @click.stop>
         <button class="chip" @click="menuOpen = !menuOpen">已选 {{ selKeys.length }} ▾</button>
@@ -321,6 +325,8 @@ mark { background: var(--accent); color: var(--on-accent); }
 .fwrap .filter { flex: 1; min-width: 0; font-size: var(--fs-11); padding-right: 22px; }
 .fx { position: absolute; right: 2px; top: 50%; transform: translateY(-50%); height: auto; padding: 0 4px; border: none; background: none; color: var(--text-faint); cursor: pointer; }
 .selinfo { font-size: var(--fs-11); color: var(--text-faint); white-space: nowrap; }
+/* 过滤栏内的迷你按钮：height:auto 是必须的——全局 button 变高时若不 opt-out 会把过滤栏撑高 */
+.mini { height: auto; font-size: var(--fs-11); padding: 1px 6px; }
 /* 批量菜单向上弹出：过滤栏是面板最后一个子元素，top:100% 会开在面板外被 overflow:hidden 裁掉 */
 .fbar .batch { position: relative; }
 .fbar .bmenu { position: absolute; right: 0; bottom: 100%; top: auto; z-index: 20; }
