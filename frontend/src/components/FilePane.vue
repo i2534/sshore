@@ -64,7 +64,7 @@ const posExpanded = ref({})
 const posAnchor = ref({ left: 0, top: 0 })
 // 弹层宽度只有这一个来源：模板内联 style 用它，锚点也用它。
 // 配合 .posmenu 的 box-sizing: border-box，"右对齐按钮"才是精确的（否则 padding+border 会让外框宽 10px）。
-const POS_MENU_WIDTH = 260
+const POS_MENU_WIDTH = 220
 const groups = computed(() => positionGroups({
   presets: props.presets, disks: props.disks, bookmarks: props.bookmarks, recents: props.recents,
   expanded: posExpanded.value, filter: posFilter.value,
@@ -283,12 +283,12 @@ function fmtSize(bytes) {
 .pos { max-width: 150px; font-size: var(--fs-11); }
 .pos.on { border-color: var(--accent); color: var(--accent); }
 /* position: fixed + z-index 1000：与 ContextMenu.vue 的既有做法一致；对话框浮层是 2000，菜单在其之下。
-   宽度定长 260px 是为了和 Step 7 里 "r.right - 260" 的锚点算法对齐。 */
+   宽度定长 POS_MENU_WIDTH（220px）是为了和 "r.right - POS_MENU_WIDTH" 的锚点算法对齐。 */
 .posmenu { position: fixed; z-index: 1000; box-sizing: border-box; max-height: 60vh; overflow: auto; text-align: left; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 4px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
-.posfilter { width: 100%; font-size: var(--fs-11); margin-bottom: 4px; }
+.posfilter { width: 100%; box-sizing: border-box; font-size: var(--fs-11); margin-bottom: 4px; }
 .poslabel { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px 2px; font-size: var(--fs-11); color: var(--text-faint); }
 .poslabel .more { font-size: var(--fs-11); height: auto; }
-.positem { display: block; width: 100%; height: auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; padding: 4px 8px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
+.positem { box-sizing: border-box; display: block; width: 100%; height: auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; padding: 4px 8px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
 .positem:hover { background: var(--surface-hover); }
 .posempty { padding: 6px 8px; font-size: var(--fs-12); color: var(--text-faint); }
 .star.on { color: var(--seed); }

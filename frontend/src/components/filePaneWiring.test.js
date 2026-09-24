@@ -99,6 +99,16 @@ describe('位置弹层', () => {
     expect(filePane).toContain("width: POS_MENU_WIDTH + 'px'")
   })
 
+  it('弹层宽度收窄到 220px，且锚点算法与内联宽度用同一个常量', () => {
+    expect(filePane).toMatch(/POS_MENU_WIDTH\s*=\s*220/)
+    expect(filePane).toContain('r.right - POS_MENU_WIDTH')
+  })
+
+  it('弹层子项显式 border-box（否则 width:100% + padding 必然横向溢出）', () => {
+    expect(filePane).toMatch(/\.positem\s*\{[^}]*box-sizing:\s*border-box/)
+    expect(filePane).toMatch(/\.posfilter\s*\{[^}]*box-sizing:\s*border-box/)
+  })
+
   it('点面板内非弹层区域收起弹层（焦点会落到 .pane 自身，focusout 判不出"离开"）', () => {
     expect(filePane).toContain('@mousedown="onPaneMouseDown"')
     expect(filePane).toMatch(/function onPaneMouseDown\(e\)\s*\{[^}]*closest\('\.pos-wrap'\)/)
