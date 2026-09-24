@@ -48,6 +48,11 @@ describe('控件尺寸的单一来源', () => {
     expect(read('./components/SettingsDialog.vue')).toMatch(/\.dclose\s*\{[^}]*height:\s*auto/)
     expect(read('./components/UpdateSection.vue')).toMatch(/\.link\s*\{[^}]*height:\s*auto/)
   })
+  it('右键菜单项显式左对齐（全局 button{justify-content:center} 会把图标+文字整行居中）', () => {
+    // I3：T3 fix 轮加过 justify-content: flex-start，但此前只钉了 height: auto，
+    // 删掉 flex-start 仍全绿——补这条断言后删实现即红。
+    expect(read('./components/ContextMenu.vue')).toMatch(/\.menu :deep\(button\)[^}]*justify-content:\s*flex-start/)
+  })
   it('列宽魔数不再散落（88px/140px 只作为 --col-size/--col-time 的值出现）', () => {
     const pane = read('./components/FilePane.vue')
     expect(pane.match(/grid-template-columns:[^;]*\b(88px|140px)\b/g) || []).toHaveLength(0)

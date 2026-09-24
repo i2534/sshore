@@ -50,6 +50,9 @@ watch(() => props.path, (p) => {
   upActive.value = false
 })
 watch(() => props.selKeys.length, (n) => { if (n) upActive.value = false })
+// 选择清空后批量菜单必须一起收起：`v-if="selKeys.length"` 会把 .batch 整个隐藏，
+// 但 menuOpen 若还留着 true，用户重新选中时菜单会「未点先弹」（M1）。
+watch(() => props.selKeys.length, (n) => { if (!n) menuOpen.value = false })
 
 // ===== 位置弹层（📍 位置）=====
 // 为什么是 position: fixed + 打开时现算坐标，而不是 absolute 挂在按钮下方：

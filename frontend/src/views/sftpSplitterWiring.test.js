@@ -39,6 +39,23 @@ describe('日志分隔条接线不变量', () => {
     expect((body.match(/preventDefault\(\)/g) || []).length).toBe(2)
   })
 
+  // I1：mouseup 落在窗口外时 window 永远收不到，若只挂 mouseup 摘监听，
+  // 监听会残留到下一次 mouseup/切标签，鼠标移回窗口便“不按键跟着光标伸缩”。
+  it('I1：只接左键，且窗口失焦时兜底摘掉 window 监听（blur 成对挂摘）', () => {
+    const down = sftp.match(/function onSplitterDown\(ev\)\s*\{([\s\S]*?)\n\}/)
+    expect(down, '找不到 onSplitterDown').toBeTruthy()
+    const downBody = down[1]
+    // 判别力：删掉 ev.button !== 0 守卫这条必红（右键拖动会进入 resize）
+    expect(downBody).toMatch(/if\s*\(ev\.button\s*!==\s*0\)\s*return/)
+    // 判别力：删掉 blur 的 addEventListener 这条必红（窗口外松开后残留监听）
+    expect(downBody).toMatch(/addEventListener\('blur',\s*onSplitterUp\)/)
+
+    const up = sftp.match(/function onSplitterUp\(\)\s*\{([\s\S]*?)\n\}/)
+    expect(up, '找不到 onSplitterUp').toBeTruthy()
+    // 判别力：只 add 不 remove 同样残留，这条必须钉住 remove
+    expect(up[1]).toMatch(/removeEventListener\('blur',\s*onSplitterUp\)/)
+  })
+
   it('夹取与默认值来自 utils/logpane，单一来源', () => {
     expect(sftp).toContain("from '../utils/logpane'")
     expect(sftp).toContain('clampLogHeight(')
