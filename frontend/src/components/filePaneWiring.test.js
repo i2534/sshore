@@ -11,7 +11,12 @@ describe('路径栏（可编辑）', () => {
     expect(filePane).toContain('data-role="path"')
     expect(filePane).toMatch(/<input[^>]*data-role="path"/)
     expect(filePane).not.toContain('{{ path }}</span>')
-    expect(filePane).toContain('@keyup.enter="commitPath"')
+    // I2：IME 守卫必须挂在 keydown 上（WebKit 在 compositionend 之后才发 keyup，
+    // 那时 isComposing 已为 false，keyup 版守卫在 Linux/WebKitGTK 目标上等于没有）。
+    expect(filePane).toContain('@keydown.enter="commitPath"')
+    expect(filePane).not.toContain('@keyup.enter="commitPath"')
+    expect(filePane).toContain('isImeCommit(')
+    expect(filePane).toContain("from '../utils/pathbar'")
     expect(filePane).toContain("@keyup.esc=\"resetPath\"")
     expect(filePane).toContain("emit('navigate'")
     expect(filePane).toMatch(/defineEmits\(\[[^\]]*'navigate'/) // 新增事件必须在 emits 里声明（否则只有 dev 警告，测试不红）
@@ -49,6 +54,21 @@ describe('「..」行与普通目录行统一', () => {
     expect(filePane).toContain('const upActive = ref(false)')
     // sel.* 全在父层调用；父层绝不能把 '..' 放进选择集，否则 runBatchFor 会把它当成传输项
     expect(sftp).not.toMatch(/sel\.(single|toggle|rangeTo)\([^)]*'\.\.'/)
+  })
+
+  // I1：单击「..」后 selKeys.length 恒为 0，watch(() => selKeys.length) 的 n→0 守卫不会触发；
+  // 所以「点列表空白」与「按 Esc」这两条清空路径必须自己复位 upActive，否则「..」行会留下假高亮。
+  it('清空选中（点列表空白 / Esc）同时复位「..」高亮，不留 stale 高亮', () => {
+    const blank = filePane.match(/function onListBlankClick\(\)\s*\{([^}]*)\}/)
+    expect(blank, '找不到 onListBlankClick').not.toBeNull()
+    expect(blank[1]).toContain('upActive.value = false')
+    expect(blank[1]).toContain("emit('clear')")
+    expect(filePane).toContain('@click.self="onListBlankClick"')
+
+    const kd = filePane.match(/function onPaneKeydown\(e\)\s*\{([^}]*)\}/)
+    expect(kd, '找不到 onPaneKeydown').not.toBeNull()
+    expect(kd[1]).toContain("e.key === 'Escape'")
+    expect(kd[1]).toContain('upActive.value = false')
   })
 })
 

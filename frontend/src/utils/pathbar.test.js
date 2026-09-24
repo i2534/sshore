@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolvePathInput, REMOTE_HOME } from './pathbar'
+import { resolvePathInput, isImeCommit, REMOTE_HOME } from './pathbar'
 
 const local = (raw, current = 'C:\\base') => resolvePathInput({ pane: 'local', raw, current, hasHost: false, connected: false })
 const remote = (raw, opts = {}) => resolvePathInput({ pane: 'remote', raw, current: '/base', hasHost: true, connected: true, ...opts })
@@ -50,5 +50,24 @@ describe('resolvePathInput：路径栏输入 → 导航意图', () => {
 
   it('远程未选主机 → noop(no-host)', () => {
     expect(remote('/x', { hasHost: false, connected: false })).toEqual({ kind: 'noop', reason: 'no-host' })
+  })
+})
+
+describe('isImeCommit：路径栏回车的 IME 守卫（必须挂在 keydown 上）', () => {
+  it('组合态中的回车（isComposing=true）判定为「确认候选」，不得提交跳转', () => {
+    expect(isImeCommit({ isComposing: true, keyCode: 13 })).toBe(true)
+  })
+
+  it('keyCode 229（部分浏览器组合态的 keydown 哨兵）也判定为 IME 确认', () => {
+    expect(isImeCommit({ isComposing: false, keyCode: 229 })).toBe(true)
+  })
+
+  it('普通回车（组合已结束、isComposing=false）不得被当成 IME 确认', () => {
+    expect(isImeCommit({ isComposing: false, keyCode: 13 })).toBe(false)
+  })
+
+  it('事件缺失时安全返回 false（不吞掉任何提交）', () => {
+    expect(isImeCommit(null)).toBe(false)
+    expect(isImeCommit(undefined)).toBe(false)
   })
 })
