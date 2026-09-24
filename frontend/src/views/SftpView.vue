@@ -13,6 +13,7 @@ import ConflictDialog from '../components/ConflictDialog.vue'
 import * as sel from '../utils/selection'
 import { join as localJoin, parentOf as localParent, joinRel, splitPath } from '../utils/localpath'
 import { actionFor } from '../utils/keys'
+import { clampLogHeight, LOG_DEFAULT_H } from '../utils/logpane'
 import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName, nextTransferSeq, transferID } from '../utils/batch'
 import { failureText, isInternalTempName, applyProgress, TRANSFER_PROGRESS_EVENT,
   applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch } from '../utils/queue'
@@ -909,6 +910,32 @@ async function syncConnection() {
   } catch { /* 状态查询失败时保持现状 */ }
 }
 
+// 日志区高度：仅会话内记忆（KeepAlive 缓存期间保留，窗口重开回到默认），不落设置文件。
+const logHeight = ref(LOG_DEFAULT_H)
+let splitterStart = null
+function onSplitterDown(ev) {
+  splitterStart = { y: ev.clientY, h: logHeight.value }
+  window.addEventListener('mousemove', onSplitterMove)
+  window.addEventListener('mouseup', onSplitterUp)
+  ev.preventDefault()
+}
+function onSplitterMove(ev) {
+  if (!splitterStart) return
+  logHeight.value = clampLogHeight(splitterStart.h + (splitterStart.y - ev.clientY))
+}
+// 幂等：拖拽中切标签/丢 mouseup 时也要能安全重复调用，避免 window 上残留监听。
+function onSplitterUp() {
+  splitterStart = null
+  window.removeEventListener('mousemove', onSplitterMove)
+  window.removeEventListener('mouseup', onSplitterUp)
+}
+function onSplitterKey(ev) {
+  // Shift+↑/↓ 是「文件选择区间扩展」的键位（Task 2）：焦点在分隔条上时不要抢，直接让给全局处理
+  if (ev.shiftKey) return
+  if (ev.key === 'ArrowUp') { logHeight.value = clampLogHeight(logHeight.value + 16); ev.preventDefault() }
+  else if (ev.key === 'ArrowDown') { logHeight.value = clampLogHeight(logHeight.value - 16); ev.preventDefault() }
+}
+
 // KeepAlive 生命周期：切入时挂菜单监听、重启时钟并同步连接状态；切出时停时钟。
 // 必须成对挂摘：SftpView 被 <KeepAlive> 缓存，setup 只跑一次（App.vue:57-61）。
 // 在 setup 顶层注册会让「端口转发/文件同步」标签下按 Delete 弹出 SFTP 的删除确认框，
@@ -930,6 +957,7 @@ onDeactivated(() => {
   setSystemDropHandler(null)
   if (offProgress) { offProgress(); offProgress = null }
   stopClock()
+  onSplitterUp() // 拖拽中切标签：不摘会残留 window mousemove/mouseup
 })
 onUnmounted(() => {
   window.removeEventListener('click', outsideClick)
@@ -938,6 +966,7 @@ onUnmounted(() => {
   setSystemDropHandler(null)
   if (offProgress) { offProgress(); offProgress = null }
   stopClock()
+  onSplitterUp()
 })
 </script>
 
@@ -984,7 +1013,9 @@ onUnmounted(() => {
     </div>
     <TransferQueue :transfers="transfers" :now="now" @copy-failures="copyFailures"
       @cancel="cancelTransfer" @retry="retryItem" @resume="resumeItem" @clean="cleanItem" />
-    <div class="logpane ui-panel"><LogPanel :source-types="['sftp', 'system']" /></div>
+    <div class="splitter" data-role="log-splitter" role="separator" aria-orientation="horizontal"
+      tabindex="0" title="拖动调整日志高度" @mousedown="onSplitterDown" @keydown="onSplitterKey"></div>
+    <div class="logpane ui-panel" :style="{ height: logHeight + 'px' }"><LogPanel :source-types="['sftp', 'system']" /></div>
 
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
       <template v-if="menu.pane === 'remote'">
@@ -1030,6 +1061,7 @@ onUnmounted(() => {
 .pane-wrap { flex: 1; display: flex; min-width: 0; }
 /* 系统拖入悬停提示（spec R3 的「拖入期间高亮，让用户确认落点」）：落点回退靠它可见 */
 .pane-wrap.drop-hover { outline: 2px dashed var(--accent); outline-offset: -2px; border-radius: 4px; }
-.logpane { height: 140px; flex-shrink: 0; padding: 12px; overflow: auto; }
+.splitter { height: 7px; flex: none; cursor: row-resize; background: var(--bg-elev); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.logpane { flex: none; padding: 12px; overflow: auto; }
 .hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: var(--fs-12); color: var(--text-dim); }
 </style>
