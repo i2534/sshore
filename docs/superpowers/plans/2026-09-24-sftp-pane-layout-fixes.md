@@ -18,7 +18,7 @@
 | Q2 | 列头与列表列错位 | **两者共用同一套 grid 轨道** `minmax(0,1fr) / var(--col-size) / var(--col-time)` | 同上；列头行不再放任何非列头控件 |
 | Q3 | 计数重复 | 未选中只显示淡灰「N 项」；选中显示「已选 n / N 项 ▾」（▾ 打开批量菜单） | 用户确认 |
 | Q4 | 按钮/输入框高度不一致 | **全局 `--ctl-h: 28px`** + `box-sizing: border-box; height; line-height` | 实测同屏 34px（工具条）/ 29px（面板头、过滤框）/ ≈17px（路径框）三种高度 |
-| Q5 | 位置弹层盖住面板且有横向滚动条 | 260 → **220px**，子项 `box-sizing: border-box`` | 实拍 P3 底部有 1566px 的 `#8B8B8B` 横向滚动条；根因是无全局 box-sizing 时 `width:100% + padding` 溢出 |
+| Q5 | 位置弹层盖住面板且有横向滚动条 | 260 → **220px**，子项 `box-sizing: border-box`（防御性） | 实拍 P3 底部有 1566px 的 `#8B8B8B` 横向滚动条；根因是 v0.7.2 时代无全局 box-sizing 时 `width:100% + padding` 溢出——**该根因已被 Task 3 的全局规则消除**，Task 4 保留显式声明作为组件自身不变量 |
 | Q6 | 位置分段太长 | `POSITION_SECTION_ROWS` 8 → **4** | 用户确认（上一轮已提过「最近太长」） |
 | Q7 | 传输队列空态占一行 | 空态**不渲染**（高度 0） | 用户确认 |
 | Q8 | 日志固定 140px | 加 **7px 可拖分隔条**（80–420px 夹取，**仅会话内记忆**） | 用户确认（不写设置文件 = 不碰 Go 配置结构）。**原计划的「chips 行固定高度」作废**：SFTP 页不传 `tunnels` ⇒ chips 恒空，去掉 v-if 只会留一条空带（reviewer 实测） |
@@ -825,8 +825,11 @@ git commit -m "fix(ui): 统一 button/input/select 高度并随字号缩放，�
 - Modify: `frontend/src/utils/positions.test.js`、`frontend/src/components/filePaneWiring.test.js`
 
 **Interfaces:**
-- Consumes: Task 1 的列轨道（弹层锚点算法不变）。
+- Consumes: Task 1 的列轨道（弹层锚点算法不变）；**Task 3 的全局 `box-sizing: border-box`**（见下方前提纠正）。
 - Produces: `POS_MENU_WIDTH = 220`；`POSITION_SECTION_ROWS = 4`（仍是唯一常量来源）。
+
+> **前提纠正（Task 4 实现+审查后补记）**：本文档最初写的「项目没有全局 `box-sizing: border-box`，故 `width:100% + padding` 必然横向溢出」在 **Task 3 落地后已过期**——Task 3 新增的 `button, input:not([type=checkbox]):not([type=radio]), select { box-sizing: border-box }` 已经覆盖 `.positem`(`<button>`)/`.posfilter`(`<input>`)，**横向滚动条实际是 Task 3 修掉的**；Task 4 里那两处显式声明是**防御性**的（组件不依赖全局规则、并被源码断言钉住），不是修复本身。
+> 证据：Task 3 之后拍的 `/tmp/sshkit-t3/shots/09-posmenu.png`（当时弹层仍是 260px）底部**没有**滚动条；而 v0.7.2 基线 `/tmp/rel072-shots/P3-scrolled-to-last-row.png` 底部有 1566px 的 `#8B8B8B` 带。最终判定仍以 Task 7 的 W3 真机判据为准。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -836,7 +839,10 @@ it('弹层宽度收窄到 220px，且锚点算法与内联宽度用同一个常�
   expect(filePane).toMatch(/POS_MENU_WIDTH\s*=\s*220/)
   expect(filePane).toContain('r.right - POS_MENU_WIDTH')
 })
-it('弹层子项显式 border-box（否则 width:100% + padding 必然横向溢出）', () => {
+// 防御性声明：Task 3 的全局规则已覆盖这两个元素，但组件自身的「不溢出」不变量
+// 不应依赖全局规则（未来被 scope 掉就会静默回归），所以显式声明 + 源码断言钉住。
+// 真正的「无横向滚动条」由 Task 7 的 W3 真机像素判据验证。
+it('弹层子项显式 border-box（组件自身不变量，不依赖全局规则）', () => {
   expect(filePane).toMatch(/\.positem\s*\{[^}]*box-sizing:\s*border-box/)
   expect(filePane).toMatch(/\.posfilter\s*\{[^}]*box-sizing:\s*border-box/)
 })
@@ -885,8 +891,8 @@ export const POSITION_SECTION_ROWS = 4
 ```
 
 ```css
-.positem { box-sizing: border-box; /* ...既有规则 */ }
-.posfilter { box-sizing: border-box; /* ...既有规则 */ }
+.positem { box-sizing: border-box; /* 防御性：全局规则已覆盖，但组件不变量不应依赖全局 */ /* ...既有规则 */ }
+.posfilter { box-sizing: border-box; /* 同上 */ /* ...既有规则 */ }
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -1240,7 +1246,7 @@ VBoxManage controlvm <vm> screenshotpng /tmp/win-NN.png
 | W1（用户缺陷①） | 宿主 XTEST 点「修改时间」列头 | 前后截图 `compare -metric AE` > 0 且箭头落在「修改时间」；再点一次箭头反向 |
 | W2（用户缺陷②） | 四屏各截一张：SFTP（工具条+面板头）、设置对话框、端口转发、文件同步 | 每个控件高度 = 28（字号 1.0 档）；用 `vprobe` 量 `.fbar .filter / .navrow .curpath / .navrow .pos` 的上下边框 y 差 ≤ 1 |
 | W2b | 同上四屏 | 同排控件互为等高（例如「连接/刷新/下拉」三者上下边框 y 相同）；侧栏导航按钮高度 ≥ 40px（没被压成 28px） |
-| W3 | 点「📍 位置」 | 弹层宽 220（`hprobe` 量弹层左右边框 x 之差）；**底部 8px 带内不得出现连续 > 100px 的 `#8B8B8B`**（横向滚动条）；「展开全部 N」文字可见、分段默认 4 行 |
+| W3 | 点「📍 位置」 | ① 弹层宽 = 220（`hprobe` 量弹层左右边框 x 之差；同时横向文本不得被裁）② **底部 8px 带内不得出现连续 > 100px 的 `#8B8B8B`**（横向滚动条；对照基线 `/tmp/rel072-shots/P3-scrolled-to-last-row.png` 确有该带）③ 「展开全部 N」文字可见、分段默认 4 行（`最近` 类分组超过 4 条时出现「展开全部 N」） |
 | W4 | Ctrl+点击 / Shift+点击 / Ctrl+A / Shift+↑↓ / 过滤栏三按钮 | 每次截图后读底栏计数文本，须依次出现 `已选 1 / N 项` → 区间 → `已选 N / N 项` |
 | W4b | 点「已选 n ▾」 | 菜单**向上**展开：菜单顶边 y < 底栏顶边 y，且整块在面板矩形内（不被 `overflow:hidden` 裁掉）；能点到「删除」 |
 | W5 | 空态队列 | 面板底边框到日志分隔条上边框的距离 ≤ 12px（有任务时应被队列撑到 ≥ 30px）——两态各截一张对比 |
