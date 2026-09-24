@@ -104,7 +104,7 @@ function onAct(name, t) { emit(name, t) }
 .status.skip { color: var(--text-faint); }
 .status.cancel { color: var(--text-faint); }
 .acts { display: flex; gap: 6px; }
-.act { font-size: var(--fs-11); padding: 0 6px; }
+.act { height: auto; font-size: var(--fs-11); padding: 0 6px; }
 .pbar { height: 3px; background: var(--border); border-radius: 2px; margin-top: 2px; overflow: hidden; }
 .pfill { height: 100%; background: var(--accent); transition: width .15s linear; }
 /* total<0（未知/降级扫描）：不定条，绝不假装 0% 或 100% */
@@ -113,4 +113,6 @@ function onAct(name, t) { emit(name, t) }
 .ptext { color: var(--text-faint); }
 .qsum { padding: 3px 8px; color: var(--text-faint); display: flex; gap: 8px; align-items: center; }
 .empty { padding: 3px 8px; color: var(--text-faint); }
+/* 「复制失败清单」行内按钮：不能变成 28px 撑高汇总行（此前无样式规则，本任务新增） */
+.copy { height: auto; }
 </style>

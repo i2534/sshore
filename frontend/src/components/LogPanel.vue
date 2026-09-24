@@ -102,7 +102,7 @@ watch(() => [logStore.filterSource, logStore.filterLevel], async () => {
 .logpanel { display: flex; flex-direction: column; height: 100%; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .chip {
-  font-size: var(--fs-12); padding: 3px 8px; border-radius: 10px;
+  height: auto; font-size: var(--fs-12); padding: 3px 8px; border-radius: 10px;
   background: transparent; border: 1px solid var(--border); color: var(--text-dim);
   cursor: pointer;
 }
