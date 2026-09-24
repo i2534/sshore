@@ -26,6 +26,44 @@ describe('positionGroups：分区顺序 / 截断 / 展开 / 筛选', () => {
     expect(g.total).toBe(20)
   })
 
+  // Windows 缺陷 W1：展开控件的 v-if 若依赖 rows.length/total，展开后按钮被摘下 DOM，
+  // 焦点节点消失 → 面板子树 focusout(relatedTarget=null) → 弹层整个收起。
+  // 所以「是否可展开」必须来自一个不随 expanded 变化的字段。
+  it('expandable 由筛选后的条数决定：>8 为 true，≤8 为 false', () => {
+    const recent = positionGroups({ recents }).find((x) => x.key === 'recent')
+    expect(recent.total).toBe(20)
+    expect(recent.expandable).toBe(true)
+
+    // 恰好 8 条：rows.length === total，旧判据（total > rows.length）为 false，expandable 也必须 false
+    const exactly8 = positionGroups({ recents: recents.slice(0, 8) }).find((x) => x.key === 'recent')
+    expect(exactly8.total).toBe(POSITION_SECTION_ROWS)
+    expect(exactly8.rows).toHaveLength(POSITION_SECTION_ROWS)
+    expect(exactly8.expandable).toBe(false)
+
+    // 少于 8 条
+    expect(positionGroups({ presets })[0].expandable).toBe(false)
+    expect(positionGroups({ bookmarks })[0].expandable).toBe(false)
+  })
+
+  it('expandable 不随 expanded 变化（展开前后同为 true，控件节点不消失）', () => {
+    const collapsed = positionGroups({ recents }).find((x) => x.key === 'recent')
+    const expanded = positionGroups({ recents, expanded: { recent: true } }).find((x) => x.key === 'recent')
+    expect(collapsed.rows).toHaveLength(POSITION_SECTION_ROWS)
+    expect(expanded.rows).toHaveLength(20)
+    expect(collapsed.expandable).toBe(true)
+    expect(expanded.expandable).toBe(true)
+  })
+
+  it('expandable 跟随筛选结果：筛选把条数压到 ≤8 时转 false', () => {
+    const many = positionGroups({ recents, filter: '/r1' }).find((x) => x.key === 'recent')
+    expect(many.total).toBe(11) // /r1、/r10…/r19
+    expect(many.expandable).toBe(true)
+
+    const few = positionGroups({ recents, filter: '/r0' }).find((x) => x.key === 'recent')
+    expect(few.total).toBe(1)
+    expect(few.expandable).toBe(false)
+  })
+
   it('筛选同时匹配名称与路径，大小写不敏感', () => {
     const byPath = positionGroups({ presets, recents, filter: 'var/log' })
     expect(byPath.map((g) => g.key)).toEqual(['preset'])
