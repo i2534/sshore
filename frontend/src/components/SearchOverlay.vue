@@ -33,7 +33,15 @@ function title() {
 async function run() {
   // 空模式不查询：后端把空 pattern 解释为「匹配全部」（internal/sftp/search.go 的注释），
   // 一打开就查 = 无条件全量扫描 + 最多 500 条命中，见 utils/searchbox.js。
-  if (!shouldSearch(pattern.value)) { hint.value = EMPTY_PATTERN_HINT; return }
+  if (!shouldSearch(pattern.value)) {
+    // 清空态的守卫：先清掉上一次搜索的残留（错误/命中/进度），再 return，全程不发请求。
+    // 否则上一次报错后清空输入回车，模板 v-if="errorText" 会优先显示旧错误而不是提示。
+    errorText.value = ''
+    hits.value = []
+    scanned.value = 0
+    hint.value = EMPTY_PATTERN_HINT
+    return
+  }
   hint.value = ''
   const id = 's' + (++seq)
   running.value = true

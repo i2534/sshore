@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, watch, onUnmounted } from 'vue'
 import { positionGroups } from '../utils/positions'
+import { isImeCommit } from '../utils/pathbar'
 
 const props = defineProps({
   title: String,
@@ -32,7 +33,9 @@ const menuOpen = ref(false)
 // 这样 Enter 提交后无论成功还是被父层回滚，输入框显示的都与真实目录一致。
 const pathDraft = ref(props.path || '')
 function commitPath(e) {
-  if (e && e.isComposing) return // 中文输入法里按 Enter 确认候选，不该触发跳转
+  // IME 守卫必须由 keydown 触发（见 pathbar.isImeCommit）：WebKit 在 compositionend 之后
+  // 仍会发 keyup 且 isComposing=false，keyup 版守卫在本项目的 Linux/WebKitGTK 目标上等于没有。
+  if (isImeCommit(e)) return // 中文输入法里按 Enter 确认候选，不该触发跳转
   emit('navigate', pathDraft.value)
   // 失焦即回读 props.path：父层 noop / 失败时输入框自动回到真实目录；
   // 成功时 props.path 已被乐观提交改掉，回读到的就是新目录。
@@ -49,7 +52,7 @@ watch(() => props.selKeys.length, (n) => { if (n) upActive.value = false })
 
 // ===== 位置弹层（📍 位置）=====
 // 为什么是 position: fixed + 打开时现算坐标，而不是 absolute 挂在按钮下方：
-// .pane 是 overflow: hidden（FilePane.vue:170），absolute 弹层会被面板裁掉——默认 720 高的窗口里，
+// .pane 是 overflow: hidden（FilePane.vue:255），absolute 弹层会被面板裁掉——默认 720 高的窗口里，
 // 传输队列非空时面板只剩 ~380px，而 60vh 的菜单要 432px，底部几行会永久够不到。
 // fixed 不受祖先 overflow 裁剪，坐标由按钮 rect 现算：**定位方式**与 ContextMenu.vue 一致，
 // 但**关闭机制刻意不同**——不用 document 全局监听（SftpView 被 KeepAlive 缓存会留残留），
@@ -94,7 +97,9 @@ function onPaneMouseDown(e) {
   if (e.target && e.target.closest && e.target.closest('.pos-wrap')) return
   closePos()
 }
-function onPaneKeydown(e) { if (e.key === 'Escape') closePos() }
+// Esc 清空选中：面板 keydown 先于 SftpView 的 window 处理器冒泡，
+// 在这里同步复位「..」高亮（否则 selKeys 恒为 0，watch 的 n→0 守卫不会触发）。
+function onPaneKeydown(e) { if (e.key === 'Escape') { upActive.value = false; closePos() } }
 onUnmounted(() => window.removeEventListener('resize', closePos))
 
 function onUpClick() {
@@ -102,6 +107,10 @@ function onUpClick() {
   emit('clear') // 与「点面板空白处」同义：单击「..」先取消当前选中
 }
 function openUp() { emit('open', { name: '..', isDir: true }) }
+// 清空选中的第二条路径（点列表空白）。此时 selKeys.length 恒为 0，
+// watch(() => selKeys.length) 的 n→0 守卫不会触发，必须在这里同步复位「..」高亮，
+// 否则「..」行会保留 .sel 而面板头显示「已选 0 项」——用户可能误以为「..」被选中而按 Delete/传输。
+function onListBlankClick() { upActive.value = false; emit('clear') }
 
 function pick(name) { menuOpen.value = false; emit('action', name) }
 
@@ -177,7 +186,7 @@ function fmtSize(bytes) {
       <span class="title">{{ title }}</span>
       <input class="curpath" data-role="path" spellcheck="false" :value="pathDraft"
         @input="pathDraft = $event.target.value"
-        @keyup.enter="commitPath" @keyup.esc="resetPath" @blur="resetPath(); focus = false"
+        @keydown.enter="commitPath" @keyup.esc="resetPath" @blur="resetPath(); focus = false"
         @focus="focus = true; emit('focus')" />
       <div class="pos-wrap">
         <button class="pos" data-role="position" :class="{ on: posOpen }" title="位置" @click="togglePos">📍 位置 ▾</button>
@@ -213,7 +222,7 @@ function fmtSize(bytes) {
         <span class="col-time sortable" :class="{ active: sortKey === 'modTime' }" @click="sortBy('modTime')">修改时间 {{ arrow('modTime') }}</span>
         <input class="filter" v-model="filterText" placeholder="过滤…" />
       </div>
-      <ul class="list" :class="{ busy: loading }" @click.self="emit('clear')">
+      <ul class="list" :class="{ busy: loading }" @click.self="onListBlankClick">
         <li class="up" data-role="up" :class="{ sel: upActive }" @click="onUpClick" @dblclick="openUp">
           <span class="cell-name">📁 ..</span><span class="cell-size">—</span><span class="cell-time">—</span>
         </li>
@@ -251,7 +260,6 @@ function fmtSize(bytes) {
 .curpath:hover { border-color: var(--border); }
 .curpath:focus { border-color: var(--accent); color: var(--text); outline: none; }
 .count { font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); }
-.pos-wrap { position: relative; }
 .pos { max-width: 150px; font-size: var(--fs-11); }
 .pos.on { border-color: var(--accent); color: var(--accent); }
 /* position: fixed + z-index 1000：与 ContextMenu.vue 的既有做法一致；对话框浮层是 2000，菜单在其之下。

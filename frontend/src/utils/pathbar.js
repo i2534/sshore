@@ -29,3 +29,13 @@ export function resolvePathInput({ pane, raw, hasHost, connected, current }) {
   if (p === current) return { kind: 'noop', reason: 'same' }
   return { kind: 'navigate', path: p }
 }
+
+// 路径栏回车提交前的 IME 守卫：返回 true 表示这是「输入法确认候选」的 Enter，不得提交跳转。
+// 为什么必须挂在 keydown 而不是 keyup：按规范 isComposing 只在 compositionstart→compositionend
+// 之间为真，而 WebKit/Firefox/Safari 会在 compositionend 之后仍发 keyup（此时 isComposing=false，
+// stum.de「Handling IME events in JavaScript」），本项目 Linux/WebKitGTK 目标上 keyup 版守卫会漏判。
+// keydown 期间组合态仍是 true；keyCode === 229 是部分浏览器组合态 keydown 的哨兵，作为兜底。
+export function isImeCommit(ev) {
+  if (!ev) return false
+  return ev.isComposing === true || ev.keyCode === 229
+}
