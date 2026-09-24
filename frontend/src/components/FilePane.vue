@@ -1,5 +1,6 @@
 <script setup>
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onUnmounted } from 'vue'
+import { positionGroups } from '../utils/positions'
 
 const props = defineProps({
   title: String,
@@ -46,6 +47,56 @@ watch(() => props.path, (p) => {
 })
 watch(() => props.selKeys.length, (n) => { if (n) upActive.value = false })
 
+// ===== 位置弹层（📍 位置）=====
+// 为什么是 position: fixed + 打开时现算坐标，而不是 absolute 挂在按钮下方：
+// .pane 是 overflow: hidden（FilePane.vue:170），absolute 弹层会被面板裁掉——默认 720 高的窗口里，
+// 传输队列非空时面板只剩 ~380px，而 60vh 的菜单要 432px，底部几行会永久够不到。
+// fixed 不受祖先 overflow 裁剪，坐标由按钮 rect 现算：**定位方式**与 ContextMenu.vue 一致，
+// 但**关闭机制刻意不同**——不用 document 全局监听（SftpView 被 KeepAlive 缓存会留残留），
+// 改用面板自身的 focusout + mousedown。
+const posOpen = ref(false)
+const posFilter = ref('')
+const posExpanded = ref({})
+const posAnchor = ref({ left: 0, top: 0 })
+// 弹层宽度只有这一个来源：模板内联 style 用它，锚点也用它。
+// 配合 .posmenu 的 box-sizing: border-box，"右对齐按钮"才是精确的（否则 padding+border 会让外框宽 10px）。
+const POS_MENU_WIDTH = 260
+const groups = computed(() => positionGroups({
+  presets: props.presets, disks: props.disks, bookmarks: props.bookmarks, recents: props.recents,
+  expanded: posExpanded.value, filter: posFilter.value,
+}))
+function closePos() {
+  if (!posOpen.value) return
+  posOpen.value = false
+  window.removeEventListener('resize', closePos) // 窗口尺寸变了锚点就失效：直接收起（幂等，可重复调用）
+}
+function togglePos(e) {
+  if (posOpen.value) { closePos(); return }
+  const r = e.currentTarget.getBoundingClientRect()
+  posAnchor.value = { left: Math.max(4, Math.round(r.right - POS_MENU_WIDTH)), top: Math.round(r.bottom + 2) }
+  posFilter.value = ''
+  posExpanded.value = {}
+  posOpen.value = true
+  window.addEventListener('resize', closePos)
+}
+function pickPos(path) { closePos(); emit('pick-position', path) }
+function expandGroup(key) { posExpanded.value = { ...posExpanded.value, [key]: true } }
+// 焦点离开「面板 + 弹层」这一整棵子树才收起；面板内按钮之间移动不收起。
+// 用面板自身的 focusout 而不是 document 全局监听：SftpView 被 KeepAlive 缓存，全局监听会留残留。
+function onPaneFocusOut(e) {
+  if (e && e.relatedTarget && e.currentTarget.contains(e.relatedTarget)) return
+  closePos()
+}
+// 点面板内**非弹层**区域就收起：.pane 自身是 tabindex="0"，点文件行 / 列表空白时浏览器
+// 把焦点落到 .pane 上，relatedTarget 就是面板本身 —— 只靠 focusout 判"是否离开子树"会恒为真，
+// position:fixed 的弹层就会长期盖在列表上。弹层内（.pos-wrap）的点击不收起。
+function onPaneMouseDown(e) {
+  if (e.target && e.target.closest && e.target.closest('.pos-wrap')) return
+  closePos()
+}
+function onPaneKeydown(e) { if (e.key === 'Escape') closePos() }
+onUnmounted(() => window.removeEventListener('resize', closePos))
+
 function onUpClick() {
   upActive.value = true
   emit('clear') // 与「点面板空白处」同义：单击「..」先取消当前选中
@@ -53,9 +104,6 @@ function onUpClick() {
 function openUp() { emit('open', { name: '..', isDir: true }) }
 
 function pick(name) { menuOpen.value = false; emit('action', name) }
-
-// 位置下拉：选中后立刻清零，避免同一个位置连选两次不触发 change。
-function onPick(e) { const v = e.target.value; e.target.value = ''; if (v) emit('pick-position', v) }
 
 // Sort state: key in 'name' | 'size' | 'modTime'; dir 1 = asc, -1 = desc.
 const sortKey = ref('name')
@@ -122,32 +170,30 @@ function fmtSize(bytes) {
 </script>
 
 <template>
-  <div class="pane ui-panel" :class="{ focus }" tabindex="0" @focus="focus = true; emit('focus')" @blur="focus = false">
+  <div class="pane ui-panel" :class="{ focus }" tabindex="0"
+    @focus="focus = true; emit('focus')" @blur="focus = false"
+    @focusout="onPaneFocusOut" @mousedown="onPaneMouseDown" @keydown="onPaneKeydown">
     <div class="head">
       <span class="title">{{ title }}</span>
       <input class="curpath" data-role="path" spellcheck="false" :value="pathDraft"
         @input="pathDraft = $event.target.value"
         @keyup.enter="commitPath" @keyup.esc="resetPath" @blur="resetPath(); focus = false"
         @focus="focus = true; emit('focus')" />
-      <select class="pos" :value="''" @change="onPick($event)">
-        <option value="" disabled selected>📍 位置</option>
-        <!-- key 必须含 name（以及 host）：后端 preset.User 的去重键是 name+path+host，
-             "同一路径配不同名字都要保留"是被 TestUserFilterDedupeAndOrder 锁住的语义；
-             同名同路径但 host 限定不同的远端条目也会同时出现。只按 path 做 key 会撞 key
-             （Vue 重复 key 警告 + 更新期节点复用不可预期）。磁盘组无需如此：盘符天然唯一。 -->
-        <optgroup v-if="presets.length" label="预设">
-          <option v-for="p in presets" :key="'p' + p.name + p.path + (p.host || '')" :value="p.path" :title="p.path">{{ p.name }}</option>
-        </optgroup>
-        <optgroup v-if="disks.length" label="磁盘">
-          <option v-for="d in disks" :key="'d' + d.path" :value="d.path" :title="d.path">{{ d.name }}</option>
-        </optgroup>
-        <optgroup v-if="bookmarks.length" label="书签">
-          <option v-for="b in bookmarks" :key="'b' + b.path" :value="b.path">{{ b.name || b.path }}</option>
-        </optgroup>
-        <optgroup v-if="recents.length" label="最近">
-          <option v-for="r in recents" :key="'r' + r.path" :value="r.path">{{ r.path }}</option>
-        </optgroup>
-      </select>
+      <div class="pos-wrap">
+        <button class="pos" data-role="position" :class="{ on: posOpen }" title="位置" @click="togglePos">📍 位置 ▾</button>
+        <div v-if="posOpen" class="posmenu" tabindex="-1" @click.stop
+          :style="{ left: posAnchor.left + 'px', top: posAnchor.top + 'px', width: POS_MENU_WIDTH + 'px' }">
+          <input class="posfilter" v-model="posFilter" placeholder="筛选位置…" />
+          <template v-for="g in groups" :key="g.key">
+            <div class="poslabel">
+              <span>{{ g.label }}</span>
+              <button v-if="g.total > g.rows.length" class="more" @click="expandGroup(g.key)">展开全部 {{ g.total }}</button>
+            </div>
+            <button v-for="o in g.rows" :key="o.key" class="positem" :title="o.path" @click="pickPos(o.path)">{{ o.label }}</button>
+          </template>
+          <div v-if="!groups.length" class="posempty">没有匹配的位置</div>
+        </div>
+      </div>
       <button class="star" :class="{ on: bookmarked }" :title="bookmarked ? '取消收藏' : '收藏当前目录'" @click="emit('toggle-bookmark')">☆</button>
       <button class="find" title="递归深搜" @click="emit('search')">🔍</button>
       <span class="count">{{ shown.length }} 项</span>
@@ -205,7 +251,18 @@ function fmtSize(bytes) {
 .curpath:hover { border-color: var(--border); }
 .curpath:focus { border-color: var(--accent); color: var(--text); outline: none; }
 .count { font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); }
+.pos-wrap { position: relative; }
 .pos { max-width: 150px; font-size: var(--fs-11); }
+.pos.on { border-color: var(--accent); color: var(--accent); }
+/* position: fixed + z-index 1000：与 ContextMenu.vue 的既有做法一致；对话框浮层是 2000，菜单在其之下。
+   宽度定长 260px 是为了和 Step 7 里 "r.right - 260" 的锚点算法对齐。 */
+.posmenu { position: fixed; z-index: 1000; box-sizing: border-box; max-height: 60vh; overflow: auto; text-align: left; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 4px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
+.posfilter { width: 100%; font-size: var(--fs-11); margin-bottom: 4px; }
+.poslabel { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px 2px; font-size: var(--fs-11); color: var(--text-faint); }
+.poslabel .more { font-size: var(--fs-11); }
+.positem { display: block; width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; padding: 4px 8px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
+.positem:hover { background: var(--surface-hover); }
+.posempty { padding: 6px 8px; font-size: var(--fs-12); color: var(--text-faint); }
 .star.on { color: var(--seed); }
 .batch { position: relative; }
 .batch .chip { font-size: var(--fs-11); }
