@@ -674,7 +674,9 @@ git commit -m "feat(sftp): 过滤栏加全选/反选/清空，支持 Shift+上�
   - 高度规则选择器 `button, input:not([type="checkbox"]):not([type="radio"]), select` **只准放盒模型属性**（`box-sizing`/`height`/`line-height`）
   - 视觉属性（`background`/`border`/`border-radius`/`padding`）必须留在**元素级**规则 `button, input, select` 里
 
-> **特异性红线（reviewer 实测指出）**：`input:not([type="checkbox"]):not([type="radio"])` 的特异性是 **(0,2,1)**，会压过 scoped 的 `.curpath[data-v-x]` **(0,2,0)**。若把 `border/border-radius/background` 放进前者，路径框会从「静默、hover 才显边框」变成常显边框 + 6px 圆角——这就是本任务最容易踩的回归。
+> **特异性红线（reviewer 实测指出；叙述已按最终审查的实测校正）**：`input:not([type="checkbox"]):not([type="radio"])` 的特异性是 **(0,2,1)**，会压过 scoped 的 `.curpath[data-v-x]` **(0,2,0)**。
+> **前提校正**：这条规则在本分支之前就已经在写 `border-color`，所以路径框**今天本来就不是「静默、hover 才显边框」**——它是既有规则造成的常显边框，**不是本分支引入的回归**。
+> 红线本身仍成立：往这条高特异性规则里再搬 `border-style/border-width/border-radius/background/padding` 会**立刻**改变路径框外观（例如 6px 圆角、内缩），所以高度规则只放盒模型属性、视觉属性一律留在元素级规则。
 
 - [ ] **Step 1: 写失败的源码不变量测试**
 
@@ -1273,7 +1275,7 @@ git commit -m "docs: 记录 SFTP 面板排版修复的 Linux/Windows 真机验�
 |---|---|---|
 | 全局控件高度（Task 3） | 所有页面与浮层 | 单独 commit；`styleTokens.test.js` 钉住 opt-out 列表；Step 6 全页面自检；出问题 `git revert` 单 commit |
 | `.list li` 由 flex 改 grid | 行内三列、hover/sel 高亮、拖拽命中 | 仍是同一个 `li` 元素，事件绑定不动；Task 7 判据 A 钉住对齐 |
-| 过滤栏占底部 ~30px | 列表少约 1 行 | 已获用户确认；日志区可拖可部分补偿 |
+| 过滤栏占底部 ~35px（28px 控件 + 3px×2 padding + 1px 上边框） | 列表少约 1 行 | 已获用户确认；日志区可拖可部分补偿 |
 | Shift+↑/↓ 与浏览器滚动冲突 | 列表滚动 | 仅在 `actionFor` 返回扩展动作时 `preventDefault`，且焦点在输入框时不处理 |
 | 位置分段 8 → 4 | 常用路径需要多点一次「展开全部」 | 用户已确认（嫌长） |
 | 隐藏项语义 | `invert` 与 `all` 行为不同 | 在 `selection.js` 注释写明并单测钉住；UI 用 `hiddenSelected` 如实标注 |
