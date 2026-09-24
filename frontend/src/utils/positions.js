@@ -26,7 +26,13 @@ export function positionGroups({ presets = [], disks = [], bookmarks = [], recen
   for (const d of defs) {
     const hit = d.rows.filter((row) => matches(row, filter))
     if (!hit.length) continue
-    out.push({ key: d.key, label: d.label, total: hit.length, rows: expanded[d.key] ? hit : hit.slice(0, POSITION_SECTION_ROWS) })
+    // expandable 只看筛选后的条数，**不随 expanded 变化**：展开控件因此可以常驻 DOM。
+    // 旧写法在模板里用 total > rows.length 当渲染条件，展开后按钮被移除，焦点节点消失，
+    // Chromium/WebView2 会给面板子树发 focusout(relatedTarget=null)，弹层被整个收起（W1）。
+    out.push({
+      key: d.key, label: d.label, total: hit.length, expandable: hit.length > POSITION_SECTION_ROWS,
+      rows: expanded[d.key] ? hit : hit.slice(0, POSITION_SECTION_ROWS),
+    })
   }
   return out
 }

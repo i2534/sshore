@@ -83,7 +83,9 @@ function togglePos(e) {
   window.addEventListener('resize', closePos)
 }
 function pickPos(path) { closePos(); emit('pick-position', path) }
-function expandGroup(key) { posExpanded.value = { ...posExpanded.value, [key]: true } }
+// 展开/收起是同一颗按钮：控件始终存在（见 :199 的 v-if="g.expandable"），
+// 避免"展开后按钮消失 → 焦点节点被摘下 → 弹层 focusout 收起"这一 Windows/WebView2 缺陷（W1）。
+function toggleGroup(key) { posExpanded.value = { ...posExpanded.value, [key]: !posExpanded.value[key] } }
 // 焦点离开「面板 + 弹层」这一整棵子树才收起；面板内按钮之间移动不收起。
 // 用面板自身的 focusout 而不是 document 全局监听：SftpView 被 KeepAlive 缓存，全局监听会留残留。
 function onPaneFocusOut(e) {
@@ -196,7 +198,7 @@ function fmtSize(bytes) {
           <template v-for="g in groups" :key="g.key">
             <div class="poslabel">
               <span>{{ g.label }}</span>
-              <button v-if="g.total > g.rows.length" class="more" @click="expandGroup(g.key)">展开全部 {{ g.total }}</button>
+              <button v-if="g.expandable" class="more" @click="toggleGroup(g.key)">{{ posExpanded[g.key] ? '收起' : '展开全部 ' + g.total }}</button>
             </div>
             <button v-for="o in g.rows" :key="o.key" class="positem" :title="o.path" @click="pickPos(o.path)">{{ o.label }}</button>
           </template>

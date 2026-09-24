@@ -103,6 +103,27 @@ describe('位置弹层', () => {
     expect(filePane).toContain('@mousedown="onPaneMouseDown"')
     expect(filePane).toMatch(/function onPaneMouseDown\(e\)\s*\{[^}]*closest\('\.pos-wrap'\)/)
   })
+
+  // W1（Windows/WebView2）：旧写法 v-if="g.total > g.rows.length" 让「展开全部」在展开后
+  // 从 DOM 消失；Chromium 在焦点节点被移除时给子树发 focusout(relatedTarget=null)，
+  // onPaneFocusOut 便把整个弹层收起（Linux/WebKit 时序不同，故此前漏检）。
+  // 不变量：控件是否渲染只看 g.expandable（与 expanded 无关），且展开后控件仍在、文案变「收起」。
+  it('展开控件以 g.expandable 为唯一渲染条件，节点不随展开消失', () => {
+    const more = filePane.match(/<button[^>]*class="more"[^>]*>[^<]*<\/button>/)
+    expect(more, '找不到 .more 展开/收起按钮').not.toBeNull()
+    expect(more[0]).toContain('v-if="g.expandable"')
+    // 回归守卫：这两条一旦回来，就说明又用「行数」当渲染条件了
+    expect(filePane).not.toContain('g.total > g.rows.length')
+    expect(filePane).not.toMatch(/class="more"[^>]*v-if="[^"]*rows\.length/)
+  })
+
+  it('展开控件是 toggle：展开态可点「收起」，且不再只有 expandGroup', () => {
+    expect(filePane).toContain('toggleGroup(g.key)')
+    expect(filePane).toMatch(/function toggleGroup\(key\)\s*\{/)
+    expect(filePane).toContain("'收起'")
+    expect(filePane).toContain('展开全部 ')
+    expect(filePane).not.toContain('expandGroup(g.key)')
+  })
 })
 
 
