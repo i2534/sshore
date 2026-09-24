@@ -3,7 +3,7 @@
 // 「最近」在后端最多存 20 条（internal/config/store.go 的 maxRecent），
 // 但下拉里默认只展示 POSITION_SECTION_ROWS 行，其余靠「展开全部」显式取用——
 // 这是本轮「位置里的最近太长」的修复点。
-export const POSITION_SECTION_ROWS = 8
+export const POSITION_SECTION_ROWS = 4
 
 const norm = (s) => String(s == null ? '' : s).toLowerCase()
 
