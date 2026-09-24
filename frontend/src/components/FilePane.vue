@@ -287,15 +287,15 @@ function fmtSize(bytes) {
 .posmenu { position: fixed; z-index: 1000; box-sizing: border-box; max-height: 60vh; overflow: auto; text-align: left; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 4px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
 .posfilter { width: 100%; font-size: var(--fs-11); margin-bottom: 4px; }
 .poslabel { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px 2px; font-size: var(--fs-11); color: var(--text-faint); }
-.poslabel .more { font-size: var(--fs-11); }
-.positem { display: block; width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; padding: 4px 8px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
+.poslabel .more { font-size: var(--fs-11); height: auto; }
+.positem { display: block; width: 100%; height: auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; padding: 4px 8px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
 .positem:hover { background: var(--surface-hover); }
 .posempty { padding: 6px 8px; font-size: var(--fs-12); color: var(--text-faint); }
 .star.on { color: var(--seed); }
 .batch { position: relative; }
-.batch .chip { font-size: var(--fs-11); }
+.batch .chip { font-size: var(--fs-11); height: auto; }
 .bmenu { position: absolute; right: 0; top: 100%; z-index: 20; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 3px 0; min-width: 160px; }
-.bmenu button { display: block; width: 100%; text-align: left; padding: 4px 10px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
+.bmenu button { display: block; width: 100%; height: auto; text-align: left; padding: 4px 10px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
 .bmenu button:hover:not(:disabled) { background: var(--surface-hover); }
 .bmenu button:disabled { color: var(--text-faint); cursor: default; }
 /* 表头与列表在同一个滚动容器里：表头 sticky，两者内容盒宽度必然一致。
