@@ -17,6 +17,11 @@
   --seed: #f59e0b;
   /* UI 设置相关变量（由前端按用户设置覆盖） */
   --ui-scale: 1;
+  /* 所有 button/input/select 的统一高度：唯一来源。
+     修 Windows/WebView2 上「同屏 34/29/17 三种高度」的根因——
+     此前只统一了 padding，没有 height/line-height/box-sizing。
+     乘 --ui-scale 是为了跟随用户「字号」档位（0.9 / 1 / 1.15）。 */
+  --ctl-h: calc(28px * var(--ui-scale));
   --font-latin: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Helvetica Neue", Arial;
   --font-cjk: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", "Microsoft JhengHei", "WenQuanYi Micro Hei";
   /* 强调色/危险色底上的文字色，统一避免各处硬编码 #fff */
@@ -86,8 +91,24 @@ button, input, select {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 6px 10px;
+  padding: 0 10px;
 }
+
+/* 统一高度规则：只放盒模型属性（box-sizing/height/line-height）。
+   绝不能把 background/border/border-radius/padding 搬进来——这条 `:not()` 选择器的
+   特异性是 (0,2,1)，会压过 scoped 的 `.curpath[data-v-x]` (0,2,0)，把「静默、hover 才显
+   边框」的路径框变成常显边框 + 6px 圆角。视觉属性一律留在上面的元素级规则里。 */
+button,
+input:not([type="checkbox"]):not([type="radio"]),
+select {
+  box-sizing: border-box;
+  height: var(--ctl-h);
+  line-height: normal;
+}
+/* 单行文本框：把行高设成「高度 - 上下边框」，文字才会垂直居中 */
+input:not([type="checkbox"]):not([type="radio"]) { line-height: calc(var(--ctl-h) - 2px); }
+/* button/select 用 flex 居中，避免 Chromium/WebKit 行盒差异 */
+button, select { display: inline-flex; align-items: center; justify-content: center; line-height: 1; }
 
 button {
   cursor: pointer;

@@ -236,5 +236,5 @@ async function applyNow() {
 .update .field select, .update .field input[type="text"], .update .field input:not([type]) { flex: 1 1 auto; min-width: 0; }
 /* 子组件里没有父作用域的 .check 规则，这里补一份，让复选框行与其它设置行同字号 */
 .update .field .check { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-size: var(--fs-14); cursor: pointer; }
-.update .link { background: none; border: none; color: var(--accent); cursor: pointer; font-size: var(--fs-13); padding: 0; }
+.update .link { background: none; border: none; color: var(--accent); cursor: pointer; font-size: var(--fs-13); padding: 0; height: auto; }
 </style>

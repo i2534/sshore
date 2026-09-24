@@ -13,6 +13,7 @@ import ConflictDialog from '../components/ConflictDialog.vue'
 import * as sel from '../utils/selection'
 import { join as localJoin, parentOf as localParent, joinRel, splitPath } from '../utils/localpath'
 import { actionFor } from '../utils/keys'
+import { clampLogHeight, LOG_DEFAULT_H } from '../utils/logpane'
 import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName, nextTransferSeq, transferID } from '../utils/batch'
 import { failureText, isInternalTempName, applyProgress, TRANSFER_PROGRESS_EVENT,
   applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch } from '../utils/queue'
@@ -459,11 +460,10 @@ function hiddenFor(pane) { return hiddenSelectedCount(selectionFor(pane), visibl
 function actionsFor(pane) {
   const s = selectionFor(pane)
   const n = s.keys.size
+  // 全选/清空已移到过滤栏的可见按钮（唯一入口），菜单 tail 里不再重复。
   const tail = [
     { name: 'rename', label: '重命名', disabled: n !== 1 },
     { name: 'remove', label: '删除 (' + n + ')' },
-    { name: 'select-all', label: '全选' },
-    { name: 'clear', label: '清空' },
   ]
   if (n === 0 && pane === 'remote') return tail
   const head = pane === 'remote'
@@ -474,7 +474,9 @@ function actionsFor(pane) {
 
 function onPaneAction(pane, name) {
   const s = selectionFor(pane)
+  // 过滤栏三按钮走的就是这条既有链路，两支必须保留（只删了菜单项，没删分派）。
   if (name === 'select-all') return sel.all(s, visibleFor(pane))
+  if (name === 'invert') return sel.invert(s, visibleFor(pane))
   if (name === 'clear') return sel.clear(s)
   if (name === 'remove') return removeSelected(pane)
   if (name === 'upload-picked') return uploadPicked()
@@ -712,6 +714,9 @@ function onKeydown(ev) {
   const vis = visibleFor(focusedPane.value)
   if (action === 'delete') { ev.preventDefault(); removeSelected(focusedPane.value) }
   else if (action === 'select-all') { ev.preventDefault(); sel.all(s, vis) }
+  // Shift+↑/↓：以 anchor 为起点、cursor 为游标扩展区间（Ctrl+A 后可从末尾逐格收窄）。
+  else if (action === 'extend-up') { ev.preventDefault(); sel.extend(s, vis, -1) }
+  else if (action === 'extend-down') { ev.preventDefault(); sel.extend(s, vis, 1) }
   else if (action === 'escape') { sel.clear(s) }
 }
 
@@ -905,6 +910,40 @@ async function syncConnection() {
   } catch { /* 状态查询失败时保持现状 */ }
 }
 
+// 日志区高度：仅会话内记忆（KeepAlive 缓存期间保留，窗口重开回到默认），不落设置文件。
+const logHeight = ref(LOG_DEFAULT_H)
+let splitterStart = null
+function onSplitterDown(ev) {
+  if (ev.button !== 0) return // 只接左键：右键/中键拖动不该进入 resize（也不该吞掉 contextmenu）
+  splitterStart = { y: ev.clientY, h: logHeight.value }
+  window.addEventListener('mousemove', onSplitterMove)
+  window.addEventListener('mouseup', onSplitterUp)
+  // 窗口外松开鼠标时 mouseup 落不到 window 上：blur 兜底摘监听，否则移回窗口后会
+  // 不按键地跟着光标伸缩日志区，直到下一次 mouseup 或切标签（I1）。
+  window.addEventListener('blur', onSplitterUp)
+  ev.preventDefault()
+}
+function onSplitterMove(ev) {
+  if (!splitterStart) return
+  logHeight.value = clampLogHeight(splitterStart.h + (splitterStart.y - ev.clientY))
+}
+// 幂等：拖拽中切标签/丢 mouseup/窗口失焦时都要能安全重复调用，避免 window 上残留监听。
+function onSplitterUp() {
+  splitterStart = null
+  window.removeEventListener('mousemove', onSplitterMove)
+  window.removeEventListener('mouseup', onSplitterUp)
+  window.removeEventListener('blur', onSplitterUp)
+}
+function onSplitterKey(ev) {
+  // Shift+↑/↓ 名义上是「文件选择区间扩展」的键位（Task 2），但焦点在分隔条上时
+  // keys.js 的 isEditableTarget 会因 [role="separator"] 守卫让 actionFor 返回 null，
+  // 全局永远收不到这个动作 —— 所以这里是完全 no-op（不是「让给全局」），
+  // 目的是避免 resize 与区间扩展在同一次按键上互相打架（㉕）。
+  if (ev.shiftKey) return
+  if (ev.key === 'ArrowUp') { logHeight.value = clampLogHeight(logHeight.value + 16); ev.preventDefault() }
+  else if (ev.key === 'ArrowDown') { logHeight.value = clampLogHeight(logHeight.value - 16); ev.preventDefault() }
+}
+
 // KeepAlive 生命周期：切入时挂菜单监听、重启时钟并同步连接状态；切出时停时钟。
 // 必须成对挂摘：SftpView 被 <KeepAlive> 缓存，setup 只跑一次（App.vue:57-61）。
 // 在 setup 顶层注册会让「端口转发/文件同步」标签下按 Delete 弹出 SFTP 的删除确认框，
@@ -926,6 +965,7 @@ onDeactivated(() => {
   setSystemDropHandler(null)
   if (offProgress) { offProgress(); offProgress = null }
   stopClock()
+  onSplitterUp() // 拖拽中切标签：不摘会残留 window mousemove/mouseup
 })
 onUnmounted(() => {
   window.removeEventListener('click', outsideClick)
@@ -934,6 +974,7 @@ onUnmounted(() => {
   setSystemDropHandler(null)
   if (offProgress) { offProgress(); offProgress = null }
   stopClock()
+  onSplitterUp()
 })
 </script>
 
@@ -980,7 +1021,9 @@ onUnmounted(() => {
     </div>
     <TransferQueue :transfers="transfers" :now="now" @copy-failures="copyFailures"
       @cancel="cancelTransfer" @retry="retryItem" @resume="resumeItem" @clean="cleanItem" />
-    <div class="logpane ui-panel"><LogPanel :source-types="['sftp', 'system']" /></div>
+    <div class="splitter" data-role="log-splitter" role="separator" aria-orientation="horizontal"
+      tabindex="0" title="拖动调整日志高度" @mousedown="onSplitterDown" @keydown="onSplitterKey"></div>
+    <div class="logpane ui-panel" :style="{ height: logHeight + 'px' }"><LogPanel :source-types="['sftp', 'system']" /></div>
 
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
       <template v-if="menu.pane === 'remote'">
@@ -1026,6 +1069,7 @@ onUnmounted(() => {
 .pane-wrap { flex: 1; display: flex; min-width: 0; }
 /* 系统拖入悬停提示（spec R3 的「拖入期间高亮，让用户确认落点」）：落点回退靠它可见 */
 .pane-wrap.drop-hover { outline: 2px dashed var(--accent); outline-offset: -2px; border-radius: 4px; }
-.logpane { height: 140px; flex-shrink: 0; padding: 12px; overflow: auto; }
+.splitter { height: 7px; flex: none; cursor: row-resize; background: var(--bg-elev); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.logpane { flex: none; padding: 12px; overflow: auto; }
 .hidden-toggle { display: flex; align-items: center; gap: 4px; font-size: var(--fs-12); color: var(--text-dim); }
 </style>

@@ -2,6 +2,7 @@
 import { ref, computed, watch, onUnmounted } from 'vue'
 import { positionGroups } from '../utils/positions'
 import { isImeCommit } from '../utils/pathbar'
+import { selectionLabel, filterClearVisible, EMPTY_FILTER_HINT } from '../utils/panefooter'
 
 const props = defineProps({
   title: String,
@@ -49,6 +50,9 @@ watch(() => props.path, (p) => {
   upActive.value = false
 })
 watch(() => props.selKeys.length, (n) => { if (n) upActive.value = false })
+// 选择清空后批量菜单必须一起收起：`v-if="selKeys.length"` 会把 .batch 整个隐藏，
+// 但 menuOpen 若还留着 true，用户重新选中时菜单会「未点先弹」（M1）。
+watch(() => props.selKeys.length, (n) => { if (!n) menuOpen.value = false })
 
 // ===== 位置弹层（📍 位置）=====
 // 为什么是 position: fixed + 打开时现算坐标，而不是 absolute 挂在按钮下方：
@@ -63,7 +67,7 @@ const posExpanded = ref({})
 const posAnchor = ref({ left: 0, top: 0 })
 // 弹层宽度只有这一个来源：模板内联 style 用它，锚点也用它。
 // 配合 .posmenu 的 box-sizing: border-box，"右对齐按钮"才是精确的（否则 padding+border 会让外框宽 10px）。
-const POS_MENU_WIDTH = 260
+const POS_MENU_WIDTH = 220
 const groups = computed(() => positionGroups({
   presets: props.presets, disks: props.disks, bookmarks: props.bookmarks, recents: props.recents,
   expanded: posExpanded.value, filter: posFilter.value,
@@ -159,6 +163,13 @@ const shown = computed(() => {
 })
 const visibleKeys = computed(() => shown.value.map((it) => it.name))
 watch(visibleKeys, (keys) => emit('visible', keys), { immediate: true })
+
+// 底部过滤栏的计数文案（唯一来源：utils/panefooter.js）
+const selLabel = computed(() => selectionLabel({
+  selected: props.selKeys.length,
+  total: shown.value.length,
+  hidden: props.hiddenSelected,
+}))
 function hit(text) {
   const q = filterText.value.trim().toLowerCase()
   const i = q ? text.toLowerCase().indexOf(q) : -1
@@ -184,7 +195,8 @@ function fmtSize(bytes) {
   <div class="pane ui-panel" :class="{ focus }" tabindex="0"
     @focus="focus = true; emit('focus')" @blur="focus = false"
     @focusout="onPaneFocusOut" @mousedown="onPaneMouseDown" @keydown="onPaneKeydown">
-    <div class="head">
+    <!-- ① 导航行：标题 + 路径 + 位置 + 收藏 + 深搜（计数/批量已下移到底部过滤栏） -->
+    <div class="navrow">
       <span class="title">{{ title }}</span>
       <input class="curpath" data-role="path" spellcheck="false" :value="pathDraft"
         @input="pathDraft = $event.target.value"
@@ -207,22 +219,13 @@ function fmtSize(bytes) {
       </div>
       <button class="star" :class="{ on: bookmarked }" :title="bookmarked ? '取消收藏' : '收藏当前目录'" @click="emit('toggle-bookmark')">☆</button>
       <button class="find" title="递归深搜" @click="emit('search')">🔍</button>
-      <span class="count">{{ shown.length }} 项</span>
-      <div v-if="selKeys.length || actions.length" class="batch" @click.stop>
-        <button class="chip" @click="menuOpen = !menuOpen">
-          已选 {{ selKeys.length }} 项<template v-if="hiddenSelected">（含 {{ hiddenSelected }} 项被过滤）</template> ▾
-        </button>
-        <div v-if="menuOpen" class="bmenu">
-          <button v-for="a in actions" :key="a.name" :disabled="a.disabled" @click="pick(a.name)">{{ a.label }}</button>
-        </div>
-      </div>
     </div>
     <div class="list-holder">
-      <div class="columns">
+      <!-- ② 列头行：只放三个列头；grid 轨道与 .list li 完全相同（宽度只来自 --col-size/--col-time） -->
+      <div class="hdrow" data-role="columns">
         <span class="col-name sortable" :class="{ active: sortKey === 'name' }" @click="sortBy('name')">名称 {{ arrow('name') }}</span>
         <span class="col-size sortable" :class="{ active: sortKey === 'size' }" @click="sortBy('size')">大小 {{ arrow('size') }}</span>
         <span class="col-time sortable" :class="{ active: sortKey === 'modTime' }" @click="sortBy('modTime')">修改时间 {{ arrow('modTime') }}</span>
-        <input class="filter" v-model="filterText" placeholder="过滤…" />
       </div>
       <ul class="list" :class="{ busy: loading }" @click.self="onListBlankClick">
         <li class="up" data-role="up" :class="{ sel: upActive }" @click="onUpClick" @dblclick="openUp">
@@ -250,53 +253,84 @@ function fmtSize(bytes) {
       </ul>
       <div v-if="loading" class="loading">加载中…</div>
     </div>
+    <!-- ③ 底部过滤栏：过滤 + 计数/已选（批量菜单只在有选中时出现） -->
+    <div class="fbar" data-role="filterbar">
+      <span class="fwrap">
+        <input class="filter" data-role="filter" v-model="filterText" :placeholder="EMPTY_FILTER_HINT" />
+        <button v-if="filterClearVisible(filterText)" class="fx" data-role="filter-clear" title="清空过滤" @click="filterText = ''">✕</button>
+      </span>
+      <!-- 可见的多选入口：Ctrl/Shift 点击之外的低门槛入口（原先只有批量菜单里的全选/清空） -->
+      <button class="mini" data-role="select-all" :disabled="!shown.length" title="全选当前可见项" @click="emit('action', 'select-all')">全选</button>
+      <button class="mini" data-role="invert" :disabled="!shown.length" title="反选当前可见项" @click="emit('action', 'invert')">反选</button>
+      <button class="mini" data-role="clear" :disabled="!selKeys.length" title="清空选择" @click="emit('action', 'clear')">清空</button>
+      <span class="selinfo" data-role="selinfo">{{ selLabel }}</span>
+      <div v-if="selKeys.length" class="batch" @click.stop>
+        <button class="chip" @click="menuOpen = !menuOpen">已选 {{ selKeys.length }} ▾</button>
+        <div v-if="menuOpen" class="bmenu">
+          <button v-for="a in actions" :key="a.name" :disabled="a.disabled" @click="pick(a.name)">{{ a.label }}</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+/* 列宽唯一来源：列头行与列表行都引用这两个变量 */
+.pane { --col-size: 88px; --col-time: 140px; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .pane.focus { border-color: var(--accent); }
-.head { padding: 6px 8px; background: var(--bg-elev); font-weight: 600; color: var(--text-dim); display: flex; justify-content: space-between; align-items: center; }
+.navrow { display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: var(--bg-elev); font-weight: 600; color: var(--text-dim); }
 .title { font-weight: 600; }
 .curpath { flex: 1; min-width: 0; font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); text-align: left; background: transparent; border: 1px solid transparent; border-radius: 3px; padding: 1px 6px; margin: 0 8px; font-family: inherit; }
 .curpath:hover { border-color: var(--border); }
 .curpath:focus { border-color: var(--accent); color: var(--text); outline: none; }
-.count { font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); }
 .pos { max-width: 150px; font-size: var(--fs-11); }
 .pos.on { border-color: var(--accent); color: var(--accent); }
 /* position: fixed + z-index 1000：与 ContextMenu.vue 的既有做法一致；对话框浮层是 2000，菜单在其之下。
-   宽度定长 260px 是为了和 Step 7 里 "r.right - 260" 的锚点算法对齐。 */
+   宽度定长 POS_MENU_WIDTH（220px）是为了和 "r.right - POS_MENU_WIDTH" 的锚点算法对齐。 */
 .posmenu { position: fixed; z-index: 1000; box-sizing: border-box; max-height: 60vh; overflow: auto; text-align: left; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 4px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4); }
-.posfilter { width: 100%; font-size: var(--fs-11); margin-bottom: 4px; }
+.posfilter { width: 100%; box-sizing: border-box; font-size: var(--fs-11); margin-bottom: 4px; }
 .poslabel { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px 2px; font-size: var(--fs-11); color: var(--text-faint); }
-.poslabel .more { font-size: var(--fs-11); }
-.positem { display: block; width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; padding: 4px 8px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
+.poslabel .more { font-size: var(--fs-11); height: auto; }
+.positem { box-sizing: border-box; display: block; width: 100%; height: auto; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; padding: 4px 8px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
 .positem:hover { background: var(--surface-hover); }
 .posempty { padding: 6px 8px; font-size: var(--fs-12); color: var(--text-faint); }
 .star.on { color: var(--seed); }
 .batch { position: relative; }
-.batch .chip { font-size: var(--fs-11); }
+.batch .chip { font-size: var(--fs-11); height: auto; }
 .bmenu { position: absolute; right: 0; top: 100%; z-index: 20; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px; padding: 3px 0; min-width: 160px; }
-.bmenu button { display: block; width: 100%; text-align: left; padding: 4px 10px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
+.bmenu button { display: block; width: 100%; height: auto; text-align: left; padding: 4px 10px; background: none; border: none; color: var(--text); font-size: var(--fs-12); cursor: pointer; }
 .bmenu button:hover:not(:disabled) { background: var(--surface-hover); }
 .bmenu button:disabled { color: var(--text-faint); cursor: default; }
-.columns { display: flex; padding: 4px 8px; font-size: var(--fs-11); color: var(--text-faint); border-bottom: 1px solid var(--border); }
-.sortable { cursor: pointer; user-select: none; }
-.sortable:hover { color: var(--text-dim); }
-.sortable.active { color: var(--accent); }
-.filter { width: 110px; font-size: var(--fs-11); }
-.list-holder { flex: 1; display: flex; flex-direction: column; position: relative; min-height: 0; }
-.list { list-style: none; margin: 0; padding: 0; overflow: auto; flex: 1; }
+/* 表头与列表在同一个滚动容器里：表头 sticky，两者内容盒宽度必然一致。
+   若把表头放在滚动容器外，列表出现纵向滚动条时内容会窄 ~15px，表头与行会再次错位。 */
+.list-holder { flex: 1; display: flex; flex-direction: column; position: relative; min-height: 0; overflow: auto; }
+.hdrow { display: grid; grid-template-columns: minmax(0,1fr) var(--col-size) var(--col-time); column-gap: 6px; align-items: center; position: sticky; top: 0; z-index: 5; padding: 4px 8px; font-size: var(--fs-11); color: var(--text-faint); background: var(--bg-elev); border-bottom: 1px solid var(--border); white-space: nowrap; }
+.hdrow .col-size, .hdrow .col-time { text-align: right; }
+.list { list-style: none; margin: 0; padding: 0; flex: none; }
 .list.busy { opacity: 0.4; pointer-events: none; }
 .loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-faint); font-size: var(--fs-12); pointer-events: none; }
-.list li { display: flex; align-items: center; padding: 4px 8px; cursor: pointer; font-family: monospace; font-size: var(--fs-13); color: var(--text); white-space: nowrap; }
+.list li { display: grid; grid-template-columns: minmax(0,1fr) var(--col-size) var(--col-time); column-gap: 6px; align-items: center; padding: 4px 8px; cursor: pointer; font-family: monospace; font-size: var(--fs-13); color: var(--text); white-space: nowrap; }
 .list li:hover { background: var(--surface-hover); }
 .list li.sel { background: var(--surface-hover); color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
 .list li.anchor { outline: 1px dashed var(--seed); outline-offset: -1px; }
 .list li.up { color: var(--text-dim); border-bottom: 1px solid var(--border); }
 .list li.up.sel { background: var(--surface-hover); color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); border-bottom-color: var(--accent); }
 mark { background: var(--accent); color: var(--on-accent); }
-.col-name, .cell-name { flex: 1; overflow: hidden; text-overflow: ellipsis; padding-right: 16px; }
-.col-size, .cell-size { width: 88px; text-align: right; padding-right: 16px; color: var(--text-dim); }
-.col-time, .cell-time { width: 140px; text-align: right; color: var(--text-faint); }
+.sortable { cursor: pointer; user-select: none; }
+.sortable:hover { color: var(--text-dim); }
+.sortable.active { color: var(--accent); }
+.cell-name { overflow: hidden; text-overflow: ellipsis; }
+.cell-size { text-align: right; color: var(--text-dim); }
+.cell-time { text-align: right; color: var(--text-faint); }
+/* 底部过滤栏 */
+.fbar { display: flex; align-items: center; gap: 6px; padding: 3px 8px; border-top: 1px solid var(--border); background: var(--bg-elev); flex: none; }
+.fwrap { position: relative; flex: 1; min-width: 90px; display: flex; }
+.fwrap .filter { flex: 1; min-width: 0; font-size: var(--fs-11); padding-right: 22px; }
+.fx { position: absolute; right: 2px; top: 50%; transform: translateY(-50%); height: auto; padding: 0 4px; border: none; background: none; color: var(--text-faint); cursor: pointer; }
+.selinfo { font-size: var(--fs-11); color: var(--text-faint); white-space: nowrap; }
+/* 过滤栏内的迷你按钮：height:auto 是必须的——全局 button 变高时若不 opt-out 会把过滤栏撑高 */
+.mini { height: auto; font-size: var(--fs-11); padding: 1px 6px; }
+/* 批量菜单向上弹出：过滤栏是面板最后一个子元素，top:100% 会开在面板外被 overflow:hidden 裁掉 */
+.fbar .batch { position: relative; }
+.fbar .bmenu { position: absolute; right: 0; bottom: 100%; top: auto; z-index: 20; }
 </style>

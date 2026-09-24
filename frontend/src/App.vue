@@ -103,12 +103,12 @@ onUnmounted(() => {
 <style>
 .app { display: flex; height: 100vh; }
 .sidebar { width: 140px; border-right: 1px solid var(--border); padding-top: 8px; flex-shrink: 0; display: flex; flex-direction: column; }
-.sidebar button { display: block; width: 100%; text-align: left; padding: 12px 16px; border: none; background: none; cursor: pointer; color: var(--text-dim); }
+.sidebar button { display: block; width: 100%; height: auto; text-align: left; padding: 12px 16px; border: none; background: none; cursor: pointer; color: var(--text-dim); }
 .sidebar button:hover { background: var(--surface); color: var(--text); }
 .sidebar button.active { background: var(--surface-hover); color: var(--text); border-left: 3px solid var(--accent); }
 .sidebar button.settings { position: relative; margin-top: auto; border-top: 1px solid var(--border); }
 .sidebar .badge { position: absolute; top: 10px; right: 14px; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
 .workspace { flex: 1; padding: 12px; overflow: auto; text-align: left; }
 .fatal { background: var(--danger); color: var(--on-danger); padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.fatal-close { background: transparent; border: none; color: var(--on-danger); font-size: var(--fs-16); cursor: pointer; line-height: 1; padding: 0 4px; }
+.fatal-close { background: transparent; border: none; color: var(--on-danger); font-size: var(--fs-16); cursor: pointer; line-height: 1; padding: 0 4px; height: auto; }
 </style>
