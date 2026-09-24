@@ -19,6 +19,7 @@ import { failureText, isInternalTempName, applyProgress, TRANSFER_PROGRESS_EVENT
 import { payloadFor, payloadFromDragEvent, DRAG_MIME, pickDropPane, canDropInto } from '../utils/dnd'
 import { setSystemDropHandler } from '../utils/systemDrop'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
+import { resolvePathInput, REMOTE_HOME } from '../utils/pathbar'
 // 说明：StatPaths / CopyLocal / SftpMove / ListLocal / RenameLocal 已在既有 import 行里，
 // 这里**不重复声明**（重复 import 同名标识符会让 vite build 直接 SyntaxError）。
 
@@ -26,9 +27,6 @@ const logStore = useLogStore()
 const locations = useLocationsStore()
 // 浮层 watch 没有 immediate ⇒ visible 初值必须是 false，只由用户动作置 true。
 const search = reactive({ visible: false, pane: 'remote' })
-// 远程「主目录」预设的 sentinel：必须与 Go 侧 preset.RemoteHomeToken 字面量一致。
-// 远端 home 要先连上主机 pwd 才知道，所以下拉里传的是占位符而不是路径。
-const REMOTE_HOME = '~'
 const hosts = ref([])
 const host = ref('')
 
@@ -257,18 +255,95 @@ async function connect() {
   }
 }
 
+// 乐观提交 + 失败整体回滚：输入框立刻反映用户输入，打不开时路径与目录内容一起复原，
+// 并把后端原始错误写进日志面板（用户看得见，不是"点了没反应"）。
+// 本地也要自己的请求序号：乐观提交引入了回滚，慢的失败响应若晚于更晚的成功返回，
+// 就会把目录回滚成旧值（远程早有 remoteSeq 守这件事，本地原来没有回滚所以不需要）。
+let localSeq = 0
+
+async function goLocal(target) {
+  const prevPath = localPath.value
+  const prevItems = localItems.value
+  const seq = ++localSeq
+  localPath.value = target
+  localLoading.value = true
+  try {
+    const items = (await ListLocal(target || '/')) || []
+    if (seq !== localSeq) return
+    localItems.value = items
+    sel.clear(localSelection)
+    await locations.addLocalRecent(target)
+  } catch (e) {
+    if (seq !== localSeq) return
+    localPath.value = prevPath
+    localItems.value = prevItems
+    err('无法打开 ' + target + '：' + String((e && e.message) || e))
+  } finally { if (seq === localSeq) localLoading.value = false }
+}
+
+// 远程同形；remoteSeq 的过期丢弃语义与 loadRemote 保持一致（旧主机的响应不得污染当前视图）。
+async function goRemote(target) {
+  const prevPath = remotePath.value
+  const prevItems = remoteItems.value
+  const seq = ++remoteSeq
+  remotePath.value = target
+  remoteLoading.value = true
+  try {
+    const items = (await SftpList(host.value, '', target || '/')) || []
+    if (seq !== remoteSeq) return
+    remoteItems.value = items
+    sel.clear(remoteSelection)
+    await locations.addRemoteRecent(host.value, target)
+  } catch (e) {
+    if (seq !== remoteSeq) return
+    remotePath.value = prevPath
+    remoteItems.value = prevItems
+    err('无法打开 ' + target + '：' + String((e && e.message) || e))
+  } finally { if (seq === remoteSeq) remoteLoading.value = false }
+}
+
+// 远程「主目录」：未连接时把 pendingPath 清空再 connect()（connect 的 home 分支），
+// 已连接则直接解析 SftpHome 后跳转。行为变化（有意）：home 也会记入「最近」。
+async function goRemoteHome() {
+  if (!host.value) { err('请先选择主机'); return }
+  if (!connected.value) { pendingPath.value = ''; await connect(); return }
+  let home = '/'
+  try { home = await SftpHome(host.value) } catch (e) { err(e); return }
+  return goRemote(home)
+}
+
+// 面板头路径栏提交（唯一入口是 FilePane 的 @navigate）。
+async function onNavigate(pane, raw) {
+  const r = resolvePathInput({
+    pane, raw,
+    hasHost: !!host.value,
+    connected: connected.value,
+    current: pane === 'local' ? localPath.value : remotePath.value,
+  })
+  if (r.kind === 'noop') {
+    if (r.reason === 'no-host') err('请先选择主机')
+    else if (r.reason === 'local-home') err('本地路径不支持 ~ 写法，请填绝对路径')
+    return
+  }
+  if (r.kind === 'home') return goRemoteHome()
+  if (r.kind === 'connect') {
+    pendingPath.value = r.path
+    await connect()
+    // connect() 失败时不改 remotePath、也不清 pendingPath（SftpView.vue:254-257 的既有行为）。
+    // 残留的 pendingPath 会让**下一次**成功连接落到上次失败的目录，所以这里显式清掉。
+    if (pendingPath.value === r.path) pendingPath.value = ''
+    return
+  }
+  if (pane === 'local') return goLocal(r.path)
+  return goRemote(r.path)
+}
+
 // 面板头「📍 位置」选中一项：本地面板直接跳转；远程面板同机已连接则直接跳转，
 // 未连接则记入 pendingPath 后交给既有的 connect()（它内部消费 pendingPath）。
 async function pickPosition(pane, path) {
-  if (pane === 'local') { localPath.value = path; await loadLocal(); await locations.addLocalRecent(path); return }
-  if (path === REMOTE_HOME) {
-    if (!host.value) { err('请先选择主机'); return }
-    if (!connected.value) { pendingPath.value = ''; await connect(); return }
-    try { remotePath.value = await SftpHome(host.value) } catch (e) { err(e); return }
-    await loadRemote()
-    return
-  }
-  if (host.value && connected.value) { remotePath.value = path; await loadRemote(); await locations.addRemoteRecent(host.value, path); return }
+  if (pane === 'local') return goLocal(path)
+  if (path === REMOTE_HOME) return goRemoteHome()
+  if (host.value && connected.value) return goRemote(path)
   pendingPath.value = path
   await connect()
 }
@@ -884,6 +959,7 @@ onUnmounted(() => {
           @select="onSelect('local', $event)" @open="openLocal" @action="onPaneAction('local', $event)"
           @pick-position="pickPosition('local', $event)" @toggle-bookmark="toggleBookmark('local')" @search="search.pane = 'local'; search.visible = true"
           @clear="sel.clear(localSelection)"
+          @navigate="onNavigate('local', $event)"
           @context="showMenu('local', $event)" @visible="localVisible = $event" @focus="focusedPane = 'local'"
           @dragstart="onDragStart('local', $event)" @dropon="onMoveDrop('local', $event)" />
       </div>
@@ -895,6 +971,7 @@ onUnmounted(() => {
           @select="onSelect('remote', $event)" @open="openRemote" @action="onPaneAction('remote', $event)"
           @pick-position="pickPosition('remote', $event)" @toggle-bookmark="toggleBookmark('remote')" @search="search.pane = 'remote'; search.visible = true"
           @clear="sel.clear(remoteSelection)"
+          @navigate="onNavigate('remote', $event)"
           @context="showMenu('remote', $event)" @visible="remoteVisible = $event" @focus="focusedPane = 'remote'"
           @dragstart="onDragStart('remote', $event)" @dropon="onMoveDrop('remote', $event)" />
       </div>
