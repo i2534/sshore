@@ -70,6 +70,15 @@ describe('「..」行与普通目录行统一', () => {
     expect(kd[1]).toContain("e.key === 'Escape'")
     expect(kd[1]).toContain('upActive.value = false')
   })
+
+  // M1：选择清空后 selKeys.length 归零，`v-if="selKeys.length"` 会把 .batch 整个隐藏，
+  // 但 menuOpen 仍是 true；用户重新选中时菜单「未点先弹」。必须在归零时复位 menuOpen。
+  it('选择归零时批量菜单 menuOpen 一并复位，重新选中不会未点先弹', () => {
+    const m = filePane.match(/watch\(\(\) => props\.selKeys\.length,\s*\(n\)\s*=>\s*\{[^}]*menuOpen\.value = false[^}]*\}\)/)
+    expect(m, '找不到把 menuOpen 置 false 的 selKeys.length watch').not.toBeNull()
+    // 判别力：删掉这条 watch 即红；且它必须只在归零（!n）时生效
+    expect(m[0]).toMatch(/if\s*\(!n\)/)
+  })
 })
 
 describe('位置弹层', () => {
@@ -104,7 +113,7 @@ describe('位置弹层', () => {
     expect(filePane).toContain('r.right - POS_MENU_WIDTH')
   })
 
-  it('弹层子项显式 border-box（否则 width:100% + padding 必然横向溢出）', () => {
+  it('弹层子项显式 border-box（防御性组件不变量：横向溢出实由 Task 3 全局 box-sizing 消除）', () => {
     expect(filePane).toMatch(/\.positem\s*\{[^}]*box-sizing:\s*border-box/)
     expect(filePane).toMatch(/\.posfilter\s*\{[^}]*box-sizing:\s*border-box/)
   })

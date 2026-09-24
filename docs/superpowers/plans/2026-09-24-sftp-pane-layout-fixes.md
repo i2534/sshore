@@ -14,7 +14,7 @@
 
 | # | 问题 | 决策 | 取证/影响 |
 |---|---|---|---|
-| Q1 | 过滤框挤在列头行里 | **下移到面板底部一条过滤栏**（24–30px） | 实测：表头比列表多一个 132px 的过滤框 → 「大小」右边缘 163 vs 294、「修改时间」325 vs 450；过滤框 x 320–451 正好压在时间值上方，点它命中 input，`sortBy('modTime')` 收不到 |
+| Q1 | 过滤框挤在列头行里 | **下移到面板底部一条过滤栏**（实测 **~35px**：28px 统一控件高 + 上下 padding 3px×2 + 上边框 1px；初稿的 24–30px 是统一 28px 控件之前的估算） | 实测：表头比列表多一个 132px 的过滤框 → 「大小」右边缘 163 vs 294、「修改时间」325 vs 450；过滤框 x 320–451 正好压在时间值上方，点它命中 input，`sortBy('modTime')` 收不到 |
 | Q2 | 列头与列表列错位 | **两者共用同一套 grid 轨道** `minmax(0,1fr) / var(--col-size) / var(--col-time)` | 同上；列头行不再放任何非列头控件 |
 | Q3 | 计数重复 | 未选中只显示淡灰「N 项」；选中显示「已选 n / N 项 ▾」（▾ 打开批量菜单） | 用户确认 |
 | Q4 | 按钮/输入框高度不一致 | **全局 `--ctl-h: 28px`** + `box-sizing: border-box; height; line-height` | 实测同屏 34px（工具条）/ 29px（面板头、过滤框）/ ≈17px（路径框）三种高度 |
@@ -771,7 +771,7 @@ button, select { display: inline-flex; align-items: center; justify-content: cen
 
 **不要**把 `background/border/border-radius` 搬进上面的 `:not()` 规则——那会按特异性压过 `.curpath[data-v]`，把静默路径框变成常显边框（见本任务开头的红线）。
 
-- [ ] **Step 4: 给 13 处菜单类/胶囊类/图标类按钮加 opt-out（补 `height: auto``，各自 padding 保留）**
+- [ ] **Step 4: 给 14 处菜单类/胶囊类/图标类按钮加 opt-out（补 `height: auto``，各自 padding 保留）**
 
 | 文件 | 选择器 | 为什么必须 opt-out |
 |---|---|---|
@@ -1314,8 +1314,8 @@ git commit -m "docs: 记录 SFTP 面板排版修复的 Linux/Windows 真机验�
 | A/B-M1 | 全局 `input:not(...)`(0,2,1) 压过 scoped `.curpath`(0,2,0)，路径框会变常显边框 | Task 3 重构：高度规则**只放盒模型属性**，视觉属性留在元素级 `button, input, select` 里；并加断言禁止视觉属性进入前者 |
 | B-B1 | ImageMagick Q16 输出 16 位图时 hex 是 **12 位**，老式探针截 6 位 ⇒ 判据恒 PASS（假通过） | 探针全部加 `-depth 8`；窗口宽用 `identify` 现取；判据 A 打印 diff 并 `test -le 2 || exit 1`；判据 B 改为「列头行内无输入框色带」；C 补竖向探针；D 改像素 diff |
 | B-B2 | Windows 通道没有鼠标注入，且 **Wails 上 CDP 不可用**（§2.9 #1），原 CDP 判据无法执行 | Task 7 Step 3 重写：宿主 XTEST 打 VirtualBox 控制台窗口（§2.7/§2.9 #6 坐标映射）+ `controlvm screenshotpng` 取证 + 像素探针；明确禁止尝试 CDP |
-| B-I1 | opt-out 清单漏 `App.vue .sidebar button`（会被压成 28px 裁字） | 加入清单与断言（现表格 13 项） |
-| B-I2 | `styleTokens.test.js` 并未钉住完整 opt-out 清单 | 断言扩到全部 13 处（含 `.more`/`.fx`/`.batch .chip`/`.copy`/ContextMenu/App/SettingsDialog/UpdateSection） |
+| B-I1 | opt-out 清单漏 `App.vue .sidebar button`（会被压成 28px 裁字） | 加入清单与断言（现表格 14 项） |
+| B-I2 | `styleTokens.test.js` 并未钉住完整 opt-out 清单 | 断言扩到全部 14 处（含 `.more`/`.fx`/`.batch .chip`/`.copy`/ContextMenu/App/SettingsDialog/UpdateSection） |
 | B-I3 | KeepAlive 切标签不触发 `onUnmounted` | 明确挂 `onDeactivated` + `onUnmounted` 两处 |
 | B-I4 | SFTP 页不传 `tunnels` ⇒ chips 恒空，「去掉 v-if + min-height 防跳」会留空带 | Q8 纠正：**保留 `v-if`**、去掉 min-height 改动；草图中 SFTP 日志面板的 chip 仅为示意，实为产不出来 |
 | B-I5 / B-M3 | 分隔条不在键盘守卫内：焦点在它上面按 Delete 会删文件、Shift+↑↓ 会同时 resize + 扩展选择 | `keys.js` 守卫纳入 `[role="separator"]`（+单测）；`onSplitterKey` 遇 `ev.shiftKey` 直接 return |

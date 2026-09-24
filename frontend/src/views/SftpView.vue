@@ -914,23 +914,31 @@ async function syncConnection() {
 const logHeight = ref(LOG_DEFAULT_H)
 let splitterStart = null
 function onSplitterDown(ev) {
+  if (ev.button !== 0) return // 只接左键：右键/中键拖动不该进入 resize（也不该吞掉 contextmenu）
   splitterStart = { y: ev.clientY, h: logHeight.value }
   window.addEventListener('mousemove', onSplitterMove)
   window.addEventListener('mouseup', onSplitterUp)
+  // 窗口外松开鼠标时 mouseup 落不到 window 上：blur 兜底摘监听，否则移回窗口后会
+  // 不按键地跟着光标伸缩日志区，直到下一次 mouseup 或切标签（I1）。
+  window.addEventListener('blur', onSplitterUp)
   ev.preventDefault()
 }
 function onSplitterMove(ev) {
   if (!splitterStart) return
   logHeight.value = clampLogHeight(splitterStart.h + (splitterStart.y - ev.clientY))
 }
-// 幂等：拖拽中切标签/丢 mouseup 时也要能安全重复调用，避免 window 上残留监听。
+// 幂等：拖拽中切标签/丢 mouseup/窗口失焦时都要能安全重复调用，避免 window 上残留监听。
 function onSplitterUp() {
   splitterStart = null
   window.removeEventListener('mousemove', onSplitterMove)
   window.removeEventListener('mouseup', onSplitterUp)
+  window.removeEventListener('blur', onSplitterUp)
 }
 function onSplitterKey(ev) {
-  // Shift+↑/↓ 是「文件选择区间扩展」的键位（Task 2）：焦点在分隔条上时不要抢，直接让给全局处理
+  // Shift+↑/↓ 名义上是「文件选择区间扩展」的键位（Task 2），但焦点在分隔条上时
+  // keys.js 的 isEditableTarget 会因 [role="separator"] 守卫让 actionFor 返回 null，
+  // 全局永远收不到这个动作 —— 所以这里是完全 no-op（不是「让给全局」），
+  // 目的是避免 resize 与区间扩展在同一次按键上互相打架（㉕）。
   if (ev.shiftKey) return
   if (ev.key === 'ArrowUp') { logHeight.value = clampLogHeight(logHeight.value + 16); ev.preventDefault() }
   else if (ev.key === 'ArrowDown') { logHeight.value = clampLogHeight(logHeight.value - 16); ev.preventDefault() }
