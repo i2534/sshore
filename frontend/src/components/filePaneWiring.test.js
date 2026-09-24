@@ -52,3 +52,37 @@ describe('「..」行与普通目录行统一', () => {
   })
 })
 
+describe('位置弹层', () => {
+  it('不再用原生 select，改用分区弹层 + 纯函数分组', () => {
+    expect(filePane).not.toMatch(/<select class="pos"/)
+    expect(filePane).toContain("from '../utils/positions'")
+    expect(filePane).toContain('positionGroups(')
+    expect(filePane).toContain('data-role="position"')
+  })
+
+  it('对外契约不变：仍是 emit(pick-position, path)，且旧 onPick 已删', () => {
+    expect(filePane).toContain("emit('pick-position'")
+    expect(filePane).not.toContain('onPick($event)')
+  })
+
+  it('弹层显式左对齐（全局 html{text-align:center} 会把它带歪）', () => {
+    expect(filePane).toMatch(/\.posmenu\s*\{[^}]*text-align:\s*left/)
+  })
+
+  // 钉住"弹层不能被 .pane 的 overflow:hidden 裁掉"：absolute 版在默认窗口下就被裁，
+  // 回归时只表现为"展开全部后看不到最后几行"，没有这几条断言会静默通过。
+  it('弹层用 position:fixed + 现算锚点（absolute 会被 .pane{overflow:hidden} 裁掉）', () => {
+    expect(filePane).toMatch(/\.posmenu\s*\{[^}]*position:\s*fixed/)
+    expect(filePane).toMatch(/\.posmenu\s*\{[^}]*box-sizing:\s*border-box/)
+    expect(filePane).toContain('getBoundingClientRect()')
+    expect(filePane).toContain('r.right - POS_MENU_WIDTH') // 锚点与宽度必须同源
+    expect(filePane).toContain("width: POS_MENU_WIDTH + 'px'")
+  })
+
+  it('点面板内非弹层区域收起弹层（焦点会落到 .pane 自身，focusout 判不出"离开"）', () => {
+    expect(filePane).toContain('@mousedown="onPaneMouseDown"')
+    expect(filePane).toMatch(/function onPaneMouseDown\(e\)\s*\{[^}]*closest\('\.pos-wrap'\)/)
+  })
+})
+
+
