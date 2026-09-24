@@ -2,17 +2,18 @@
 
 - 仓库：/home/lan/workspace/scripts/sshkit
 - 分支：feat/sftp-pane-ux-polish ｜ 验收时 HEAD：c9225cb（`v0.7.1-6-gc9225cb`）
-- 验收时间：2026-09-24 19:05 ~ 19:20 CST（本机 `date` 输出）；fix round 1 重拍：2026-09-24 19:29 ~ 19:37 CST（同一夹具）
+- 验收时间：2026-09-24 19:05 ~ 19:20 CST（本机 `date` 输出）；fix round 1 重拍：2026-09-24 19:29 ~ 19:37 CST（同一夹具）；**final fix wave 真机复检：19:48 ~ 19:51 CST**（独立夹具 /tmp/sshkit-fixwave，同一 Xvfb :99 + 真实 GTK/WebKit + XTEST 配方）
 - fix round 1 时 HEAD：823656d（只改本报告，未改源码）
-- 性质：**验证与取证**。本任务刻意不改任何源码；首次提交只含本报告，fix round 1 也只改本报告（未改任何源码）。
-- 截图目录：/tmp/sshkit-t5/shots/（**在 /tmp，未提交进仓库**）
-- 驱动脚本：/tmp/sshkit-t5/xdrive.py（XTEST）、/tmp/sshkit-t5/gui.sh（窗口操作封装）、/tmp/sshkit-t5/xsendevent.py（对照实验）
+- **final fix wave 代码 HEAD：beda9cb（基于 b41bb95）**；本轮是整支分支的唯一修复波，**改了源码**（I1/I2 + Minor 4/5/6），故判据 1 补子项、判据 8 更新；验收任务本身的「不改源码」只适用于首次提交与 fix round 1。
+- 性质：**验证与取证**（首次提交与 fix round 1 只改本报告，未改任何源码；final fix wave 另见上）。
+- 截图目录：/tmp/sshkit-t5/shots/（首次验收与 fix round 1）、**/tmp/sshkit-fixwave/shots/（final fix wave）**（均在 /tmp，未提交进仓库）
+- 驱动脚本：/tmp/sshkit-t5/xdrive.py（XTEST）、/tmp/sshkit-t5/gui.sh（窗口操作封装）、/tmp/sshkit-t5/xsendevent.py（对照实验）；final fix wave 复用同一套脚本
 
 ## 0. 结论摘要
 
-| # | 判据 | 结论 | 关键证据（/tmp/sshkit-t5/shots/） |
+| # | 判据 | 结论 | 关键证据（默认 /tmp/sshkit-t5/shots/） |
 |---|---|---|---|
-| 1 | 单击「..」不跳转；双击「..」跳上级 | **通过** | 08、09（单击）；10（双击） |
+| 1 | 单击「..」不跳转；双击「..」跳上级；随后点列表空白 / 按 Esc 均清除「..」高亮（final fix wave 补测） | **通过** | 08、09（单击）；10（双击）；final fix wave（/tmp/sshkit-fixwave/shots/）：14→15（Esc 清除）、16→17（空白清除）、montage-up-row.png、montage-head.png |
 | 2 | 本地路径栏输入不存在路径：错误入日志 + 路径与列表整体回滚 | **通过** | 13、14 |
 | 3 | 远端路径栏输入 `~`；位置弹层点「主目录」——两条入口都跳远端 home；**未连接时也不得静默无反应** | **通过** | 已连接：15、16、17、21；未连接输入 `~` 回车：70、71、72；未连接点「主目录」：84、85 |
 | 4 | >8 条最近：每区 ≤8 行 +「展开全部 N」；展开后能滚到最后一行且整行可见 | **通过** | 26、27、28 |
@@ -22,6 +23,8 @@
 | 8 | 中文输入法回车确认候选不得触发跳转 | **未验证** | 环境无可用的活中文输入法，见「判据 8」 |
 
 **分布：8 条中 7 条通过 / 0 条部分通过 / 1 条未验证（判据 8：环境无可用的活中文输入法）。未发现产品缺陷。**
+
+> **final fix wave（2026-09-24 19:48~19:51，HEAD beda9cb）**：判据 1 补测「单击「..」后点列表空白 / 按 Esc 会留下 stale 高亮」子项，真机复检**通过**（判据 1 保持通过）；判据 8 的守卫由 keyup 改为 keydown 并补了单测，但**真实 IME 会话仍无法构造，保持未验证**。分布因此仍为 **7 通过 / 0 部分通过 / 1 未验证**。
 
 > **fix round 1 订正**：首次提交的判据 7 证据（35/38/39/43 等）前置帧里弹层并未打开、不具判别力，已全部重拍为「弹层可见 → 点击后消失」；判据 3 补上了 brief 明列的「未连接时输入 `~` 不得静默无反应」分支；「未触碰用户数据」的表述按 §6 据实改为「只读枚举了真实 home 的目录名」。重拍过程与命令见 `.superpowers/sdd/2026-09-20-sftp-pane-ux-polish/task-5-report.md` 的 fix round 1 附录。
 
@@ -137,6 +140,18 @@ XTEST 事件被 grab 持有者消费，`xev` 收不到任何 ButtonPress/KeyPres
 - 单击「..」行（窗口坐标 250,152）：截图 **09** —— 「..」行高亮（蓝色 + 左侧 accent 条）、「已选 0 项」（原选中被取消）、路径栏与列表**完全未变**（仍是 sshkit 仓库列表 17 项）。判定：未跳转 ✔。
 - 双击「..」：截图 **10** —— 列表由仓库内容（17 项）变为 `/home/lan/workspace/scripts` 的内容（27 项：12306/comet/crack/crons/dsh/edu/golden/jsapi/knowledge/lz/mumu/my-agent/opencode/prompt/quark…），路径栏前缀同步为 `/home/lan/workspace/script…`。判定：跳上级 ✔。
 
+**final fix wave 补测（I1：清空选中必须同时复位「..」高亮）—— 通过**
+
+背景：单击「..」时先置 `upActive=true` 再 `emit('clear')`；此后 `selKeys.length` 恒为 0，`watch(() => props.selKeys.length, n => { if (n) ... })` 的 n→0 守卫不触发，因此「点列表空白 / 按 Esc」这两条清空路径必须自己复位 `upActive`，否则「..」行会留下与「已选 0 项」矛盾的假高亮。
+
+- 夹具：/tmp/sshkit-fixwave（Xvfb :99 + 真实 GTK/WebKit + XTEST；只测本地 pane，无需远端，故未起 sshd）。截图目录 /tmp/sshkit-fixwave/shots/。
+- 前置态：点本地「..」→ 截图 `07-local-up-before-blank.png` / `14-up-esc-before.png`：「..」行有左侧 accent 条 + 蓝色文字（`.sel`），头部「已选 0 项」；up 行背景取样 (300,152) = `#E8EDF4`（`--surface-hover`）。
+- 点本地列表空白（先把列表用过滤框收成一行以露出空白）→ 截图 `08-local-blank-after.png` / `17-up-blank-after.png`：accent 条与蓝字消失，头部仍「已选 0 项」；背景 → `#F6F8FB`。
+- 再点「..」后按 Esc → 截图 `15-up-esc-after.png`：同样清除（`#E8EDF4` → `#F6F8FB`）。
+- 放大对照 `montage-up-row.png`（自上而下 = 14 前 / 15 后 / 16 前 / 17 后）：第 1、3 行有 accent 条与蓝字，第 2、4 行没有；头部条带 `montage-head.png` 四帧都显示「已选 0 项」。
+- 像素判据：up 行区域（470x26+148+140）`compare -metric AE`：`14→15 = 10122`、`16→17 = 10070`。
+- 方法学订正：首轮 `09→10`（Esc）取样时把指针留在「..」行上，`:hover` 背景与 `.sel` 背景同为 `#E8EDF4`，不具判别力（会误判为「Esc 没清掉」）；`14~17` 每次截图前把指针移到 (900,650)，才是有效证据。`09-local-up-before-esc.png` / `10-local-esc-after.png` 作废留档。
+
 ### 判据 2：本地路径栏输入不存在路径 → 错误入日志 + 整体回滚 —— 通过
 
 - 清空路径栏后输入 `/no/such/dir-task5`：截图 **13**（输入框完整显示该字符串，列表保持不变）。
@@ -221,8 +236,12 @@ XTEST 事件被 grab 持有者消费，`xev` 收不到任何 ButtonPress/KeyPres
 
 - fcitx5 与中文拼音引擎**已安装但未运行**；桌面上的 `ibus-daemon` 属于 :1 会话，与验收所用的 :99 隔离显示无关。
 - 在 :99 上启用 fcitx5 需要额外的 DBus 会话 + 输入法激活，并且要真的构造出「preedit 中按 Enter 确认候选」这一状态才能判定 `e.isComposing`；本次未建立该回路，因此**不给出任何结论**。
-- 代码层事实（只读核对，非实测）：`frontend/src/components/FilePane.vue:35` 有显式守卫 `if (e && e.isComposing) return`；前端仓库里 `grep -rn isComposing frontend/src` 只有这一处，**没有对应单测**。
-- 建议：由控制者决定是补一条针对 `commitPath` 的 `isComposing` 单测，还是在装有活中文输入法的桌面上做一次人工验证。
+- **final fix wave 订正（代码层 + 单测，非真机 IME 实测）**：原守卫挂在 `@keyup.enter` 且只查 `e.isComposing`——按规范 `isComposing` 只在 compositionstart→compositionend 之间为真，而 WebKit/Firefox/Safari 会在 compositionend 之后仍发 keyup（此时 `isComposing=false`），所以在 Linux/WebKitGTK 目标上守卫会被绕过。现改为：
+  - 触发点由 `@keyup.enter` 改为 `@keydown.enter`（**删除旧 keyup，二者并存会让一次 Enter 提交两次**）；
+  - 判定抽成纯函数 `frontend/src/utils/pathbar.js` 的 `isImeCommit(ev)`（`ev.isComposing === true || ev.keyCode === 229`），`commitPath` 调它；
+  - 单测 `frontend/src/utils/pathbar.test.js` 的 `isImeCommit` 组 4 例：组合态 `isComposing=true` → true、`keyCode=229` → true、普通回车 → false、事件缺失 → false；全绿。
+  - 接线不变量 `frontend/src/components/filePaneWiring.test.js` 同步断言 `@keydown.enter="commitPath"`、不再含 `@keyup.enter`、含 `isImeCommit(`。
+- **仍然未验证**（保持判据 8 未验证，不因上述单测升级为通过）：本轮没有在活的 fcitx5/ibus 中文输入法会话里构造「preedit 中按 Enter 确认候选」，因此「WebKitGTK 组合态下 keydown 的 `isComposing` 确为 true / keyCode 为 229」这一前提未在真机 IME 上实测；单测只钉住纯函数的判定边界，不覆盖浏览器事件时序。
 
 
 ## 4. 过程观察（非缺陷结论）
@@ -233,7 +252,7 @@ XTEST 事件被 grab 持有者消费，`xev` 收不到任何 ButtonPress/KeyPres
 
 触发该草稿态的具体事件序列尚未定位（脚本注入的点击/焦点切换是嫌疑），故仅按「疑似草稿≠已提交路径（可自愈）」记录，不作为缺陷上报。若控制者要追，建议在真实鼠标操作下按「点路径栏 → 失焦」顺序复核，并优先用 DOM 层断言而不是截图裁剪来判定。
 
-## 5. 截图清单（全部在 /tmp/sshkit-t5/shots/，未提交进仓库）
+## 5. 截图清单（首次验收与 fix round 1 在 /tmp/sshkit-t5/shots/，final fix wave 在 /tmp/sshkit-fixwave/shots/；均未提交进仓库）
 
 ### 5.1 fix round 1 重拍（本轮新增，判据 3/7 与 §4 的正证据）
 
@@ -298,9 +317,26 @@ XTEST 事件被 grab 持有者消费，`xev` 收不到任何 ButtonPress/KeyPres
 
 > 全部 100+ 个文件都在 /tmp/sshkit-t5/shots/（含上述各文件与 zoom-* 放大派生帧）；未提交进仓库。正文引用的文件均已在上表中列出。
 
+### 5.5 final fix wave 复检（/tmp/sshkit-fixwave/shots/，2026-09-24 19:48~19:51，HEAD beda9cb）
+
+| 文件 | 内容 |
+|---|---|
+| 01-sftp-tab.png | 应用启动并切到 SFTP 页（隔离 HOME，本地 pane 显示仓库 17 项；窗口标题 SSHore v0.7.1-8-gb41bb95） |
+| 02-local-selected.png | 判据1 前置：选中本地 app.go（已选 1 项） |
+| 03-local-up-single.png | 单击本地「..」→ 高亮、已选 0 项、未跳转、路径未变 |
+| 04-remote-up-single.png / 05-remote-blank-after.png | 远端 pane 的「..」单击 → 点远端列表空白后远端高亮清除（对照组） |
+| 06-local-filtered.png | 用过滤框把本地列表收成 1 行，露出可用空白区（为空白点击做准备） |
+| 07-local-up-before-blank.png / 08-local-blank-after.png | **判据1 子项**：点空白前高亮 → 点空白后清除 |
+| 09-local-up-before-esc.png / 10-local-esc-after.png | **作废留档**：指针留在「..」行，`:hover` 与 `.sel` 同色，不具判别力 |
+| 14-up-esc-before.png / 15-up-esc-after.png | **判据1 子项（Esc，有效证据）**：指针移开后 前=高亮 / 后=清除 |
+| 16-up-blank-before.png / 17-up-blank-after.png | **判据1 子项（空白，有效证据，指针移开）**：前=高亮 / 后=清除 |
+| montage-up-row.png | 14/15/16/17 的「..」行放大纵向拼接（带红边框）：1、3 有 accent 条与蓝字；2、4 没有 |
+| montage-head.png | 14/15/16/17 的本地面板头放大拼接：四帧均为「已选 0 项」 |
+| 11-posmenu-open.png / 12-posmenu-after-esc.png / 13-posmenu-after-esc-xfocus.png | 判别实验：位置弹层打开 → Esc 关闭，证明 Esc keydown 确实到达 FilePane（弹层取样点 (200,150) 由 #FFFFFF → #F6F8FB） |
+
 ## 6. 清理与数据边界
 
-- **进程/临时数据清理**：首次验收结束时清理了 sshd（pid 见 /tmp/sshkit-t5/sshd.pid）、应用（/tmp/sshkit-t5/app99.pid）、Xvfb :99（/tmp/sshkit-t5/xvfb.pid）、临时 HOME 与垫片；fix round 1 复用了同一夹具，结束后同样清理。
+- **进程/临时数据清理**：首次验收结束时清理了 sshd（pid 见 /tmp/sshkit-t5/sshd.pid）、应用（/tmp/sshkit-t5/app99.pid）、Xvfb :99（/tmp/sshkit-t5/xvfb.pid）、临时 HOME 与垫片；fix round 1 复用了同一夹具，结束后同样清理。final fix wave 用独立夹具 /tmp/sshkit-fixwave（Xvfb :99 + 应用，隔离 HOME；**只测本地 pane，未起 sshd、未连远端**），结束时按 pid 文件 kill 应用与 Xvfb 并删除临时 HOME，仅保留截图与日志；`make build` 重写的 frontend/dist 与 build/bin 均被 .gitignore 忽略。
 - **数据边界（据实订正）**：本地侧是隔离的（临时 `$HOME` + PATH 垫片，**未读写**用户真实 `~/.ssh/config`，也未覆盖任何既有 exe/脚本/配置）。但**远端不是隔离环境**：sshd 以当前用户身份运行，`~` 解析为**真实家目录** `/home/lan`；判据 6 的 `*` 深搜就是在 `t5host : /home/lan` 下**只读递归枚举真实目录名**（截图 34 命中了 `.ssh`、`.pki`、`.keys`、`workspace`、`.copilot`、`.gitconfig` 等真实条目）。整个过程只走 `ReadDir/ListMany`（枚举 + 读元数据），**没有任何写入、改名或删除**；但「未触碰用户数据」的说法不成立——准确表述是「**只读枚举了真实 home 的目录名**」。
 - **已知限制 / 后续改进**：真机验收的远端应换成**专用用户或 chroot/容器**（把家目录指到临时目录），避免递归遍历真实 home。本轮未做，因此凡依赖「远端 home 内容」的判据（判据 3/6）其证据都带有「真实 home、只读」的限定。
 - 日志证据保留在 /tmp/task5-make-ci.log、/tmp/task5-make-build.log、/tmp/sshkit-t5/app99.log、/tmp/sshkit-t5/sshd.log。
