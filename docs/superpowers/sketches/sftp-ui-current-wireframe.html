@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>SSHore SFTP 现状草图 v0.7.2</title>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; padding: 18px; width: 1120px; background: #ffffff;
+  font-family: "Noto Sans CJK SC","Microsoft YaHei UI",sans-serif; color: #0f172a; }
+h1 { font-size: 19px; margin: 0 0 2px; }
+.sub { font-size: 12px; color: #475569; margin: 0 0 14px; }
+h2 { font-size: 15px; margin: 24px 0 8px; }
+.cap { font-size: 12px; color: #475569; margin: 6px 0 0; }
+.mark { position: relative; }
+.badge { position: absolute; left: -13px; top: -13px; z-index: 9; width: 22px; height: 22px; border-radius: 50%;
+  background: #e11d48; color: #fff; font-size: 13px; font-weight: 700; line-height: 22px; text-align: center;
+  box-shadow: 0 0 0 2px #ffffff; }
+.win { width: 1044px; border: 1px solid #94a3b8; border-radius: 8px; overflow: hidden; background: #eef2f7;
+  color: #1e293b; font-size: 11px; text-align: left; }
+.titlebar { height: 30px; background: #dbe3ee; border-bottom: 1px solid #cbd5e1; display: flex; align-items: center;
+  padding: 0 10px; gap: 8px; font-size: 12px; }
+.tb-right { margin-left: auto; color: #475569; letter-spacing: 4px; }
+.app { display: flex; height: 660px; }
+.sidebar { width: 140px; border-right: 1px solid #cbd5e1; padding-top: 8px; display: flex; flex-direction: column; }
+.sidebar .nav { padding: 12px 16px; color: #475569; }
+.sidebar .nav.active { background: #e8edf4; color: #1e293b; border-left: 3px solid #2563eb; }
+.sidebar .settings { margin-top: auto; border-top: 1px solid #cbd5e1; padding: 12px 16px; color: #475569; }
+.workspace { flex: 1; padding: 12px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.toolbar { display: flex; gap: 8px; align-items: center; flex: none; }
+.ctl { background: #f6f8fb; border: 1px solid #cbd5e1; border-radius: 6px; padding: 3px 9px; }
+.ctl.dim { color: #475569; }
+.panes { display: flex; gap: 8px; flex: 1; min-height: 0; }
+.pane { flex: 1; display: flex; flex-direction: column; border: 1px solid #cbd5e1; border-radius: 8px;
+  background: #f6f8fb; min-width: 0; overflow: hidden; }
+.head { display: flex; align-items: center; gap: 5px; padding: 6px 8px; color: #475569; font-weight: 600; }
+.curpath { flex: 1; min-width: 0; font-size: 11px; font-weight: 400; color: #94a3b8; border: 1px solid #cbd5e1;
+  border-radius: 3px; padding: 3px 6px; margin: 0 6px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.btn { border: 1px solid #cbd5e1; border-radius: 6px; padding: 3px 7px; background: #f6f8fb; font-size: 11px;
+  color: #1e293b; white-space: nowrap; }
+.cnt { font-weight: 400; font-size: 11px; color: #94a3b8; white-space: nowrap; }
+.columns { display: flex; align-items: stretch; padding: 4px 8px; font-size: 11px; color: #94a3b8;
+  border-bottom: 1px solid #cbd5e1; height: 49px; }
+.columns .active { color: #2563eb; }
+.columns .c-name { flex: 1; overflow: hidden; padding-right: 16px; line-height: 1.25; }
+.filter { width: 110px; font-size: 11px; border: 1px solid #cbd5e1; border-radius: 6px; background: #ffffff;
+  color: #1e293b; padding: 3px 6px; height: 44px; }
+.filter::placeholder { color: #94a3b8; }
+.list { flex: 1; overflow: hidden; font-family: monospace; font-size: 13px; }
+.row { display: flex; align-items: center; padding: 4px 8px; white-space: nowrap; }
+.row.up { color: #475569; border-bottom: 1px solid #cbd5e1; }
+.c-name { flex: 1; overflow: hidden; text-overflow: ellipsis; padding-right: 16px; }
+.c-size { width: 88px; text-align: right; padding-right: 16px; color: #475569; }
+.c-time { width: 140px; text-align: right; color: #94a3b8; }
+.scroll { width: 12px; background: #e8edf4; border-left: 1px solid #cbd5e1; }
+.queue { border-top: 1px solid #cbd5e1; font-family: monospace; font-size: 12px; color: #475569;
+  padding: 3px 8px; flex: none; }
+.logpane { height: 140px; flex: none; border: 1px solid #cbd5e1; background: #f6f8fb; border-radius: 8px; padding: 12px;
+  display: flex; flex-direction: column; gap: 6px; }
+.logbar { display: flex; gap: 8px; }
+.logbar .filter { flex: 1; width: auto; height: auto; }
+.loglines { flex: 1; overflow: hidden; font-family: monospace; font-size: 12px; color: #475569; }
+.cards { display: flex; gap: 14px; flex-wrap: wrap; }
+.card { width: 336px; background: #f6f8fb; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; font-size: 11px; }
+.card .cap2 { color: #475569; font-size: 11px; margin-bottom: 6px; }
+.mini { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 4px; padding: 4px; width: 260px; text-align: left; }
+.mini .lbl { display: flex; justify-content: space-between; padding: 4px 6px 2px; color: #94a3b8; font-size: 11px; }
+.mini .it { padding: 4px 8px; font-size: 12px; }
+.mini .it.sel { background: #e8edf4; }
+.menu { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 4px; padding: 3px 0; width: 180px; }
+.menu div { padding: 4px 10px; font-size: 12px; }
+.menu .sep { border-top: 1px solid #cbd5e1; margin-top: 3px; padding-top: 6px; }
+.dlg { background: #ffffff; border: 1px solid #94a3b8; border-radius: 8px; width: 300px; padding: 14px; }
+.dlg .t { font-weight: 600; margin-bottom: 8px; }
+.dlg .f { background: #ffffff; border: 1px solid #2563eb; border-radius: 6px; padding: 4px 8px; margin-bottom: 10px; }
+.dlg .b { display: flex; gap: 8px; justify-content: flex-end; }
+img.shot { display: block; border: 1px solid #94a3b8; border-radius: 4px; }
+table { border-collapse: collapse; width: 1084px; font-size: 12px; }
+th, td { border: 1px solid #cbd5e1; padding: 5px 7px; text-align: left; vertical-align: top; }
+th { background: #e8edf4; }
+td.n { width: 34px; text-align: center; font-weight: 700; color: #e11d48; }
+td.loc { font-family: monospace; font-size: 11px; color: #334155; width: 200px; }
+td.area { width: 140px; font-weight: 600; }
+ol { font-size: 12.5px; line-height: 1.75; margin: 6px 0 0 -8px; }
+code { font-family: monospace; background: #e8edf4; padding: 0 3px; border-radius: 3px; }
+.note { font-size: 12px; color: #475569; margin-top: 6px; }
+.hint { background: #fff7ed; border: 1px solid #fdba74; border-radius: 6px; padding: 8px 10px; font-size: 12.5px;
+  color: #7c2d12; margin: 10px 0 0; }
+</style></head>
+<body>
+<h1>SSHore · SFTP 界面现状草图</h1>
+<p class="sub">基线 <b>v0.7.2</b>（master <code>494978f</code>，就是已发布的 exe）｜实拍图为浅色主题（该环境系统主题为浅色，深色主题结构完全相同、只是配色不同）｜编号 ①②… 在实拍图、线框图、对照表三处一一对应</p>
+
+<h2>① 实拍标注（发布产物 v0.7.2 真机运行，1044×720）</h2>
+<img class="shot" src="sftp-ui-current-live-annotated.png" width="1044" height="720" alt="v0.7.2 SFTP 实拍标注" />
+<p class="cap">红色框＝区域边界，红圈数字＝编号。此图取自 0.7.2 的 Windows 真机冒烟测试（<code>/tmp/rel072-shots/00-sftp.png</code> 原图另存为 <code>sftp-ui-current-live.png</code>）。</p>
+
+<h2>② 线框草图（同编号；未连接状态的初始界面）</h2>
+<div class="win">
+  <div class="titlebar"><span>▣ SSHore v0.7.2</span><span class="tb-right">— ▢ ✕</span></div>
+  <div class="app">
+    <div class="mark sidebar"><span class="badge">6</span>
+      <div class="nav">端口转发</div>
+      <div class="nav">文件同步</div>
+      <div class="nav active">SFTP</div>
+      <div class="settings">⚙ 设置</div>
+    </div>
+    <div class="workspace">
+      <div class="mark toolbar"><span class="badge">1</span>
+        <span class="ctl">winlocal ▾</span>
+        <span class="ctl">🔌 连接</span>
+        <span class="ctl">刷新</span>
+        <span class="ctl dim">☐ 显示隐藏文件</span>
+      </div>
+      <div class="panes">
+        <div class="mark pane"><span class="badge">2</span>
+          <div class="head">
+            <span>本地</span>
+            <span class="curpath">C:\Users\lan</span>
+            <span class="btn">📍 位置 ▾</span>
+            <span class="btn">☆</span>
+            <span class="btn">🔍</span>
+            <span class="cnt">84 项</span>
+            <span class="btn">已选 0 项 ▾</span>
+          </div>
+          <div class="mark columns"><span class="badge">3</span>
+            <span class="c-name">名<br/>称<br/>▲</span><span class="c-size">大小</span><span class="c-time">修改时间</span>
+            <input class="filter" placeholder="过滤…" />
+          </div>
+          <div style="display:flex; flex:1; min-height:0;">
+            <div class="list">
+              <div class="row up"><span class="c-name">📁 ..</span><span class="c-size">—</span><span class="c-time">—</span></div>
+              <div class="row"><span class="c-name">📁 「开始」菜单</span><span class="c-size">—</span><span class="c-time">2026-08-31 10:46</span></div>
+              <div class="row"><span class="c-name">📁 AppData</span><span class="c-size">—</span><span class="c-time">2026-08-31 10:46</span></div>
+              <div class="row"><span class="c-name">📁 Application Data</span><span class="c-size">—</span><span class="c-time">2026-08-31 10:46</span></div>
+              <div class="row"><span class="c-name">📁 bin</span><span class="c-size">—</span><span class="c-time">2026-09-19 09:26</span></div>
+              <div class="row"><span class="c-name">📁 data</span><span class="c-size">—</span><span class="c-time">2026-09-24 15:40</span></div>
+              <div class="row"><span class="c-name">📄 dbg.test.exe</span><span class="c-size">8.2 MB</span><span class="c-time">2026-09-18 22:56</span></div>
+              <div class="row"><span class="c-name">📁 Desktop</span><span class="c-size">—</span><span class="c-time">2026-09-16 19:43</span></div>
+              <div class="row"><span class="c-name">📁 Documents</span><span class="c-size">—</span><span class="c-time">2026-08-31 10:48</span></div>
+            </div>
+            <div class="scroll"></div>
+          </div>
+        </div>
+        <div class="mark pane"><span class="badge">4</span>
+          <div class="head">
+            <span>远程</span>
+            <span class="curpath">/</span>
+            <span class="btn">📍 位置 ▾</span>
+            <span class="btn">☆</span>
+            <span class="btn">🔍</span>
+            <span class="cnt">0 项</span>
+            <span class="btn">已选 0 项 ▾</span>
+          </div>
+          <div class="columns">
+            <span class="c-name">名<br/>称<br/>▲</span><span class="c-size">大小</span><span class="c-time">修改时间</span>
+            <input class="filter" placeholder="过滤…" />
+          </div>
+          <div style="display:flex; flex:1; min-height:0;">
+            <div class="list">
+              <div class="row up"><span class="c-name">📁 ..</span><span class="c-size">—</span><span class="c-time">—</span></div>
+            </div>
+            <div class="scroll"></div>
+          </div>
+        </div>
+      </div>
+      <div class="mark queue"><span class="badge">5</span>无传输任务</div>
+      <div class="mark logpane"><span class="badge">7</span>
+        <div class="logbar">
+          <input class="filter" placeholder="filter source_id (规则名/主机)" />
+          <span class="ctl">全部 ▾</span>
+          <span class="ctl">清空</span>
+        </div>
+        <div class="loglines">2026-09-24 19:11:28 [INFO] sftp transport=gosftp</div>
+      </div>
+    </div>
+  </div>
+</div>
+<p class="cap">③ 行是我按实拍 1:1 复刻的：窗口 1044px 宽时「名称 ▲」被挤成 3 行、同时「过滤…」框被拉伸到约 44px 高——这两个都是实测现象，不是画错。<br/>
+尺寸实测：侧栏 140px／工作区 padding 12px／面板间距 8px／列宽 大小 88px、修改时间 140px／过滤框 110px／日志面板 140px（外框 534→699）／传输队列上限 140px。</p>
+
+<h2>③ 点开后才出现的浮层（同一编号体系）</h2>
+<div class="cards">
+  <div class="card mark"><span class="badge">8</span>
+    <div class="cap2">位置弹层 posmenu —— <code>position: fixed</code>，宽 260px，<code>max-height: 60vh</code></div>
+    <div class="mini">
+      <div class="lbl" style="padding-left:4px"><input class="filter" style="width:100%;height:auto" placeholder="筛选位置…" /></div>
+      <div class="lbl"><span>Z: / 预设</span></div>
+      <div class="it">Z:\</div>
+      <div class="lbl"><span>最近</span><span style="color:#2563eb">收起</span></div>
+      <div class="it">C:\Users\lan</div>
+      <div class="it sel">C:\Users\lan\Desktop</div>
+      <div class="lbl"><span>盘符</span></div>
+      <div class="it">C:\  D:\</div>
+      <div class="lbl"><span>收藏</span></div>
+      <div class="it">C:\sshore</div>
+    </div>
+  </div>
+  <div class="card mark"><span class="badge">9</span>
+    <div class="cap2">批量动作菜单 bmenu —— 点「已选 N 项 ▾」展开，右对齐</div>
+    <div class="menu">
+      <div>⬇ 下载…</div>
+      <div class="sep">🗑 删除</div>
+      <div>📁 新建文件夹</div>
+    </div>
+  </div>
+  <div class="card mark"><span class="badge">10</span>
+    <div class="cap2">右键菜单 ContextMenu —— 两个面板条目不同（远程“上传…”，本地“上传到远程”）</div>
+    <div class="menu">
+      <div>⬇ 下载…</div>
+      <div>⬆ 上传…</div>
+      <div>✏ 重命名</div>
+      <div class="sep">🗑 删除</div>
+      <div>📁 新建文件夹</div>
+    </div>
+  </div>
+  <div class="card mark"><span class="badge">11</span>
+    <div class="cap2">深搜浮层 SearchOverlay —— 宽 640px，命中列表 <code>max-height: 46vh</code>，上限 500 条</div>
+    <div class="mini" style="width:300px">
+      <div class="lbl"><span style="color:#1e293b;font-weight:600">递归深搜：远程 /home/lan</span><span>关闭</span></div>
+      <div style="display:flex;gap:6px;padding:4px"><input class="filter" style="flex:1;width:auto;height:auto" placeholder="名称匹配（支持 * ?）" /><span class="btn">搜索</span></div>
+      <div style="padding:0 6px;color:#94a3b8">命中 3 项</div>
+      <div class="it">📄 /home/lan/a.log</div>
+      <div class="it">📁 /home/lan/docs</div>
+    </div>
+  </div>
+  <div class="card mark"><span class="badge">12</span>
+    <div class="cap2">对话框 AppDialog / ConflictDialog —— 重命名、新建文件夹、移动冲突确认</div>
+    <div class="dlg">
+      <div class="t">重命名</div>
+      <div class="f">新名称…</div>
+      <div class="b"><span class="btn">取消</span><span class="btn">确定</span></div>
+    </div>
+  </div>
+</div>
+
+<h2>④ 编号对照表</h2>
+<table>
+<tr><th>#</th><th>区域</th><th>当前表现（v0.7.2 实测）</th><th>代码位置</th></tr>
+<tr><td class="n">1</td><td class="area">顶部工具条</td><td>主机下拉 + 连接/断开 + 刷新 + ☐显示隐藏文件，四项平铺一行，没有分组、没有连接状态指示；未连接时“刷新”灰置。</td><td class="loc">SftpView.vue:942-952</td></tr>
+<tr><td class="n">2</td><td class="area">面板头（本地/远程各一份）</td><td>一行塞 7 个元素：标题 + 可编辑路径框 + 📍位置 + ☆ + 🔍 + “N 项” + “已选 N 项 ▾”；1044px 窗口里路径框只剩约 150px，长路径被截断（远程显示 <code>/</code> 时几乎空一条）。</td><td class="loc">FilePane.vue:184-219</td></tr>
+<tr><td class="n">3</td><td class="area">列头 + 过滤框</td><td>「名称 ▲ / 大小 / 修改时间」与 110px 的「过滤…」同处一行；实测「名称 ▲」被挤成 3 行、过滤框被拉伸成 ~44px 高，两者把行高撑到 49px。</td><td class="loc">FilePane.vue:221-226, 287</td></tr>
+<tr><td class="n">4</td><td class="area">远程面板</td><td>与本地同构；未连接时路径框、位置、收藏、深搜按钮照样显示（各自有“无主机”分支），操作后才给反馈。</td><td class="loc">SftpView.vue:968-979</td></tr>
+<tr><td class="n">5</td><td class="area">传输队列</td><td>空态一行灰字「无传输任务」；有任务时每行＝名称 · 大小|耗时|速度|ETA · 状态 · 备注 · 取消/重试/续传/清理 + 3px 进度条，底部一行汇总 + “复制失败清单”。</td><td class="loc">TransferQueue.vue:62-91（<code>:94</code> 上限 140px）</td></tr>
+<tr><td class="n">6</td><td class="area">左侧导航</td><td>端口转发 / 文件同步 / SFTP（当前项左蓝条）/ ⚙设置（吸底＋更新徽标），固定 140px。</td><td class="loc">App.vue:81-101, 105</td></tr>
+<tr><td class="n">7</td><td class="area">日志面板</td><td>固定 140px 高、不会随窗口长高：来源 chips 行（仅有来源分组时出现）+ 过滤栏（filter 输入 + 级别下拉 + 清空）+ 日志行。</td><td class="loc">SftpView.vue:983, 1029；LogPanel.vue:69-99</td></tr>
+<tr><td class="n">8</td><td class="area">位置弹层</td><td>点 📍位置 后 <code>fixed</code> 弹出（宽 260px、≤60vh）：筛选框 + 预设/盘符 + 最近 + 收藏 分段，每段超 8 行出现「展开全部 N / 收起」。弹层会盖住左面板的路径框与列表，长路径还会出现横向滚动条。</td><td class="loc">FilePane.vue:193-207, 269-275；utils/positions.js</td></tr>
+<tr><td class="n">9</td><td class="area">批量动作菜单</td><td>「已选 N 项 ▾」在动作列表非空时恒显示（0 选中也显示）；菜单绝对定位、右对齐，最宽 160px。</td><td class="loc">FilePane.vue:211-218, 279-282</td></tr>
+<tr><td class="n">10</td><td class="area">右键菜单</td><td>跟随鼠标 fixed 定位；两面板条目不同，删除项带分隔线。</td><td class="loc">SftpView.vue:985-999；ContextMenu.vue</td></tr>
+<tr><td class="n">11</td><td class="area">深搜浮层</td><td>居中模态（遮罩 0.5 黑）：搜索框 + 「命中 N 项」说明行 + 命中列表（名/大小/时间）；空模式只提示、不发起搜索。</td><td class="loc">SearchOverlay.vue:105-134, 137, 144</td></tr>
+<tr><td class="n">12</td><td class="area">对话框</td><td>重命名 / 新建文件夹 / 冲突确认，居中模态；遮罩 z-index 2000，浮层 1000 在其之下。</td><td class="loc">AppDialog.vue、ConflictDialog.vue</td></tr>
+</table>
+
+<h2>⑤ 我对着实拍看到的可疑点（只记录，未改任何代码）</h2>
+<ol>
+  <li><b>③ 列头被压变形</b>：1044px 窗口下「名称 ▲」换 3 行、过滤框被拉成 44px 高，行高 49px；同样一行的「大小/修改时间」却是单行右对齐。</li>
+  <li><b>② 面板头过挤</b>：7 个元素挤一行，路径框（唯一能看清“我在哪”的控件）被压到最短；窗口再窄还会继续挤。</li>
+  <li><b>② 计数重复</b>：「84 项」与「已选 0 项 ▾」语义相近、紧挨在一起，0 选中时也留着一个菜单入口。</li>
+  <li><b>③ 过滤框位置</b>：坐在表头行右侧，与「大小/修改时间」没有列对齐关系，用户难判断它过滤的是“当前列”还是“整个列表”。</li>
+  <li><b>⑧ 位置弹层遮挡</b>：260px 固定宽、盖住整个左侧面板；长路径横向滚动，最近列表和收藏挤在同一柱里。</li>
+  <li><b>⑤ 队列位置</b>：夹在两面板与日志之间，空态也占一行；任务多时上限 140px 会滚动。</li>
+  <li><b>⑦ 日志面板</b>：固定 140px，窗口最大化也不变高；chips 行出现/消失时过滤栏会整体上下跳。</li>
+  <li><b>整体中英混排</b>：按钮中文、日志正文英文、过滤占位符 <code>filter source_id (规则名/主机)</code>；深浅主题都跟随系统（<code>theme: system</code>）。</li>
+</ol>
+
+<p class="hint">下一步：你直接回编号就行，例如「③ 列头重排」「② 面板头拆两行」「⑧ 位置弹层改窄/贴按钮」。收到编号后我先出调整方案（不直接改代码），确认后再落盘。</p>
+</body></html>
