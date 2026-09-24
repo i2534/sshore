@@ -46,6 +46,12 @@ watch(() => props.path, (p) => {
 })
 watch(() => props.selKeys.length, (n) => { if (n) upActive.value = false })
 
+function onUpClick() {
+  upActive.value = true
+  emit('clear') // 与「点面板空白处」同义：单击「..」先取消当前选中
+}
+function openUp() { emit('open', { name: '..', isDir: true }) }
+
 function pick(name) { menuOpen.value = false; emit('action', name) }
 
 // 位置下拉：选中后立刻清零，避免同一个位置连选两次不触发 change。
@@ -162,7 +168,7 @@ function fmtSize(bytes) {
         <input class="filter" v-model="filterText" placeholder="过滤…" />
       </div>
       <ul class="list" :class="{ busy: loading }" @click.self="emit('clear')">
-        <li class="up" @click="emit('open', { name: '..', isDir: true })">
+        <li class="up" data-role="up" :class="{ sel: upActive }" @click="onUpClick" @dblclick="openUp">
           <span class="cell-name">📁 ..</span><span class="cell-size">—</span><span class="cell-time">—</span>
         </li>
         <li
@@ -221,6 +227,7 @@ function fmtSize(bytes) {
 .list li.sel { background: var(--surface-hover); color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
 .list li.anchor { outline: 1px dashed var(--seed); outline-offset: -1px; }
 .list li.up { color: var(--text-dim); border-bottom: 1px solid var(--border); }
+.list li.up.sel { background: var(--surface-hover); color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); border-bottom-color: var(--accent); }
 mark { background: var(--accent); color: var(--on-accent); }
 .col-name, .cell-name { flex: 1; overflow: hidden; text-overflow: ellipsis; padding-right: 16px; }
 .col-size, .cell-size { width: 88px; text-align: right; padding-right: 16px; color: var(--text-dim); }

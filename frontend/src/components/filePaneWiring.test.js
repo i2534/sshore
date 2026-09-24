@@ -32,3 +32,23 @@ describe('路径栏（可编辑）', () => {
     expect((sftp.match(/\+\+localSeq/g) || []).length).toBe(2) // goLocal + loadLocal
   })
 })
+
+describe('「..」行与普通目录行统一', () => {
+  it('up 行是「单击高亮 + 双击打开」，不再单击直接 open', () => {
+    const i = filePane.indexOf('class="up"')
+    expect(i, '找不到 up 行').toBeGreaterThan(-1)
+    // 只截 up 行自身：上界 200 保证不会切进下一行的 @dblclick="emit('open', it)"
+    const up = filePane.slice(i, i + 200)
+    expect(up).toContain('@dblclick="openUp"')
+    expect(up).toContain('@click="onUpClick"')
+    expect(up).not.toContain("emit('open'")
+  })
+
+  it('「..」不进 selKeys：单击只清空选中并置本地高亮', () => {
+    expect(filePane).toMatch(/function onUpClick\(\)\s*\{[^}]*emit\('clear'\)/)
+    expect(filePane).toContain('const upActive = ref(false)')
+    // sel.* 全在父层调用；父层绝不能把 '..' 放进选择集，否则 runBatchFor 会把它当成传输项
+    expect(sftp).not.toMatch(/sel\.(single|toggle|rangeTo)\([^)]*'\.\.'/)
+  })
+})
+
