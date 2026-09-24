@@ -391,13 +391,15 @@ async function disconnect() {
   sel.clear(remoteSelection)
 }
 async function loadLocal() {
+  const seq = ++localSeq // 与 goLocal 共用序号：任何更新的本地加载都会先作废在途 goLocal，其失败回滚不再发生
   localLoading.value = true
   try {
-    localItems.value = (await ListLocal(localPath.value || '/')) || []
-    await locations.addLocalRecent(localPath.value) // 只在成功时记；条数上限由后端负责
+    const items = (await ListLocal(localPath.value || '/')) || []
+    if (seq === localSeq) localItems.value = items // 已被更新请求取代则丢弃
+    if (seq === localSeq) await locations.addLocalRecent(localPath.value) // 只在成功时记；条数上限由后端负责
   }
-  catch (e) { err(e) }
-  finally { localLoading.value = false }
+  catch (e) { if (seq === localSeq) err(e) } // 过期请求的错误不得污染更新的导航
+  finally { if (seq === localSeq) localLoading.value = false }
 }
 
 function openRemote(it) {

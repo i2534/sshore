@@ -27,4 +27,8 @@ describe('路径栏（可编辑）', () => {
     expect(sftp).not.toMatch(/const REMOTE_HOME = '~'/)
     expect(sftp).toContain("from '../utils/pathbar'")
   })
+
+  it('本地加载与 goLocal 共用同一个 localSeq（否则旧的失败回滚会覆盖更新的导航）', () => {
+    expect((sftp.match(/\+\+localSeq/g) || []).length).toBe(2) // goLocal + loadLocal
+  })
 })
