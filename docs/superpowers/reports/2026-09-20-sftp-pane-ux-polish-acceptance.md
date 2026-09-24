@@ -6,9 +6,10 @@
 - fix round 1 时 HEAD：823656d（只改本报告，未改源码）
 - **final fix wave 代码 HEAD：beda9cb（基于 b41bb95）**；本轮是整支分支的唯一修复波，**改了源码**（I1/I2 + Minor 4/5/6），故判据 1 补子项、判据 8 更新；验收任务本身的「不改源码」只适用于首次提交与 fix round 1。
 - 性质：**验证与取证**（首次提交与 fix round 1 只改本报告，未改任何源码；final fix wave 另见上）。
-- 截图目录：/tmp/sshkit-t5/shots/（首次验收与 fix round 1）、**/tmp/sshkit-fixwave/shots/（final fix wave）**（均在 /tmp，未提交进仓库）
+- 截图目录：/tmp/sshkit-t5/shots/（首次验收与 fix round 1）、**/tmp/sshkit-fixwave/shots/（final fix wave）**、**/tmp/win-ux-shots/（Windows 首次验收）、/tmp/win2-shots/（Windows W1 修复复验）**（均在 /tmp，未提交进仓库）
 - 驱动脚本：/tmp/sshkit-t5/xdrive.py（XTEST）、/tmp/sshkit-t5/gui.sh（窗口操作封装）、/tmp/sshkit-t5/xsendevent.py（对照实验）；final fix wave 复用同一套脚本
-- **Windows 真机验收（本轮新增）**：2026-09-24 20:05 ~ 20:39 CST，HEAD b077cb1，VirtualBox win10 + `windows/386` 产物，证据 /tmp/win-ux-shots/；结论与缺陷见 §0.1
+- **Windows 真机验收（首次）**：2026-09-24 20:05 ~ 20:39 CST，HEAD b077cb1，VirtualBox win10 + `windows/386` 产物，证据 /tmp/win-ux-shots/；结论与缺陷见 §0.1
+- **Windows W1 修复复验**：2026-09-24 20:45 ~ 20:53 CST，HEAD `7b75bdb`，被验 exe sha256 `494411b7…`，证据 /tmp/win2-shots/；判据 3 由「部分通过」升为**通过**，W1 判定 **FIXED**，过程报告 `.superpowers/sdd/2026-09-20-sftp-pane-ux-polish/w1-fix-report.md`
 
 ## 0. 结论摘要
 
@@ -25,9 +26,9 @@
 
 **Linux 分布：8 条中 7 条通过 / 0 条部分通过 / 1 条未验证（判据 8：环境无可用的活中文输入法）。Linux 侧未发现产品缺陷。**
 
-> **Windows 真机验收（本轮新增，HEAD b077cb1）**：6 条平台判据中 **5 条通过 / 1 条部分通过（判据 3）/ 0 条未验证**，并发现 **1 个产品缺陷 W1**（「展开全部 N」把位置弹层整个收起）。详见 **§0.1**。
+> **Windows 真机验收（首次 HEAD b077cb1；W1 修复复验 HEAD 7b75bdb）**：6 条平台判据中 **6 条通过 / 0 条部分通过 / 0 条未验证**。首次验收发现的 **W1**（「展开全部 N」把位置弹层整个收起）已在 7b75bdb 修复，并于 2026-09-24 20:45~20:53 在 Windows 真机复验 **FIXED**（判据 3 由部分通过升为通过）。详见 **§0.1**。
 >
-> **两平台合计：Linux 8 条（7 通过 / 1 未验证，0 缺陷）＋ Windows 6 条（5 通过 / 1 部分通过，1 缺陷）。Windows 判据 5（中文输入法）本轮已由「不可用」变为真实通过。**
+> **两平台合计：Linux 8 条（7 通过 / 1 未验证，0 缺陷）＋ Windows 6 条（6 通过 / 0 部分通过 / 0 未验证，0 未决缺陷）。Windows 判据 5（中文输入法）首次验收已由「不可用」变为真实通过；唯一缺陷 W1 已修复并复验 FIXED。**
 
 > **final fix wave（2026-09-24 19:48~19:51，HEAD beda9cb）**：判据 1 补测「单击「..」后点列表空白 / 按 Esc 会留下 stale 高亮」子项，真机复检**通过**（判据 1 保持通过）；判据 8 的守卫由 keyup 改为 keydown 并补了单测，但**真实 IME 会话仍无法构造，保持未验证**。分布因此仍为 **7 通过 / 0 部分通过 / 1 未验证**。
 
@@ -37,12 +38,13 @@
 
 - 运行时间：2026-09-24 20:05 ~ 20:39 CST；被验二进制 `build/bin/sshore.exe`，4,413,440 B，sha256 `ea71e42bb52b9f968894dad90403a54a367a6f9df96d3d873e719e479116250e`，窗口标题实测 `SSHore v0.7.1-10-gb077cb1`（构建 HEAD b077cb1）。
 - 环境：VirtualBox `win10`（Windows 10.0.19045.6466，用户 `lan`，会话 1 交互桌面）。产物由 `wails build -platform windows/386` 生成（本机仅有 i686-w64-mingw32-gcc，无 amd64 交叉编译器）。
+- **W1 修复复验（2026-09-24 20:45 ~ 20:53 CST，HEAD 7b75bdb）**：被验二进制 `build/bin/sshore.exe`，4,413,440 B，sha256 `494411b7cc03b4d24562882d9718f69de0acadde4de9eac804d3d40f64d477eb`（与客户机 `C:\Users\lan\rt\ux2\sshore-ux2.exe` 一致），窗口标题实测 `SSHore v0.7.1-12-g7b75bdb`。部署在**新目录** `C:\Users\lan\rt\ux2\`（新文件名 `sshore-ux2.exe`），未覆盖用户既有 `C:\sshore\`；驱动沿用首次的 `schtasks /it` 会话 1 + `C:\Users\lan\rt\drag\lib.ps1` + `kbd/fore/dhelp`。为彻底避开用户配置，启动器用 `set APPDATA=C:\Users\lan\rt\ux2\appdata` 做配置隔离（并预置 14 条 `local_recent`）；运行前后用户 `%APPDATA%\sshore\{sshore,presets}.toml` 的 sha256 完全不变（`3851c7ff…` / `2a1925e1…`）。证据 `/tmp/win2-shots/`。
 - 驱动：客户机 `C:\Users\lan\rt\drag\lib.ps1`（`PrintWindow(PW_RENDERFULLCONTENT)` 窗口类截图 + `SendInput` 绝对坐标点击）＋ 本轮新增的 `kbd.ps1`（SendInput 键盘/扫描码/滚轮）与 `fore.ps1`；所有驱动经 `schtasks /create /it` + `schtasks /run` 投放到**会话 1**（纯 SSH shell 落在会话 0，WebView2 会 `800700aa`）。
 - 证据目录：`/tmp/win-ux-shots/`（宿主机，未提交进仓库）；本轮应用部署在 `C:\Users\lan\rt\ux\`（新目录/新文件名 `sshore-ux.exe`），未覆盖用户既有 `C:\sshore\` 或 `sshore.exe`。
 
 ### 386 + WOW64 路径垫片（必读前提）
 
-32 位进程的 `C:\Windows\System32` 被 WOW64 重定向到 `SysWOW64`，**看不见** `C:\Windows\System32\OpenSSH\ssh.exe`，而 SFTP 由 Go 侧 `exec` 拉起 `sftp`/`ssh`。本轮把 `C:\Windows\System32\OpenSSH\*.exe` 拷到 `C:\Users\lan\rt\ux\bin`，启动器先 `set PATH=C:\Users\lan\rt\ux\bin;%PATH%` 再 `start "" <exe>`，SFTP 因此可用（见判据 6）。
+32 位进程的 `C:\Windows\System32` 被 WOW64 重定向到 `SysWOW64`，**看不见** `C:\Windows\System32\OpenSSH\ssh.exe`，而 SFTP 由 Go 侧 `exec` 拉起 `sftp`/`ssh`。本轮把 `C:\Windows\System32\OpenSSH\*.exe` 拷到 `C:\Users\lan\rt\ux\bin`，启动器先 `set PATH=C:\Users\lan\rt\ux\bin;%PATH%` 再 `start "" <exe>`，SFTP 因此可用（见判据 6）。**W1 修复复验用同一做法，垫片在 `C:\Users\lan\rt\ux2\bin`。**
 
 ### Windows 逐条结论
 
@@ -53,26 +55,31 @@
 | 1c | 粘贴式引号路径 `"C:\Program Files"` → 去引号并跳转 | **通过** | D-03：路径栏 `C:\Program Files`，列表 20 项（Common Files、Internet Explorer…） |
 | 1d | 输入不存在路径 `C:\no-such-dir-ux` → 错误入日志 + 路径栏与列表整体回滚 | **通过** | D-04/05 + logD.png：日志 `[ERROR] 无法打开 C:\no-such-dir-ux: open … The system cannot find the file specified.`；路径栏与列表回滚到上一目录 `C:\Program Files` |
 | 2 | 单击「..」高亮/清空选中/不跳转；双击「..」跳上级；点列表空白或 Esc 清除高亮 | **通过** | D-09（前置）→ D-10（选中文件，已选 1 项）→ D-11（单击「..」：高亮 + 已选 0 项 + 路径不变）→ D-12（双击「..」→ `C:\Users\lan\rt\ux`）；D-13/14（点空白前/后）、D-15/16（Esc 前/后）；uprow.png 为「..」行放大对照 |
-| 3 | 位置弹层：分区（预设/磁盘/最近）、最近 ≤8 行 +「展开全部 N」、展开后可滚到最后一行且不被面板裁剪、点文件行/空白/☆/🔍 收起 | **部分通过（发现缺陷 W1）** | 通过部分：G-01/G-03（预设+磁盘+最近，最近恰 8 行 +「展开全部 14」）；收起：J-10/11（文件行）、L-01b/02（列表空白，AE=130385）、J-12/13（☆）、J-14/15（🔍 弹出搜索浮层并收起弹层）。**失败部分：激活「展开全部 N」不展开，而是把整个弹层收起**（见缺陷 W1） |
+| 3 | 位置弹层：分区（预设/磁盘/最近）、最近 ≤8 行 +「展开全部 N」、展开后可滚到最后一行且不被面板裁剪、点文件行/空白/☆/🔍 收起 | **通过**（首次部分通过，缺陷 W1 已修复复验） | 首次（/tmp/win-ux-shots/）通过部分：G-01/G-03（预设+磁盘+最近，最近恰 8 行 +「展开全部 14」）；收起：J-10/11（文件行）、L-01b/02（列表空白，AE=130385）、J-12/13（☆）、J-14/15（🔍）。首次失败部分（W1）：激活「展开全部 N」不展开而是收起弹层（G-04/G-05、H-08/H-09、J-03→J-04/J-05）。**修复复验（/tmp/win2-shots/，HEAD 7b75bdb）**：W2-01→W2-02（**点**「展开全部 14」→ 弹层保持打开、按钮变「收起」、14 行全部渲染，AE=2044）；W2-03（滚到最后一行 `C:\Users\lan\rt\ux2`，整行可见、未被面板裁剪）；W2-06→W2-07（**点**「收起」→ 回到 8 行、弹层仍开，AE=0）；四类收起回归：W2-28→W2-29（文件行，AE=134679）、W2-22→W2-23（列表空白，AE=128409）、W2-24→W2-25（☆，AE=128503）、W2-26→W2-27（🔍，AE=673143，搜索浮层出现）；键盘路径：W2-11（Tab×8 焦点环落在「展开全部 14」）→W2-12（回车**展开**、弹层保持打开）→W2-13（再回车收起） |
 | 4 | 打开 🔍 不自动深搜；输入 `*` 回车正常深搜 | **通过** | E-01(0.8s) vs E-02(3.8s)：两帧逐像素完全相同（`compare -metric AE = 0`），仅显示提示「输入名称或通配符（支持 * ?）后回车搜索」且无命中；E-03：输入 `*` 回车 → `命中 500 项 · 触发上限（最多 500 条）`，列表可滚动（drag/*.png、clean.txt…） |
 | 5 | 中文输入法回车确认候选不得触发跳转 | **通过** | M-02：Ctrl+Space 切到微软拼音（任务栏「中」，Mt.png）后按扫描码键入 pinyin → 路径栏 `ce'shi` 带组合下划线；M-03/04/05：回车 → 组合提交为 `ceshi`（下划线消失），**路径栏文本保留、列表未变、日志无新增 ERROR**（Mlog.png 前后两帧逐行相同）；对照 M-06/M-07：切回英文后输入 `C:\Users\lan\rt\ux` 回车正常跳转（44 项） |
 | 6 | SFTP 连接回归 | **通过** | 未改动客户机 `~/.ssh/config`：应用在 PATH 垫片下连接用户既有 `winlocal` 主机，远端面板列出 `/C:/Users/lan`（84 项，D-00/E-00），日志含 `[INFO] sftp transport=gosftp`（logD.png 等） |
 
-**Windows 分布：6 条判据中 5 条通过 / 1 条部分通过（判据 3：展开全部失效）/ 0 条未验证；另发现 1 个产品缺陷（W1）。**
+**Windows 分布（首次 + W1 修复复验合并）：6 条判据中 6 条通过 / 0 条部分通过 / 0 条未验证；首次发现的 1 个产品缺陷（W1）已修复并复验 FIXED。**
 
-### Windows 上发现的缺陷（本轮新增，未修复）
+### Windows 上发现的缺陷（W1 —— 已修复并复验）
 
-**W1：「📍 位置」弹层的「展开全部 N」不可用（点一下整个弹层消失）**
+**W1：「📍 位置」弹层的「展开全部 N」不可用（点一下整个弹层消失）—— FIXED（提交 7b75bdb）**
 
-- 复现：SFTP 本地面板 → 点「📍 位置」→ 弹层打开（最近 8 行 +「展开全部 14」）→ 点击「展开全部 14」，或键盘 Tab 到该按钮后回车 → 弹层**立即消失**，最近分组未展开，多出的 6 条永远看不到。
-- 证据：`G-04/G-05`（G-03 前置帧弹层可见）、`H-08/H-09`（H-07 前置帧弹层可见）、`J-03 → J-04/J-05`。
+- 复现（首次，HEAD b077cb1）：SFTP 本地面板 → 点「📍 位置」→ 弹层打开（最近 8 行 +「展开全部 14」）→ 点击「展开全部 14」，或键盘 Tab 到该按钮后回车 → 弹层**立即消失**，最近分组未展开，多出的 6 条永远看不到。
+- 首次证据：`G-04/G-05`（G-03 前置帧弹层可见）、`H-08/H-09`（H-07 前置帧弹层可见）、`J-03 → J-04/J-05`。
 - 判别力：`J-03` 证明该按钮**已获得键盘焦点**（焦点环落在「展开全部 14」上）后才按回车，排除「没点中」；对照 `G-01` vs `G-02`（仅调 ForceFore）AE=0，排除焦点强拉导致收起。
-- 推测机制（非结论）：`expandGroup` 后 `g.total == g.rows.length`，`.poslabel` 里的「展开全部」按钮被 `v-if` 移除；焦点节点从 DOM 消失使面板子树 `focusout`（relatedTarget=null），触发 `FilePane.vue` 的 `onPaneFocusOut → closePos()`。
-- 平台差异：同一路径在 Linux/WebKitGTK 上通过（见判据 4）；Windows/WebView2(Chromium) 上按钮移除后的焦点事件时序不同，故此前只跑 Linux 未暴露。
+- 根因（修复前为推断，修复后由代码 + 复验确认）：`expandGroup` 后 `g.total == g.rows.length`，`.poslabel` 里的「展开全部」按钮被 `v-if="g.total > g.rows.length"` 移除；焦点节点从 DOM 消失使面板子树 `focusout`（relatedTarget=null），触发 `FilePane.vue` 的 `onPaneFocusOut → closePos()`，整个弹层收起。
+- 修复（移除成因，保证可聚焦节点永不消失，提交 `7b75bdb`）：
+  - `frontend/src/utils/positions.js`：每组新增 `expandable = hit.length > POSITION_SECTION_ROWS`，**不随 `expanded` 变化**；`total`/`rows`/`POSITION_SECTION_ROWS=8`/分区顺序/筛选语义不变。
+  - `frontend/src/components/FilePane.vue`：控件改为 `v-if="g.expandable"`（不再依赖 `rows.length`/`total`）的 **toggle**，展开态文案「收起」，点击调 `toggleGroup(g.key)`（已展开则收起）；`.more` 类、四条收起路径全部保留。
+  - 测试：`positions.test.js` 增 3 例（>8 / ≤8 / 恰 8；不随 `expanded` 变；随筛选变化）；`filePaneWiring.test.js` 增源码不变量（渲染只认 `g.expandable`、不得再出现 `g.total > g.rows.length`、必须是 `toggleGroup` + 「收起」）。全量 vitest 由 330 → **335 用例通过**（25 文件不变）。
+- 修复复验（Windows 真机，HEAD 7b75bdb，sha256 `494411b7…`，/tmp/win2-shots/）：见判据 3 行的全部证据；首次失效的两次鼠标点击（G-04/G-05、H-08/H-09）与键盘路径（J-03→J-04/J-05）分别由 `W2-01→W2-02`、`W2-06→W2-07`、`W2-11→W2-12→W2-13` 复现为「保持打开并展开/收起」。
+- 平台差异：同一路径在 Linux/WebKitGTK 上通过（见判据 4）；Windows/WebView2(Chromium) 在焦点节点被移除时发 `focusout(relatedTarget=null)`，故此前只跑 Linux 未暴露。
 
 ### Windows 未覆盖 / 存疑
 
-- 判据 3 的「展开后滚到最后一行、不被面板裁剪」**未能验证**：展开动作本身在 Windows 上失效，没有可滚动的展开态。
+- 判据 3 的「展开后滚到最后一行、不被面板裁剪」**已在 W1 修复复验中验证**（`W2-03`：展开后 14 行全出，滚到最后一行为 `C:\Users\lan\rt\ux2`，整行可见且弹层未被面板 `overflow:hidden` 裁剪）。
 - 输入法仅验证了微软拼音（TIP `0804:{81D4E9C9-…}{FA550B04-…}`）的「组合→回车提交」路径；五笔/搜狗等第三方 IME 未覆盖。
 
 ## 1. 门禁（make ci）
@@ -380,6 +387,27 @@ XTEST 事件被 grab 持有者消费，`xev` 收不到任何 ButtonPress/KeyPres
 | montage-up-row.png | 14/15/16/17 的「..」行放大纵向拼接（带红边框）：1、3 有 accent 条与蓝字；2、4 没有 |
 | montage-head.png | 14/15/16/17 的本地面板头放大拼接：四帧均为「已选 0 项」 |
 | 11-posmenu-open.png / 12-posmenu-after-esc.png / 13-posmenu-after-esc-xfocus.png | 判别实验：位置弹层打开 → Esc 关闭，证明 Esc keydown 确实到达 FilePane（弹层取样点 (200,150) 由 #FFFFFF → #F6F8FB） |
+
+### 5.6 Windows W1 修复复验证据（/tmp/win2-shots/，2026-09-24 20:45~20:53，HEAD 7b75bdb）
+
+| 文件 | 内容 |
+|---|---|
+| W2-01-popover-open-8rows.png | 判据3 前置（首次）：地本地面板位置弹层打开，最近 8 行 +「展开全部 14」 |
+| W2-02-expanded-popover-open.png | **判据3 修复点**：鼠标点击「展开全部 14」→ 弹层**保持打开**、按钮变「收起」、14 行全部渲染（与 W2-01 AE=2044，证明内容变了但弹层没关） |
+| W2-03-scrolled-to-last-row.png | 判据3：滚到展开后的最后一行 `C:\Users\lan\rt\ux2`，整行可见、弹层底边与横向滚动条完整，未被面板裁剪 |
+| W2-04-scrolled-back-to-top.png | 展开态滚回顶部（与 W2-02 逐像素相同） |
+| W2-06a-open-8rows.png / W2-06-pre-collapse-expanded-14rows.png | 收起动作的前置帧：先开（8 行）→ 展开（14 行、按钮「收起」） |
+| W2-07-post-collapse-8rows-popover-open.png | **判据3**：点「收起」→ 回到 8 行、按钮恢复「展开全部 14」、弹层仍开（与前置帧 AE=0，证明是干净的逆操作） |
+| W2-09-kbd-open.png / W2-10-kbd-tab7.png / W2-11-kbd-tab8-focus-expand.png | 键盘路径前置：Tab×8 后焦点环落在「展开全部 14」上 |
+| W2-12-kbd-enter-expanded-popover-open.png | **判据4 键盘路径**：回车 → **展开**（按钮「收起」、焦点环仍在）、弹层保持打开（对照首次 J-04/J-05 的「回车即关闭」） |
+| W2-13-kbd-enter-again-collapsed.png | 再回车 → 收起回 8 行、弹层仍开 |
+| W2-28-pre-filerow.png / W2-29-post-filerow.png | 收起回归·文件行：弹层可见 → 点本地列表文件行（x=500，弹层右侧）→ 弹层消失、`desktop.ini` 被选（已选 1 项），AE=134679 |
+| W2-22-pre-blank.png / W2-23-post-blank.png | 收起回归·列表空白：弹层可见 → 点 (600,500) → 弹层消失，AE=128409 |
+| W2-24-pre-star.png / W2-25-post-star.png | 收起回归·☆：弹层可见 → 点 ☆ → 弹层消失、星标进入收藏态，AE=128503 |
+| W2-26-pre-find.png / W2-27-post-find.png | 收起回归·🔍：弹层可见 → 点 🔍 → 弹层消失、深搜浮层出现，AE=673143 |
+| W2-20-pre-filerow.png / W2-21-post-filerow.png | 过程留档（坐标订正用）：原计划点文件行，但 (220,226) 落在弹层内的「桌面」预设上 → 实际是 pickPos 路径（弹层关闭并跳到 `C:\Users\lan\Desktop`）；文件行的有效证据以 W2-28/29 为准 |
+
+**像素判据说明**：所有「弹层是否打开」均在弹层内固定取样点 (200,150) 判定——前置帧为弹层底色 `#FFFFFF`（文件行前置帧因过滤框聚焦为 `#C6EDFF`），收起后回到列表底 `#F6F8FB` 或搜索遮罩 `#7B7C7D`。
 
 ## 6. 清理与数据边界
 
