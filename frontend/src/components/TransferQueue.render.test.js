@@ -80,4 +80,17 @@ describe('TransferQueue.vue 生产渲染（SSR）', () => {
     const html = await render([row({ pending: true })])
     expect(html).toContain('data-act="cancel"')
   })
+
+  // —— Task 5：传输队列空态不占高 ——
+  it('无任务时不渲染任何内容（空态不再占一行高度）', async () => {
+    // render(transfers) 是本文件顶部既有的辅助：renderToString(createSSRApp(...))
+    const html = await render([])
+    expect(html).not.toContain('class="queue"')
+    expect(html).not.toContain('无传输任务')
+  })
+
+  it('有任务时渲染 .queue 根元素（证明上面的空态断言不是恒真）', async () => {
+    const html = await render([row()])
+    expect(html).toContain('class="queue"')
+  })
 })
