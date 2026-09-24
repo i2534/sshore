@@ -10,6 +10,9 @@ export function isEditableTarget(el) {
   if (EDITABLE_TAGS.has(el.tagName)) return true
   if (el.isContentEditable) return true
   if (typeof el.closest !== 'function') return false
+  // 「焦点在应用自己的控件上」一并纳入守卫（分隔条这类 tabindex=0 的 UI 控件不属于
+  // 文件列表，Delete/Ctrl+A/Shift+↑↓ 都不该作用于文件）。
+  if (el.closest('[role="separator"]')) return true
   return !!(el.closest('.ui-overlay') || el.closest('[role="dialog"]') || el.closest('.search-overlay'))
 }
 

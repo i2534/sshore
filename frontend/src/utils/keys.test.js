@@ -43,4 +43,9 @@ describe('keys 键盘分派', () => {
   it('焦点在输入框时 Shift+↑/↓ 不处理', () => {
     expect(actionFor({ ...ev('ArrowDown', { target: input() }), shiftKey: true })).toBe(null)
   })
+  it('焦点在分隔条上时所有面板动作都不处理', () => {
+    const sep = { tagName: 'DIV', isContentEditable: false, closest: (s) => (s === '[role="separator"]' ? {} : null) }
+    expect(actionFor({ key: 'Delete', target: sep })).toBe(null)
+    expect(actionFor({ ...ev('ArrowDown', { target: sep }), shiftKey: true })).toBe(null)
+  })
 })

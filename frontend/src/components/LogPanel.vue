@@ -80,7 +80,7 @@ watch(() => [logStore.filterSource, logStore.filterLevel], async () => {
       <input
         :value="displaySource"
         @input="logStore.filterSource = $event.target.value"
-        placeholder="filter source_id (规则名/主机)"
+        placeholder="按来源筛选（规则名/主机）"
       />
       <select v-model="logStore.filterLevel">
         <option value="">全部</option>
