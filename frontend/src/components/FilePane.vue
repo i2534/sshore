@@ -23,8 +23,29 @@ const props = defineProps({
   presets: { type: Array, default: () => [] },
   disks: { type: Array, default: () => [] },
 })
-const emit = defineEmits(['select', 'open', 'context', 'visible', 'focus', 'dragstart', 'dropon', 'clear', 'action', 'pick-position', 'toggle-bookmark', 'search'])
+const emit = defineEmits(['select', 'open', 'context', 'visible', 'focus', 'dragstart', 'dropon', 'clear', 'action', 'pick-position', 'toggle-bookmark', 'search', 'navigate'])
 const menuOpen = ref(false)
+
+// ===== 路径栏（可编辑）=====
+// draft 是输入框的唯一真源；prop.path 变化（导航完成、失败回滚）时同步回来，
+// 这样 Enter 提交后无论成功还是被父层回滚，输入框显示的都与真实目录一致。
+const pathDraft = ref(props.path || '')
+function commitPath(e) {
+  if (e && e.isComposing) return // 中文输入法里按 Enter 确认候选，不该触发跳转
+  emit('navigate', pathDraft.value)
+  // 失焦即回读 props.path：父层 noop / 失败时输入框自动回到真实目录；
+  // 成功时 props.path 已被乐观提交改掉，回读到的就是新目录。
+  if (e && e.target && e.target.blur) e.target.blur()
+}
+function resetPath() { pathDraft.value = props.path || '' }
+// 「..」行的单击高亮：不并入 selKeys（父层的删除/传输直接取 selKeys，'..' 进去是危险语义）
+const upActive = ref(false)
+watch(() => props.path, (p) => {
+  pathDraft.value = p || ''
+  upActive.value = false
+})
+watch(() => props.selKeys.length, (n) => { if (n) upActive.value = false })
+
 function pick(name) { menuOpen.value = false; emit('action', name) }
 
 // 位置下拉：选中后立刻清零，避免同一个位置连选两次不触发 change。
@@ -98,7 +119,10 @@ function fmtSize(bytes) {
   <div class="pane ui-panel" :class="{ focus }" tabindex="0" @focus="focus = true; emit('focus')" @blur="focus = false">
     <div class="head">
       <span class="title">{{ title }}</span>
-      <span class="curpath">{{ path }}</span>
+      <input class="curpath" data-role="path" spellcheck="false" :value="pathDraft"
+        @input="pathDraft = $event.target.value"
+        @keyup.enter="commitPath" @keyup.esc="resetPath" @blur="resetPath(); focus = false"
+        @focus="focus = true; emit('focus')" />
       <select class="pos" :value="''" @change="onPick($event)">
         <option value="" disabled selected>📍 位置</option>
         <!-- key 必须含 name（以及 host）：后端 preset.User 的去重键是 name+path+host，
@@ -171,7 +195,9 @@ function fmtSize(bytes) {
 .pane.focus { border-color: var(--accent); }
 .head { padding: 6px 8px; background: var(--bg-elev); font-weight: 600; color: var(--text-dim); display: flex; justify-content: space-between; align-items: center; }
 .title { font-weight: 600; }
-.curpath { font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px; flex: 1; text-align: center; }
+.curpath { flex: 1; min-width: 0; font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); text-align: left; background: transparent; border: 1px solid transparent; border-radius: 3px; padding: 1px 6px; margin: 0 8px; font-family: inherit; }
+.curpath:hover { border-color: var(--border); }
+.curpath:focus { border-color: var(--accent); color: var(--text); outline: none; }
 .count { font-weight: 400; font-size: var(--fs-11); color: var(--text-faint); }
 .pos { max-width: 150px; font-size: var(--fs-11); }
 .star.on { color: var(--seed); }
