@@ -2,6 +2,7 @@
 import { ref, watch, nextTick, onUnmounted } from 'vue'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { SftpSearch, LocalSearch, SearchCancel } from '../../wailsjs/go/main/App'
+import { EMPTY_PATTERN_HINT, shouldSearch } from '../utils/searchbox'
 
 const props = defineProps({
   visible: Boolean,
@@ -19,6 +20,7 @@ const unreadable = ref(0)
 const truncated = ref(false)
 const cancelled = ref(false)
 const errorText = ref('')
+const hint = ref(EMPTY_PATTERN_HINT)
 let seq = 0
 let offProgress = null
 
@@ -29,6 +31,10 @@ function title() {
 }
 
 async function run() {
+  // 空模式不查询：后端把空 pattern 解释为「匹配全部」（internal/sftp/search.go 的注释），
+  // 一打开就查 = 无条件全量扫描 + 最多 500 条命中，见 utils/searchbox.js。
+  if (!shouldSearch(pattern.value)) { hint.value = EMPTY_PATTERN_HINT; return }
+  hint.value = ''
   const id = 's' + (++seq)
   running.value = true
   cancelled.value = false
@@ -65,8 +71,15 @@ watch(() => props.visible, (v) => {
     nextTick(() => { const el = document.querySelector('.search-overlay input'); if (el) el.focus() })
     pattern.value = ''
     hits.value = []
+    scanned.value = 0
+    unreadable.value = 0
+    truncated.value = false
+    cancelled.value = false
+    errorText.value = ''
+    // 打开即提示「先输入」；这里不再自动发起搜索 —— 空模式全量搜索正是「列表太长」的根因
+    hint.value = EMPTY_PATTERN_HINT
+    running.value = false // 不自动搜索了，运行态必须是干净的（防将来重入留下 stale 的"搜索中…"）
     offProgress = EventsOn('sftp:search-progress', (p) => { if (p && p.id === 's' + seq) scanned.value = p.scanned })
-    run()
   } else {
     // 关闭即取消：否则远端 BFS 会继续空跑（spec §8.2）。
     SearchCancel('s' + seq)
@@ -95,12 +108,13 @@ onUnmounted(() => {
         <button @click="run">搜索</button>
       </div>
       <p v-if="errorText" class="err">{{ errorText }}</p>
+      <p v-else-if="hint" class="dim" data-role="hint">{{ hint }}</p>
       <p v-else class="dim">
         命中 {{ hits.length }} 项<template v-if="truncated"> · 触发上限（最多 500 条）</template>
         <template v-if="unreadable"> · {{ unreadable }} 个目录不可读</template>
         <template v-if="cancelled"> · 已取消（结果为已扫描部分）</template>
       </p>
-      <ul class="hits">
+      <ul class="hits" data-role="hits">
         <li v-for="h in hits" :key="h.path" @dblclick="emit('open-hit', h)">
           <span class="p">{{ h.isDir ? '📁' : '📄' }} {{ h.path }}</span>
           <span class="s">{{ h.size || '—' }}</span>
@@ -119,7 +133,7 @@ onUnmounted(() => {
 .bar input { flex: 1; }
 .dim { color: var(--text-faint); font-size: var(--fs-12); }
 .err { color: var(--danger); font-size: var(--fs-12); }
-.hits { list-style: none; margin: 0; padding: 0; overflow: auto; font-family: monospace; font-size: var(--fs-12); }
+.hits { list-style: none; margin: 0; padding: 0; overflow: auto; max-height: 46vh; font-family: monospace; font-size: var(--fs-12); }
 .hits li { display: flex; gap: 10px; padding: 3px 4px; color: var(--text); cursor: pointer; }
 .hits li:hover { background: var(--surface-hover); }
 .hits .p { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
