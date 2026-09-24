@@ -141,7 +141,7 @@ watch(
 /* 头/脚固定、只有主体滚动：设置项多（含更新区）时「完成」不必滚到底才能点到。 */
 .dhead { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px 10px; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
 .dtitle { font-weight: 600; color: var(--text); }
-.dclose { background: none; border: none; color: var(--text-dim); font-size: var(--fs-20); line-height: 1; cursor: pointer; padding: 2px 8px; border-radius: 4px; }
+.dclose { background: none; border: none; color: var(--text-dim); font-size: var(--fs-20); line-height: 1; cursor: pointer; padding: 2px 8px; border-radius: 4px; height: auto; }
 .dclose:hover { background: var(--surface-hover); color: var(--text); }
 .dbody { flex: 1 1 auto; overflow-y: auto; padding: 14px 20px; }
 .dbtns { display: flex; justify-content: flex-end; padding: 10px 20px 14px; border-top: 1px solid var(--border); flex: 0 0 auto; }

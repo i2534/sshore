@@ -60,7 +60,7 @@ function onAct(name, t) { emit(name, t) }
 </script>
 
 <template>
-  <div class="queue">
+  <div v-if="transfers.length" class="queue">
     <div v-for="(t, i) in transfers" :key="i" class="t">
       <div class="row">
         <span class="name">{{ line(t) }}</span>
@@ -82,8 +82,7 @@ function onAct(name, t) { emit(name, t) }
       </div>
       <div v-if="rowProgressText(t)" class="ptext">{{ rowProgressText(t) }}</div>
     </div>
-    <div v-if="!transfers.length" class="empty">无传输任务</div>
-    <div v-if="transfers.length" class="qsum">
+    <div class="qsum">
       成功 {{ summary.ok }} · 跳过 {{ summary.skipped }} · 失败 {{ summary.failed }} · 取消 {{ summary.cancelled }} · 进行中 {{ summary.running }}
       <button v-if="summary.failed" class="copy" @click="emit('copy-failures')">复制失败清单</button>
     </div>
@@ -104,7 +103,7 @@ function onAct(name, t) { emit(name, t) }
 .status.skip { color: var(--text-faint); }
 .status.cancel { color: var(--text-faint); }
 .acts { display: flex; gap: 6px; }
-.act { font-size: var(--fs-11); padding: 0 6px; }
+.act { height: auto; font-size: var(--fs-11); padding: 0 6px; }
 .pbar { height: 3px; background: var(--border); border-radius: 2px; margin-top: 2px; overflow: hidden; }
 .pfill { height: 100%; background: var(--accent); transition: width .15s linear; }
 /* total<0（未知/降级扫描）：不定条，绝不假装 0% 或 100% */
@@ -112,5 +111,6 @@ function onAct(name, t) { emit(name, t) }
 @keyframes indet { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
 .ptext { color: var(--text-faint); }
 .qsum { padding: 3px 8px; color: var(--text-faint); display: flex; gap: 8px; align-items: center; }
-.empty { padding: 3px 8px; color: var(--text-faint); }
+/* 「复制失败清单」行内按钮：不能变成 28px 撑高汇总行（此前无样式规则，本任务新增） */
+.copy { height: auto; }
 </style>

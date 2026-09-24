@@ -70,6 +70,15 @@ describe('「..」行与普通目录行统一', () => {
     expect(kd[1]).toContain("e.key === 'Escape'")
     expect(kd[1]).toContain('upActive.value = false')
   })
+
+  // M1：选择清空后 selKeys.length 归零，`v-if="selKeys.length"` 会把 .batch 整个隐藏，
+  // 但 menuOpen 仍是 true；用户重新选中时菜单「未点先弹」。必须在归零时复位 menuOpen。
+  it('选择归零时批量菜单 menuOpen 一并复位，重新选中不会未点先弹', () => {
+    const m = filePane.match(/watch\(\(\) => props\.selKeys\.length,\s*\(n\)\s*=>\s*\{[^}]*menuOpen\.value = false[^}]*\}\)/)
+    expect(m, '找不到把 menuOpen 置 false 的 selKeys.length watch').not.toBeNull()
+    // 判别力：删掉这条 watch 即红；且它必须只在归零（!n）时生效
+    expect(m[0]).toMatch(/if\s*\(!n\)/)
+  })
 })
 
 describe('位置弹层', () => {
@@ -99,6 +108,16 @@ describe('位置弹层', () => {
     expect(filePane).toContain("width: POS_MENU_WIDTH + 'px'")
   })
 
+  it('弹层宽度收窄到 220px，且锚点算法与内联宽度用同一个常量', () => {
+    expect(filePane).toMatch(/POS_MENU_WIDTH\s*=\s*220/)
+    expect(filePane).toContain('r.right - POS_MENU_WIDTH')
+  })
+
+  it('弹层子项显式 border-box（防御性组件不变量：横向溢出实由 Task 3 全局 box-sizing 消除）', () => {
+    expect(filePane).toMatch(/\.positem\s*\{[^}]*box-sizing:\s*border-box/)
+    expect(filePane).toMatch(/\.posfilter\s*\{[^}]*box-sizing:\s*border-box/)
+  })
+
   it('点面板内非弹层区域收起弹层（焦点会落到 .pane 自身，focusout 判不出"离开"）', () => {
     expect(filePane).toContain('@mousedown="onPaneMouseDown"')
     expect(filePane).toMatch(/function onPaneMouseDown\(e\)\s*\{[^}]*closest\('\.pos-wrap'\)/)
@@ -125,5 +144,75 @@ describe('位置弹层', () => {
     expect(filePane).not.toContain('expandGroup(g.key)')
   })
 })
+describe('面板四段结构与列共轨', () => {
+  // 抠出列头行那一小段：不要用 split('list-holder') 切，列头行改到 .list-holder 内部后那样会切错
+  const hdrowOf = () => (filePane.match(/<div class="hdrow" data-role="columns">[\s\S]*?<\/div>/) || [''])[0]
+
+  it('列头与列表共用同一套 grid 轨道（宽度只来自两个变量，没有字面量列宽）', () => {
+    expect(filePane).toMatch(/--col-size:\s*88px/)
+    expect(filePane).toMatch(/--col-time:\s*140px/)
+    const grids = filePane.match(/grid-template-columns:\s*minmax\(0,1fr\) var\(--col-size\) var\(--col-time\)/g) || []
+    expect(grids).toHaveLength(2) // .hdrow 与 .list li 各一条（grid 轨道必须逐选择器声明）
+    expect(filePane.match(/grid-template-columns:[^;]*\b(88px|140px)\b/g) || []).toHaveLength(0)
+  })
+  it('表头与列表在同一个滚动容器里，表头 sticky（否则出现纵向滚动条时两行又会差一个滚动条宽）', () => {
+    const holder = filePane.split('class="list-holder"')[1] || ''
+    expect(holder).toContain('data-role="columns"')
+    expect(holder).toContain('class="list"')
+    expect(filePane).toMatch(/\.hdrow\s*\{[^}]*position:\s*sticky/)
+    expect(filePane).toMatch(/\.list-holder\s*\{[^}]*overflow:\s*auto/)
+    expect(filePane).toMatch(/\.list\s*\{[^}]*flex:\s*none/)
+  })
+  it('列头行只放三个列头、不再含输入框、且 nowrap', () => {
+    const hd = hdrowOf()
+    expect(hd).toContain('col-name')
+    expect(hd).toContain('col-size')
+    expect(hd).toContain('col-time')
+    expect(hd).not.toContain('<input')
+    expect(filePane).toMatch(/\.hdrow\s*\{[^}]*white-space:\s*nowrap/)
+  })
+  it('.list li 就地改成 grid（不要另写合并选择器，否则与旧 flex 规则同特异性、谁在后面谁赢）', () => {
+    expect(filePane).toMatch(/\.list li\s*\{[^}]*display:\s*grid/)
+    expect(filePane).not.toMatch(/\.hdrow, \.list li/)
+  })
+  it('底部过滤栏承载过滤框 + 计数；批量入口只在有选中时出现', () => {
+    const bar = filePane.split('data-role="filterbar"')[1] || ''
+    expect(bar).toContain('data-role="filter"')
+    expect(bar).toContain('data-role="selinfo"')
+    expect(bar).toContain('{{ selLabel }}')
+    expect(filePane).toContain('selectionLabel(')      // 在 <script> 里，别限定在 bar 内断言
+    expect(filePane).toMatch(/v-if="selKeys\.length"/)
+    expect(filePane).not.toContain('selKeys.length || actions.length')
+  })
+  it('导航行只留 标题/路径/位置/收藏/深搜（计数与批量已下移）', () => {
+    const nav = filePane.split('class="navrow"')[1].split('data-role="columns"')[0]
+    expect(nav).toContain('data-role="path"')
+    expect(nav).toContain('data-role="position"')
+    expect(nav).toContain("emit('search')")
+    expect(nav).not.toContain('class="count"')
+    expect(nav).not.toContain('class="batch"')
+  })
+  it('过滤栏的批量菜单向上弹出（面板 overflow:hidden 会裁掉向下的菜单）', () => {
+    expect(filePane).toMatch(/\.fbar \.bmenu\s*\{[^}]*bottom:\s*100%/)
+    expect(filePane).toMatch(/\.fbar \.bmenu\s*\{[^}]*top:\s*auto/)
+  })
+})
+
+describe('过滤栏的多选入口', () => {
+  it('三个按钮都在过滤栏里，且都 emit(action, ...)', () => {
+    const bar = filePane.split('data-role="filterbar"')[1]
+    expect(bar).toContain('data-role="select-all"')
+    expect(bar).toContain('data-role="invert"')
+    expect(bar).toContain('data-role="clear"')
+    expect(bar).toMatch(/emit\('action', 'invert'\)/)
+  })
+  it('SftpView 分派 invert 与 extend-up/extend-down', () => {
+    // sftp 是本文件顶部既有的 readFileSync(new URL('../views/SftpView.vue', import.meta.url)) 常量
+    expect(sftp).toContain("name === 'invert'")
+    expect(sftp).toContain("action === 'extend-up'")
+    expect(sftp).toContain("action === 'extend-down'")
+  })
+})
+
 
 
