@@ -8,6 +8,7 @@
 - 性质：**验证与取证**（首次提交与 fix round 1 只改本报告，未改任何源码；final fix wave 另见上）。
 - 截图目录：/tmp/sshkit-t5/shots/（首次验收与 fix round 1）、**/tmp/sshkit-fixwave/shots/（final fix wave）**（均在 /tmp，未提交进仓库）
 - 驱动脚本：/tmp/sshkit-t5/xdrive.py（XTEST）、/tmp/sshkit-t5/gui.sh（窗口操作封装）、/tmp/sshkit-t5/xsendevent.py（对照实验）；final fix wave 复用同一套脚本
+- **Windows 真机验收（本轮新增）**：2026-09-24 20:05 ~ 20:39 CST，HEAD b077cb1，VirtualBox win10 + `windows/386` 产物，证据 /tmp/win-ux-shots/；结论与缺陷见 §0.1
 
 ## 0. 结论摘要
 
@@ -22,11 +23,57 @@
 | 7 | 弹层打开时点文件行 / 列表空白 / ☆ / 🔍 → 立即收起 | **通过**（fix round 1 重拍） | 文件行 73→74；列表空白 82→83；☆ 75b→76b；🔍 77→78（每对都是「弹层可见」前置帧 + 收起后帧） |
 | 8 | 中文输入法回车确认候选不得触发跳转 | **未验证** | 环境无可用的活中文输入法，见「判据 8」 |
 
-**分布：8 条中 7 条通过 / 0 条部分通过 / 1 条未验证（判据 8：环境无可用的活中文输入法）。未发现产品缺陷。**
+**Linux 分布：8 条中 7 条通过 / 0 条部分通过 / 1 条未验证（判据 8：环境无可用的活中文输入法）。Linux 侧未发现产品缺陷。**
+
+> **Windows 真机验收（本轮新增，HEAD b077cb1）**：6 条平台判据中 **5 条通过 / 1 条部分通过（判据 3）/ 0 条未验证**，并发现 **1 个产品缺陷 W1**（「展开全部 N」把位置弹层整个收起）。详见 **§0.1**。
+>
+> **两平台合计：Linux 8 条（7 通过 / 1 未验证，0 缺陷）＋ Windows 6 条（5 通过 / 1 部分通过，1 缺陷）。Windows 判据 5（中文输入法）本轮已由「不可用」变为真实通过。**
 
 > **final fix wave（2026-09-24 19:48~19:51，HEAD beda9cb）**：判据 1 补测「单击「..」后点列表空白 / 按 Esc 会留下 stale 高亮」子项，真机复检**通过**（判据 1 保持通过）；判据 8 的守卫由 keyup 改为 keydown 并补了单测，但**真实 IME 会话仍无法构造，保持未验证**。分布因此仍为 **7 通过 / 0 部分通过 / 1 未验证**。
 
 > **fix round 1 订正**：首次提交的判据 7 证据（35/38/39/43 等）前置帧里弹层并未打开、不具判别力，已全部重拍为「弹层可见 → 点击后消失」；判据 3 补上了 brief 明列的「未连接时输入 `~` 不得静默无反应」分支；「未触碰用户数据」的表述按 §6 据实改为「只读枚举了真实 home 的目录名」。重拍过程与命令见 `.superpowers/sdd/2026-09-20-sftp-pane-ux-polish/task-5-report.md` 的 fix round 1 附录。
+
+## 0.1 Windows 真机验收（补齐 Linux 覆盖不到的平台差异）
+
+- 运行时间：2026-09-24 20:05 ~ 20:39 CST；被验二进制 `build/bin/sshore.exe`，4,413,440 B，sha256 `ea71e42bb52b9f968894dad90403a54a367a6f9df96d3d873e719e479116250e`，窗口标题实测 `SSHore v0.7.1-10-gb077cb1`（构建 HEAD b077cb1）。
+- 环境：VirtualBox `win10`（Windows 10.0.19045.6466，用户 `lan`，会话 1 交互桌面）。产物由 `wails build -platform windows/386` 生成（本机仅有 i686-w64-mingw32-gcc，无 amd64 交叉编译器）。
+- 驱动：客户机 `C:\Users\lan\rt\drag\lib.ps1`（`PrintWindow(PW_RENDERFULLCONTENT)` 窗口类截图 + `SendInput` 绝对坐标点击）＋ 本轮新增的 `kbd.ps1`（SendInput 键盘/扫描码/滚轮）与 `fore.ps1`；所有驱动经 `schtasks /create /it` + `schtasks /run` 投放到**会话 1**（纯 SSH shell 落在会话 0，WebView2 会 `800700aa`）。
+- 证据目录：`/tmp/win-ux-shots/`（宿主机，未提交进仓库）；本轮应用部署在 `C:\Users\lan\rt\ux\`（新目录/新文件名 `sshore-ux.exe`），未覆盖用户既有 `C:\sshore\` 或 `sshore.exe`。
+
+### 386 + WOW64 路径垫片（必读前提）
+
+32 位进程的 `C:\Windows\System32` 被 WOW64 重定向到 `SysWOW64`，**看不见** `C:\Windows\System32\OpenSSH\ssh.exe`，而 SFTP 由 Go 侧 `exec` 拉起 `sftp`/`ssh`。本轮把 `C:\Windows\System32\OpenSSH\*.exe` 拷到 `C:\Users\lan\rt\ux\bin`，启动器先 `set PATH=C:\Users\lan\rt\ux\bin;%PATH%` 再 `start "" <exe>`，SFTP 因此可用（见判据 6）。
+
+### Windows 逐条结论
+
+| # | 判据 | 结论 | 证据（/tmp/win-ux-shots/） |
+|---|---|---|---|
+| 1a | 本地路径栏输入 `C:\` + 回车 → 进 C 盘根 | **通过** | D-00/01：路径栏 `C:\`，列表 17 项（$Recycle.Bin、Documents and Settings…） |
+| 1b | 裸盘符归一：输入 `Z:` + 回车 → `Z:\` 并跳转 | **通过** | D-02：路径栏归一为 `Z:\`，列表 3 项（vmctl、winapp、System Volume Information）。盘符实测：`C:` 固定盘、`D:` 空光驱（设备未就绪）、`Z:` VirtualBox 共享目录；仅 C: 是固定盘，故用 Z: 验裸盘符归一 |
+| 1c | 粘贴式引号路径 `"C:\Program Files"` → 去引号并跳转 | **通过** | D-03：路径栏 `C:\Program Files`，列表 20 项（Common Files、Internet Explorer…） |
+| 1d | 输入不存在路径 `C:\no-such-dir-ux` → 错误入日志 + 路径栏与列表整体回滚 | **通过** | D-04/05 + logD.png：日志 `[ERROR] 无法打开 C:\no-such-dir-ux: open … The system cannot find the file specified.`；路径栏与列表回滚到上一目录 `C:\Program Files` |
+| 2 | 单击「..」高亮/清空选中/不跳转；双击「..」跳上级；点列表空白或 Esc 清除高亮 | **通过** | D-09（前置）→ D-10（选中文件，已选 1 项）→ D-11（单击「..」：高亮 + 已选 0 项 + 路径不变）→ D-12（双击「..」→ `C:\Users\lan\rt\ux`）；D-13/14（点空白前/后）、D-15/16（Esc 前/后）；uprow.png 为「..」行放大对照 |
+| 3 | 位置弹层：分区（预设/磁盘/最近）、最近 ≤8 行 +「展开全部 N」、展开后可滚到最后一行且不被面板裁剪、点文件行/空白/☆/🔍 收起 | **部分通过（发现缺陷 W1）** | 通过部分：G-01/G-03（预设+磁盘+最近，最近恰 8 行 +「展开全部 14」）；收起：J-10/11（文件行）、L-01b/02（列表空白，AE=130385）、J-12/13（☆）、J-14/15（🔍 弹出搜索浮层并收起弹层）。**失败部分：激活「展开全部 N」不展开，而是把整个弹层收起**（见缺陷 W1） |
+| 4 | 打开 🔍 不自动深搜；输入 `*` 回车正常深搜 | **通过** | E-01(0.8s) vs E-02(3.8s)：两帧逐像素完全相同（`compare -metric AE = 0`），仅显示提示「输入名称或通配符（支持 * ?）后回车搜索」且无命中；E-03：输入 `*` 回车 → `命中 500 项 · 触发上限（最多 500 条）`，列表可滚动（drag/*.png、clean.txt…） |
+| 5 | 中文输入法回车确认候选不得触发跳转 | **通过** | M-02：Ctrl+Space 切到微软拼音（任务栏「中」，Mt.png）后按扫描码键入 pinyin → 路径栏 `ce'shi` 带组合下划线；M-03/04/05：回车 → 组合提交为 `ceshi`（下划线消失），**路径栏文本保留、列表未变、日志无新增 ERROR**（Mlog.png 前后两帧逐行相同）；对照 M-06/M-07：切回英文后输入 `C:\Users\lan\rt\ux` 回车正常跳转（44 项） |
+| 6 | SFTP 连接回归 | **通过** | 未改动客户机 `~/.ssh/config`：应用在 PATH 垫片下连接用户既有 `winlocal` 主机，远端面板列出 `/C:/Users/lan`（84 项，D-00/E-00），日志含 `[INFO] sftp transport=gosftp`（logD.png 等） |
+
+**Windows 分布：6 条判据中 5 条通过 / 1 条部分通过（判据 3：展开全部失效）/ 0 条未验证；另发现 1 个产品缺陷（W1）。**
+
+### Windows 上发现的缺陷（本轮新增，未修复）
+
+**W1：「📍 位置」弹层的「展开全部 N」不可用（点一下整个弹层消失）**
+
+- 复现：SFTP 本地面板 → 点「📍 位置」→ 弹层打开（最近 8 行 +「展开全部 14」）→ 点击「展开全部 14」，或键盘 Tab 到该按钮后回车 → 弹层**立即消失**，最近分组未展开，多出的 6 条永远看不到。
+- 证据：`G-04/G-05`（G-03 前置帧弹层可见）、`H-08/H-09`（H-07 前置帧弹层可见）、`J-03 → J-04/J-05`。
+- 判别力：`J-03` 证明该按钮**已获得键盘焦点**（焦点环落在「展开全部 14」上）后才按回车，排除「没点中」；对照 `G-01` vs `G-02`（仅调 ForceFore）AE=0，排除焦点强拉导致收起。
+- 推测机制（非结论）：`expandGroup` 后 `g.total == g.rows.length`，`.poslabel` 里的「展开全部」按钮被 `v-if` 移除；焦点节点从 DOM 消失使面板子树 `focusout`（relatedTarget=null），触发 `FilePane.vue` 的 `onPaneFocusOut → closePos()`。
+- 平台差异：同一路径在 Linux/WebKitGTK 上通过（见判据 4）；Windows/WebView2(Chromium) 上按钮移除后的焦点事件时序不同，故此前只跑 Linux 未暴露。
+
+### Windows 未覆盖 / 存疑
+
+- 判据 3 的「展开后滚到最后一行、不被面板裁剪」**未能验证**：展开动作本身在 Windows 上失效，没有可滚动的展开态。
+- 输入法仅验证了微软拼音（TIP `0804:{81D4E9C9-…}{FA550B04-…}`）的「组合→回车提交」路径；五笔/搜狗等第三方 IME 未覆盖。
 
 ## 1. 门禁（make ci）
 
