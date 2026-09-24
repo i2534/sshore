@@ -10,7 +10,7 @@
 
 | 编号 | 操作 | 期望 | 实测数值 | 结论 |
 |---|---|---|---|---|
-| S1 | `make ci` | RC=0、vet/test/vitest/build 全绿 | `MAKE_CI_RC=0`；vitest `Test Files 30 passed (30)` / `Tests 386 passed (386)`；`go test -race` 13 包全 ok | 通过 |
+| S1 | `make ci` | RC=0、vet/test/vitest/build 全绿 | `MAKE_CI_RC=0`；vitest `Test Files 30 passed (30)` / `Tests 386 passed (386)`；`go test -race` 13 包全 ok（2026-09-25 00:39 复核重跑：日志 **2897 B**、RC=0，见 §1） | 通过 |
 | A | 无滚动条面板：列头「修改时间」右墨缘 vs 首个文件行时间值右墨缘 | diff ≤ 2 | header=456 row=455 **diff=1** | 通过 |
 | A2 | 带纵向滚动条（classic，占 21px）重测 A | diff ≤ 2，且列头行与列表行同止于内容盒右边界 | 两行底边框同止于 **x=594**（442px）；header=435 row=434 **diff=1** | 通过 |
 | B | 列头行内不得出现输入框色带 | 只有三段列头文字 | 8 段字形 run，最长 **27px**（名称▲ / 大小 / 修改时间▲） | 通过 |
@@ -22,8 +22,8 @@
 | W2b | 同上；侧栏导航按钮 | 同排控件 y 相同；侧栏 ≥40px | 上下边框行 x 区间**逐段相同**；侧栏项背景带 **40px** | 通过 |
 | W3 | 点「📍位置」 | 弹层宽 220；底部 8px 无 >100px 的 `#8B8B8B`；分段默认 4 行、`展开全部 N` 可见 | 宽 **220px**（546→765）；底带最长 `#8B8B8B` = **0px**；默认 **4 行**；8 条预设时 OCR = `展开全部 8` | 通过 |
 | W4 | Ctrl/Shift 点选、Ctrl+A、Shift+↑↓、全选/反选/清空 | 计数依次 已选 1/N → 区间 → 已选 N/N | OCR：**1/27 → 2/27 → 4 → 6 →（Ctrl+A）**；反选 **26/27**、全选 **27/27**、清空 **0** | 通过 |
-| W4b | 点「已选 n ▾」 | 菜单顶边 < 底栏顶边；整块在面板矩形内；能点到「删除」 | 菜单 y **463→549**、x 696→857；底栏顶边 **543** → 向上；面板 149–578 内未裁切；**「能点到删除」未完全验证** | 部分通过 |
-| W5 | 空态队列：面板底边框→分隔条上边框 | ≤ 12px（有任务时 ≥30px） | 空态 **8px** ≤ 12；**有任务态未验证** | 部分通过 |
+| W4b | 点「已选 n ▾」 | 菜单顶边 < 底栏顶边；整块在面板矩形内；能点到「删除」 | 菜单 y **463→549**、x 696→857；底栏顶边 **543** → 向上；面板 149–578 内未裁切；**「能点到删除」未完全验证**；取证帧与 W5 **同源**（md5 相同，见 §3.6） | 部分通过 |
+| W5 | 空态队列：面板底边框→分隔条上边框 | ≤ 12px（有任务时 ≥30px） | 空态 **8px** ≤ 12（由与 W4b **同一帧**像素复算；该帧含已展开菜单但不产生整宽边框行，见 §3.7）；**有任务态未验证** | 部分通过 |
 | W6 | 按住分隔条拖 40px；再拖到顶/底 | 高度变化 ∈[30,50]；夹取后仍在 80–420 | 166→206（**Δ+40**）；拖到顶 **446**、拖到底 **106**（= 420+26 / 80+26） | 通过 |
 | W7 | 过滤框用中文输入法打「测试」回车 | 过滤生效且不触发路径跳转 | **未验证**（应用窗口失去输入响应；见 §6.2） | 未验证 |
 | W8 | 面板头路径框宽度 | ≥ 180px | 本地 **212px**（469→680）、远程 **211px**（933→1143） | 通过 |
@@ -44,8 +44,8 @@
 | W2b 同排控件 y 相同 / 侧栏未压扁 | Windows | 通过 | 上下边框行的 x 区间**逐段相同**；侧栏导航按钮高 **40px** |
 | W3 位置弹层 | Windows | 通过 | 宽 **220px**（x 546→765）；底部 8px 带内 `#8B8B8B` 最长 **0px**；预设默认 **4 行**、有 `展开全部 8` |
 | W4 Ctrl/Shift 点选、Ctrl+A、Shift+↑↓、三按钮 | Windows | 通过 | OCR：`1/27` → `2/27` → 区间 `4` → `6` → 全选；反选 `26/27`、全选 `27/27`、清空 `0` |
-| W4b 批量菜单向上展开不被裁 | Windows | 部分通过 | 菜单矩形 y 463→549、x 696→857；底栏顶边框 y=**543** → 463 < 543（向上）；整块在面板矩形 149–578 内。**「能点到删除」未完全验证**（见 §6） |
-| W5 空态队列贴分隔条 | Windows | 部分通过 | 空态：面板底边框(508) → 分隔条上边框(517) = **8px** ≤ 12；**有任务态未验证**（见 §6） |
+| W4b 批量菜单向上展开不被裁 | Windows | 部分通过 | 菜单矩形 y 463→549、x 696→857；底栏顶边框 y=**543** → 463 < 543（向上）；整块在面板矩形 149–578 内；**取证与 W5 为同一帧**（md5 相同，见 §3.6）。**「能点到删除」未完全验证**（见 §6） |
+| W5 空态队列贴分隔条 | Windows | 部分通过 | 空态：面板底边框(508) → 分隔条上边框(517) = **8px** ≤ 12（与 W4b **同一帧**复算，见 §3.7）；**有任务态未验证**（见 §6） |
 | W6 拖分隔条 40px | Windows | 通过 | 日志面框高 166→206（**Δ+40** ∈[30,50]）；拖到顶 **446**、拖到底 **106**（= LOG_MAX 420 / LOG_MIN 80 + 26 内边距边框） |
 | W7 中文输入法打「测试」回车 | Windows | **未验证** | 客户机有 zh-Hans-CN 微软拼音，但应用窗口在注入前失去输入响应（见 §6），不得默认通过 |
 | W8 路径框宽 ≥180px | Windows | 通过 | 本地 **212px**（x 469→680）、远程 **211px**（x 933→1143） |
@@ -54,7 +54,7 @@
 
 ## 1. Step 1 门禁（make ci）
 
-命令与原始输出（完整日志 `/tmp/sshkit-t7/logs/make-ci.log`）：
+初版内联输出（**I1 修正说明**：初版引用的日志 `/tmp/sshkit-t7/logs/make-ci.log` 当时为 **0 字节**，下列内联文本在修正前**无法独立复核**，仅作历史记录；可复核的门禁原始输出见下方 §1.1）：
 
 ```console
 $ cd /home/lan/workspace/scripts/sshkit && make ci
@@ -78,6 +78,107 @@ ok  	sshore/internal/watch	6.821s
 cd frontend && npx vitest run
  Test Files  30 passed (30)
       Tests  386 passed (386)
+MAKE_CI_RC=0
+```
+
+> 上列内联文本在初版时无落盘日志佐证（文件 0 字节），不作为证据；**可独立复核的门禁原始输出见下**。
+
+### 1.1 复核重跑（2026-09-25 00:39，HEAD `cb27c4b`）
+
+命令（`2>&1 | tee`，不使用任何会写出 0 字节的重定向方式）：
+
+```console
+$ cd /home/lan/workspace/scripts/sshkit && make ci 2>&1 | tee /tmp/sshkit-t7/logs/make-ci.log
+```
+
+落盘自检（文件非空 + RC）：
+
+```console
+$ wc -c /tmp/sshkit-t7/logs/make-ci.log
+2897 /tmp/sshkit-t7/logs/make-ci.log
+$ grep -n 'MAKE_CI_RC' /tmp/sshkit-t7/logs/make-ci.log
+73:MAKE_CI_RC=0
+$ tail -3 /tmp/sshkit-t7/logs/make-ci.log
+
+make[1]: Leaving directory '/home/lan/workspace/scripts/sshkit'
+MAKE_CI_RC=0
+```
+
+完整日志（73 行，逐字来自上述文件）：
+
+```console
+make[1]: Entering directory '/home/lan/workspace/scripts/sshkit'
+cd frontend && npm run build
+
+> frontend@0.0.0 build
+> vite build
+
+vite v7.3.6 building client environment for production...
+transforming...
+✓ 72 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                        0.37 kB │ gzip:  0.27 kB
+dist/assets/nunito-v16-latin-regular-CSmEcOMa.woff2   18.97 kB
+dist/assets/index-BhxAZx2b.css                        26.74 kB │ gzip:  5.31 kB
+dist/assets/index-4EDa91-i.js                        179.62 kB │ gzip: 64.42 kB
+✓ built in 1.28s
+go vet ./...
+go test ./... -race -count=1
+ok  	sshore	1.698s
+ok  	sshore/internal/config	1.344s
+ok  	sshore/internal/forward	1.891s
+ok  	sshore/internal/importer	1.021s
+ok  	sshore/internal/localfs	1.025s
+ok  	sshore/internal/namepattern	1.028s
+ok  	sshore/internal/osutil	6.457s
+ok  	sshore/internal/preset	1.029s
+ok  	sshore/internal/sftp	3.289s
+ok  	sshore/internal/sshconn	1.031s
+ok  	sshore/internal/sync	16.273s
+ok  	sshore/internal/update	14.868s
+ok  	sshore/internal/watch	6.829s
+cd frontend && npx vitest run
+
+ RUN  v4.1.11 /home/lan/workspace/scripts/sshkit/frontend
+
+ ✓ src/views/sftpSplitterWiring.test.js (5 tests) 5ms
+ ✓ src/views/sftpDropWiring.test.js (6 tests) 8ms
+ ✓ src/styleTokens.test.js (6 tests) 9ms
+ ✓ src/components/filePaneWiring.test.js (25 tests) 13ms
+ ✓ src/components/logPanel.test.js (2 tests) 5ms
+ ✓ src/utils/update.test.js (36 tests) 22ms
+ ✓ src/utils/queue.test.js (63 tests) 30ms
+ ✓ src/utils/searchbox.test.js (3 tests) 5ms
+ ✓ src/utils/systemDrop.test.js (5 tests) 8ms
+ ✓ src/utils/localpath.test.js (7 tests) 11ms
+ ✓ src/utils/batch.test.js (9 tests) 8ms
+ ✓ src/utils/selection.test.js (17 tests) 10ms
+ ✓ src/utils/keys.test.js (10 tests) 6ms
+ ✓ src/utils/dnd.test.js (15 tests) 10ms
+ ✓ src/utils/positions.test.js (10 tests) 11ms
+ ✓ src/utils/forward.test.js (3 tests) 4ms
+ ✓ src/utils/pathbar.test.js (15 tests) 7ms
+ ✓ src/utils/time.test.js (4 tests) 4ms
+ ✓ src/utils/sync.test.js (25 tests) 13ms
+ ✓ src/utils/panefooter.test.js (7 tests) 6ms
+ ✓ src/utils/logpane.test.js (3 tests) 3ms
+ ✓ src/stores/logs.test.js (3 tests) 11ms
+ ✓ src/stores/locations.test.js (11 tests) 15ms
+ ✓ src/views/updateWiring.test.js (13 tests) 18ms
+ ✓ src/stores/settings.test.js (17 tests) 24ms
+ ✓ src/stores/update.test.js (29 tests) 36ms
+ ✓ src/components/searchOverlay.test.js (4 tests) 14ms
+ ✓ src/components/TransferQueue.render.test.js (11 tests) 21ms
+ ✓ src/components/updateSection.test.js (19 tests) 33ms
+ ✓ src/views/sync-smoke.test.js (3 tests) 3ms
+
+ Test Files  30 passed (30)
+      Tests  386 passed (386)
+   Start at  00:39:12
+   Duration  676ms (transform 5.52s, setup 0ms, import 7.80s, tests 370ms, environment 14ms)
+
+make[1]: Leaving directory '/home/lan/workspace/scripts/sshkit'
 MAKE_CI_RC=0
 ```
 
@@ -369,7 +470,7 @@ $ python3 bin/w4an3.py ocr shots-win/51-posmenu8.png 540,180,775,440 6
 
 ### 3.6 W4b —— 批量菜单向上展开 部分通过
 
-菜单矩形（从菜单已打开的 `70-w4b-before.png` 直接量边框）：
+菜单矩形（从菜单已打开的 `70-w4b-before.png` 直接量边框）。**I2 披露：该文件与 §3.7 的 `71-split-base.png` 字节完全相同**——md5 均为 `0ab65f2f1aa517e39f97bcb0dc8e7f5c`，二者是**同一帧**：
 
 ```console
 $ python3 probe.py col shots-win/70-w4b-before.png 750 440 570 | head -6
@@ -388,22 +489,56 @@ $ python3 probe.py row shots-win/70-w4b-before.png 500 660 880 | tail -8
 
 截图：`70-w4b-before.png`（菜单打开、四项可见）、`86-w4b-hover-delete.png`
 
+> 同源披露：`70-w4b-before.png` 与 §3.7 的 `71-split-base.png` 是**同一帧**（byte-identical，md5 `0ab65f2f1aa517e39f97bcb0dc8e7f5c`），不再作为两条独立证据（I2）。
+
 ### 3.7 W5 —— 空态队列贴分隔条 部分通过
 
-空态（无任何传输任务）：
+空态（无任何传输任务）——**取证帧与 §3.6 同源**：
+
+> **I2 披露**：本项使用的 `71-split-base.png` 与 §3.6 的 `70-w4b-before.png` **字节完全相同**（md5 `0ab65f2f1aa517e39f97bcb0dc8e7f5c`），是**同一帧**；该帧中批量菜单处于**展开状态**，并非一张「干净空态」截图。因此 W4b/W5 不再作为两条独立取证，W5 的 8px 结论改由对该帧的**像素复算**给出。
+
+独立复核（不依赖已被删除的 `/tmp/sshkit-t7/bin/splity.py`，直接用 PIL 复算；脚本 `/tmp/sshkit-t7/recheck/verify-evidence.py`）：
 
 ```console
-$ python3 bin/splity.py rt/71-split-base.png 70 150
-  full-width rows (window-local): [169, 508, 517, 525, 534, 699]  counts: [882, 880, 920, 920, 904, 904]
-  panes_bottom=508 splitter_top=517 splitter_bottom=525 logpane_top=534
-  gap panes_bottom -> splitter_top = 8 px
-  logpane height = 175 px
+$ python3 /tmp/sshkit-t7/recheck/verify-evidence.py
+md5(70) = 0ab65f2f1aa517e39f97bcb0dc8e7f5c
+md5(71) = 0ab65f2f1aa517e39f97bcb0dc8e7f5c
+IDENTICAL = True
+full-width BORD rows (window-local y, count), thresh>=800:
+  y=79 n=880
+  y=143 n=882
+  y=169 n=882
+  y=508 n=880
+  y=517 n=920
+  y=525 n=920
+  y=534 n=904
+  y=699 n=904
+gap = splitter_top - panes_bottom - 1 = 8 px
+logpane height = 166 px
 ```
 
-**面板底边框 → 日志分隔条上边框 = 8px ≤ 12px** 通过（正好等于 `.sftp` 的 `gap: 8px`，即空态队列完全不占高度，Task 5 生效）。
+菜单存在性与「不产生整宽边框行」的复核（脚本 `/tmp/sshkit-t7/recheck/menu2.py`；坐标均为 guest 坐标）：
+
+```console
+$ python3 /tmp/sshkit-t7/recheck/menu2.py
+guest(696,463)=(232, 237, 244)
+guest(857,463)=(252, 252, 252)
+guest(696,549)=(250, 251, 252)
+guest(857,549)=(250, 251, 252)
+guest(750,463)=(203, 213, 225)
+guest(750,549)=(255, 255, 255)
+col x_guest=750 (win x=500), guest y 380..500 BORD runs: [(463, 463)]
+row y_guest=520 (win y=450), guest x 640..900 BORD runs: [(696, 696), (857, 857), (866, 866), (875, 875)]
+guest row y=543 BORD count=752
+guest row y=547 BORD count=415
+```
+
+**面板底边框(508) → 日志分隔条上边框(517) = 8px ≤ 12px** 通过（正好等于 `.sftp` 的 `gap: 8px`，即空态队列完全不占高度，Task 5 生效）。菜单矩形为 guest x 696..857（宽 162px）；在 guest y 463..549 内逐行统计整幅 BORD 像素，最大仅 **752px**（来自过滤栏顶边框 y=543），未达报告使用的整宽阈值 800px，故菜单**不会**污染 `panes_bottom(508) → splitter_top(517)` 的测量。
+（口径更正：初版此处写 `logpane height = 175 px`，与整宽边框行 534/699 不符；复算为 `699−534+1 = 166px`，与 §3.8 的初始态 166px 一致。该数值不影响 W5 的 gap 结论。）
+
 **有任务态（应被队列撑到 ≥30px）：未验证** —— 见 §6。
 
-截图：`71-split-base.png`（空态）
+截图：`71-split-base.png`（**与 §3.6 的 `70-w4b-before.png` 同源帧**：菜单展开态，非干净空态）
 
 ### 3.8 W6 —— 拖分隔条 40px 通过
 
@@ -445,7 +580,7 @@ $ python3 bin/splity.py rt/80b.png 70 150                # 再拖到底部
 
 | 文件 | 内容 |
 |---|---|
-| `/tmp/sshkit-t7/logs/make-ci.log` | `make ci` 全量输出（MAKE_CI_RC=0） |
+| `/tmp/sshkit-t7/logs/make-ci.log` | 2026-09-25 00:39 复核重跑的 `make ci` 全量输出（**2897 B**、`MAKE_CI_RC=0`；初版该文件曾为 0 字节，见 §1） |
 | `/tmp/sshkit-t7/shots/00-boot.png` | Linux 应用冷启动 |
 | `/tmp/sshkit-t7/shots/01-sftp-boot.png` | Linux SFTP 页（本地=仓库目录，已出现纵向滚动条） |
 | `/tmp/sshkit-t7/shots/10-local-small.png` | 判据 A/B/C 取证（无滚动条，3 个文件） |
@@ -455,9 +590,12 @@ $ python3 bin/splity.py rt/80b.png 70 150                # 再拖到底部
 | `/tmp/sshkit-t7/shots-win/30-boot.png`、`31-sftp.png`、`32-connected.png` | Windows 应用启动 / SFTP 页 / 连接 winlocal（84 项，`sftp transport=gosftp`） |
 | `/tmp/sshkit-t7/shots-win/40..42-*.png` | W1 排序前后与箭头反转 |
 | `/tmp/sshkit-t7/shots-win/43-posmenu.png`、`51-posmenu8.png` | W3 弹层（4 行 / 展开全部 8） |
-| `/tmp/sshkit-t7/shots-win/52..65-*.png`、`70-w4b-before.png`、`86-w4b-hover-delete.png` | W4 各选择态与 W4b 菜单 |
-| `/tmp/sshkit-t7/shots-win/71..80b-*.png` | W5 空态 / W6 分隔条四种状态 |
+| `/tmp/sshkit-t7/shots-win/52..65-*.png`、`70-w4b-before.png`、`86-w4b-hover-delete.png` | W4 各选择态与 W4b 菜单（`70` 与下行 `71` 为**同源帧**） |
+| `/tmp/sshkit-t7/shots-win/71..80b-*.png` | W5 空态（`71` 实为 `70` **同源帧**，含展开菜单）/ W6 分隔条四种状态 |
 | `/tmp/sshkit-t7/shots-win/90-forward.png`、`91-sync.png`、`92-settings.png`、`94-sftp.png` | W2 四屏 |
+
+> 证据口径说明：`logs/` 下的 `xvfb.log` 为 **0 字节**、`launch.out` 仅 16 B、`app.log` 421 B、`sshd.log` 351 B，均**不作为判据证据**（仅 `make-ci.log` 是门禁原始输出）；另有 `appendix.md` 为报告附录文本副本。§3.6 的 `70-w4b-before.png` 与 §3.7 的 `71-split-base.png` 是**同一帧**（md5 相同），W4b/W5 共用一条截图证据。
+> 命令路径说明：初版若干命令写作 `rt/xxx.png`（当时的工作目录 `/tmp/sshkit-t7/rt`，收尾已删）；留存证据为 `shots-win/` 下的**同名**文件。同名文件是否与当时 `rt/` 下逐字节相同**未复核**（原目录已删），本报告只把 `shots-win/` 下的留存文件当作证据。
 
 ## 5. 本次未触碰用户数据
 
@@ -473,7 +611,7 @@ $ python3 bin/splity.py rt/80b.png 70 150                # 再拖到底部
   $ dir C:\Users\lan\sshore.exe
   2026/09/16  18:54         4,424,192 sshore.exe                      # 大小/mtime 未变
   ```
-- 用户配置目录文件清单与 mtime 前后一致（全部早于本次会话 23:47–00:30）：
+- 用户配置目录文件清单与 mtime 前后一致（全部早于本次会话 23:47–00:30）。**该目录未做前后逐文件哈希对比**（客户机当前为 `savestate`、SSH 通道 2222 关闭，本轮无法补测），故其证据强度为「清单 + mtime」，不能据此声称文件内容逐字节未变：
   ```console
   $ dir C:\Users\lan\AppData\Roaming\sshore
   2026/09/16  19:10             1,163 presets.toml
@@ -481,7 +619,7 @@ $ python3 bin/splity.py rt/80b.png 70 150                # 再拖到底部
   2026/09/20  09:58             2,037 sshore.toml
   2026/09/24  20:07    <DIR>          state          # state/*.json 亦为 20:07
   ```
-- 客户机临时目录归还原状：清理后 `C:\Users\lan\rt` = `18 File(s) 51,259,826 bytes`，与运行前清单逐字节一致。
+- 客户机临时目录归还原状：清理后 `C:\Users\lan\rt` = `18 File(s) 51,259,826 bytes`，与运行前清单在「**文件数 18 + 总字节 51,259,826**」口径上一致。**未做逐文件 SHA256/MD5 前后对比**（客户机 `savestate`、2222 通道不可用），故不声称「逐字节一致」。
 - 未删除/重命名任何用户文件；被误触发的「上传文件」原生对话框用 Escape 取消、误开的记事本已关闭。
 
 ## 6. 未通过 / 未验证项与原因
@@ -557,3 +695,15 @@ State:                       saved (since 2026-09-24T16:28:53.396000000)     # �
 4. A2 的判别力依赖**会占布局宽度的滚动条**；本机 WebKitGTK 默认 overlay（不占宽），故额外用 `GTK_OVERLAY_SCROLLING=0` 造出 classic 滚动条，使「表头若在滚动容器外就会错位 22px」这一条件真正成立。
 5. Windows 侧控件高度判据用「一对边框行 + 两行边框色 x 区间逐段相同」的通用检查，避免依赖单点猜测坐标；过滤栏按钮位置随 `已选 n ▾` 出现而左移，所有点击坐标按态重取（§3.5 注）。
 6. Windows 通道与 brief 预设不同（headless 无控制台窗口），已改用会话 1 内的 guest 侧 `SendInput` 代理；输入等价且无需坐标映射，取证仍用 `controlvm screenshotpng`。
+
+## 9. 证据完整性修正（2026-09-25 独立复核）
+
+本报告初版（commit `cb27c4b`）经证据完整性复核发现 3 处 Important 问题，本节记录修正；全部为**文档/证据**改动，无生产代码改动。
+
+| 编号 | 问题 | 修正 |
+|---|---|---|
+| I1 | §1/§4 引用的 `make-ci.log` 实为 **0 字节**（`xvfb.log` 同为 0 字节），门禁原始输出无法独立复核 | 2026-09-25 00:39（HEAD `cb27c4b`）以 `make ci 2>&1 \| tee` 重跑落盘：**2897 B、RC=0**，完整 73 行逐字贴入 §1.1；空日志从证据口径剔除/标注（§4） |
+| I2 | `70-w4b-before.png` 与 `71-split-base.png` **字节相同**（md5 `0ab65f2f1aa517e39f97bcb0dc8e7f5c`），§3.6/§3.7/§4 却列为两条独立证据 | 采纳方案 (a)：§3.6/§3.7 明确披露**同源帧**，W5 结论改由像素复算给出（8px ≤ 12px）；菜单不产生整宽边框行（§3.7） |
+| I3 | §5「与运行前清单逐字节一致」仅有计数+总字节支撑；用户 `%APPDATA%\sshore` 未做哈希前后对比 | 改为可证明口径：**文件数 18 + 总字节 51,259,826 + 前后清单/mtime**；明确标注**未做逐文件哈希对比**（客户机 savestate、2222 通道关闭），不再使用「逐字节一致」 |
+
+另修正两处 Minor：§3.7 的 `logpane height` 由初版 175px 复算为 **166px**（与 §3.8 初始态一致，不影响 gap 结论）；§4 增加空日志与命令路径 `rt/` → `shots-win/` 的说明。`W4b`「能点到删除」、`W5` 有任务态、`W7`（IME）仍为**未验证/未完全验证**，结论不因本轮修正而改变。
