@@ -127,21 +127,68 @@ func TestGoBackendPutTreeCleanupReadDirCountFollowsWriteDirSet(t *testing.T) {
 	}
 }
 
-// TestPutTreeCleanupDirsIsParentSetOfRel：扫描面由 rel 的父目录推导（去重 + 含目标根）。
-// 直接钉纯函数，避免「实现里换回递归遍历」时只有大用例才变红。
-func TestPutTreeCleanupDirsIsParentSetOfRel(t *testing.T) {
+// TestGoBackendPutTreeCleanupTargetsArePerDir（复核轮 2 / Minor-4 的判据收窄，RED→GREEN）：
+// 每个待扫目录只认「**该目录里**本树会写的 basename」，而不是「本树所有目标的 basename 并集」。
+//
+// 为什么必须收窄：并集判据下，只要某个 basename 在本树任意位置出现，本树写到的**任何**目录里
+// 同名 .part 都会被删 —— 于是「同一最终路径」之外仍然可能删到别的任务的锚点（配合 shortID
+// 的 8 rune 截断碰撞）。按目录切分后，误删的必要条件正好收敛为「同一目录 + 同一 basename
+// = 同一最终目标路径 + 8 rune 碰撞」，也就是真实的同文件冲突。
+//
+// 本用例：本树 = out/big.bin + out/sub/y.bin。out/sub 里放一个 **big.bin** 的过期 .part
+// （big.bin 是本树目标，但本树在 out/sub 里只写 y.bin）—— 并集判据会删掉它，按目录判据必须留下；
+// 同一目录里 y.bin 的本项 .part 照旧必须被清掉（完备性不能因为收窄而丢）。
+func TestGoBackendPutTreeCleanupTargetsArePerDir(t *testing.T) {
+	remoteRoot, src := t.TempDir(), t.TempDir()
+	makeLocalTree(t, src, map[string]string{"a/big.bin": "BIG", "a/sub/y.bin": "Y"})
+	g := backendForTestServer(t, remoteRoot)
+
+	const id, collidingID = "t10000-10", "t10000-11"
+	rootRemote := filepath.Join(remoteRoot, "out")
+	// 别的任务（id 前 8 rune 与本次相同）在 out/sub 里传 big.bin：本树在 out/sub 只写 y.bin，
+	// 这条 .part 与「本树会写的最终路径」无关，必须留下。
+	foreignInSub := filepath.Join(rootRemote, "sub", "big.bin"+PartMarker+shortID(collidingID)+"-dead1")
+	// 本树自己的过期 .part（out/sub/y.bin）：必须清掉。
+	mineInSub := filepath.Join(rootRemote, "sub", "y.bin"+PartMarker+shortID(id)+"-stale2")
+	for _, p := range []string{foreignInSub, mineInSub} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := g.PutTree(TransferRequest{ID: id, Host: "h", Remote: "out", Local: filepath.Join(src, "a"), Atomic: true}, nil); err != nil {
+		t.Fatalf("PutTree: %v", err)
+	}
+	if _, serr := os.Stat(mineInSub); !os.IsNotExist(serr) {
+		t.Fatalf("同一目录里本项目标的过期 .part 必须被清掉: %s stat err=%v", mineInSub, serr)
+	}
+	if _, serr := os.Stat(foreignInSub); serr != nil {
+		t.Fatalf("本树在该目录里不写 big.bin，别的任务的 big.bin .part 不得被删: %s err=%v", foreignInSub, serr)
+	}
+}
+
+// TestPutTreeCleanupScopeIsPerDirTargetSet：直接钉纯函数 —— 扫描面 = {path.Dir(rel) → basename}，
+// 每个目录只带**该目录里**会写的目标；空树不产生任何扫描单元。
+func TestPutTreeCleanupScopeIsPerDirTargetSet(t *testing.T) {
 	files := []treeFile{
 		{rel: "x.txt"},
 		{rel: "sub/y.txt"},
 		{rel: "sub/deep/z.txt"},
 		{rel: "sub/another.txt"},
 	}
-	got := putTreeCleanupDirs(files)
-	want := []string{".", "sub", "sub/deep"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("putTreeCleanupDirs = %v, want %v", got, want)
+	got := putTreeCleanupScope(files)
+	want := []cleanupScope{
+		{dir: ".", targets: []string{"x.txt"}},
+		{dir: "sub", targets: []string{"another.txt", "y.txt"}},
+		{dir: "sub/deep", targets: []string{"z.txt"}},
 	}
-	if n := len(putTreeCleanupDirs(nil)); n != 1 {
-		t.Fatalf("空树也必须含目标根一个目录（用于清根目录里的过期 .part），got %d", n)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("putTreeCleanupScope = %+v, want %+v", got, want)
+	}
+	if n := len(putTreeCleanupScope(nil)); n != 0 {
+		t.Fatalf("空树没有任何会写的文件 ⇒ 不需要清理，got %d 个扫描单元", n)
 	}
 }
