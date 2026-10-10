@@ -1,6 +1,6 @@
 # SFTP：双侧刷新 + 右键菜单分级 + 最后路径/排序持久化 + 连接失效自愈 设计
 
-> 状态：v1.3 · 用户已逐节确认（§15 决策记录）· **两阶段审核已完成并逐条处置**（第一阶段作者自审 9 项 + 第二阶段干净 subagent 双面审核 33 项，见 §16）· **待用户评审** · 尚未实施
+> 状态：v1.4 · **用户已评审通过**（2026-10-10，选定「B. 通过，并把 `AddBookmark`/`RemoveBookmark` 的同类竞态本轮一并修」⇒ 范围扩大见 §15 D21）· 两阶段审核已完成并逐条处置（第一阶段作者自审 9 项 + 第二阶段干净 subagent 双面审核 33 项，见 §16）· 下一步：由 `writing-plans` 出实施计划 · 尚未实施
 > 关联：`docs/superpowers/specs/2026-09-16-sftp-selection-dnd-navigation-design.md`（选择/批量/拖拽/位置基线，本轮遵其决策 5/6/32）、`docs/superpowers/specs/2026-09-18-sftp-gosftp-transport-design.md`（gosftp 底座与粘性 Connected 的由来）、`docs/superpowers/specs/2026-09-24-sftp-pane-layout-fixes.md`（面板排版基线）
 > 路径判定：**架构级**（配置结构变更 + 新增后端绑定 + 前端交互模型调整 + 连接状态机自愈）
 > 证据来源：§1 的代码事实均带 `file:line`，本次逐条读过源码后记录（非引用旧文档）
@@ -89,6 +89,7 @@
 | D18 | `SaveSftpUI` 的调用形态 | 前端先 `GetSftpUI()` 读回、**只覆盖 sort 四字段**再整结构写回；payload 六个 snake_case 键逐字写出 | 二阶段审核 BF2/FF9 |
 | D19 | 探活的两层上界 | 后端 `Pool.Probe` 修预算缺陷 + legacy batch 走 ctx runner；前端 `probeTimed` 客户端超时（超时=未知，`finally` 复位 `probing`） | 二阶段审核 BF5/BF6 |
 | D20 | 落点决策单一实现 | `connect()` 与 `syncConnection()` 共用 `utils/remotepath.js` 的 `resolveRemoteTarget` | 二阶段审核 FF8 |
+| D21 | 范围扩大 | `AddBookmark`/`RemoveBookmark` 的同类 slice 竞态**并入本轮**（用户 2026-10-10 在规格评审时选定"B. 通过，并一并修"）；对外行为与去重语义不变 | 用户决定 |
 
 ---
 
@@ -254,9 +255,13 @@ SftpUI SftpUIState `toml:"sftp_ui" json:"sftp_ui"`
 
 1. **整结构赋值**：`cfg.SftpUI` 一律"构造新值后整结构赋值"，**绝不原地修改 `LastRemoteDirs` 这个 map**。原因：`snapshotConfig()`（`app.go:649-657`）是浅拷贝，map 头被共享；原地写会与锁外正在跑的 TOML 编码（`saveConfig`，`app.go:659-669`）并发读写同一个 map ⇒ `-race` 能抓到、生产会 panic。
 2. **锁内绝不 Normalize、绝不碰返回值的 map/slice 头**：`GetSftpUI` 只在读锁内做 `s := a.cfg.SftpUI`（值拷贝），**解锁后**再 `s.Normalize()` 并返回（审核 BF3：`Normalize()` 会给 nil map 赋新 map 头，若在读锁内调用就是对共享结构的原地写）。`SaveSftpUI` 的 Normalize 在加写锁**之前**完成。
-3. **slice 同类问题（审核 BF4，既有缺口，本轮就地修）**：`AddLocalRecent`/`AddRemoteRecent` 现在用 `kept := a.cfg.LocalRecent[:0]`（`app.go:1353`、`:1380`）**原地复用底层数组**，而 `snapshotConfig` 的浅拷贝与该数组共享 ⇒ 锁外 TOML 编码期间并发写同一数组，是**真的 `-race` 缺陷**。本轮这两个函数本来就要改，所以：改为 `kept := make([]T, 0, len(x))` 新数组，并把"recents 去重 + last path 更新"整段放进 `cfgMu` 写锁内（锁内只赋值，解锁后再 `saveConfig()`）。
+3. **slice 同类问题（审核 BF4；**范围已按用户 2026-10-10 决定扩大**）**：`AddLocalRecent`/`AddRemoteRecent`（`kept := a.cfg.LocalRecent[:0]`，`app.go:1353`、`:1380`）与 `AddBookmark`/`RemoveBookmark`（`app.go:1324`、`:1332`）**都**原地复用底层数组，而 `snapshotConfig` 的浅拷贝与该数组共享 ⇒ 锁外 TOML 编码期间并发写同一数组，是**真的 `-race` 缺陷**。本轮**四个函数统一改造**：
 
-   **诚实声明**：`AddBookmark`（`app.go:1324`）与 `RemoveBookmark`（`app.go:1332`）存在**同款既有缺口**，**不在本轮范围**（见 R13 与 §13）。因此本规格**不声称**"全仓并发安全"，只声称"本轮改动的三个写点安全"。
+   - `kept := make([]T, 0, len(x))` 新数组（不复用 `[:0]`），或直接整结构赋值新 slice；
+   - 去重/增删 + （仅 recents 两处）last path 更新整段进 `cfgMu` 写锁；
+   - 锁内只赋值，解锁后再 `saveConfig()`。
+
+   由此本规格可以声称"**这 4 个配置写入点并发安全**"；但**仍不声称全仓并发安全** —— 其它直接改 `a.cfg` 的路径（如 `updateTunnel` 等）未在本轮审计范围内。
 4. 附：`app.go:37-42` 的 `cfgMu` 注释需同步扩写为"保护 `cfg.App` 与 `cfg.SftpUI`"。
 
 #### 6.3.5 锁与 IO 规约
@@ -490,6 +495,7 @@ async function verifyRemote() {
 | `app.go` 绑定 | `SaveSftpUI(s config.SftpUIState) error` | `Normalize()` → `cfgMu` 写锁内 **`if a.cfg == nil { a.cfg = &config.AppConfig{} }`**（BF13，照 `setAppSettings`）+ 整结构赋值 → 解锁后 `saveConfig()` |
 | `app.go` 绑定 | `SftpProbe(host string) bool` | §8.2；`a.sftp == nil` 时 false |
 | `app.go` 改动 | `AddLocalRecent`/`AddRemoteRecent` | §6.3：recents 逻辑保持，新增"last path 不受短路约束"的写入；**slice 重建改新数组 + 整段进写锁**（BF4）；内部 `recordRecentSFTP` 加 `rememberLast` 参数并由内部调用一律传 `false`（BF1） |
+| `app.go` 改动 | `AddBookmark`/`RemoveBookmark` | §6.3.4 第 3 条（用户 2026-10-10 决定纳入本轮）：同样改新数组 + 进写锁，消除既有 `-race`；**不改这两个函数的对外行为与去重语义** |
 | `app.go` 注释 | `cfgMu` 注释（`app.go:37-42`） | 扩写为"保护 `cfg.App` 与 `cfg.SftpUI`" |
 | `frontend/wailsjs/go/{main/App.js,main/App.d.ts,models.ts}` | **必须重生成并入库** | `wails generate module -tags webkit2_41`（仓库根执行；`wails v2.15.0 generate module` 支持 `-tags` 已实测）；`models.ts` 会多出 `SftpUIState` 类，`last_remote_dirs` 生成 `Record<string, string>`（同版本既有先例：`App.d.ts:149`） |
 | 前端新增 | `stores/sftpui.js`、`utils/sort.js`、`utils/remotepath.js`（各 + 测试） | §7.1/§7.3/§6.4 B5 |
@@ -534,7 +540,7 @@ async function verifyRemote() {
 | `Ctrl.Probe` 分派 | 注入强制后端（`NewCtrlForcedBackend`）→ 走"有上界的列目录"分支；`*GoBackend` + fake `DialFunc`（`cancel_test.go:491` 有注入先例）→ 走 `pool.Probe`（失败会话被丢弃） |
 | `Pool.Probe` 预算缺陷回归（**审核 BF5**） | fake dial 人为慢于 `probeTimeout` 但**成功建出会话** ⇒ `Probe` 必须返回 `true`（不得因 cctx 过期把健康连接判死），且该会话不得被 `Release(s,false)` 关掉 |
 | `SftpProbe` 绑定 | 未连接的 host → `false`；`a.sftp == nil` → `false`、不 panic |
-| 竞态（`-race`，**审核 BF4/BF14**） | ① `SaveSftpUI` ‖ `saveConfig`；② **`AddRemoteRecent` ‖ `saveConfig`**（防 slice 原地复用）；③ **`GetSftpUI` ‖ `SaveSftpUI`**（防锁内 Normalize）。另补**结构性判据**（源码断言，与前端 wiring 同风格）：三个写入路径中不出现 `a.cfg.SftpUI.LastRemoteDirs[` 赋值、写锁内构造了新 map——因为 `-race` 绿只说明"这次没重叠"，不能证明实现没原地写 |
+| 竞态（`-race`，**审核 BF4/BF14**） | ① `SaveSftpUI` ‖ `saveConfig`；② **`AddRemoteRecent` ‖ `saveConfig`**；③ **`AddLocalRecent` ‖ `saveConfig`**；④ **`AddBookmark` ‖ `saveConfig`**、⑤ **`RemoveBookmark` ‖ `saveConfig`**（后两条来自用户 2026-10-10 决定扩大的范围，防 slice 原地复用）；⑥ **`GetSftpUI` ‖ `SaveSftpUI`**（防锁内 Normalize）。另补**结构性判据**（源码断言，与前端 wiring 同风格）：四个写入路径中不出现 `a.cfg.SftpUI.LastRemoteDirs[` 赋值、写锁内构造了新 map、不出现 `kept := a.cfg.X[:0]`——因为 `-race` 绿只说明"这次没重叠"，不能证明实现没原地写 |
 
 ### 11.2 前端 vitest
 
@@ -590,7 +596,7 @@ async function verifyRemote() {
 | R10 | 行菜单去掉「新建文件夹」是行为变更，老用户肌肉记忆会失效 | 已与用户确认（D6）；若实机反馈不便，一行加回 |
 | R11 | `remoteOpFailed` 的替换点漏一个远程 catch，则那一类失败不会自愈 | §11.2 的**分类型覆盖口径**钉死（纯远程函数 / 混合面板函数 / 新增的 `:767` 与 `:163`）；实施时逐个核对 §8.4 的 12 项清单 |
 | R12 | **`SftpHome` 改写 last path（审核 BF1，Blocking）** ⇒ 单主机用户的最后路径被静默改成 home，且验收 C2 看不出来 | 已按 §6.3.1 修（内部 `recordRecentSFTP` 一律不写 last path）；§11.1 加 `recordRecentSFTP(...,false)` 回归用例 + §11.3 C4 端到端回归 |
-| R13 | **`AddBookmark`/`RemoveBookmark` 的 slice 原地复用是同类既有 `-race` 缺陷**（`app.go:1324`/`:1332`），本轮只修被本功能触及的 `AddLocalRecent`/`AddRemoteRecent` | 规格**明确不声称全仓并发安全**；该缺口列入 §13 后续子项。**待用户决定是否本轮一并修**（改动量与已修的两个同构） |
+| R13 | **`AddBookmark`/`RemoveBookmark` 的 slice 原地复用是同类既有 `-race` 缺陷**（`app.go:1324`/`:1332`） | **已按用户决定纳入本轮**（§6.3.4 第 3 条，四个函数统一改造）；§11.1 加 `AddBookmark ‖ saveConfig`、`RemoveBookmark ‖ saveConfig` 两条 `-race` 用例；范围记录见 §15 D21 |
 | R14 | `last_remote_dirs` 的键不含 user：同一 host 的不同 user 会共用一条记忆 | 视图范围内 user 恒 `''` ⇒ 不触发；已写进 §6.1 前提声明，扩展到 sync/watch 前必须先改键 |
 | R15 | 前端探针超时把"未知"当"失效"会误触发重连 | `probeTimed` 超时**不改状态、不重连**，只复位 `probing`；需要 `finally` 保证（R8 的同一处代码） |
 
@@ -598,7 +604,8 @@ async function verifyRemote() {
 
 ## 13. 后续子项（另行评审，不在本轮）
 
-- **`AddBookmark`/`RemoveBookmark` 的同类 slice 竞态**（R13，`app.go:1324`/`:1332`）：与已修的两个函数同构（改成新数组 + 进写锁即可），但**不在本轮范围**。**待用户决定**是否本轮一并修（若用户要求，本规格范围相应扩大并在 §16 记录）。
+- **`AddBookmark`/`RemoveBookmark` 的同类 slice 竞态**（R13）：**已并入本轮**（用户 2026-10-10 决定），见 §6.3.4 第 3 条与 §15 D21 —— 本条不再作为后续子项。
+- **`updateTunnel` 等其它直接写 `a.cfg` 的路径的并发审计**：本轮未覆盖（规格不声称全仓并发安全）。
 - **`last_remote_dirs` 的键纳入 user**（R14）：扩展到 sync/watch 之前必须做。
 - **探活耗时再优化**：若 §11.3 F1 实测偏慢，改为后台探测 + 结果异步落地。
 - **失败的远程操作自动重放**（本轮明确不做）。
@@ -616,7 +623,7 @@ async function verifyRemote() {
 **改动**
 - `internal/config/store.go`（`SftpUIState` + `AppConfig.SftpUI` + `Normalize` 挂点）+ `internal/config/store_test.go`
 - `internal/sftp/ctrl.go`（`Ctrl.Probe`）、`internal/sftp/session.go`（`Pool.Probe` 预算缺陷修复）+ 对应测试；**不改** `internal/sftp/api.go` 的接口（仅可加注释）
-- `app.go`（`GetSftpUI`/`SaveSftpUI`/`SftpProbe`；`AddLocalRecent`/`AddRemoteRecent` 的新写法；`recordRecentSFTP` 加 `rememberLast`；`cfgMu` 注释）+ `app_test.go`
+- `app.go`（`GetSftpUI`/`SaveSftpUI`/`SftpProbe`；`AddLocalRecent`/`AddRemoteRecent` 的新写法；`AddBookmark`/`RemoveBookmark` 的 slice/锁改造；`recordRecentSFTP` 加 `rememberLast`；`cfgMu` 注释）+ `app_test.go`
 - `frontend/src/views/SftpView.vue`（刷新入口、菜单矩阵、`actionsFor` 置灰、恢复点与顺序、共享落点、自愈、排序接线、`cleanItem`/`onMoveDrop` 的 catch 改造）
 - `frontend/src/components/FilePane.vue`（右键触发面、排序 props/emit 含 `arrow()`）
 - `frontend/src/components/ContextMenu.vue`（禁用样式）
@@ -670,7 +677,7 @@ async function verifyRemote() {
 | BF1 | **Blocking** | `SftpHome` 每次 connect 都调 `recordRecentSFTP` ⇒ 顺带写会把单主机用户的 last path 改写成 home；前端队首短路又让污染不被纠正 ⇒ **验收 C2 通过但盘上已错，下次启动永久 home** | 接受。§6.3.1 改为"只有前端面向的导航绑定写 last path"，内部 `recordRecentSFTP` 加 `rememberLast=false`；§11.1 加回归用例；§11.3 加 C4 端到端回归；R12 |
 | BF2 | Important | "store 是 last_* 唯一持有者"不成立（后端 4 处传输 + SftpHome 会写），一次 `saveSnapshot()` 整结构回写就把较新值静默回滚 | 接受。§6.3.1 消掉越权写点；§6.3.3 要求 `saveSnapshot()` 先 `GetSftpUI()` 读回、只覆盖 sort 四字段；§7.2 补说明 |
 | BF3 | Important | `GetSftpUI` 若在读锁内 `Normalize()`（会给 nil map 赋新头）⇒ 与并发写共享结构竞争，且 `-race` 用例抓不到 | 接受。§9 写死"锁内只值拷贝、解锁后 Normalize"；§11.1 加 `GetSftpUI ‖ SaveSftpUI` 竞态用例 |
-| BF4 | Important | 规格说"slice 改动保持原样"，但 `kept := cfg.X[:0]` 与浅拷贝共享底层数组 ⇒ 真 `-race` | 接受。§6.3.4 第 3 条：改新数组 + 整段进写锁；**明确声明** `AddBookmark`/`RemoveBookmark` 同款缺口不在本轮（R13/§13，待用户决定）；`-race` 加 `AddRemoteRecent ‖ saveConfig` |
+| BF4 | Important | 规格说"slice 改动保持原样"，但 `kept := cfg.X[:0]` 与浅拷贝共享底层数组 ⇒ 真 `-race` | 接受。§6.3.4 第 3 条：改新数组 + 整段进写锁；**范围经用户 2026-10-10 决定扩大** —— `AddBookmark`/`RemoveBookmark` 一并修（R13/§15 D21），`-race` 加 4 条写入用例 |
 | BF5 | Important | `AcquireList` 不用 ctx ⇒ 拨号 ≥5s 时健康连接被判失效、健康会话被关、误触发重连；且探针会置粘性 `Connected`（未声明副作用） | 接受。§8.2 修 `Pool.Probe`（过期但会话建出 ⇒ 新预算复核）+ 文档化副作用；§11.1 加 slow-dial 回归；R1 重写、F1 实测 |
 | BF6 | Important | legacy batch 探针无活性上界 ⇒ `await` 永不返回 ⇒ `probing` 恒 true ⇒ 自愈永久静默失效 | 接受。§8.2 batch 分支用 `osutil.NewCtxRunner()`（仓库已有）+ §8.3 `probeTimed` 客户端超时（超时=未知、`finally` 复位）；R8 重写、F2 验收 |
 | BF7 | Important | §11.1 的两条判据互相矛盾（既有用例构造下 map 为空，"短路⇒不写 map"又与意图冲突） | 接受。§11.1 判据重写为"无论队首是否同值，last path 必须 == path" |
