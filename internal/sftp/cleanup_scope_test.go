@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 
@@ -190,5 +191,35 @@ func TestPutTreeCleanupScopeIsPerDirTargetSet(t *testing.T) {
 	}
 	if n := len(putTreeCleanupScope(nil)); n != 0 {
 		t.Fatalf("空树没有任何会写的文件 ⇒ 不需要清理，got %d 个扫描单元", n)
+	}
+}
+
+// TestPutTreeCleanupScopeRejectsUnsafeRels（复核轮 3 / Minor 的守卫）：推导侧拒绝
+// rel 为空/绝对/含 ".."/basename 为 "." 或 ".." 的条目 —— scanLocalTree 实测不产出这类 rel，
+// 这里防的是推导本身出错：宁可不扫（少删），也不能扫到目标树以外的目录。
+func TestPutTreeCleanupScopeRejectsUnsafeRels(t *testing.T) {
+	files := []treeFile{
+		{rel: ""},
+		{rel: "/abs/x.txt"},
+		{rel: ".."},
+		{rel: "../evil/x.txt"},
+		{rel: "a/../../b.txt"},
+		{rel: "a/.."},
+		{rel: "ok/good.txt"},
+	}
+	got := putTreeCleanupScope(files)
+	want := []cleanupScope{{dir: "ok", targets: []string{"good.txt"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("putTreeCleanupScope(含不安全 rel) = %+v, want %+v（不安全条目必须整体丢弃）", got, want)
+	}
+	for _, sc := range got {
+		if sc.dir == ".." || strings.HasPrefix(sc.dir, "../") || path.IsAbs(sc.dir) || strings.Contains(sc.dir, "/../") {
+			t.Fatalf("扫描面不得包含越出目标树的目录: %+v", sc)
+		}
+		for _, n := range sc.targets {
+			if n == "." || n == ".." || strings.Contains(n, "/") {
+				t.Fatalf("清理目标名必须是非 . / .. 的单段名: %q（scope=%+v）", n, sc)
+			}
+		}
 	}
 }

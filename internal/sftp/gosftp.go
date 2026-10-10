@@ -1001,7 +1001,7 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 		}
 	}
 	if err := removeRemote(s.Conn, bak); err != nil && !os.IsNotExist(err) {
-		warn("提交成功但删除备份 %s 失败（残留孤儿 bak，由临时文件清理兜底）: %v", bak, err)
+		warn("提交成功但删除备份 %s 失败（残留孤儿 bak；.bak 不在任何清理判据内，只能靠这里删）: %v", bak, err)
 	}
 	return nil
 }
@@ -1129,9 +1129,12 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	// putTreeCleanupScope）：每个单元各做**一次** ReadDir，绝不递归整棵既有子树。
 	// 改前那种递归有两个问题：(a) 往返次数随用户既有子树规模线性增长（每个目录一次 ReadDir）；
 	// (b) shortID 只截 8 rune，碰撞时会扫到与本树无关的分支。判据仍是 isPartForTarget 的
-	// 双重命中（目标 basename 前缀 + 本次 id 短前缀），再加上「只认本目录自己的目标」，
-	// 于是跨任务误删的必要条件收敛为「同一目录 + 同一 basename」= 同一最终目标路径。
-	// 清理**不含** backup-swap 的 .bak。
+	// 双重命中（目标 basename 前缀 + 本次 id 短前缀），再加上「只认本目录自己的目标」。
+	// 复核轮 3 实测补充：跨任务误删的**必要条件**是「同一目录 + 8 rune 短 id 前缀碰撞」——
+	// 常规命名还需 basename 相同（= 同一最终路径），但退化短名 `.sshore-sftppart-<id>-…`
+	// 不含 basename，只要碰撞就可能命中本树写到的目录里的同名 .part。
+	// 推导侧另有守卫：rel 为空/绝对/含 ".." 的条目一律不纳入扫描面（见 putTreeCleanupScope）。
+	// 清理**不含** backup-swap 的 .bak：bak 从不 recordPart，也不被任何清理判据覆盖。
 	g.cleanupRemoteTreeParts(ctx, s, rootRemote, putTreeCleanupScope(files), req.ID)
 	tp.begin()
 
@@ -1895,7 +1898,8 @@ type cleanupScope struct {
 // 为什么每个目录只带**该目录**的目标（而不是全树 basename 并集）：并集判据下，只要某个
 // basename 在本树任意位置出现，本树写到的任何目录里同名 .part 都会被删 —— 于是除了
 // 「同一最终目标路径」之外还可能删到别的任务的锚点（配合 shortID 的 8 rune 截断碰撞）。
-// 按目录切分后，误删的必要条件正好收敛为「同一目录 + 同一 basename = 同一最终路径」。
+// 按目录切分后，误删的必要条件是「同一目录 + 8 rune 短 id 前缀碰撞」（常规命名还需 basename
+// 相同 = 同一最终路径；退化短名不含 basename，见本函数头注释）。
 // 详见 TestGoBackendPutTreeCleanupTargetsArePerDir。
 //
 // 依据（2026-10-10 复核轮 2 / Important-1）：新语义下 rootRemote 是「用户可能已有内容的最终
@@ -1905,6 +1909,15 @@ func putTreeCleanupScope(files []treeFile) []cleanupScope {
 	order := []string{"."}
 	byDir := map[string]map[string]bool{".": {}}
 	for _, f := range files {
+		// 守卫（复核轮 3 / Minor）：rel 由 scanLocalTree 唯一生产，实测不产出空/绝对/含 ".."
+		// 的路径；这里仍然拒绝它们 —— 推导若出错，宁可不扫（少删）也不能扫到目标树以外的目录。
+		if f.rel == "" || path.IsAbs(f.rel) || f.rel == ".." || strings.HasPrefix(f.rel, "../") || strings.Contains(f.rel, "/../") {
+			continue
+		}
+		if b := path.Base(f.rel); b == "." || b == ".." {
+			// 例如 rel="a/.."：清理目标名会是 ".."，同样拒绝（宁可不扫）。
+			continue
+		}
 		dir := path.Dir(f.rel) // f.rel 是 POSIX 相对路径，父目录同样用 path 家族
 		if dir == "" {
 			dir = "."
@@ -1953,7 +1966,7 @@ var readRemoteDir = func(c *sftp.Client, ctx context.Context, dir string) ([]os.
 // 扫描面由 scope 显式给定（生产调用点传 putTreeCleanupScope(files)）：对每个扫描单元恰好做
 // **一次** ReadDir，**不递归** —— 因此目录数/往返次数只跟本树写入目录集合同阶，绝不随既有
 // 目标子树规模增长；每个目录只用自己的目标集合判定，因此跨任务误删的必要条件收敛为
-// 「同一目录 + 同一 basename」= 同一最终目标路径（见 putTreeCleanupScope）。
+// 「同一目录 + 同一 basename（+ 8 rune 短 id 碰撞）」= 同一最终目标路径（见 putTreeCleanupScope）。
 // scope 里的目录可能还不存在（根目录建失败等）：os.IsNotExist 是正常路径，不 warn。
 // 其它错误（目录不可读等）都只 warn —— 尽力而为，绝不让重试失败。
 func (g *GoBackend) cleanupRemoteTreeParts(ctx context.Context, s *Session, remoteRoot string, scope []cleanupScope, id string) int {
