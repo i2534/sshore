@@ -1,64 +1,70 @@
-# Windows / WebView2 验收（C 轮）——已试，被环境阻塞，附证据与可执行清单
+# Windows / WebView2 验收（C 轮）——已执行，结论与证据
 
-## 结论一句话
+**一句话结论**：应用在真 Windows（VBox `win10` = `DESKTOP-LLF2GB6`，19045 x64）上能构建、启动、渲染；**SFTP 两个面板的右键菜单分级、禁用态在 Windows/WebView2 上逐项符合设计**（本次用 RDP 真实输入通道驱动，非注入）；同时发现**一个只属于 `windows/386` 构建的问题**：SFTP 连接时报 `exec: "ssh": executable file not found in %PATH%`（WOW64 重定向，见 §2）。
 
-**应用能在真 Windows（VBox `win10`，19045 x64）上构建、启动并正确渲染**；但**这台客户机当前整条合成输入链路不通**（连 Windows 开始菜单都点不动），且备用的真实输入通道（RDP）缺客户机口令 ⇒ **Windows 特有的菜单/窗口行为本轮未能验证**。这是环境阻塞，不是应用缺陷的证据。
+- 被测二进制：`build/bin/sshore.exe`（12.5 MB，`windows/386`，`Version=v0.7.2-71-gc5a59ba`）
+- 构建命令（本机只有 **i686** mingw，没有 x86_64 ⇒ 只能出 386；仓库 `make windows` 目标写的是 `windows/amd64`）：
+  `wails build -platform windows/386 -skipbindings -clean -nopackage -ldflags "-s -w -X main.Version=v0.7.2-71-gc5a59ba" -trimpath`
+- 通道：应用由会话内 agent 在 **Session 1** 启动；GUI 由 **RDP 真实会话**驱动（`Xvfb :99` + skill 自带 `xfreerdp` → `127.0.0.1:13390`），宿主用自写 `xdo` 在 RDP 窗口上点击、用 `import` 截屏。
 
-## 已完成（含原始证据）
+## 1. 通过项
 
-| 步骤 | 命令 / 证据 |
-|---|---|
-| 交叉构建 | 本机只有 **i686** mingw（`dpkg -l` 无 x86_64 包）⇒ 目标 `windows/386`：`wails build -platform windows/386 -skipbindings -clean -nopackage -ldflags "-s -w -X main.Version=v0.7.2-52-g0aba549" -trimpath` ⇒ `build/bin/sshore.exe` 12,561,920 字节 |
-| 部署到客户机 | 写共享目录 `/home/lan/virtual/share/vbox-agent/sshore-b/` ⇒ 客户机 `Z:\vbox-agent\sshore-b\`（只用自己目录，遵守 skill §4.0 共享 VM 礼仪） |
-| 启动（两条路径都试了） | ① `vboxctl gui run2.ps1`（计划任务 + Interactive）；② 会话内 agent `{"op":"run",...}` ⇒ `{"ok":true,"pid":8476}` |
-| 渲染确认 | 窗口标题 `SSHore v0.7.2-52-g0aba549`，hwnd 655922，矩形 `150,145,1250,865`，**foreground**；控件树 `Chrome_WidgetWin_0` / `Chrome_WidgetWin_1` / `Chrome_RenderWidgetHostHWND("Chrome Legacy Window")` / `Intermediate D3D Window` 全在（`ctls` 输出）；`Get-Process`：`sshore` + **8 个 msedgewebview2**，`Responding=True`，全部 `SessionId=1` |
+| # | 项 | 结果 | 关键观察 | 证据 |
+|---|---|---|---|---|
+| C-1 | 构建/投放/启动/渲染 | **PASS** | 窗口 `SSHore v0.7.2-71-gc5a59ba` 正常渲染；WebView2 控件树 `Chrome_WidgetWin_0/1` + `Chrome_RenderWidgetHostHWND` + `Intermediate D3D Window` 齐备；`sshore` + 8×`msedgewebview2` 全 `Responding=True`、全部 `SessionId=1` | `c-win-launched.jpg` |
+| C-2 | **行右键菜单**（本地行 `sshore.exe`） | **PASS** | 菜单 = `上传到远程 / 重命名 / 删除 / ── / 刷新`（**无「新建文件夹」**），是行级菜单 ⇒ WebView2 的 `contextmenu`/`e.target` 路由正确 | `c-win-rowmenu.jpg` |
+| C-3 | **空白右键菜单**（面板空白处） | **PASS** | 菜单 = `刷新 / 新建文件夹 / 上传文件…`（面板级），与 Linux 侧形态一致 | `c-win-blankmenu.jpg` |
+| C-4 | 菜单项**禁用态**渲染与惰性（未连接时） | **PASS** | 依赖连接的 `上传到远程`/`上传文件…` 被置灰：文字平均灰度 **173.2**，启用项 `刷新`/`新建文件夹` 为 **97.4 / 90.6**；点击置灰项**无任何反应**（菜单也不关）⇒ 与 spec §5.3「本地面板的 upload/upload-picked 落点依赖 remotePath，未连接时置灰」一致 | `c-win-blankmenu.jpg` + 像素量化 |
+| C-5 | 启用项**可用** | **PASS** | 点 `刷新` 菜单项 ⇒ 菜单关闭；点 `新建文件夹` ⇒ 弹出模态「新建文件夹 / 新建文件夹名称 / 确定 取消」 | `c-win-newfolder-modal.jpg` |
 
-## 阻塞点（有对照实验）
+## 2. 发现：`windows/386` 构建下 SFTP 连接不可用（candidate，待你决定是否处理）
 
-> **2026-10-10 第 2 次尝试（同一 VM，重启后干净桌面）——诊断进一步收紧：**
-> - 先排除了"控制台会话被 RDP 顶掉"：`query session` = `console lan 1 Active`、`services 0 Disc`、`rdp-tcp 65536 Listen`，agent `sessionId=1` ⇒ 会话状态正常。
-> - 排除了 DPI 缩放：`AppliedDPI=96`（100%）；且 agent `wins` 给出的窗口矩形（`150,145,1250,865`）与帧缓冲截图逐像素一致 ⇒ 坐标空间就是 1400x1050。
-> - 发现 **agent 的 `click` 不吃 x/y**（每次返回 `cursor` 恒为屏幕中心 `700,525`；必须先 `setpos` 再 `click`）——这是本轮之前"点哪都没反应"的一半原因。
-> - **改成 `setpos` 精确定位后再 `click`，仍然完全无 UI 效果**：开始菜单 `(64,1037)`、任务栏搜索框 `(75,1037)`、桌面「此电脑」双击 `(30,45)` 全部无反应；键盘侧用扫描码发左 Win（`{"op":"key","sc":91,"hold":true/false}`）也无效（`LWIN` 不在 agent 键名表里，会报 `unknown key: LWIN`）。
-> - 而桌面本身持续刷新（相邻截图时间 16:18→16:21、托盘网络图标形变）⇒ **不是"截图是陈旧帧"，是注入的鼠标/键盘事件到不了交互输入桌面**；agent 自身 `diag` 又报告 `sendInputLastRet: 1`（SendInput 调用本身成功）⇒ 属于"调用成功但不落地"的输入桌面/会话隔离问题。
-> - 结论：**该 VM 当前状态下，会话内 agent 这条通道无法驱动 GUI**（不论鼠标或键盘）。要继续必须换通道：RDP（需口令）、修 agent 的输入桌面归属、或改用 aigc 上的 KVM win10。
-
-
-1. **合成输入进不到桌面**（不是只进不到应用）：
-   - 点应用内 SFTP 页签 `(192,283)`、点输入框 `(500,294)` 后 `type "ABC123"`、点窗口最大化 `(1165,158)` —— 全部无任何变化；
-   - **对照**：点 Windows 开始按钮 `(64,1025)` 同样无反应；
-   - 而桌面是活的：相邻两次截图之间 KHelpHub 的 toast 文案变了（`推荐给别人使用` → `通过配置卡片中的"推荐给"…`）⇒ 截图不是陈旧帧。
-   - `diag` 显示 `foreground=hwnd 655922`、agent 在 `sessionId=1`、`elevated=false`，光标按请求精确落位（`setpos "at":"192,283"`）。任务 `VBoxAgent/VBoxAgentKeep` 的 `RunLevel` 均为 `Limited`（排除 UIPI 提权假设）；换成 agent 自己 `run` 启动的实例表现相同（排除"计划任务 token"假设）。
-2. **备用真实输入通道不可用**：`vboxctl rdp-session --seconds 25 --shot /tmp/c-rdp.png` ⇒ `vboxctl: 读不到客户机口令（~/.dsh/.credentials.yaml 的 vbox_win10_password 或 $VBOX_WIN_PASSWORD）`（exit 2）。加了口令即可继续。
-3. **顺带修掉的两个环境坑**（都已处理，供后续复用）：
-   - **端口冲突**：我上一轮 SFTP 验收的 TCP 代理占着 `127.0.0.1:2222`（正是 VBox `sshfwd` 的宿主端口），VM 启动时 NAT 转发**静默失败** ⇒ `vboxctl ping` 报"客户机 SSH 不通"。处置：杀掉遗留代理（pid 311062）+ `VBoxManage controlvm win10 natpf1 delete/… sshfwd,tcp,127.0.0.1,2222,,22` ⇒ 立即恢复（`ping` 返回 `pong:true, host:DESKTOP-LLF2GB6`）。
-   - **known_hosts 陈旧**：宿主 `known_hosts` 里 `[127.0.0.1]:2222` 存的是**旧 win10 客户机**的密钥，裸 `ssh -p 2222` 会被"REMOTE HOST IDENTIFICATION HAS CHANGED"拒绝（vboxctl 自带选项不受影响）。这也是本轮之前 `acc-proxy`（同样借道 2222 做 SFTP 代理）首次连接失败的同一根因。
-
-## 未验证（照实记录，不得读成"通过"）
-
-- Windows/WebView2 下的右键菜单语义（行菜单 vs 空白菜单、`e.target`/`contextmenu` 行为、新窗口/原生文件对话框）；
-- DPI 缩放/窗口行为、原生「上传文件…」文件选择器；
-- Windows 侧的 SFTP 会话（默认 gosftp 走 `ssh -s … sftp`，Windows OpenSSH 客户端路径语义）。
-
-## 可执行清单（下一位接手照做即可）
-
-```bash
-# 0) 先确认没有别的会话占用（skill §4.0）
-export PATH=~/.dsh/skills/vbox-win/bin:$PATH && vboxctl who && vboxctl status
-# 1) 确保宿主 2222 空闲（勿把验收代理留在 2222）
-ss -ltnp | grep :2222 || true
-# 2) 起 VM；若 ping 不通，重挂 NAT 转发
-vboxctl start; vboxctl ping || { VBoxManage controlvm win10 natpf1 delete sshfwd; \
-  VBoxManage controlvm win10 natpf1 "sshfwd,tcp,127.0.0.1,2222,,22"; vboxctl ping; }
-# 3) 把口令写进 ~/.dsh/.credentials.yaml（键：vbox_win10_password）后走真实输入通道
-vboxctl rdp-session --seconds 90 --shot /tmp/desk.png     # 宿主 Xvfb 上的真 RDP 会话
-#    然后在宿主用 xdo 对 xfreerdp 窗口做点击/截图（真实输入，不依赖 agent SendInput）
-# 4) 应用投放（已构建好）：build/bin/sshore.exe → /home/lan/virtual/share/vbox-agent/… → Z:\…
+真机点击「连接」（主机 `winlocal`）后日志：
 ```
-备选：先排查 agent 注入失效本身（比如 `{"op":"mclick"}` 消息注入、或换 `win10-aigc` 上那台正在运行的 KVM win10）。
+2026-10-10 17:55:18 [ERROR] Error: exec: "ssh": executable file not found in %PATH%
+```
+客户机侧核实：
+```
+System32\OpenSSH\ssh.exe exists: True
+SysWOW64\OpenSSH exists:         False
+SysWOW64\OpenSSH\ssh.exe exists: False
+PATH 含 OpenSSH:                 C:\Windows\System32\OpenSSH\
+OS 架构: AMD64
+```
+⇒ 32 位进程经 PATH 解析 `ssh` 时被 **WOW64 文件系统重定向**：`C:\Windows\System32` → `C:\Windows\SysWOW64`，而后者**没有** `OpenSSH` 目录 ⇒ `os/exec` 找不到 `ssh.exe`。
 
-## 收尾（已执行）
+**范围界定（重要）**：这是 **386 目标**的架构性后果。仓库 `Makefile` 的 windows 目标是 `windows/amd64`，本次因本机只有 i686 mingw 无法构建 amd64 验证。若 386 不是发布目标，这条只作为记录；若要支持 386，修法是显式解析 `%SystemRoot%\Sysnative\OpenSSH\ssh.exe`（或 `ProgramFiles` 下的 OpenSSH）而不是裸 `ssh`。
 
-- 客户机内应用已 kill（`{"op":"kill","name":"sshore"}` → `killed:1`）；VM 已 ACPI 关机（"已关机"）；占用锁已释放（"已释放"）。
-- 共享目录投放件已删除；宿主我的验收实例已停（`HOME=/tmp/sshkit-acc/home`、`DISPLAY=:99`，确认是我的实例后才 kill）。
-- `~/.ssh/config` 已还原并 **md5 校验一致**：`8b71afb349b86c58b35a73e95a97dc4b`（与本轮备份 `/tmp/sshkit-acc/ssh-config.bak2` 相同，即用户原文件）。
+证据：`c-win-ssh-not-found.jpg`
+
+## 3. 未验证（照实记录）
+
+- **原生文件选择器**：`上传文件…` 需先连上远端才启用，而连接被 §2 阻断 ⇒ 未取到 Windows 原生对话框证据（Linux 侧已验过等价功能）。
+- 已连接状态下的**远端行菜单**（下载…/上传…）与传输/进度 UI（同上被阻断）。
+- 窗口行为细节（最大化/最小化/DPI 缩放/多显示器）未逐项验。
+- 跨物理网络未覆盖。
+
+## 4. 本轮排障中最值钱的一条：宿主端口被别人的隧道占用
+
+前几轮 C 一直失败在 `SPNEGO … STATUS_LOGON_FAILURE [0xC000006D]`，而同一口令经 **GA 通道认证成功**（`VBoxManage guestcontrol … whoami` → `desktop-llf2gb6\lan`）。根因：
+
+```
+ss -ltnp | grep 13389
+LISTEN 127.0.0.1:13389  users:(("ssh",pid=52430,fd=5))     ← 别人的 ssh 本地转发
+```
+VBox 配置的 `rdpfwd,tcp,127.0.0.1,13389,,3389` **绑定失败**（端口被占，VBox 静默不报错）⇒ 我一直在向 `13389` 后面的**另一台** Windows 认证（其 RDP 证书 CN = `DESKTOP-MTJ8KQ3`，本机应为 `DESKTOP-LLF2GB6`）⇒ 必然口令错误。
+
+处置：另挂 `rdpalt,tcp,127.0.0.1,13390,,3389`（不影响别人的隧道），证书 CN 立刻变成 `DESKTOP-LLF2GB6`，登录成功 ⇒ 所有 C 项才得以执行。**同类坑**：早前宿主 `127.0.0.1:2222` 被我的验收代理占用，导致 VBox 的 `sshfwd` 静默绑定失败（`vboxctl ping` 报"客户机 SSH 不通"）。
+
+**建议**（给 skill/后续）：跑 `vboxctl rdp-session` / `start` 前先 `ss -ltnp | grep -E ':13389|:2222'`，并核对 RDP 证书 CN 是否等于目标机器名；`start` 后也应校验两个转发真的绑上。
+
+## 5. 未采用的其它通道（备查）
+
+- 会话内 agent 的 `SendInput`：`setpos` 定位后 `click`/键盘扫描码在该 VM 上**无 UI 效果**（连开始菜单都点不开，而桌面持续刷新；`diag` 自报 `sendInputLastRet: 1`）⇒ 本轮改用 RDP 通道绕开。**另一个坑**：agent 的 `click` 不吃 x/y，返回 `cursor` 恒为屏幕中心，必须先 `setpos`。
+- aigc 主机上那台 KVM win10（当时 running）：未使用。
+
+## 6. 收尾（已执行）
+
+- 客户机内应用已 kill；我加的 `rdpalt` 转发已删除；`vboxctl console-restore` 把会话 1 接回控制台；VM 已 ACPI 关机；占用锁已释放；共享目录投放件已删除。
+- 宿主侧：我的 `xfreerdp`/`Xvfb :99` 已退出；**未触碰**别人占用 `13389` 的 ssh 隧道。
+- 口令已按你的指示写入 `~/.dsh/.credentials.yaml`（`vboxctl` 自己读的那个文件），**没有**写进仓库/文档，避免进 git 历史。
