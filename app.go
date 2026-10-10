@@ -1539,8 +1539,16 @@ func (a *App) addRemoteRecentLocked(host, path string, rememberLast bool) (chang
 }
 
 // addLocalRecentLocked 是 AddLocalRecent 的锁内实现（同构）。本地侧与改造前一致：
-// **没有** path 空值守卫，语义不做任何收紧。
+// 语义不做任何收紧 —— 唯一例外是下面的空路径守卫（见注释）。
 func (a *App) addLocalRecentLocked(path string, rememberLast bool) (changed bool) {
+	// 空路径 = 无操作，与 addRemoteRecentLocked 的 `host == "" || path == ""` 守卫对齐
+	// （收尾复核 Minor：两侧原来不对称）。没有这条守卫时空路径会**清掉 LastLocalDir**
+	// 并把一条 {Path: ""} 置顶进 LocalRecent、再整份落盘 —— 一次误传就静默毁掉用户的
+	// 最后本地目录。调用点若在传空串（recordRecentSFTP 的 SftpHome 路径传 localDir == ""），
+	// 期望的是"什么也不发生"而不是"清空"。
+	if path == "" {
+		return false
+	}
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
 	}
@@ -1571,6 +1579,8 @@ func (a *App) addLocalRecentLocked(path string, rememberLast bool) (changed bool
 // AddLocalRecent 记录一次导航到的本地目录：去重置顶、上限 20，并写 LastLocalDir。
 // 公开绑定就是「写锁内 *Locked(..., true) → 解锁 → 仅当 changed 时才 saveConfig()」
 // （规格 §6.3.5：锁内无 IO，changed == false 不写盘）。
+// 空路径是**无操作**：守卫在 addLocalRecentLocked 内 ⇒ 公开绑定与内部路径（recordRecentSFTP）
+// 语义一致，且与 AddRemoteRecent(host/path 为空) 同口径（返回 nil、不落盘、内存态不变）。
 func (a *App) AddLocalRecent(path string) error {
 	a.cfgMu.Lock()
 	changed := a.addLocalRecentLocked(path, true)
