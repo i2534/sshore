@@ -3,6 +3,7 @@ import { ref, reactive, computed, onMounted, onUnmounted, onActivated, onDeactiv
 import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import { useLocationsStore } from '../stores/locations'
+import { useSftpUIStore } from '../stores/sftpui'
 import SearchOverlay from '../components/SearchOverlay.vue'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
@@ -21,11 +22,14 @@ import { payloadFor, payloadFromDragEvent, DRAG_MIME, pickDropPane, canDropInto 
 import { setSystemDropHandler } from '../utils/systemDrop'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { resolvePathInput, REMOTE_HOME } from '../utils/pathbar'
+import { resolveRemoteTarget } from '../utils/remotepath'
 // 说明：StatPaths / CopyLocal / SftpMove / ListLocal / RenameLocal 已在既有 import 行里，
 // 这里**不重复声明**（重复 import 同名标识符会让 vite build 直接 SyntaxError）。
 
 const logStore = useLogStore()
 const locations = useLocationsStore()
+// 最后路径/排序的持久化 store（T7）：启动恢复、落点决策、排序写入的唯一真源。
+const sftpui = useSftpUIStore()
 // 浮层 watch 没有 immediate ⇒ visible 初值必须是 false，只由用户动作置 true。
 const search = reactive({ visible: false, pane: 'remote' })
 const hosts = ref([])
@@ -59,6 +63,9 @@ const connected = ref(false)
 // pendingPath：位置下拉点到"未连接的主机"时先记下目标目录，由 connect() 消费
 // （同机已连接则直接跳转，不走这里）。
 const pendingPath = ref('')
+// pendingHome：「主目录」按钮的**显式意图**（§6.4 B3 / D15）。不能再靠"空 pendingPath = home"
+// 这个隐含约定 —— 一旦插入"记忆路径"优先级，"主目录"就会被送回上次的目录。
+const pendingHome = ref(false)
 
 const transfers = ref([])
 
@@ -214,17 +221,45 @@ async function loadHosts() {
 async function err(e) {
   logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'error', message: String(e), ts: new Date().toISOString() })
 }
+// 级别不能写错（spec §10 / 审核 F7）：err() 把 level 硬编码成 'error'，所以「记住的路径
+// 失效回落」这类 warn、探活这类 info 必须走独立 helper，否则验收 grep 的级别会失真。
+async function warn(msg) {
+  logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'warn', message: String(msg), ts: new Date().toISOString() })
+}
+async function info(msg) {
+  logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'info', message: String(msg), ts: new Date().toISOString() })
+}
+
+// 取列表的**裸函数**：只做「取列表 + 抛错」（spec §6.5）。
+// 序号守卫、loading、最近路径三项绝不塞进来（审核 F23）：goRemote/goLocal 的
+// 「旧响应丢弃 + 失败整体回滚」靠调用点自己自增序号与回滚；fetch* 若也动这些，
+// 一个过期的失败响应就会把目录回滚成旧值。
+async function fetchRemote(target) {
+  return (await SftpList(host.value, '', target || '/')) || []
+}
 
 async function loadRemote() {
   if (!host.value) return
   const seq = ++remoteSeq
   remoteLoading.value = true
   try {
-    const items = (await SftpList(host.value, '', remotePath.value || '/')) || []
+    const items = await fetchRemote(remotePath.value || '/')
     if (seq === remoteSeq) remoteItems.value = items // 已被更新请求取代则丢弃
+    // 审核 F10：双击进目录（openRemote）与工具栏刷新都只经这里，不补记则最常用的手势
+    // 永远不写 last_remote_dirs（本地侧 loadLocal 本来就记，这正是两侧不对称的来源）。
+    // 不增加写盘：locations.addRemoteRecent 有队首短路，记录无变化时不发 IPC。
+    if (seq === remoteSeq) await locations.addRemoteRecent(host.value, remotePath.value)
   }
-  catch (e) { err(e) }
+  // 审核 F5：本轮语义变更 —— 记原文 + 一次探活复核（可能自愈），不再只是 err(e)。
+  // 故意不 await：探活最多 15s，await 会把 loading 与调用方（如 runBatch 收尾）一起拖住。
+  catch (e) { remoteOpFailed(e) }
   finally { if (seq === remoteSeq) remoteLoading.value = false }
+}
+
+// 排序状态上收（§7.3）：FilePane 只 emit「下一个方向」，父层只负责持久化 ——
+// 绝不在父层再取反（T9 交接：payload.dir 已经是目标方向），否则每次点击都翻转方向。
+async function onSort(pane, { key, dir }) {
+  try { await sftpui.setSort(pane, key, dir) } catch (e) { err(e) }
 }
 
 // Host dropdown change: reset connection state, do NOT auto-connect.
@@ -238,16 +273,41 @@ function onHostChange() {
 async function connect() {
   const h = host.value
   if (!h) return
+  // B4 / 审核 F8：load() 未完成时点「连接」拿不到记忆路径（幂等重试即可）。
+  // 必须 catch：load() 会 reject，裸 await 会让这里的失败变成未捕获拒绝、
+  // 连接按钮"点了没反应"。加载失败仍继续（回落到 home）。
+  if (!sftpui.loaded) await sftpui.load().catch(err)
   try {
     await SftpConnect(h)
-    let dest = '/'
-    try { dest = await SftpHome(h) } catch { dest = '/' }
     if (host.value !== h) return // await 期间已切换主机，丢弃结果
-    // 「最近位置」预设了目标目录时优先进它，否则落到 home
-    // 只有空串才是"未指定"：把 '/' 当未指定会让「远程 根目录」预设落到 home
-    remotePath.value = pendingPath.value ? pendingPath.value : dest
+    // SftpHome 失败沿用既有回落（内层静默；外层 catch 覆盖，spec §8.4 排除清单）
+    let home = '/'
+    try { home = await SftpHome(h) } catch { home = '/' }
+    if (host.value !== h) return
+    // §6.4 B5：落点决策只有 resolveRemoteTarget 一个实现（connect 与 syncConnection 共用）。
+    // 必须传 .value（审核 F17）：传 ref 对象会恒为真值，把 ref 当路径交给后端。
+    const target = resolveRemoteTarget({
+      pendingPath: pendingPath.value,
+      pendingHome: pendingHome.value,
+      remembered: sftpui.lastPathFor('remote', h),
+      home,
+    })
+    // 消费后清空（含失败分支）：残留会让**下一次**连接落到上一次的目标（既有 :335 原则）
     pendingPath.value = ''
+    pendingHome.value = false
     connected.value = true
+    remotePath.value = target.path
+    // §6.5 前提前置（B2）：只有"本次落点来自记忆"才需要先列一次以判定要不要回落 home。
+    // 用户显式指定的路径（pendingPath/pendingHome）失败仍按既有失败语义处理，绝不偷偷改道。
+    if (target.fromMemory && target.path !== home) {
+      try {
+        await fetchRemote(target.path)
+      } catch (e) {
+        remotePath.value = home
+        await fetchRemote(home) // 回落本身也失败 ⇒ 抛给外层 catch（不二次回落）
+        warn('上次的远程目录 ' + target.path + ' 已不可用，已回到 ' + home)
+      }
+    }
     await loadRemote()
     await locations.addRemoteRecent(h, remotePath.value)
   } catch (e) {
@@ -269,7 +329,7 @@ async function goLocal(target) {
   localPath.value = target
   localLoading.value = true
   try {
-    const items = (await ListLocal(target || '/')) || []
+    const items = await fetchLocal(target || '/')
     if (seq !== localSeq) return
     localItems.value = items
     sel.clear(localSelection)
@@ -290,7 +350,7 @@ async function goRemote(target) {
   remotePath.value = target
   remoteLoading.value = true
   try {
-    const items = (await SftpList(host.value, '', target || '/')) || []
+    const items = await fetchRemote(target || '/')
     if (seq !== remoteSeq) return
     remoteItems.value = items
     sel.clear(remoteSelection)
@@ -303,11 +363,12 @@ async function goRemote(target) {
   } finally { if (seq === remoteSeq) remoteLoading.value = false }
 }
 
-// 远程「主目录」：未连接时把 pendingPath 清空再 connect()（connect 的 home 分支），
-// 已连接则直接解析 SftpHome 后跳转。行为变化（有意）：home 也会记入「最近」。
+// 远程「主目录」：未连接时置**显式标志** pendingHome 再 connect()（D15：不再用
+// "清空 pendingPath"表达 home，否则记忆路径会把它截胡），已连接则直接解析 SftpHome 后跳转。
+// 行为变化（有意）：home 也会记入「最近」。
 async function goRemoteHome() {
   if (!host.value) { err('请先选择主机'); return }
-  if (!connected.value) { pendingPath.value = ''; await connect(); return }
+  if (!connected.value) { pendingHome.value = true; await connect(); return }
   let home = '/'
   try { home = await SftpHome(host.value) } catch (e) { err(e); return }
   return goRemote(home)
@@ -391,11 +452,16 @@ async function disconnect() {
   remoteItems.value = []
   sel.clear(remoteSelection)
 }
+// 取列表的裸函数（与 fetchRemote 同构）：只取列表并抛错，序号/loading/recent 留在调用方。
+async function fetchLocal(target) {
+  return (await ListLocal(target || '/')) || []
+}
+
 async function loadLocal() {
   const seq = ++localSeq // 与 goLocal 共用序号：任何更新的本地加载都会先作废在途 goLocal，其失败回滚不再发生
   localLoading.value = true
   try {
-    const items = (await ListLocal(localPath.value || '/')) || []
+    const items = await fetchLocal(localPath.value || '/')
     if (seq === localSeq) localItems.value = items // 已被更新请求取代则丢弃
     if (seq === localSeq) await locations.addLocalRecent(localPath.value) // 只在成功时记；条数上限由后端负责
   }
@@ -883,8 +949,24 @@ onMounted(async () => {
   await locations.load() // 书签与双侧最近位置（T6 store），供两个面板头的位置下拉使用
   // presets.toml 坏掉时只发一次 startup 事件可能早于前端订阅而丢失，所以由这里补一次用户可见提示
   if (locations.presetsError) err('预设文件解析失败：' + locations.presetsError)
-  // local starts at current working dir
-  try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
+  // B3/B4 顺序是硬约束，且这里的 load() 失败必须被吞掉（审核 F8）：裸 await 会让下面
+  // 恢复本地面板的两次调用全不执行（本地面板直接空着，用户以为坏了）。
+  try { await sftpui.load() } catch (e) { err(e) }
+  // 本地恢复（§6.4 B3）：记忆值优先，为空或打不开才回落到当前工作目录。
+  // 探针必须用**会抛错**的 fetchLocal：loadLocal 内部吞错，判不出"这个目录打不开"（§6.5）。
+  const rememberedLocal = sftpui.lastPathFor('local')
+  let localTarget = ''
+  if (rememberedLocal) {
+    try { await fetchLocal(rememberedLocal); localTarget = rememberedLocal } catch (e) { localTarget = '' }
+  }
+  if (!localTarget) {
+    let cwd = '/'
+    try { cwd = await Cwd() } catch (e) { err(e); cwd = '/' }
+    // 文案逐字取自 spec §10，级别必须是 warn（审核 F7：err() 硬编码 error，会误导验收 grep）
+    if (rememberedLocal) warn('上次的本地目录 ' + rememberedLocal + ' 已不可用，已回到 ' + cwd)
+    localTarget = cwd
+  }
+  localPath.value = localTarget
   await loadLocal()
 })
 
@@ -904,8 +986,32 @@ async function syncConnection() {
     const ok = await SftpConnected(h)
     if (host.value !== h || connected.value) return // await 期间状态已变
     if (!ok) { connected.value = false; return }
+    // §6.4 B5：与 connect() 共用同一落点决策（不再无条件 SftpHome）。
+    // 否则「切主机再切回」（后端粘性 Connected 仍为 true，走这里恢复）会落到 home，
+    // 与「回到该主机最后路径」直接矛盾。
+    let home = '/'
+    try { home = await SftpHome(h) } catch { home = '/' }
+    if (host.value !== h) return
+    const target = resolveRemoteTarget({
+      pendingPath: pendingPath.value,
+      pendingHome: pendingHome.value,
+      remembered: sftpui.lastPathFor('remote', h),
+      home,
+    })
+    pendingPath.value = ''
+    pendingHome.value = false
     connected.value = true
-    try { remotePath.value = await SftpHome(h) } catch { remotePath.value = '/' }
+    remotePath.value = target.path
+    // §6.5：只有"来自记忆"才回落 home（判定与 connect 逐字同构）
+    if (target.fromMemory && target.path !== home) {
+      try {
+        await fetchRemote(target.path)
+      } catch (e) {
+        remotePath.value = home
+        await fetchRemote(home)
+        warn('上次的远程目录 ' + target.path + ' 已不可用，已回到 ' + home)
+      }
+    }
     await loadRemote()
   } catch { /* 状态查询失败时保持现状 */ }
 }
@@ -999,10 +1105,12 @@ onUnmounted(() => {
           :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
           :presets="locations.presetsForPane('local', '')" :disks="locations.disksForPane('local')"
           :bookmarks="locations.bookmarksForPane('local', '')" :recents="locations.recentsForPane('local', '')" :bookmarked="bookmarkedFor('local')"
+          :sort-key="sftpui.sort.local.key" :sort-dir="sftpui.sort.local.dir"
           @select="onSelect('local', $event)" @open="openLocal" @action="onPaneAction('local', $event)"
           @pick-position="pickPosition('local', $event)" @toggle-bookmark="toggleBookmark('local')" @search="search.pane = 'local'; search.visible = true"
           @clear="sel.clear(localSelection)"
           @navigate="onNavigate('local', $event)"
+          @sort="onSort('local', $event)"
           @context="showMenu('local', $event)" @visible="localVisible = $event" @focus="focusedPane = 'local'"
           @dragstart="onDragStart('local', $event)" @dropon="onMoveDrop('local', $event)" />
       </div>
@@ -1011,10 +1119,12 @@ onUnmounted(() => {
           :show-hidden="showAll" :loading="remoteLoading" :actions="actionsFor('remote')" :hidden-selected="hiddenFor('remote')"
           :presets="locations.presetsForPane('remote', host)"
           :bookmarks="locations.bookmarksForPane('remote', host)" :recents="locations.recentsForPane('remote', host)" :bookmarked="bookmarkedFor('remote')"
+          :sort-key="sftpui.sort.remote.key" :sort-dir="sftpui.sort.remote.dir"
           @select="onSelect('remote', $event)" @open="openRemote" @action="onPaneAction('remote', $event)"
           @pick-position="pickPosition('remote', $event)" @toggle-bookmark="toggleBookmark('remote')" @search="search.pane = 'remote'; search.visible = true"
           @clear="sel.clear(remoteSelection)"
           @navigate="onNavigate('remote', $event)"
+          @sort="onSort('remote', $event)"
           @context="showMenu('remote', $event)" @visible="remoteVisible = $event" @focus="focusedPane = 'remote'"
           @dragstart="onDragStart('remote', $event)" @dropon="onMoveDrop('remote', $event)" />
       </div>
