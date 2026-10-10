@@ -3,7 +3,7 @@
 **一句话结论**：应用在真 Windows（VBox `win10` = `DESKTOP-LLF2GB6`，19045 x64）上能构建、启动、渲染；**SFTP 两个面板的右键菜单分级、禁用态在 Windows/WebView2 上逐项符合设计**（本次用 RDP 真实输入通道驱动，非注入）；同时发现**一个只属于 `windows/386` 构建的问题**：SFTP 连接时报 `exec: "ssh": executable file not found in %PATH%`（WOW64 重定向，见 §2）。
 
 - 被测二进制：`build/bin/sshore.exe`（12.5 MB，`windows/386`，`Version=v0.7.2-71-gc5a59ba`）
-- 构建命令（本机只有 **i686** mingw，没有 x86_64 ⇒ 只能出 386；仓库 `make windows` 目标写的是 `windows/amd64`）：
+- 构建命令（**事后更正**：本机实测可直接交叉构建 amd64 —— `wails build -platform windows/amd64` 9.2s 成功、`file` 判定 `PE32+ executable (GUI) x86-64, for MS Windows`，**不需要 mingw**；本轮用 386 出自我「只有 i686 mingw ⇒ 只能出 386」的误判，§2 的 WOW64 问题也因此才被引入）：
   `wails build -platform windows/386 -skipbindings -clean -nopackage -ldflags "-s -w -X main.Version=v0.7.2-71-gc5a59ba" -trimpath`
 - 通道：应用由会话内 agent 在 **Session 1** 启动；GUI 由 **RDP 真实会话**驱动（`Xvfb :99` + skill 自带 `xfreerdp` → `127.0.0.1:13390`），宿主用自写 `xdo` 在 RDP 窗口上点击、用 `import` 截屏。
 
@@ -47,7 +47,7 @@ OS 架构: AMD64
 ```
 ⇒ 32 位进程经 PATH 解析 `ssh` 时被 **WOW64 文件系统重定向**：`C:\Windows\System32` → `C:\Windows\SysWOW64`，而后者**没有** `OpenSSH` 目录 ⇒ `os/exec` 找不到 `ssh.exe`。
 
-**范围界定（重要）**：这是 **386 目标**的架构性后果。仓库 `Makefile` 的 windows 目标是 `windows/amd64`，本次因本机只有 i686 mingw 无法构建 amd64 验证。若 386 不是发布目标，这条只作为记录；若要支持 386，修法是显式解析 `%SystemRoot%\Sysnative\OpenSSH\ssh.exe`（或 `ProgramFiles` 下的 OpenSSH）而不是裸 `ssh`。
+**范围界定（重要）**：这是 **386 目标**的架构性后果。本机实测 **amd64 可直接构建且无需安装任何工具链**（见文首更正），故该问题**不影响发布目标**；修复仍保留（386 也能用了）。仓库 `Makefile` 的 windows 目标是 `windows/amd64`，本次因本机只有 i686 mingw 无法构建 amd64 验证。若 386 不是发布目标，这条只作为记录；若要支持 386，修法是显式解析 `%SystemRoot%\Sysnative\OpenSSH\ssh.exe`（或 `ProgramFiles` 下的 OpenSSH）而不是裸 `ssh`。
 
 证据：`c-win-ssh-not-found.jpg`
 
