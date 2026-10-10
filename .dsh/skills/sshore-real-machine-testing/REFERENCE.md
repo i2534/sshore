@@ -102,7 +102,7 @@ vboxctl who && vboxctl start && vboxctl ping          # ping 返回 pong:true �
 ss -ltnp | grep -E ':13389|:2222'                     # 13389 若被别人的 ssh 隧道占用 → 用自己的备端口
 VBoxManage controlvm win10 natpf1 "rdpalt,tcp,127.0.0.1,13390,,3389"
 echo | openssl s_client -connect 127.0.0.1:13390 2>/dev/null | openssl x509 -noout -subject
-#   subject CN 必须等于客户机名（本机实测 DESKTOP-LLF2GB6）；若是别的名字 ⇒ 你连错了机器
+#   subject CN 必须等于客户机名（本机实测 DESKTOP-ACCEPT）；若是别的名字 ⇒ 你连错了机器
 
 # 3) 部署与启动（共享目录）
 SB=/home/lan/virtual/share/vbox-agent/sshore-mrt && mkdir -p $SB

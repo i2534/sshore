@@ -14,3 +14,7 @@ e2e/winprobe/winprobe.exe
 .omo
 .superpowers
 frontend/package.json.md5
+
+# 真机验收的临时夹具（大文件，禁止入库）
+b-fixtures/
+__pycache__/
