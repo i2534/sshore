@@ -291,3 +291,15 @@ EXIT=0
 证据：`real/c-win-386-ssh-fixed-connected.jpg`、`real/c-win-native-filedialog.jpg`（结论同时回写到 `real/WINDOWS-C.md` 的 C-6 与 §2）。
 
 收尾：客户机 app 已 kill、RDP 会话已断开并把会话 1 接回控制台、我临时挂的 `rdpalt` 转发已删除、VM 关机、锁释放、宿主 `xfreerdp`/`Xvfb` 归零。
+
+
+## 事实更正（2026-10-10 晚）
+
+当初「本机只有 i686 mingw ⇒ 只能构建 386」的判断**不成立**：实测
+`GOCACHE=$PWD/.gocache wails build -platform windows/amd64 -skipbindings -nopackage -trimpath`
+在本机 **9.2 秒成功**，产物经 `file` 判定为 `PE32+ executable (GUI) x86-64, for MS Windows` —— **Wails v2 的 Windows 目标不需要 C 工具链**（新版 Go WebView2Loader 为纯 Go）。
+
+因此：
+- 本问题**只影响 `windows/386` 目标**；仓库发布目标 `windows/amd64` 从一开始就没这个毛病。
+- 本机无 x86_64 mingw、也无 clang/zig 都无所谓；若将来确实需要 mingw（例如别的 cgo 依赖），`sudo apt install gcc-mingw-w64-x86-64` 即可（当前 apt 候选 10.3.0-14ubuntu1+24.3；sudo 需要密码）。
+- 修复仍然保留：它让 386 目标可用，且解析顺序对 amd64 无副作用（amd64 走 `LookPath` 命中 System32 下的 ssh）。
