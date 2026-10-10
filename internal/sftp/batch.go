@@ -316,7 +316,8 @@ func (c *BatchBackend) buildPutTreeBatch(remoteDir, local string) ([]byte, error
 // mkdirAncestors 返回远端目录 p **自上而下**的全部层级（含 p 自身），用于逐级幂等 `-mkdir`。
 //
 // 为什么需要它（2026-10-10 复核轮 2 / Minor-2）：GoBackend 用 MkdirAll 自己补缺失祖先，
-// 而 OpenSSH sftp 的 mkdir 是**单级**语义 —— 真机实测（一次性 sshd，sftp 3.x）：
+// 而 OpenSSH sftp 的 mkdir 是**单级**语义 —— 真机实测（一次性 sshd；本机
+// OpenSSH_8.9p1 的 sftp 客户端，脚本见报告「第二轮」小节）：
 // `-mkdir <深路径>` 在父目录缺失时报 "No such file or directory" 且**什么也不建**；带 `-`
 // 前缀时该失败被抑制（EXIT=0），于是后续 put 落到不存在的父目录 ⇒ 整批 EXIT=1。
 // 逐级 `-mkdir` 与 MkdirAll 等价；`-mkdir` 对已存在目录报 Failure 但同样被抑制，故幂等。
