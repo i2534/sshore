@@ -647,6 +647,12 @@ func TestBuildBatchPutRecursive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 实现会先把源根 EvalSymlinks 再遍历（软链根必须能上传），脚本里的本地路径因此是解析后
+	// 的真实路径（Windows 上 EvalSymlinks 可能改变大小写）—— 期望值同样按解析后的路径构造。
+	root, rerr := filepath.EvalSymlinks(src)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
 	q := func(p string) string {
 		t.Helper()
 		s, qerr := quoteArg(p)
@@ -660,8 +666,8 @@ func TestBuildBatchPutRecursive(t *testing.T) {
 		`-mkdir "/remote/dir"`,
 		`-mkdir "/remote/dir/empty"`,
 		`-mkdir "/remote/dir/sub"`,
-		"put " + q(filepath.Join(src, "sub", "y.txt")) + ` "/remote/dir/sub/y.txt"`,
-		"put " + q(filepath.Join(src, "x.txt")) + ` "/remote/dir/x.txt"`,
+		"put " + q(filepath.Join(root, "sub", "y.txt")) + ` "/remote/dir/sub/y.txt"`,
+		"put " + q(filepath.Join(root, "x.txt")) + ` "/remote/dir/x.txt"`,
 	}, "\n") + "\n"
 	if got := string(b); got != want {
 		t.Fatalf("putr batch =\n%q\nwant\n%q", got, want)
