@@ -661,8 +661,11 @@ func TestBuildBatchPutRecursive(t *testing.T) {
 		}
 		return s
 	}
-	// 目录行按 WalkDir 的字典序（父先于子），随后是逐文件 put（put 不建父目录）。
+	// 目录行按 `-mkdir` 的生成顺序：先是远端目标的**全部祖先**自上而下（OpenSSH 的 mkdir
+	// 是单级语义，只 -mkdir 叶子在父目录缺失时会静默失败、随后 put 让整批失败），
+	// 再按 WalkDir 的字典序补源树里的每个子目录（父先于子），最后是逐文件 put。
 	want := strings.Join([]string{
+		`-mkdir "/remote"`,
 		`-mkdir "/remote/dir"`,
 		`-mkdir "/remote/dir/empty"`,
 		`-mkdir "/remote/dir/sub"`,
@@ -674,6 +677,53 @@ func TestBuildBatchPutRecursive(t *testing.T) {
 	}
 	if strings.Contains(string(b), "put -r ") {
 		t.Fatalf("递归上传不得再走 put -r（父目录约定会多套一层）: %q", string(b))
+	}
+}
+
+// TestBuildBatchPutRecursiveCreatesMissingAncestors（2026-10-10 复核轮 2 / Minor-2，RED→GREEN）：
+// 目标目录的**中间层**可能不存在（GoBackend 用 MkdirAll 自己补；batch 只 -mkdir 叶子会整批
+// 失败）。批处理必须对目标路径自上而下逐级 `-mkdir`，且每级都带 `-` 前缀 —— `-mkdir` 对
+// **已存在**的目录也报 "Failure"，带前缀时该失败被抑制、EXIT 仍为 0，所以逐级建天然幂等
+// （真机实测见 e2e/PROBE，用例侧证据见 TestTreeE2E 的「祖先缺失」阶段）。
+func TestBuildBatchPutRecursiveCreatesMissingAncestors(t *testing.T) {
+	for _, tc := range []struct {
+		remoteDir string
+		want      []string
+	}{
+		{"/remote/deep/nested/dir", []string{`-mkdir "/remote"`, `-mkdir "/remote/deep"`, `-mkdir "/remote/deep/nested"`, `-mkdir "/remote/deep/nested/dir"`}},
+		{"rel/dir", []string{`-mkdir "rel"`, `-mkdir "rel/dir"`}},
+		{".", nil}, // 当前目录一定存在：不产生任何 -mkdir 行
+	} {
+		src := t.TempDir()
+		makeLocalTree(t, src, map[string]string{"x.txt": "X"})
+		c := NewBatchBackend(nil, nil)
+		b, err := c.buildBatch("putr", tc.remoteDir, src)
+		if err != nil {
+			t.Fatalf("buildBatch(%q): %v", tc.remoteDir, err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+		if len(lines) < len(tc.want)+1 {
+			t.Fatalf("remoteDir=%q 脚本过短: %q", tc.remoteDir, string(b))
+		}
+		for i, want := range tc.want {
+			if lines[i] != want {
+				t.Fatalf("remoteDir=%q 第 %d 行 = %q, want %q（必须自上而下逐级建祖先）\n脚本=%q", tc.remoteDir, i, lines[i], want, string(b))
+			}
+		}
+		// 目录行必须全部带 `-` 前缀，且都排在 put 之前。
+		seenPut := false
+		for _, ln := range lines {
+			if strings.HasPrefix(ln, "put ") {
+				seenPut = true
+				continue
+			}
+			if strings.Contains(ln, "mkdir") && !strings.HasPrefix(ln, "-mkdir ") {
+				t.Fatalf("remoteDir=%q 的 mkdir 行必须带 `-` 前缀（已存在要容忍）: %q", tc.remoteDir, ln)
+			}
+			if seenPut {
+				t.Fatalf("remoteDir=%q 的目录行必须排在所有 put 之前: %q", tc.remoteDir, ln)
+			}
+		}
 	}
 }
 

@@ -292,12 +292,15 @@ func (c *BatchBackend) buildBatch(op, remote, local string) ([]byte, error) {
 // buildPutTreeBatch 构造「递归上传到最终目录」的 `sftp -b` 脚本（契约见 PutRecursive）。
 //
 // 脚本形状：
-//   - 先对目标目录与源树里每一级子目录发 `-mkdir <最终远端路径>`（WalkDir 保证父先于子）；
+//   - 先对目标目录的**全部祖先**自上而下逐级 `-mkdir`（OpenSSH 的 mkdir 是单级语义：
+//     目标中间层缺失时只建叶子会失败，见 mkdirAncestors），再补源树里每一级子目录
+//     （WalkDir 保证父先于子）；
 //   - 再逐文件 `put <local> <remoteDir>/<相对源根路径>`。
 //
 // 两个刻意的选择：
 //  1. `-mkdir` 带 `-` 前缀：`-b` 模式下未加前缀的命令失败会**中止整批**，而「目录已存在」
 //     在合并语义下是必须容忍的正常情况（与 RemoveRecursive 的 -rm/-rmdir 同一手法）。
+//     这也让逐级建祖先天然幂等：`-mkdir` 对已存在目录同样报 Failure，但被前缀抑制、EXIT=0。
 //  2. `put` **不加**前缀：文件级失败必须中止整批并把 stderr 透出，绝不静默漏传。
 //
 // 本地路径用 filepath 家族（本机语义），远端路径一律用 path 家族（POSIX）——Windows
@@ -308,6 +311,36 @@ func (c *BatchBackend) buildPutTreeBatch(remoteDir, local string) ([]byte, error
 		return nil, err
 	}
 	return []byte(strings.Join(lines, "\n") + "\n"), nil
+}
+
+// mkdirAncestors 返回远端目录 p **自上而下**的全部层级（含 p 自身），用于逐级幂等 `-mkdir`。
+//
+// 为什么需要它（2026-10-10 复核轮 2 / Minor-2）：GoBackend 用 MkdirAll 自己补缺失祖先，
+// 而 OpenSSH sftp 的 mkdir 是**单级**语义 —— 真机实测（一次性 sshd，sftp 3.x）：
+// `-mkdir <深路径>` 在父目录缺失时报 "No such file or directory" 且**什么也不建**；带 `-`
+// 前缀时该失败被抑制（EXIT=0），于是后续 put 落到不存在的父目录 ⇒ 整批 EXIT=1。
+// 逐级 `-mkdir` 与 MkdirAll 等价；`-mkdir` 对已存在目录报 Failure 但同样被抑制，故幂等。
+//
+// 绝对路径到根为止（不返回 "/"：它一定存在，建它只会多一条无意义的 Failure 行）；
+// 相对路径到第一级为止（不返回 "."）。p 为 "." / "" / "/" 时返回 nil。
+func mkdirAncestors(p string) []string {
+	if p == "" || p == "." || p == "/" {
+		return nil
+	}
+	var rev []string
+	for cur := p; ; {
+		rev = append(rev, cur)
+		parent := path.Dir(cur)
+		if parent == cur || parent == "/" || parent == "." {
+			break
+		}
+		cur = parent
+	}
+	out := make([]string, 0, len(rev))
+	for i := len(rev) - 1; i >= 0; i-- {
+		out = append(out, rev[i])
+	}
+	return out
 }
 
 // putTreeBatchLines 遍历本地源树，产出批处理行（目录行在前、文件行在后）。
@@ -337,11 +370,16 @@ func putTreeBatchLines(remoteDir, local string) ([]string, error) {
 	}
 	dirLines := make([]string, 0, 8)
 	fileLines := make([]string, 0, 8)
-	first, err := mkdirLine(remoteRoot)
-	if err != nil {
-		return nil, err
+	// 目标目录的祖先自上而下逐级建（幂等，见 mkdirAncestors）。
+	for _, ancestor := range mkdirAncestors(remoteRoot) {
+		line, aerr := mkdirLine(ancestor)
+		if aerr != nil {
+			return nil, aerr
+		}
+		dirLines = append(dirLines, line)
 	}
-	dirLines = append(dirLines, first)
+	// 注：remoteRoot 为 "." 时 mkdirAncestors 返回 nil（当前目录一定存在），下面的
+	// 子目录行与文件行照旧 —— 不需要任何特殊分支。
 
 	werr := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
