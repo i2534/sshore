@@ -1542,10 +1542,12 @@ func (a *App) addRemoteRecentLocked(host, path string, rememberLast bool) (chang
 // 语义不做任何收紧 —— 唯一例外是下面的空路径守卫（见注释）。
 func (a *App) addLocalRecentLocked(path string, rememberLast bool) (changed bool) {
 	// 空路径 = 无操作，与 addRemoteRecentLocked 的 `host == "" || path == ""` 守卫对齐
-	// （收尾复核 Minor：两侧原来不对称）。没有这条守卫时空路径会**清掉 LastLocalDir**
-	// 并把一条 {Path: ""} 置顶进 LocalRecent、再整份落盘 —— 一次误传就静默毁掉用户的
-	// 最后本地目录。调用点若在传空串（recordRecentSFTP 的 SftpHome 路径传 localDir == ""），
-	// 期望的是"什么也不发生"而不是"清空"。
+	// （收尾复核 Minor：两侧原来不对称）。没有这条守卫时，**直接调用绑定**传空路径会清掉
+	// LastLocalDir、把一条 {Path: ""} 置顶进 LocalRecent、再整份落盘。
+	// 可达性（收尾复核逐行核过）：**今天没有任何调用点能触达该破坏性行为** —— recordRecentSFTP
+	// 内部自带 `if localDir != ""` 守卫（SftpHome 传空串时根本进不到这里），UI 也传不出空路径。
+	// 所以这条守卫是**防御性对齐**（对齐 addRemoteRecentLocked 的空值语义 + 给未来调用点留护栏），
+	// 不是线上缺陷修复。
 	if path == "" {
 		return false
 	}
