@@ -548,7 +548,7 @@ func TestSftpUITOMLRoundTrip(t *testing.T) {
 	want := SftpUIState{
 		LastLocalDir: `D:\工作\虚拟 共享`,
 		LastRemoteDirs: map[string]string{
-			"10.99.152.18":   "/var/log/nginx",
+			"192.0.2.10":   "/var/log/nginx",
 			"prod db":        "/srv/app",
 			"中文主机":           "/data/中文 目录",
 			`quote"host`:     "/tmp/q",
@@ -601,7 +601,7 @@ func TestLoadConfigNormalizesSftpUISection(t *testing.T) {
 		"sort_local_key = \"bogus\"\n" +
 		"sort_local_dir = 7\n" +
 		"\n[sftp_ui.last_remote_dirs]\n" +
-		"\"10.99.152.18\" = \"/var/log/nginx\"\n"
+		"\"192.0.2.10\" = \"/var/log/nginx\"\n"
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +622,7 @@ func TestLoadConfigNormalizesSftpUISection(t *testing.T) {
 	if cfg.SftpUI.LastLocalDir != "/home/lan/work" {
 		t.Fatalf("last_local_dir 不应被动过，得到 %q", cfg.SftpUI.LastLocalDir)
 	}
-	if cfg.SftpUI.LastRemoteDirs["10.99.152.18"] != "/var/log/nginx" {
+	if cfg.SftpUI.LastRemoteDirs["192.0.2.10"] != "/var/log/nginx" {
 		t.Fatalf("last_remote_dirs 条目丢失：%#v", cfg.SftpUI.LastRemoteDirs)
 	}
 }

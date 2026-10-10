@@ -1,6 +1,6 @@
 # Windows / WebView2 验收（C 轮）——已执行，结论与证据
 
-**一句话结论**：应用在真 Windows（VBox `win10` = `DESKTOP-LLF2GB6`，19045 x64）上能构建、启动、渲染；**SFTP 两个面板的右键菜单分级、禁用态在 Windows/WebView2 上逐项符合设计**（本次用 RDP 真实输入通道驱动，非注入）；同时发现**一个只属于 `windows/386` 构建的问题**：SFTP 连接时报 `exec: "ssh": executable file not found in %PATH%`（WOW64 重定向，见 §2）。
+**一句话结论**：应用在真 Windows（VBox `win10` = `DESKTOP-ACCEPT`，19045 x64）上能构建、启动、渲染；**SFTP 两个面板的右键菜单分级、禁用态在 Windows/WebView2 上逐项符合设计**（本次用 RDP 真实输入通道驱动，非注入）；同时发现**一个只属于 `windows/386` 构建的问题**：SFTP 连接时报 `exec: "ssh": executable file not found in %PATH%`（WOW64 重定向，见 §2）。
 
 - 被测二进制：`build/bin/sshore.exe`（12.5 MB，`windows/386`，`Version=v0.7.2-71-gc5a59ba`）
 - 构建命令（**事后更正**：本机实测可直接交叉构建 amd64 —— `wails build -platform windows/amd64` 9.2s 成功、`file` 判定 `PE32+ executable (GUI) x86-64, for MS Windows`，**不需要 mingw**；本轮用 386 出自我「只有 i686 mingw ⇒ 只能出 386」的误判，§2 的 WOW64 问题也因此才被引入）：
@@ -82,9 +82,9 @@ OS 架构: AMD64
 ss -ltnp | grep 13389
 LISTEN 127.0.0.1:13389  users:(("ssh",pid=52430,fd=5))     ← 别人的 ssh 本地转发
 ```
-VBox 配置的 `rdpfwd,tcp,127.0.0.1,13389,,3389` **绑定失败**（端口被占，VBox 静默不报错）⇒ 我一直在向 `13389` 后面的**另一台** Windows 认证（其 RDP 证书 CN = `DESKTOP-MTJ8KQ3`，本机应为 `DESKTOP-LLF2GB6`）⇒ 必然口令错误。
+VBox 配置的 `rdpfwd,tcp,127.0.0.1,13389,,3389` **绑定失败**（端口被占，VBox 静默不报错）⇒ 我一直在向 `13389` 后面的**另一台** Windows 认证（其 RDP 证书 CN = `DESKTOP-OTHER`，本机应为 `DESKTOP-ACCEPT`）⇒ 必然口令错误。
 
-处置：另挂 `rdpalt,tcp,127.0.0.1,13390,,3389`（不影响别人的隧道），证书 CN 立刻变成 `DESKTOP-LLF2GB6`，登录成功 ⇒ 所有 C 项才得以执行。**同类坑**：早前宿主 `127.0.0.1:2222` 被我的验收代理占用，导致 VBox 的 `sshfwd` 静默绑定失败（`vboxctl ping` 报"客户机 SSH 不通"）。
+处置：另挂 `rdpalt,tcp,127.0.0.1,13390,,3389`（不影响别人的隧道），证书 CN 立刻变成 `DESKTOP-ACCEPT`，登录成功 ⇒ 所有 C 项才得以执行。**同类坑**：早前宿主 `127.0.0.1:2222` 被我的验收代理占用，导致 VBox 的 `sshfwd` 静默绑定失败（`vboxctl ping` 报"客户机 SSH 不通"）。
 
 **建议**（给 skill/后续）：跑 `vboxctl rdp-session` / `start` 前先 `ss -ltnp | grep -E ':13389|:2222'`，并核对 RDP 证书 CN 是否等于目标机器名；`start` 后也应校验两个转发真的绑上。
 

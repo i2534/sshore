@@ -14,7 +14,7 @@
 
 ## 1. 现象与根因
 
-真机（同一台 `DESKTOP-LLF2GB6`，AMD64）用 `windows/386` 构建点「连接」：
+真机（同一台 `DESKTOP-ACCEPT`，AMD64）用 `windows/386` 构建点「连接」：
 
 ```
 [ERROR] Error: exec: "ssh": executable file not found in %PATH%
@@ -280,7 +280,7 @@ EXIT=0
 
 ## 真机复验（已完成，2026-10-10）
 
-用修复后的 386 二进制（`Version=v0.7.2-77-gc38f5c2`）在 VBox `win10`（`DESKTOP-LLF2GB6`，AMD64）上经 RDP 真实输入通道复跑：
+用修复后的 386 二进制（`Version=v0.7.2-77-gc38f5c2`）在 VBox `win10`（`DESKTOP-ACCEPT`，AMD64）上经 RDP 真实输入通道复跑：
 
 | 步骤 | 结果 |
 |---|---|

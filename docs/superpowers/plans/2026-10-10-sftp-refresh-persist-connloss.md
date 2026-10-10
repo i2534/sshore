@@ -27,7 +27,7 @@
 
 以下 5 类输入/失效模式最可能咬到真实用户，规格提到但容易被实现者漏掉；每一类都在任务里配了测试：
 
-1. **主机名本身是配置 map 的键**（含点 `10.99.152.18`、空格、引号、中文）——若 TOML 转义或 JSON 键名映射错了，会导致配置写不进去或读到 `nil`，而界面上完全看不出来。测试落在 T1（TOML 往返）与 T7（payload 六个 snake_case 键逐字断言）。
+1. **主机名本身是配置 map 的键**（含点 `192.0.2.10`、空格、引号、中文）——若 TOML 转义或 JSON 键名映射错了，会导致配置写不进去或读到 `nil`，而界面上完全看不出来。测试落在 T1（TOML 往返）与 T7（payload 六个 snake_case 键逐字断言）。
 2. **记忆的目录已经不存在**（远程目录被删、本地盘符卸载）——必须回落 `SftpHome`/`Cwd()` 并记一条 warn，而不是停在空列表或反复报错。测试落在 T11。
 3. **"断开"之后队列「重试」把远程列表又填出来**——此时 `connected === false` 会让人误以为链路不可用（菜单被置灰、工具栏刷新跳过有内容的远程面板）。测试落在 T13（操作成功回同步 + 置灰接线断言）。
 4. **探针进行中反复切标签 / 用户在探活期间切主机**——不明文处理就会叠加探测、把"用户切了主机"误记成"重连失败"。测试落在 T13（`probing`/`recovering` 去重、host 变更静默、`finally` 复位）。
@@ -73,7 +73,7 @@ func TestLoadConfigNormalizesSftpUISection(t *testing.T)
 func TestLoadConfigWithoutSftpUISection(t *testing.T)
 ```
 
-`TestSftpUITOMLRoundTrip` 的键集合必须含：`"10.99.152.18"`、`"prod db"`、`"中文主机"`、`quote"host`、`host.with.dots`、`prod-db`；`LastLocalDir` 用 Windows 风格路径，**Go 源码里必须写成反引号 raw string**（`` `D:\工作\虚拟 共享` ``）或双反斜杠转义 —— 双引号串里的 `\工` 是非法转义、编译不过（审核 M7）。判据：`Encode` 后 `Decode` 回来**逐字段相等**（只比解码后的值，不断言落盘字节形态），且 `[app]` 段等其它字段不受影响。
+`TestSftpUITOMLRoundTrip` 的键集合必须含：`"192.0.2.10"`、`"prod db"`、`"中文主机"`、`quote"host`、`host.with.dots`、`prod-db`；`LastLocalDir` 用 Windows 风格路径，**Go 源码里必须写成反引号 raw string**（`` `D:\工作\虚拟 共享` ``）或双反斜杠转义 —— 双引号串里的 `\工` 是非法转义、编译不过（审核 M7）。判据：`Encode` 后 `Decode` 回来**逐字段相等**（只比解码后的值，不断言落盘字节形态），且 `[app]` 段等其它字段不受影响。
 
 `TestLoadConfigNormalizesSftpUISection`：写一份临时 TOML，其中 `sort_local_key = "bogus"`、`sort_local_dir = 7`、`last_remote_dirs` 只给一个键 → `LoadConfig` 读回后 `SortLocalKey=="name"`、`SortLocalDir==1`。
 
