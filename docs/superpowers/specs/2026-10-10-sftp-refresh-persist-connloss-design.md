@@ -1,6 +1,6 @@
 # SFTP：双侧刷新 + 右键菜单分级 + 最后路径/排序持久化 + 连接失效自愈 设计
 
-> 状态：v1.7 · **用户已评审通过**（2026-10-10，选定「B. 通过，并把 `AddBookmark`/`RemoveBookmark` 的同类竞态本轮一并修」⇒ 范围扩大见 §15 D21）· 规格侧两阶段审核已完成（§16.1 自审 9 项 + §16.2 subagent 双面审核 33 项）· **实施计划已出并完成它的两阶段审核（38 条全部处置，记录在计划的「两阶段审核 · 第二阶段」节），本轮据此回改了本规格 15 处（§16.3）** · 下一步：用户评审计划并选执行方式 · 尚未实施
+> 状态：v1.8 · **用户已评审通过**（2026-10-10，选定「B. 通过，并把 `AddBookmark`/`RemoveBookmark` 的同类竞态本轮一并修」⇒ 范围扩大见 §15 D21）· 规格侧两阶段审核已完成（§16.1 自审 9 项 + §16.2 subagent 双面审核 33 项）· **实施计划已出并完成它的两阶段审核（38 条全部处置，记录在计划的「两阶段审核 · 第二阶段」节），本轮据此回改了本规格 15 处（§16.3）** · 下一步：用户评审计划并选执行方式 · 尚未实施
 > 关联：`docs/superpowers/specs/2026-09-16-sftp-selection-dnd-navigation-design.md`（选择/批量/拖拽/位置基线，本轮遵其决策 5/6/32）、`docs/superpowers/specs/2026-09-18-sftp-gosftp-transport-design.md`（gosftp 底座与粘性 Connected 的由来）、`docs/superpowers/specs/2026-09-24-sftp-pane-layout-fixes.md`（面板排版基线）
 > 路径判定：**架构级**（配置结构变更 + 新增后端绑定 + 前端交互模型调整 + 连接状态机自愈）
 > 证据来源：§1 的代码事实均带 `file:line`，本次逐条读过源码后记录（非引用旧文档）
@@ -778,3 +778,18 @@ async function verifyRemote() {
 | B1（Blocking） | 计划的 Global Constraints 新增 Task 0（`npm ci && npm run build` 产 `frontend/dist`），本规格 §11.3 的验收前置同步点明 |
 
 未列出的审核项只改到计划（任务步骤与断言），未触及本规格的设计决策。
+
+### 16.4 执行期裁定与对规格的偏离（v1.8，由 SDD 逐任务复核记录）
+
+实施走 Subagent-Driven（每任务一个全新实现者 + 一个全新复核者 + 定点修复轮），逐条裁定与偏离记录在工作区 ledger（`.superpowers/sdd/2026-10-10-sftp-refresh-persist-connloss/progress.md`，gitignore 内）。**与规格文本不一致、但被判定为"等价或更好"的执行选择**如下：
+
+| 处 | 规格原文 | 执行选择 | 理由 |
+|---|---|---|---|
+| §7.2 短路镜像 | 短路（recents 队首同值）**不**更新 `sftpui` 镜像 | **也做幂等镜像** | 正常流程里 `load()` 已灌入持久值 ⇒ 短路时镜像本就同值；差异只出现在"镜像为空而队尾已有该值"（`load()` 失败）的边界，那次写是唯一修正机会、零 IPC、不改列表 |
+| §8.4 第 4 项文案 | 落点改 `remoteOpFailed(e)`，未规定是否保留上下文前缀 | `goRemote` 直接换成归口调用，不保留「无法打开 `<target>`：…」前缀 | 后端 `TransferError.Error()` 自带 `sftp ls <path>: <err>`，`Op`/`Path` 未丢（`internal/sftp/api.go`）。代价：常见场景每次两条 error 日志 |
+| §8.4 的 `loadRemote` 落点 | 未规定 await 形态 | **不 await**（`void Promise.resolve().then(...).catch(err)`），并要求 `remoteOpFailed` 内部全包、**自身永不 reject** | 探活最长 15s，await 会拖住 loading 与批量收尾；浮动调用必须终结 rejection，否则是 unhandled rejection |
+| §5.3 菜单文案 | 表格示例带 `(N)` 计数 | 行菜单不带计数 | 渲染期计数与点击后作用域可能不一致（`sel.single`）；面板头下拉已承载计数 |
+| §7.1 失败语义 | "内存保留"（措辞有歧义） | 明确为**不回滚**（保留用户刚设的新值） | 列表已按点击呈现，回滚会视觉反弹；失败以抛错 + 日志暴露 |
+| §6.3.4 读方 | 只列 4 个写入点 | 追加 `ListLocations()` 加 `cfgMu.RLock()`（M8） | Wails 每次调用一个 goroutine ⇒ 无锁读方会让"并发安全"的宣称过头 |
+
+**执行期发现的规格/计划缺陷（已修）**：计划 T13 Step 1 的测试正则 `/catch[\s\S]*?(remoteOpFailed\(|verifyRemote\(/` 少一个右括号 ⇒ 照抄会让 vitest 直接 `Invalid regular expression: Unterminated group`（实现者改正后使用）；`(N)` 与 `remoteOpFailed` 前缀两处措辞歧义见上表。
