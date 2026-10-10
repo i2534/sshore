@@ -1105,9 +1105,10 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	// 下游全部消费同一个 rootRemote，语义因此自洽：
 	//   - 建目录：MkdirAll(rootRemote) + 每个子目录；
 	//   - 逐文件落点：path.Join(rootRemote, f.rel)（f.rel 是相对**源根**的 POSIX 路径）；
-	//   - 重试前清理：cleanupRemoteTreeParts(ctx, s, rootRemote, treeFileTargets(files), id)
-	//     —— 只删「本次 id + 本树内已知目标 basename」命中的远端 .part/.bak，
-	//     绝不越界删目标目录里别人的文件（判据见 isPartForTarget）。
+	//   - 重试前清理：cleanupRemoteTreeParts(ctx, s, rootRemote, putTreeCleanupDirs(files),
+	//     treeFileTargets(files), id) —— 只在本树**实际会写到**的目录里，删「本次 id +
+	//     本树内已知目标 basename」命中的远端 .part；不递归、不碰本树不会写到的分支，
+	//     也**不**清 backup-swap 的 .bak（判据见 isPartForTarget）。
 	rootRemote := path.Clean(req.Remote)
 	// 远端目录（含空目录）按 D11 一次性建出：WalkDir 已给出完整子目录清单，绝不逐文件
 	// 重复 MkdirAll（那是每文件一次多余往返）。
@@ -1120,14 +1121,16 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 			return fail(&TransferError{Op: op, Host: req.Host, Path: p, Err: derr, RemoteMsg: s.Proc.StderrText()})
 		}
 	}
-	// spec §8 目录行的上传侧对称：重试（整项重传）前先清掉本项留在该子树里的远端 .part。
+	// spec §8 目录行的上传侧对称：重试（整项重传）前先清掉本项留在**本树写入目录**里的远端 .part。
 	//
-	// 清理边界（2026-10-10 修复后必须明说）：rootRemote 现在是**最终目标目录**，可能是用户
-	// 已有目录（此前它是一个为本棵树新建的 <remote>/<base> 专用目录）。因此这里**只能**
-	// 依赖 isPartForTarget 的双重判据（目标 basename 前缀 + 本次 id 短前缀）来界定「自己
-	// 那一棵树」，绝不能扩大成「整棵子树无差别清扫」；目录条目数/深度上限
-	// （cleanupTreeMaxEntries/cleanupTreeMaxDepth）仍是硬边界，超出即放弃清理（尽力而为）。
-	g.cleanupRemoteTreeParts(ctx, s, rootRemote, treeFileTargets(files), req.ID)
+	// 清理边界（2026-10-10 修复轮 2，Important-1）：rootRemote 现在是**最终目标目录**，可能是
+	// 用户已有目录（此前它是一个为本棵树新建的 <remote>/<base> 专用目录）。因此扫描面必须是
+	// 「本树实际会写到的目录集合」（由 files 的 rel 推导出的父目录 + 目标根，见
+	// putTreeCleanupDirs）：只在这些目录里各做**一次** ReadDir，绝不递归整棵既有子树。
+	// 改前那种递归有两个问题：(a) 往返次数随用户既有子树规模线性增长（每个目录一次 ReadDir）；
+	// (b) shortID 只截 8 rune，碰撞时会扫到与本树无关的分支。判据仍是 isPartForTarget 的
+	// 双重命中（目标 basename 前缀 + 本次 id 短前缀）；清理**不含** backup-swap 的 .bak。
+	g.cleanupRemoteTreeParts(ctx, s, rootRemote, putTreeCleanupDirs(files), treeFileTargets(files), req.ID)
 	tp.begin()
 
 	for _, f := range files {
@@ -1772,8 +1775,13 @@ func (g *GoBackend) Cancel(id string) bool {
 // 调用点：GetTree / PutTree 在**扫描成功之后、第一个文件开始传送之前**（此时已知根目录真实
 // 存在，也已知本次枚举出的每个目标名）。扫描本身失败时没有已知目标，不做清理。
 const (
-	// cleanupTreeMaxEntries / cleanupTreeMaxDepth 是清理遍历的硬上限（与 removeMaxEntries
-	// 同思路，逐条目计数、命中即停）。要删的只是本次传输自己的 .part，正常远小于该值。
+	// cleanupTreeMaxEntries / cleanupTreeMaxDepth 是**本地**清理遍历（cleanupTreeParts，
+	// filepath.WalkDir 整棵本地子树）的硬上限（与 removeMaxEntries 同思路，逐条目计数、
+	// 命中即停）。要删的只是本次传输自己的 .part，正常远小于该值。
+	//
+	// 远端侧（cleanupRemoteTreeParts）自 2026-10-10 复核轮 2 起**不再递归**：它只扫
+	// putTreeCleanupDirs 给出的「本树实际会写到的目录集合」，每个目录恰好一次 ReadDir，
+	// 因此不需要这两个上限 —— 扫描量与本树写入目录数同阶，而不是与既有子树规模同阶。
 	cleanupTreeMaxEntries = 100000
 	cleanupTreeMaxDepth   = 64
 )
@@ -1857,10 +1865,48 @@ func (g *GoBackend) cleanupTreeParts(s *Session, localRoot string, targets []str
 	return removed
 }
 
-// cleanupRemoteTreeParts 删除远端子树里的目标 .part（上传方向的失败锚点）。
-// 目录条目数 / 深度都有上限；任何错误（目录不可读等）都只 warn —— 尽力而为。
-func (g *GoBackend) cleanupRemoteTreeParts(ctx context.Context, s *Session, remoteRoot string, targets []string, id string) int {
-	if s.Conn == nil || remoteRoot == "" || len(targets) == 0 {
+// putTreeCleanupDirs 返回本棵树**实际会写到**的远端目录集合（相对 rootRemote 的 POSIX 相对
+// 路径，"." 表示 rootRemote 自身；顺序稳定：根在前，其余字典序）。
+//
+// 完备性论证（这是「收窄扫描面」不会漏清的依据）：本树的 .part 只可能落在**某个待写文件的
+// 父目录**里 —— PartNameRemote 把 .part 放在目标同目录（<target><marker>…），名字过长退化时
+// 落 path.Dir(target)，也还是同一目录。所以 { 各文件 rel 的父目录 } ∪ { 目标根 } 就是本树
+// .part 的完备扫描面；本树不会写到的目录里的 .part 一定不是本树留下的。
+//
+// 依据（2026-10-10 复核轮 2 / Important-1）：新语义下 rootRemote 是「用户可能已有内容的最终
+// 目录」。改前的递归遍历会随既有子树规模线性增加 SFTP 往返（每个目录一次 ReadDir），并在
+// shortID 只截 8 rune 发生碰撞时扩大到与本树无关的分支。
+func putTreeCleanupDirs(files []treeFile) []string {
+	seen := map[string]bool{".": true}
+	out := []string{"."}
+	for _, f := range files {
+		rel := path.Dir(f.rel) // f.rel 是 POSIX 相对路径，父目录同样用 path 家族
+		if rel == "" || rel == "." || seen[rel] {
+			continue
+		}
+		seen[rel] = true
+		out = append(out, rel)
+	}
+	sort.Strings(out) // "." 排最前（'.' < 字母/数字）；确定性顺序便于断言与复现
+	return out
+}
+
+// readRemoteDir 是清理列举远端目录的注入点（与 removeRemote / copyStream / scanCheckpoint
+// 同一手法）：单测用它**计数 ReadDir 调用次数**，钉住「扫描目录数 = 本树写入目录集合大小」，
+// 而不是「既有目标子树规模」。
+var readRemoteDir = func(c *sftp.Client, ctx context.Context, dir string) ([]os.FileInfo, error) {
+	return c.ReadDirContext(ctx, dir)
+}
+
+// cleanupRemoteTreeParts 删除远端**本树会写到的目录**里的目标 .part（上传方向的失败锚点）。
+//
+// 扫描面由 dirs 显式给定（生产调用点传 putTreeCleanupDirs(files)）：对 dirs 里每个目录恰好做
+// **一次** ReadDir，**不递归** —— 因此目录数/往返次数只跟本树写入目录集合同阶，绝不随既有
+// 目标子树规模增长，也就不会在 shortID 碰撞时扫到本树无关的分支。
+// dirs 里的目录可能还不存在（根目录建失败等）：os.IsNotExist 是正常路径，不 warn。
+// 其它错误（目录不可读等）都只 warn —— 尽力而为，绝不让重试失败。
+func (g *GoBackend) cleanupRemoteTreeParts(ctx context.Context, s *Session, remoteRoot string, dirs []string, targets []string, id string) int {
+	if s.Conn == nil || remoteRoot == "" || len(targets) == 0 || len(dirs) == 0 {
 		return 0
 	}
 	target := map[string]bool{}
@@ -1869,32 +1915,20 @@ func (g *GoBackend) cleanupRemoteTreeParts(ctx context.Context, s *Session, remo
 			target[path.Base(x)] = true
 		}
 	}
-	removed, entries := 0, 0
-	var walk func(dir string, depth int)
-	walk = func(dir string, depth int) {
-		if depth > cleanupTreeMaxDepth || entries > cleanupTreeMaxEntries {
-			return
-		}
-		infos, rerr := s.Conn.ReadDirContext(ctx, dir)
+	removed := 0
+	for _, rel := range dirs {
+		dir := path.Join(remoteRoot, rel)
+		infos, rerr := readRemoteDir(s.Conn, ctx, dir)
 		if rerr != nil {
-			// 根不存在（从没成功建过远端目录）是正常路径，不 warn。
+			// 目录不存在（还没建出来 / 本树没写到）是正常路径，不 warn。
 			if !os.IsNotExist(rerr) {
 				g.warnf(s.Host, "重试前清理远端临时文件：列目录 %s 失败: %v", dir, rerr)
 			}
-			return
+			continue
 		}
 		for _, fi := range infos {
-			entries++
-			if entries > cleanupTreeMaxEntries {
-				return
-			}
 			name := fi.Name()
-			if name == "." || name == ".." {
-				continue
-			}
-			full := path.Join(dir, name)
-			if fi.IsDir() {
-				walk(full, depth+1)
+			if name == "." || name == ".." || fi.IsDir() {
 				continue
 			}
 			// 条目名带随机后缀：逐目标做前缀比对，绝不用「等于目标名」判定。
@@ -1908,6 +1942,7 @@ func (g *GoBackend) cleanupRemoteTreeParts(ctx context.Context, s *Session, remo
 			if !matched {
 				continue
 			}
+			full := path.Join(dir, name)
 			if derr := removeRemote(s.Conn, full); derr == nil {
 				removed++
 			} else if !os.IsNotExist(derr) {
@@ -1915,7 +1950,6 @@ func (g *GoBackend) cleanupRemoteTreeParts(ctx context.Context, s *Session, remo
 			}
 		}
 	}
-	walk(remoteRoot, 0)
 	return removed
 }
 
