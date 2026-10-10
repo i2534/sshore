@@ -271,3 +271,23 @@ EXIT=0
 - `%ProgramFiles%` 在 32 位进程下会被 WOW64 重定向到 `Program Files (x86)`；本实现按
   题目要求的字面语义用 `getenv("ProgramFiles")`，没有额外引入 `ProgramW6432`。
   真正的修法是第 3 步的 `Sysnative`，`ProgramFiles` 只是多一层兜底。
+
+## 复核轮补记（已知可见差异）
+
+- **`argv[0]` 变为绝对路径**（非 Windows 亦然）：`exec.Command` 对无分隔符名字本就会内部 LookPath 并更新 `Path`，因此**可执行文件路径等价**；但 `Args[0]` 从 `"ssh"` 变成 `/usr/bin/ssh`（复核者用 `-overlay` 探针实测：子进程 `$0` 由 `sh` 变 `/bin/sh`）。对 ssh/sftp 无功能影响（basename 不变），但 `ps` 的 argv 显示、以及按 `$0=="ssh"` 判断的 wrapper 会看到差异 —— 原先"行为等价"的表述应限定为 **Path 等价**。
+- **386 下 `%ProgramFiles%` 兜底近似无效**：32 位进程读 `%ProgramFiles%` 会被重定向到 `Program Files (x86)`，而 OpenSSH 装在 64 位目录；本 bug 的修法是 **Sysnative 优先**，故不影响；该兜底仅为兼容非常规安装位置。
+
+
+## 真机复验（已完成，2026-10-10）
+
+用修复后的 386 二进制（`Version=v0.7.2-77-gc38f5c2`）在 VBox `win10`（`DESKTOP-LLF2GB6`，AMD64）上经 RDP 真实输入通道复跑：
+
+| 步骤 | 结果 |
+|---|---|
+| 点「连接」（主机 `winlocal`） | **不再出现** `exec: "ssh": executable file not found in %PATH%` |
+| 远程面板 | 列出 `/C:/Users/lan`：`「开始」菜单`、`3D Objects` 等，共 **85 项** ⇒ SFTP 通道真的建立了 |
+| 连带验证 | 已连接态下空白菜单三项全部深色启用；点 `上传文件…` 弹出**原生 Windows 文件选择器**（`选择要上传的文件`） |
+
+证据：`real/c-win-386-ssh-fixed-connected.jpg`、`real/c-win-native-filedialog.jpg`（结论同时回写到 `real/WINDOWS-C.md` 的 C-6 与 §2）。
+
+收尾：客户机 app 已 kill、RDP 会话已断开并把会话 1 接回控制台、我临时挂的 `rdpalt` 转发已删除、VM 关机、锁释放、宿主 `xfreerdp`/`Xvfb` 归零。

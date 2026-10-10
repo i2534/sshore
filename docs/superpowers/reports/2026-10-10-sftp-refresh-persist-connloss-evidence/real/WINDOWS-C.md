@@ -16,6 +16,7 @@
 | C-3 | **空白右键菜单**（面板空白处） | **PASS** | 菜单 = `刷新 / 新建文件夹 / 上传文件…`（面板级），与 Linux 侧形态一致 | `c-win-blankmenu.jpg` |
 | C-4 | 菜单项**禁用态**渲染与惰性（未连接时） | **PASS** | 依赖连接的 `上传到远程`/`上传文件…` 被置灰：文字平均灰度 **173.2**，启用项 `刷新`/`新建文件夹` 为 **97.4 / 90.6**；点击置灰项**无任何反应**（菜单也不关）⇒ 与 spec §5.3「本地面板的 upload/upload-picked 落点依赖 remotePath，未连接时置灰」一致 | `c-win-blankmenu.jpg` + 像素量化 |
 | C-5 | 启用项**可用** | **PASS** | 点 `刷新` 菜单项 ⇒ 菜单关闭；点 `新建文件夹` ⇒ 弹出模态「新建文件夹 / 新建文件夹名称 / 确定 取消」 | `c-win-newfolder-modal.jpg` |
+| C-6 | **原生文件选择器**（已连接态） | **PASS** | 连上 `winlocal` 后（远程面板列出 `/C:/Users/lan`，85 项），空白菜单三项全部**深色启用**；点 `上传文件…` ⇒ 弹出原生「选择要上传的文件」对话框：`\\VBOXSVR\share\vbox-agent\sshore-b`、左侧导航（此电脑/图片/文档/下载/本地磁盘 (C:)/share/网络）、`sshore.exe 12,280 KB 应用程序`、`文件名(N):`、`打开(O)/取消`、过滤器 `All Files (*.*)` | `c-win-native-filedialog.jpg`、`c-win-menu-enabled-crop.jpg` |
 
 ## 2. 发现：`windows/386` 构建下 SFTP 连接不可用（candidate，待你决定是否处理）
 
@@ -37,12 +38,13 @@ OS 架构: AMD64
 
 证据：`c-win-ssh-not-found.jpg`
 
+**已修复并真机复验（`23df979` + `cf9eb92`）**：新增解析器按 `SSHORE_SSH_PATH` → `exec.LookPath` → 仅 Windows `%SystemRoot%\Sysnative\OpenSSH` → `System32\OpenSSH` → `%ProgramFiles%\OpenSSH` → 裸名 的顺序解析，接线在**真实 exec 层**（调用方与参数列表逐字未动）。用修复后的 386 二进制复跑：点「连接」**不再报 exec 错误**，远程面板列出 `/C:/Users/lan`（`「开始」菜单`、`3D Objects` …，85 项）⇒ 真 Windows/386 上 SFTP 可用。证据 `c-win-386-ssh-fixed-connected.jpg`；详见 `../windows-386-ssh-path-fix.md`。
+
 已在 commit `cf9eb92` 修复（见 `windows-386-ssh-path-fix.md`）：按 `SSHORE_SSH_PATH` / `SSHORE_SFTP_PATH` → `exec.LookPath` → 仅 Windows 的 `%SystemRoot%\Sysnative\OpenSSH` → `System32\OpenSSH` → `%ProgramFiles%\OpenSSH` → 裸名 的顺序解析 OpenSSH 客户端，`Sysnative` 排在 `System32` 之前；接线只改真实 exec 的那一层（`osutil` 的 Runner / CtxRunner / Spawner / StartPipes 与 `config.defaultSSHGRun`），参数列表逐字未改。
 
 ## 3. 未验证（照实记录）
 
-- **原生文件选择器**：`上传文件…` 需先连上远端才启用，而连接被 §2 阻断 ⇒ 未取到 Windows 原生对话框证据（Linux 侧已验过等价功能）。
-- 已连接状态下的**远端行菜单**（下载…/上传…）与传输/进度 UI（同上被阻断）。
+- 已连接状态下的**远端行菜单**（下载…/上传…）与真实传输/进度 UI 未逐项点击验证（远端**列目录**已验证：`/C:/Users/lan` 85 项）。
 - 窗口行为细节（最大化/最小化/DPI 缩放/多显示器）未逐项验。
 - 跨物理网络未覆盖。
 
