@@ -50,3 +50,19 @@
 4. **上传/下载/拖拽移动**类手势不在本轮 15 项之内（本轮覆盖了双击进目录、右键菜单、点列头、切标签、连接/断开、新建文件夹）。
 5. 验收期间为让 `ssh` 子进程解析别名，临时在真实 `~/.ssh/config` 追加过两个别名块；**已删除并用 md5 校验与备份逐字节一致**（`8b71afb349b86c58b35a73e95a97dc4b`）。应用配置全程走隔离 HOME（`/tmp/sshkit-acc/home`），**未触碰**用户真实 `~/.config/sshore/sshore.toml`；测试用的 `acc-local*`/`acc-remote*`/`/tmp/acc-empty` 已删除。
 6. `wails build` / `wails generate module` 会把 `frontend/wailsjs/runtime/*` 的 mode 在 755/644 间抖动（内容零改动）；已还原为已提交状态并记入 deferred minor。
+
+---
+
+## A 之后的复验（当前 HEAD `v0.7.2-71-gc5a59ba`，含 A 块改动）
+
+| # | 项 | 结果 | 关键观察 | 证据 |
+|---|---|---|---|---|
+| C2 | 每主机最后路径（按主机隔离） | **复验 PASS** | 起始 `acc-target="/home/lan/Documents"`、`acc-proxy="/home/lan/Downloads"`；远程导航到 `/home/lan/acc-b2` 后 ⇒ `acc-target="/home/lan/acc-b2"`，而 **`acc-proxy` 未被动** | `c2e2-2-navigated.jpg` + 配置原文 |
+| E2 | 断开 → 连接回到最后路径 | **复验 PASS** | 断开 → 连接后远程面板仍落 `/home/lan/acc-b2`（**不是 home**） | `c2e2-3-reconnect.jpg` |
+| C2 | 连接时落点 = 该主机记住的路径 | **复验 PASS** | 连 `acc-target` ⇒ 远程面板 `/home/lan/Documents`（11 项） | `c2e2-1-landing.jpg` |
+| C4 | `SftpHome` 不污染最后路径 | **复验 PASS（追加）** | 上一步的"断开→连接"每次都会调 `SftpHome`，配置里的 `acc-target` 仍为 `/home/lan/acc-b2` | 同上 + 配置原文 |
+
+**顺带观察（未列为判据但值得记）**：起始 `last_local_dir` 指向我 B 轮清理掉的 `b-fixtures`（已不存在），应用没有报错，而是记一条
+`[WARN] 上次的本地目录 /home/lan/workspace/scripts/sshkit/b-fixtures 已不可用，已回到 /home/lan/workspace/scripts/sshkit`
+并回落 CWD（见 `c2e2-1-landing.jpg` 日志区）——记忆路径失效时的优雅降级。
+
