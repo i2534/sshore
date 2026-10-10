@@ -908,6 +908,6 @@ git commit -m "docs(report): SFTP 刷新/持久化/连接自愈的 Linux+Windows
 - **类型/命名一致性**（逐条对过）：`config.SftpUIState` 六字段 → T3/T4 复用；`Ctrl.Probe`/`SftpProbe` → T13 调 `SftpProbe`；`nextSort` → T9；`resolveRemoteTarget` → T11；store 的 `lastPathFor/setSort/loaded/load/noteLocalPath/noteRemotePath` → T8/T11/T13；`recordRecentSFTP(...,rememberLast)` → T4 测试同签名；`fetchRemote/fetchLocal` → T11 产出、T12/T13 复用；`probeTimed/verifyRemote/remoteOpFailed/recoverConnection` → 只在 T13 内闭环。
 - **Step 自查发现并已修的一处缺口**：Spec §11.1 的两条用例（"只含 sort 的 `SaveSftpUI` 会清零路径"这一危险语义、`GetSftpUI ‖ SaveSftpUI` 并发）原先没有落到任何任务，已补进 T3 Step 1。
 - **Review Focus 与测试的对应**：第 1 条→T1 Step 1 + T7 Step 1；第 2 条→T11 Step 1；第 3 条→T13 Step 1 + T12 Step 1；第 4 条→T13 Step 1；第 5 条→T1 Step 1（四个用例）+ T7 Step 1。
-- **比例**：本计划约 630 行，规格 729 行 —— 未出现"计划比规格还长"的抄写式膨胀；函数体只在规格固定了逐字文案/分支顺序处出现。
+- **比例**（实测数字）：本计划 913 行 / 14 任务 / 71 个步骤；规格 729 行 ⇒ 约 1.25×，属同一量级，没有"比规格长几倍"的抄写式膨胀。代码块基本是**签名 + 测试名/断言**；函数体只出现在规格固定了逐字文案或分支顺序的地方（右键 handler 分支、store 的 payload 键、探针 race 形状）。若执行者发现某步只是把实现抄了一遍，按"步骤只决定实现者无法独自决定的东西"删减。
 - **未写进计划的东西**（刻意留给执行者的判断，不是遗漏）：函数体写法、CSS 细节、测试断言的实现手法（切片正则 vs SSR）、提交粒度内的行号微调。
 - **环境前提**（实测过的，不是猜测）：`~/.cache/go-build` 只读 ⇒ 一律带 `GOCACHE=$PWD/.gocache`；`wails v2.15.0` 的 `generate module` 支持 `-tags`；前端可用的测试手段只有纯函数/store/SSR/读源码四种。
