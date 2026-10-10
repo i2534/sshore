@@ -1039,16 +1039,25 @@ func TestCtrlProbeUsesPoolForGoBackend(t *testing.T) {
 		t.Fatalf("测试前提错误：①必须只拨号一次，dials=%d", n)
 	}
 
-	// ② 判别力：工作目录消失后 pool.Probe 读 "." ⇒ false，而 List 读 "/" ⇒ true（两条可分）。
-	if err := os.RemoveAll(root); err != nil {
-		t.Fatalf("造工作目录消失失败: %v", err)
-	}
+	// ② 判别力（可移植写法）：换一个 backend，其会话的服务端工作目录指向一个**不存在的路径**
+	// —— 相对路径（探针读 "."）必失败，而绝对路径（List 读 "/"）仍成功 ⇒ 两条路径可分。
+	// 不再用「删掉工作目录」那招：Windows 不允许删除仍被占用的目录，
+	// 旧写法在 CI 的 windows job 上挂过（unlinkat: The process cannot access the file
+	// because it is being used by another process）。pkg/sftp 的 WithServerWorkingDirectory
+	// 只存字段、不做存在性校验，因此"不存在的 CWD"在两端行为一致、与平台无关。
+	g2 := NewGoBackend(nil, nil)
+	g2.pool = NewPool(func(host, user string) (*Session, error) {
+		s, _ := newPipeSession(t, host, user, filepath.Join(root, "gone-workdir"))
+		return s, nil
+	})
+	defer g2.CloseAll()
+	c2 := NewCtrlForcedBackend(g2)
 	// 先证明 List 路径在这种会话上确实会成功，否则本用例的判别力不成立、会静默退化。
-	if _, err := c.List("h", "u", "/"); err != nil {
+	if _, err := c2.List("h", "u", "/"); err != nil {
 		t.Fatalf("测试前提错误：List 路径读 \"/\" 必须成功，否则两条路径不可分: %v", err)
 	}
-	if c.Probe(context.Background(), "h", "u") {
-		t.Fatal("工作目录消失后读 \".\" 必失败：Probe 必须答 false；答 true 说明没走 pool.Probe")
+	if c2.Probe(context.Background(), "h", "u") {
+		t.Fatal("服务端工作目录不存在时读 \".\" 必失败：Probe 必须答 false；答 true 说明没走 pool.Probe")
 	}
 
 	// ③ ctx 传播：pool.Probe 用调用方的 ctx，GoBackend.List 恒用 context.Background()。
