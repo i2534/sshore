@@ -707,4 +707,12 @@ CI_EXIT=0
 E2E_EXIT=0
 ```
 
-（验证对象 = 本轮最终 HEAD `23d8336`，工作树干净 `git status --short` 无输出。完整日志：`/tmp/ci-final.log`、`/tmp/e2e-final.log`。）
+在**最终 HEAD** 上又把两条门重跑了一遍（该 HEAD 相对 `23d8336` 只多纯文档提交，无代码/测试变化）：
+
+```
+CI_EXIT=0
+E2E_EXIT=0
+```
+
+（工作树干净：`git status --short` 无输出。日志：`/tmp/ci-final.log`、`/tmp/e2e-final.log`（`23d8336`）、
+`/tmp/ci-final2.log`、`/tmp/e2e-final2.log`（最终 HEAD）。）
