@@ -15,7 +15,7 @@
 | B-6 | 多选 >1 项批量上传 | **未完成** | 见「未完成项」；工具侧限制，不下缺陷结论 |
 | B-7 | 拖拽移动/复制 | **未完成** | 见「未完成项」；行本身 `draggable="true"` + `dragstart/drop` 处理器俱在（`FilePane.vue:271-277`、`SftpView.vue:1339-1365`），只是合成拖拽没能让 WebKitGTK 起 DnD |
 | B-8 | 搜索（远程递归） | **PASS** | 浮层标题 `在 acc-target : /home/lan/acc-b 下递归搜索`，输入 `upload` 回车 ⇒ `命中 1 项 / upload-small.bin 1048576 2026-10-10 14:59` |
-| B-9 | 上传目录多套一层（**既有缺陷，非本轮引入**） | **确认缺陷** | 复现：本地 `updir/`（含 `a.txt`）上传到远端 `/home/lan/acc-b` ⇒ 落成 `/home/lan/acc-b/updir/updir/a.txt`；期望 `/home/lan/acc-b/updir/a.txt` |
+| B-9 | 上传目录多套一层（**既有缺陷，非本轮引入**；已于 commit `a5a6702`+`2420121` 修复，见下节） | **确认缺陷** | 复现：本地 `updir/`（含 `a.txt`）上传到远端 `/home/lan/acc-b` ⇒ 落成 `/home/lan/acc-b/updir/updir/a.txt`；期望 `/home/lan/acc-b/updir/a.txt` |
 | B-10 | 本轮改动在旧流程上的副作用 | **无** | 单/目录上下的日志、md5、落点均正常；传输期间未出现任何「远端连接已失效/重连」误判 |
 
 ## B-9 根因（已定位到行，且与本轮无关）
@@ -38,6 +38,17 @@ p := filepath.Join(req.Local, filepath.FromSlash(d))
 修复选项（**未执行，等决策**）：
 1. `PutTree` 改为把 `req.Remote` 当最终目录（与 `GetTree` 对齐）——同时需调整 `cleanup_test.go` 等以 `Remote: "."` 表达的父目录约定与 batch 后端；
 2. 前端在 `isDir` 时传父目录 —— 改动小，但会让传输队列展示的 dst 与文件级语义不一致。
+
+## B-9 修复（2026-10-10，选项 1 已落地）
+
+**已在 commit `a5a6702`（`internal/sftp/gosftp.go` PutTree）与 `2420121`（`internal/sftp/batch.go` PutRecursive）修复**，未改前端（前端本来就是「最终路径」约定）：
+
+- `PutTree`：`rootRemote := path.Join(req.Remote, filepath.Base(filepath.Clean(req.Local)))` → `rootRemote := path.Clean(req.Remote)`；逐文件落到 `path.Join(rootRemote, <相对源根路径>)`。
+- `PutRecursive`（batch）：不再生成 `sftp put -r <local> <remoteDir>`（OpenSSH 的父目录约定），改为本地遍历源树，在同一 `sftp -b` 脚本里 `-mkdir` 各级目标目录 + 逐文件 `put` 到最终路径。
+- 清理边界不变：重试前的 `.part` 清理仍按「本树目标 basename + 本次 id 短前缀」双重判据（`isPartForTarget`），目标目录里别的 id 的 `.part` 与同名普通业务文件都不得删除（`cleanup_test.go` 已补断言）。
+- 验证：`TestTreeE2E` 在**一次性真 sshd** 下 batch/gosftp 两个迭代都 PASS（目标目录**故意不预建**，由实现自行建出；断言落点为最终路径且不出现 `<target>/a`）；详见 `puttree-nesting-fix.md`。
+
+期望落点因此从 `/home/lan/acc-b/updir/updir/a.txt` 变为 `/home/lan/acc-b/updir/a.txt`。**注意**：B-4 那条「下载方向正确」的结论当时是基于 B-2 缺陷产生的远端树（远端源里本就含一层 `updir`）；修复后若重跑 B-4，需按修复后的远端树重新取样。
 
 ## 未完成项（工具侧限制，非"未发现问题"）
 
