@@ -1008,9 +1008,15 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 
 // PutTree 递归上传本地目录（D8/D11/D16）。
 //
-// 合并语义（D11，与 sftp put -r 实测一致，batch.go PutRecursive 的权威描述同源）：
-// 远端建 <remoteDir>/<base(local)>，同名目录已存在则**并入**（同名文件被覆盖），
-// 绝不嵌套出 <base>/<base>，也不清理远端独有的旧文件。
+// **目标语义（2026-10-10 缺陷修复，本轮钉死）**：`req.Remote` 是**最终目标目录本身**
+// （与 GetTree 的 `req.Local`、与前端 `dst` 计算对称），源树内容直接落在它下面：
+// `updir`（含 `a.txt`/`sub/c.txt`）传到 `/t` ⇒ `/t/a.txt`、`/t/sub/c.txt`。
+// **绝不再**把 `req.Remote` 当父目录、再追加 `filepath.Base(req.Local)` —— 那会让
+// 前端按「最终路径」传参时多套一层（`/t/updir/a.txt`）。源目录名与目标目录名是否相同
+// 与本契约无关（旧实现恰好只在两者同名时看起来"正确"）。
+//
+// 合并语义（D11）不变：目标目录同名子目录已存在则**并入**（同名文件被覆盖），
+// 也不清理远端独有的旧文件（不做整树替换）。
 //
 // 与 GetTree 对称：一个会话贯穿整棵树；每一项走远端 .part + commitRemote 原子提交；
 // 目录项只重试不续传（P3.1），req.Resume/req.PartPath 一律忽略。
@@ -1092,9 +1098,17 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	}
 	// 扫描成功：把真实分母写回聚合器；此后的建远端目录失败也就能报出诚实的「剩余文件数」。
 	tp.total, tp.files = total, filesTotal
-	// 合并语义：目标根 = <remoteDir>/<base(local)>。用 path（POSIX）拼接，绝不碰 filepath
-	// 的远端语义（Windows 客户端会把 / 变成反斜杠）。
-	rootRemote := path.Join(req.Remote, filepath.Base(filepath.Clean(req.Local)))
+	// 目标根 = req.Remote 本身（最终目录，见函数头）。用 path（POSIX）家族拼接，绝不碰
+	// filepath 的远端语义（Windows 客户端会把 / 变成反斜杠）；path.Clean 只做规范化
+	// （去掉尾斜杠、把 "" / "." 统一成 "."），不追加任何源目录名。
+	//
+	// 下游全部消费同一个 rootRemote，语义因此自洽：
+	//   - 建目录：MkdirAll(rootRemote) + 每个子目录；
+	//   - 逐文件落点：path.Join(rootRemote, f.rel)（f.rel 是相对**源根**的 POSIX 路径）；
+	//   - 重试前清理：cleanupRemoteTreeParts(ctx, s, rootRemote, treeFileTargets(files), id)
+	//     —— 只删「本次 id + 本树内已知目标 basename」命中的远端 .part/.bak，
+	//     绝不越界删目标目录里别人的文件（判据见 isPartForTarget）。
+	rootRemote := path.Clean(req.Remote)
 	// 远端目录（含空目录）按 D11 一次性建出：WalkDir 已给出完整子目录清单，绝不逐文件
 	// 重复 MkdirAll（那是每文件一次多余往返）。
 	if derr := s.Conn.MkdirAll(rootRemote); derr != nil {
@@ -1107,6 +1121,12 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 		}
 	}
 	// spec §8 目录行的上传侧对称：重试（整项重传）前先清掉本项留在该子树里的远端 .part。
+	//
+	// 清理边界（2026-10-10 修复后必须明说）：rootRemote 现在是**最终目标目录**，可能是用户
+	// 已有目录（此前它是一个为本棵树新建的 <remote>/<base> 专用目录）。因此这里**只能**
+	// 依赖 isPartForTarget 的双重判据（目标 basename 前缀 + 本次 id 短前缀）来界定「自己
+	// 那一棵树」，绝不能扩大成「整棵子树无差别清扫」；目录条目数/深度上限
+	// （cleanupTreeMaxEntries/cleanupTreeMaxDepth）仍是硬边界，超出即放弃清理（尽力而为）。
 	g.cleanupRemoteTreeParts(ctx, s, rootRemote, treeFileTargets(files), req.ID)
 	tp.begin()
 

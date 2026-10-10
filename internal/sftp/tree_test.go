@@ -23,6 +23,12 @@ import (
 //   - 逐文件复用单文件的 .part + 提交机制（下载 rename，上传 commitRemote）；
 //   - 目录项只重试、不续传（P3.1）：req.Resume/req.PartPath 一律忽略；
 //   - 枚举超 20000 文件 / 5s ⇒ 降级为 Total=-1 && FilesTotal=-1 && Phase=transfer。
+//
+// **目标路径契约（2026-10-10 缺陷修复，本文件所有目录用例的公共前提）**：
+// `PutTree(req).Remote` 与 `GetTree(req).Local` 都是**最终目标目录本身**，源树内容直接
+// 落在它下面。因此本文件的 PutTree 用例统一写 `Remote: "a"` + `Local: <src>/a`（模拟生产
+// 的「把 updir/ 投向 <目标>/updir」），断言 `<remoteRoot>/a/...`；旧实现（把 Remote 当父
+// 目录再拼 base(local)）会落成 `<remoteRoot>/a/a/...`，这些断言即因此变红。
 
 // makeLocalTree 在 root 下造一棵本地树。
 func makeLocalTree(t *testing.T, root string, files map[string]string) {
@@ -292,8 +298,9 @@ func TestGoBackendGetTreeCancelKeepsPartAndStops(t *testing.T) {
 }
 
 // TestGoBackendPutTreeMergesWithoutNesting：目录上传 happy path + D11 合并语义。
-// 远端建 <remoteDir>/<base(local)>；第二次上传并入同一目录（同名覆盖），绝不嵌套出 a/a，
-// 也不清理远端独有的旧文件；成功后无 .part/.bak 残留。
+// Remote 是**最终目录** `a`（源根也叫 a，正是生产里「把 updir/ 投向 <目标>/updir」的形状）：
+// 内容直接落在 a/ 下；第二次上传并入同一目录（同名覆盖），既不嵌套出 a/a（旧实现的父目录
+// 约定会），也不清理远端独有的旧文件；成功后无 .part/.bak 残留。
 func TestGoBackendPutTreeMergesWithoutNesting(t *testing.T) {
 	remoteRoot, src := t.TempDir(), t.TempDir()
 	makeLocalTree(t, src, map[string]string{"a/x.txt": "X1", "a/b/y.txt": "Y1"})
@@ -303,7 +310,7 @@ func TestGoBackendPutTreeMergesWithoutNesting(t *testing.T) {
 	put := func(id string) {
 		t.Helper()
 		sink.reset() // 每次传输独立观测帧序列（否则第二轮 scan 会跟在第一轮 transfer 之后）
-		req := TransferRequest{ID: id, Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}
+		req := TransferRequest{ID: id, Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}
 		if err := g.PutTree(req, sink.report); err != nil {
 			t.Fatalf("PutTree(%s): %v", id, err)
 		}
@@ -347,6 +354,31 @@ func TestGoBackendPutTreeMergesWithoutNesting(t *testing.T) {
 	}
 }
 
+// TestGoBackendPutTreeLandsIntoFinalDir（2026-10-10 缺陷修复的 RED→GREEN 钉子）：
+// `TransferRequest.Remote` 是**最终目标目录**（与 GetTree 的 `Local` 对称），源树内容
+// 直接落在它下面 —— 绝不再把 Remote 当父目录、再追加源目录名（旧实现给出 /t/src/x.txt）。
+// 源目录名故意取得与目标目录名不同（src → t），这样「多套一层」与「恰好同名而不嵌套」
+// 两种实现不可能同时骗过断言。
+func TestGoBackendPutTreeLandsIntoFinalDir(t *testing.T) {
+	remoteRoot, src := t.TempDir(), t.TempDir()
+	makeLocalTree(t, src, map[string]string{"src/x.txt": "X", "src/sub/y.txt": "Y"})
+
+	g := backendForTestServer(t, remoteRoot)
+	if err := g.PutTree(TransferRequest{ID: "nestfix-put", Host: "h", Remote: "t", Local: filepath.Join(src, "src"), Atomic: true}, nil); err != nil {
+		t.Fatalf("PutTree: %v", err)
+	}
+	for rel, want := range map[string]string{"x.txt": "X", "sub/y.txt": "Y"} {
+		b, err := os.ReadFile(filepath.Join(remoteRoot, "t", filepath.FromSlash(rel)))
+		if err != nil || string(b) != want {
+			t.Fatalf("最终目标目录下必须直接出现 %s: err=%v content=%q want=%q", rel, err, string(b), want)
+		}
+	}
+	// 旧实现（父目录约定）会建出 <Remote>/<base(local)> = t/src：这是本缺陷的唯一指纹。
+	if _, err := os.Stat(filepath.Join(remoteRoot, "t", "src")); !os.IsNotExist(err) {
+		t.Fatalf("不得再套一层源目录名（不应出现 t/src），stat err=%v", err)
+	}
+}
+
 // TestGoBackendPutTreePartialFailureKeepsPartAndStops：上传方向某文件短传时必须中止整项、
 // 不 commit、远端 .part 保留作重试锚点。
 func TestGoBackendPutTreePartialFailureKeepsPartAndStops(t *testing.T) {
@@ -364,7 +396,7 @@ func TestGoBackendPutTreePartialFailureKeepsPartAndStops(t *testing.T) {
 	})
 
 	var te *TransferError
-	err := g.PutTree(TransferRequest{ID: "t12-putpart", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, nil)
+	err := g.PutTree(TransferRequest{ID: "t12-putpart", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, nil)
 	if err == nil {
 		t.Fatal("短传必须报错")
 	}
@@ -402,7 +434,7 @@ func TestGoBackendTreesNonAtomicDirectWrite(t *testing.T) {
 	if parts := treeParts(t, dst); len(parts) != 0 {
 		t.Fatalf("legacy 下载不得建我方 .part: %v", parts)
 	}
-	if err := g.PutTree(TransferRequest{ID: "legacy-put", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: false}, nil); err != nil {
+	if err := g.PutTree(TransferRequest{ID: "legacy-put", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: false}, nil); err != nil {
 		t.Fatalf("PutTree(Atomic=false): %v", err)
 	}
 	if b, err := os.ReadFile(filepath.Join(remoteRoot, "a", "two.txt")); err != nil || string(b) != "TWO" {
@@ -433,7 +465,7 @@ func TestGoBackendTreeEmptyDirs(t *testing.T) {
 	if st, err := os.Stat(filepath.Join(dst, "empty")); err != nil || !st.IsDir() {
 		t.Fatalf("下载必须先建出空目录: err=%v st=%v", err, st)
 	}
-	if err := g.PutTree(TransferRequest{ID: "dirs-put", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, nil); err != nil {
+	if err := g.PutTree(TransferRequest{ID: "dirs-put", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, nil); err != nil {
 		t.Fatalf("PutTree: %v", err)
 	}
 	if st, err := os.Stat(filepath.Join(remoteRoot, "a", "empty")); err != nil || !st.IsDir() {
@@ -444,6 +476,8 @@ func TestGoBackendTreeEmptyDirs(t *testing.T) {
 // TestGoBackendPutTreeFollowsLocalRootSymlink：本地源目录本身是软链时也必须能上传。
 // filepath.WalkDir 不跟随根软链（会把它当非目录项，一个文件都枚举不到），若不像
 // scanLocalTree 那样先 EvalSymlinks，就会「成功」传出一个空目录 —— 静默丢数据。
+// 目标目录名取 `out`（与源根 `link`/`real` 都不同）：既有「必须真的有文件落上去」的
+// 断言，也顺带钉住「Remote 是最终目录、不追加源目录名」的新契约。
 func TestGoBackendPutTreeFollowsLocalRootSymlink(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows 创建软链需要额外权限")
@@ -455,11 +489,14 @@ func TestGoBackendPutTreeFollowsLocalRootSymlink(t *testing.T) {
 		t.Skipf("无法创建软链: %v", err)
 	}
 	g := backendForTestServer(t, remoteRoot)
-	if err := g.PutTree(TransferRequest{ID: "symroot", Host: "h", Remote: ".", Local: link, Atomic: true}, nil); err != nil {
+	if err := g.PutTree(TransferRequest{ID: "symroot", Host: "h", Remote: "out", Local: link, Atomic: true}, nil); err != nil {
 		t.Fatalf("PutTree(软链根): %v", err)
 	}
-	if b, err := os.ReadFile(filepath.Join(remoteRoot, "link", "one.txt")); err != nil || string(b) != "ONE" {
+	if b, err := os.ReadFile(filepath.Join(remoteRoot, "out", "one.txt")); err != nil || string(b) != "ONE" {
 		t.Fatalf("软链根下的文件必须被上传: err=%v content=%q", err, string(b))
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, "out", "link")); !os.IsNotExist(err) {
+		t.Fatalf("不得再套一层源目录名（不应出现 out/link），stat err=%v", err)
 	}
 }
 
@@ -558,7 +595,7 @@ func TestGoBackendPutTreeCancelDuringScanAborts(t *testing.T) {
 	entered, release := blockScanCheckpoint(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- g.PutTree(TransferRequest{ID: "t12-scan-put", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, nil)
+		done <- g.PutTree(TransferRequest{ID: "t12-scan-put", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, nil)
 	}()
 	select {
 	case <-entered:
@@ -645,7 +682,7 @@ func TestGoBackendPutTreeIgnoresSinglePartPathAndResume(t *testing.T) {
 	writeRemoteTree(t, remoteRoot, sentinel, []byte("SENTINEL"))
 
 	g := backendForTestServer(t, remoteRoot)
-	req := TransferRequest{ID: "t12-onepart-up", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true,
+	req := TransferRequest{ID: "t12-onepart-up", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true,
 		Resume: true, ResumeOffset: 2, PartPath: sentinel}
 	if err := g.PutTree(req, nil); err != nil {
 		t.Fatalf("PutTree: %v", err)
@@ -683,7 +720,7 @@ func TestGoBackendPutTreeDegradesByStoppingLocalWalk(t *testing.T) {
 
 	g := backendForTestServer(t, remoteRoot)
 	sink := &progressSink{}
-	if err := g.PutTree(TransferRequest{ID: "t12-putdeg", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, sink.report); err != nil {
+	if err := g.PutTree(TransferRequest{ID: "t12-putdeg", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, sink.report); err != nil {
 		t.Fatalf("降级只影响进度字段，传输仍须成功: %v", err)
 	}
 	if !called {
@@ -790,7 +827,7 @@ func TestGoBackendPutTreePartialFailureReportsCountsAndFinalFrame(t *testing.T) 
 
 	sink := &progressSink{}
 	var te *TransferError
-	err := g.PutTree(TransferRequest{ID: "t12-i4-put", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, sink.report)
+	err := g.PutTree(TransferRequest{ID: "t12-i4-put", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, sink.report)
 	if err == nil {
 		t.Fatal("短传必须报错")
 	}
@@ -1062,7 +1099,7 @@ func TestGoBackendPutTreeScanPhaseFailureEmitsTerminalFrameAndCounts(t *testing.
 	g := backendForTestServer(t, remoteRoot)
 	sink := &progressSink{}
 	var te *TransferError
-	err := g.PutTree(TransferRequest{ID: "t12-new1-putfail", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, sink.report)
+	err := g.PutTree(TransferRequest{ID: "t12-new1-putfail", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, sink.report)
 	if err == nil {
 		t.Fatal("本地枚举遇断链必须报错")
 	}
@@ -1098,7 +1135,7 @@ func TestGoBackendPutTreeScanPhaseCancelEmitsTerminalFrameAndCounts(t *testing.T
 	sink := &progressSink{}
 	done := make(chan error, 1)
 	go func() {
-		done <- g.PutTree(TransferRequest{ID: "t12-new1-putcancel", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, sink.report)
+		done <- g.PutTree(TransferRequest{ID: "t12-new1-putcancel", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, sink.report)
 	}()
 	select {
 	case <-entered:
@@ -1166,7 +1203,7 @@ func TestGoBackendPutTreeReconcilesFileGrownAfterEnumeration(t *testing.T) {
 	t.Cleanup(func() { beforeOpenLocalSource = orig })
 
 	sink := &progressSink{}
-	if err := g.PutTree(TransferRequest{ID: "t12-grow", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, sink.report); err != nil {
+	if err := g.PutTree(TransferRequest{ID: "t12-grow", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, sink.report); err != nil {
 		t.Fatalf("PutTree: %v", err)
 	}
 	if grown != 1 {
@@ -1206,7 +1243,7 @@ func TestGoBackendPutTreeUploadClearPreventsSharedPartAnchor(t *testing.T) {
 	writeRemoteTree(t, remoteRoot, sentinel, []byte("SENTINEL"))
 
 	g := backendForTestServer(t, remoteRoot)
-	req := TransferRequest{ID: "t12-i2-up", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true,
+	req := TransferRequest{ID: "t12-i2-up", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true,
 		Resume: true, ResumeOffset: 2, PartPath: sentinel}
 	if err := g.PutTree(req, nil); err != nil {
 		t.Fatalf("PutTree: %v", err)
@@ -1236,7 +1273,7 @@ func TestGoBackendPutTreeCancelMidTransferKeepsPartAndStops(t *testing.T) {
 	entered, release := blockAfterFirstChunk(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- g.PutTree(TransferRequest{ID: "t12-putcancel", Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, nil)
+		done <- g.PutTree(TransferRequest{ID: "t12-putcancel", Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, nil)
 	}()
 	select {
 	case <-entered:
