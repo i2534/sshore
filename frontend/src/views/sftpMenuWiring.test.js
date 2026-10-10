@@ -81,17 +81,33 @@ describe('SftpView 刷新入口 / 菜单矩阵 / 置灰判据', () => {
     expect(mh).not.toBe(null)
     expect(mh[1]).toContain('menu.value.item')
     expect(mh[1]).toContain("!== '..'") // '..' 行按"无选中"处理
-    expect(src.match(/doAction\('refresh'\)/g).length).toBeGreaterThanOrEqual(2)
     expect(tpl).toMatch(/v-if="!menuHasItem"/)
     expect(tpl).not.toMatch(/menu\.item/) // 模板不得散算选中判据（唯一判据只在 script 里）
     const iDownload = tpl.indexOf("doAction('download')")
     expect(iDownload).toBeGreaterThan(-1)
     const blank = tpl.slice(0, iDownload)
     const row = tpl.slice(iDownload)
+    // 刷新入口必须**在空白分支与行分支各自**都在场（复核 Minor：原先只判全文
+    // `doAction('refresh')` 总数 >= 2，删掉任一分支的刷新仍然绿）。
+    expect(blank).toContain("doAction('refresh')")
+    expect(row).toContain("doAction('refresh')")
     expect(blank).toContain("doAction('mkdir')")
     expect(blank).toContain("doAction('upload-picked')")
     expect(row).toContain("doAction('download')")
     expect(row).not.toContain("doAction('mkdir')")
+  })
+
+  // 菜单动作分派覆盖（复核 Minor / Important 的测试盲区）：模板里每个 `doAction('<name>')`
+  // 的动作名都必须在 doAction/legacyAction 里真有分派分支。缺分派时点菜单表现为"菜单关了、
+  // 什么都没发生"（doAction 先 closeMenu()，唯一出口在别处）。修复前 upload-picked 必须为红。
+  it('菜单每个动作名都在 doAction/legacyAction 里有分派分支（复核 Important：upload-picked 死按钮）', () => {
+    const names = [...new Set([...tpl.matchAll(/doAction\('([^']+)'\)/g)].map((m) => m[1]))]
+    expect(names.length).toBeGreaterThanOrEqual(6) // 防 matchAll/切片写错 ⇒ 空集恒绿
+    expect(names).toContain('upload-picked') // 正是本次复核抓到的死按钮，钉住它被抽出来
+    const legacy = src.match(/function legacyAction\(name, pane, it\)\s*\{([\s\S]*?)\n\}/)
+    expect(legacy).not.toBe(null)
+    const dispatch = doActionBody() + legacy[1]
+    expect(names.filter((n) => !dispatch.includes(`name === '${n}'`))).toEqual([])
   })
 
   it('两个面板的 @context 都接到 showMenu（审核 F18）', () => {
@@ -107,6 +123,10 @@ describe('SftpView 刷新入口 / 菜单矩阵 / 置灰判据', () => {
   })
 
   it('SaveSftpUI 唯一出口（spec §6.3.3 / 审核 FF11）：只允许 store、*.test.js 与 wailsjs/**', () => {
+    // 说明（复核 Minor）：下面扫描的 root 是 `frontend/src`（`new URL('../', import.meta.url)`
+    // 相对本测试文件 `src/views/`），**不含** `frontend/wailsjs`。白名单里的 `wailsjs/**`
+    // 只是显式声明"生成绑定不归这条红线管"，实际匹配不到任何被扫文件 —— 不要误以为
+    // 该 clause 覆盖了生成绑定（它覆盖不到）。
     const root = fileURLToPath(new URL('../', import.meta.url))
     const files = walk(root)
     expect(files.length).toBeGreaterThan(50) // 防遍历写错 ⇒ 空集恒绿
