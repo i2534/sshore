@@ -114,6 +114,31 @@ function onPaneMouseDown(e) {
 function onPaneKeydown(e) { if (e.key === 'Escape') { upActive.value = false; closePos() } }
 onUnmounted(() => window.removeEventListener('resize', closePos))
 
+// ===== T10 右键触发面（spec §5.2）=====
+// 空白 / 列头(.hdrow) / 过滤栏(.fbar) 背景一律算「面板级」⇒ emit { item: null }；
+// 文件行与 '..' 行由行自身的 @contextmenu.prevent 负责。三条刻意选择（别顺手改）：
+// ① 面板根**不带 .prevent**：路径栏(.curpath) / 过滤框(.filter) 的原生右键复制粘贴必须留着，
+//    所以由本 handler 逐分支决定是否 preventDefault()，而不是让修饰符无条件吞掉。
+// ② 对任何 li **无条件 yield**：行处理器的 @contextmenu.prevent 只 preventDefault、**不**
+//    stopPropagation ⇒ 事件照样冒泡到面板根。若不 yield，'..' 行会「行处理器 + 面板处理器」
+//    各 emit 一次 = 双菜单（自审修正 1）。
+// ③ 已知边界（审核 FF19）：loading 期间 .list.busy{pointer-events:none} 让行上的右键落到
+//    .list-holder/.pane ⇒ 命中面板级菜单而不是行级。loading 时行本来就不可交互，本轮不另修。
+function onPaneContext(e) {
+  const t = e.target
+  // 1) 可编辑控件放行原生菜单（保住路径栏/过滤框的复制粘贴）。
+  //    contenteditable="false" 必须排除（审核 FF19：否则它也会被当成可编辑）。
+  //    以后新增可编辑控件（如行内重命名输入框）要补进这个选择器，否则会被面板根劫持。
+  if (t.closest && t.closest('input, textarea, [contenteditable]:not([contenteditable="false"])')) return
+  // 2) 位置弹层（.pos-wrap）内右键：先收起弹层，且不弹我们的菜单
+  //    （审核 FF7：否则 .posmenu 与 ContextMenu 两个 z-index:1000 浮层同屏压在一起）
+  if (t.closest && t.closest('.pos-wrap')) { closePos(); e.preventDefault(); return }
+  // 3) 任何 li（含 '..' 行）都由行自己的 @contextmenu.prevent 处理器负责 —— 必须无条件 yield（见 ②）
+  if (t.closest && t.closest('li')) return
+  e.preventDefault()
+  emit('context', { item: null, event: e })
+}
+
 function onUpClick() {
   upActive.value = true
   emit('clear') // 与「点面板空白处」同义：单击「..」先取消当前选中
@@ -197,7 +222,8 @@ function fmtSize(bytes) {
 <template>
   <div class="pane ui-panel" :class="{ focus }" tabindex="0"
     @focus="focus = true; emit('focus')" @blur="focus = false"
-    @focusout="onPaneFocusOut" @mousedown="onPaneMouseDown" @keydown="onPaneKeydown">
+    @focusout="onPaneFocusOut" @mousedown="onPaneMouseDown" @keydown="onPaneKeydown"
+    @contextmenu="onPaneContext">
     <!-- ① 导航行：标题 + 路径 + 位置 + 收藏 + 深搜（计数/批量已下移到底部过滤栏） -->
     <div class="navrow">
       <span class="title">{{ title }}</span>
@@ -231,7 +257,8 @@ function fmtSize(bytes) {
         <span class="col-time sortable" :class="{ active: sortKey === 'modTime' }" @click="sortBy('modTime')">修改时间 {{ arrow('modTime') }}</span>
       </div>
       <ul class="list" :class="{ busy: loading }" @click.self="onListBlankClick">
-        <li class="up" data-role="up" :class="{ sel: upActive }" @click="onUpClick" @dblclick="openUp">
+        <li class="up" data-role="up" :class="{ sel: upActive }" @click="onUpClick" @dblclick="openUp"
+          @contextmenu.prevent="emit('context', { item: null, event: $event })">
           <span class="cell-name">📁 ..</span><span class="cell-size">—</span><span class="cell-time">—</span>
         </li>
         <li
