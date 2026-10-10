@@ -76,6 +76,11 @@ describe('locations store', () => {
   it('重复记录同一最近位置时短路：不发 IPC、列表不变', async () => {
     const s = useLocationsStore()
     await s.load()
+    const ui = useSftpUIStore()
+    // 真短路的前置：队首与内存镜像**同时**同值（新判据，§6.3.2）。真机同会话里
+    // 上一次成功写入会同时改队首与镜像，故这里先对齐镜像再断言"不写盘"。
+    ui.noteLocalPath('/home/u/a')
+    ui.noteRemotePath('prod', '/var/log')
     const beforeL = JSON.stringify(s.localRecents)
     const beforeR = JSON.stringify(s.remoteRecents)
     AddLocalRecent.mockClear()
@@ -172,11 +177,14 @@ describe('locations store', () => {
     expect(SaveSftpUI).toHaveBeenCalledTimes(0)
   })
 
-  it('队首同值短路：不发 IPC，但镜像仍对齐（幂等无害，FF17）', async () => {
+  it('真短路（队首与镜像同值）：不发 IPC，镜像保持对齐', async () => {
     const s = useLocationsStore()
     // 队首分别是 (prod, /var/log) 与 /home/u/a
     await s.load()
     const ui = useSftpUIStore()
+    // 真短路的必要条件：内存镜像也已经是这个值（新判据，§6.3.2）
+    ui.noteLocalPath('/home/u/a')
+    ui.noteRemotePath('prod', '/var/log')
 
     AddLocalRecent.mockClear()
     AddRemoteRecent.mockClear()
@@ -186,14 +194,90 @@ describe('locations store', () => {
     await s.addLocalRecent('/home/u/a')
     await s.addRemoteRecent('prod', '/var/log')
 
-    // 短路语义不变：不写盘
+    // 短路语义不变：不写盘（队首与镜像都同值，后端那次补写已无必要）
     expect(AddLocalRecent).not.toHaveBeenCalled()
     expect(AddRemoteRecent).not.toHaveBeenCalled()
     expect(GetSftpUI).toHaveBeenCalledTimes(0)
     expect(SaveSftpUI).toHaveBeenCalledTimes(0)
-    // 但镜像要对齐：load() 失败时镜像是空串而 locations 队首非空，短路正是修正机会（FF17）
+    // 短路分支仍做幂等镜像对齐（同值赋值，无害）
     expect(ui.lastPathFor('local')).toBe('/home/u/a')
     expect(ui.lastPathFor('remote', 'prod')).toBe('/var/log')
+  })
+
+  // ---- last path 补写不受队首短路约束（§6.3.2）：镜像陈旧 ⇒ 必须发一次 IPC ----
+  // 典型升级场景：老配置没有 last path（镜像空），而队首已是目标路径
+  //（SftpHome 每次 connect 把后端队首改写成 home，用户再从下拉/「主目录」选中它）。
+  // 此时若沿用"只比队首"的旧判据短路，那次 last path 补写被拦掉：同会话重连看似正确，
+  // **重启后落点丢失**。故短路判据必须追加"镜像也已经同值"。
+
+  it('队首同值但远程镜像为空（升级场景）⇒ 仍发一次 IPC 补写 last path', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    // 队首已是目标 (h, /p)，镜像尚未落值（未 load sftpui / 老配置无 last path）
+    s.remoteRecents = [{ host: 'h', path: '/p', ts: '1' }]
+    expect(ui.lastPathFor('remote', 'h')).toBe('')
+
+    AddRemoteRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+
+    await s.addRemoteRecent('h', '/p')
+
+    expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
+    expect(AddRemoteRecent).toHaveBeenCalledWith('h', '/p')
+    expect(ui.lastPathFor('remote', 'h')).toBe('/p')
+    // 补写只走这一个绑定：不夹带 sftpui 的读写（§7.2 零新增 IPC）
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+  })
+
+  it('队首同值但远程镜像陈旧（不同值）⇒ 仍发一次 IPC 补写 last path', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    s.remoteRecents = [{ host: 'h', path: '/p', ts: '1' }]
+    ui.noteRemotePath('h', '/old')
+
+    AddRemoteRecent.mockClear()
+    await s.addRemoteRecent('h', '/p')
+
+    expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
+    expect(ui.lastPathFor('remote', 'h')).toBe('/p')
+  })
+
+  it('队首同值但本地镜像为空（升级场景）⇒ 仍发一次 IPC 补写 last path', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    s.localRecents = [{ path: '/p', ts: '1' }]
+    expect(ui.lastPathFor('local')).toBe('')
+
+    AddLocalRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+
+    await s.addLocalRecent('/p')
+
+    expect(AddLocalRecent).toHaveBeenCalledTimes(1)
+    expect(AddLocalRecent).toHaveBeenCalledWith('/p')
+    expect(ui.lastPathFor('local')).toBe('/p')
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+  })
+
+  it('队首同值但本地镜像陈旧（不同值）⇒ 仍发一次 IPC 补写 last path', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    s.localRecents = [{ path: '/p', ts: '1' }]
+    ui.noteLocalPath('/old')
+
+    AddLocalRecent.mockClear()
+    await s.addLocalRecent('/p')
+
+    expect(AddLocalRecent).toHaveBeenCalledTimes(1)
+    expect(ui.lastPathFor('local')).toBe('/p')
   })
 
   it('load 同时拉取三组固定预设', async () => {

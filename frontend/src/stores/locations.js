@@ -44,12 +44,18 @@ export const useLocationsStore = defineStore('locations', {
       this.bookmarks = this.bookmarks.filter((b) => !(b.scope === scope && b.host === host && b.path === path))
     },
     async addLocalRecent(path) {
-      // 短路：队首已是同一路径 ⇒ 直接返回，不做 IPC、也不改列表。
+      // 短路：队首已是同一路径**且内存镜像也已经是这个值** ⇒ 直接返回，不做 IPC、也不改列表。
       // 否则每次目录导航/刷新/批量重载都会写一次配置（后端 AddLocalRecent 每次 saveConfig）。
-      if (this.localRecents[0]?.path === path) {
-        // 短路也要对齐镜像（幂等、无害）：sftpui.load() 失败时镜像是空串而这里队首非空，
-        // 此时短路正是唯一能修正镜像的机会。注意这是**执行期裁定**，不是规格 §7.2 的要求
-        // —— FF17 讨论的是「不做兜底」，结论与之相反（T8 复核 Minor）。纯内存，零新增 IPC。
+      //
+      // 判据里必须带上镜像（规格 §6.3.2）：后端 AddLocalRecent/AddRemoteRecent 的 last path
+      // 写入**不受队首短路约束**（app.go addLocalRecentLocked / addRemoteRecentLocked：
+      // 队首同值只说明 recents 不必重排，不说明 last path 已正确）。典型升级场景是老配置
+      // 根本没有 last path（镜像为空），而队首可能已是目标路径——SftpHome 每次 connect 会把
+      // 后端队首改写成 home，用户再从下拉/「主目录」选中它。此时若只比队首就短路，那次
+      // last path 补写会被永久拦掉：同会话重连看似正确（镜像掩盖），**重启后落点丢失**。
+      // 所以镜像陈旧时宁可多发一次 IPC，让后端把 last path 补上（它自身对队首同值仍是幂等重排）。
+      if (this.localRecents[0]?.path === path && useSftpUIStore().lastPathFor('local') === path) {
+        // 真短路（队首与镜像都同值）时仍对齐一次镜像：同值赋值幂等、无害，纯内存零 IPC。
         useSftpUIStore().noteLocalPath(path)
         return
       }
@@ -61,8 +67,11 @@ export const useLocationsStore = defineStore('locations', {
         .concat(this.localRecents.filter((r) => r.path !== path)).slice(0, 20)
     },
     async addRemoteRecent(host, path) {
-      // 同上：同一 (host, path) 已经在队首时不再写盘，但镜像仍要对齐。
-      if (this.remoteRecents[0]?.host === host && this.remoteRecents[0]?.path === path) {
+      // 同上（含镜像参与判据的理由，见 addLocalRecent）：队首同 (host, path)
+      // **且** useSftpUIStore().lastPathFor('remote', host) 已是 path 才短路；
+      // 镜像为空/陈旧时必须发一次 IPC 补写 last path（§6.3.2）。
+      if (this.remoteRecents[0]?.host === host && this.remoteRecents[0]?.path === path
+        && useSftpUIStore().lastPathFor('remote', host) === path) {
         useSftpUIStore().noteRemotePath(host, path)
         return
       }
