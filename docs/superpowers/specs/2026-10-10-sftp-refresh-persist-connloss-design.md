@@ -38,7 +38,7 @@
 ### 1.1 用户报告的缺陷（本次一并修）
 
 ```
-2026-10-10 10:10:26 [ERROR] Error: sftp mkdir /home/lan/virtual/share/dll: client_loop: ssh_packet_write_poll: Connection to 10.99.152.18 port 22: Unknown error
+2026-10-10 10:10:26 [ERROR] Error: sftp mkdir /home/lan/virtual/share/dll: client_loop: ssh_packet_write_poll: Connection to 192.0.2.10 port 22: Unknown error
 2026-10-10 10:10:32 [ERROR] Error: sftp ls /home/lan/virtual/share: client_loop: send disconnect: Connection reset
 ```
 
@@ -205,7 +205,7 @@ sort_local_dir = -1
 sort_remote_key = "name"
 sort_remote_dir = 1
 [sftp_ui.last_remote_dirs]
-"10.99.152.18" = "/var/log/nginx"
+"192.0.2.10" = "/var/log/nginx"
 "prod db" = "/srv/app"
 ```
 
@@ -720,7 +720,7 @@ async function verifyRemote() {
 | BF8 | Important | 启动顺序未写 ⇒ `sftpui.load()` 若排在 `loadLocal()` 之后，本地最后路径每次启动被抹成 cwd；且 `connect()` 未被 `loaded` 兜住 | 接受。§6.4 新增 B3（顺序硬约束）与 B4（`loaded` gate） |
 | BF9 | Minor | 验收 C3 的配置路径写成 `config.toml`（不存在） | 接受。§11.3 C3 改为 `~/.config/sshore/sshore.toml` |
 | BF10 | Minor | "反斜杠原样"其实是落盘转义形式 | 接受。§11.1 措辞改为"往返相等，只比解码后值"；并由探针实测佐证 |
-| BF11 | Minor | TOML 示例把 bare key `prod-db` 写成带引号（与真实编码不符） | 接受。§6.1 示例键改为 `"10.99.152.18"` / `"prod db"`（实测编码即为带引号形态） |
+| BF11 | Minor | TOML 示例把 bare key `prod-db` 写成带引号（与真实编码不符） | 接受。§6.1 示例键改为 `"192.0.2.10"` / `"prod db"`（实测编码即为带引号形态） |
 | BF12 | Minor | "会波及全部测试替身"夸大；漏引更贴切的先例 | 接受。§8.2 改为引 `RecoverSwaps`/`CleanupParts`（`ctrl.go:118-130`）先例，并注明替身实际只有 2 个 |
 | BF13 | Minor | `SaveSftpUI` 缺 `a.cfg == nil` 守卫 ⇒ 未 Init 时空指针、被 dispatcher 静默 recover | 接受。§9 补锁内 nil 守卫；§11.1 并入 `TestSftpBindingsFailFastBeforeInit` |
 | BF14 | Minor | `-race` 是唯一判据但依赖时序，"绿"不能证明没有原地写 | 接受。§11.1 增加结构性源码断言（不出现 `a.cfg.SftpUI.LastRemoteDirs[` 赋值 / 写锁内构造新 map） |

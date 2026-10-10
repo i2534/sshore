@@ -50,7 +50,7 @@ ok  	sshore/internal/watch	6.840s
 | GUI 驱动 | `xdotool`/`wmctrl` 不存在；`python3 -c "import Xlib"` → `ModuleNotFoundError` | 双击/右键/点列头/切标签无法自动化（`Xvfb` 只提供显示，不提供输入驱动） |
 | Windows 客户机 | `VBoxManage list runningvms` → `/dev/vboxdrv` 不存在 | Windows 侧 A/B/C1/D1 全部不可执行 |
 | 断链手段 | `sudo` 自身损坏（`/etc/sudo.conf` 属主 uid 65534） | `ss -K` / `iptables … DROP` 不可用（无提权） |
-| 远端目标 | `10.99.152.18:22` TCP 实测可达 | 唯一具备的前提 |
+| 远端目标 | `192.0.2.10:22` TCP 实测可达 | 唯一具备的前提 |
 
 ## 4 待人工执行的最小验收清单
 

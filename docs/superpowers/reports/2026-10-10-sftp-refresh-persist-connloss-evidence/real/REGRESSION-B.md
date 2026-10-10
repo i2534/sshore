@@ -2,7 +2,7 @@
 
 - 被测二进制：`build/bin/sshore`，`Version=v0.7.2-52-g0aba549`（= A 块清理后的工作树，含 `AddLocalRecent` 空路径守卫）。
 - 工作台与 A/F 轮相同：`Xvfb :99` + 自写 XTEST 驱动 `xdo` + 隔离 HOME `/tmp/sshkit-acc/home` + 可控 TCP 代理。
-- 目标主机仍是本机 `10.99.152.18`（真实 sshd + 真实 SFTP 协议）；远端校验一律**从 ssh 侧**执行，而不只看本地文件系统。
+- 目标主机仍是本机 `192.0.2.10`（真实 sshd + 真实 SFTP 协议）；远端校验一律**从 ssh 侧**执行，而不只看本地文件系统。
 - 夹具：`b-fixtures/upload-small.bin`(1MiB)、`upload-big.bin`(80MB)、`updir/{a.txt,b.txt,sub/c.txt}`、`multi1..3.bin`(200KB)；远端目录 `/home/lan/acc-b`，本地下载目录 `/home/lan/acc-dl`。
 
 | # | 项 | 结果 | 证据 / 原始输出 |

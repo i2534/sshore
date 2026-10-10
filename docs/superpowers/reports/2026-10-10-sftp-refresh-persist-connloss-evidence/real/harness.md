@@ -4,10 +4,10 @@
 - 应用二进制：`build/bin/sshore`，`LDFlags Version=v0.7.2-48-ge05d0bb`（= 分支 HEAD e05d0bb），`wails build -tags webkit2_41`。
 - 显示：`Xvfb :99`（1600x1000，无 WM）；输入：自写 XTEST 驱动 `xdo`（`/tmp/sshkit-acc/xdo.c`，等效 xdotool）。
 - 隔离 HOME：`/tmp/sshkit-acc/home`（应用配置落在 `.../home/.config/sshore/sshore.toml`，**不动用户真实配置**）。
-- 远端：`acc-target`（HostName 10.99.152.18, User lan, Port 22）。**实测本机自身就是 10.99.152.18**（`hostname -I`），即本机 sshd 的真实 SFTP 会话。
+- 远端：`acc-target`（HostName 192.0.2.10, User lan, Port 22）。**实测本机自身就是 192.0.2.10**（`hostname -I`），即本机 sshd 的真实 SFTP 会话。
 - 传输后端：应用日志 `[INFO] sftp transport=gosftp`；子进程 `ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -s acc-target sftp`（pid 258887）⇒ 断链可**直接杀该子进程**，无需 root。
 - 真实 `~/.ssh/config` 临时追加了 `acc-target`/`acc-proxy` 两个别名（**已备份**到本目录 `user-ssh-config.backup-*` 与 `/tmp/sshkit-acc/ssh-config.bak`，验收后删除并校验 md5）。
-- 代理（用于"网络黑洞/重置"）：`/tmp/sshkit-acc/proxy.py`（venv），`127.0.0.1:2222 → 10.99.152.18:22`，控制文件 `/tmp/sshkit-acc/proxy.ctl`（normal|blackhole|reset），`acc-proxy` 走它。
+- 代理（用于"网络黑洞/重置"）：`/tmp/sshkit-acc/proxy.py`（venv），`127.0.0.1:2222 → 192.0.2.10:22`，控制文件 `/tmp/sshkit-acc/proxy.ctl`（normal|blackhole|reset），`acc-proxy` 走它。
 
 ## 结果
 | # | 判据 | 结果 | 证据 |

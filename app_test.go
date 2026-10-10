@@ -1726,7 +1726,7 @@ func TestSaveSftpUIPersistsAndKeepsOtherSections(t *testing.T) {
 
 	want := config.SftpUIState{
 		LastLocalDir:   "/home/lan/work",
-		LastRemoteDirs: map[string]string{"prod-01": "/var/log", "10.99.152.18": "/srv/app"},
+		LastRemoteDirs: map[string]string{"prod-01": "/var/log", "192.0.2.10": "/srv/app"},
 		SortLocalKey:   "size",
 		SortLocalDir:   -1,
 		SortRemoteKey:  "modTime",
