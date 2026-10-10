@@ -807,6 +807,11 @@ async function doAction(name) {
   if (it && it.name !== '..' && !sel.isSelected(s, it.name)) sel.single(s, it.name)
   const names = [...s.keys]
   if (SELECTION_DEPENDENT.includes(name) && !names.length) return
+  // 空白/面板级菜单的「⬆ 上传文件…」（spec §5.3）：upload-picked 天然无选中，不在
+  // SELECTION_DEPENDENT 内，所以防御之后必须**补上这条分派** —— 它的既有出口只有
+  // onPaneAction（FilePane 的动作表链路），右键菜单走的是 doAction，缺分派就成了死按钮
+  // （先 closeMenu() 再"什么都没发生"）。形态与上面的 refresh 分支同构（复核 Important）。
+  if (name === 'upload-picked') { closeMenu(); return uploadPicked() }
   const sourceDir = pane === 'remote' ? remotePath.value : (localPath.value || '/')
   const targetDir = pane === 'remote' ? (localPath.value || '/') : remotePath.value
   const sourceItems = itemsFor(pane)
