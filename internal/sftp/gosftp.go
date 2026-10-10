@@ -1105,10 +1105,10 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	// 下游全部消费同一个 rootRemote，语义因此自洽：
 	//   - 建目录：MkdirAll(rootRemote) + 每个子目录；
 	//   - 逐文件落点：path.Join(rootRemote, f.rel)（f.rel 是相对**源根**的 POSIX 路径）；
-	//   - 重试前清理：cleanupRemoteTreeParts(ctx, s, rootRemote, putTreeCleanupDirs(files),
-	//     treeFileTargets(files), id) —— 只在本树**实际会写到**的目录里，删「本次 id +
-	//     本树内已知目标 basename」命中的远端 .part；不递归、不碰本树不会写到的分支，
-	//     也**不**清 backup-swap 的 .bak（判据见 isPartForTarget）。
+	//   - 重试前清理：cleanupRemoteTreeParts(ctx, s, rootRemote, putTreeCleanupScope(files), id)
+	//     —— 只在本树**实际会写到**的目录里，删「本目录里本树目标的 basename + 本次 id」
+	//     命中的远端 .part；不递归、不碰本树不会写到的目录/名字，也**不**清 backup-swap
+	//     的 .bak（判据见 isPartForTarget / putTreeCleanupScope）。
 	rootRemote := path.Clean(req.Remote)
 	// 远端目录（含空目录）按 D11 一次性建出：WalkDir 已给出完整子目录清单，绝不逐文件
 	// 重复 MkdirAll（那是每文件一次多余往返）。
@@ -1123,14 +1123,16 @@ func (g *GoBackend) PutTree(req TransferRequest, report func(Progress)) error {
 	}
 	// spec §8 目录行的上传侧对称：重试（整项重传）前先清掉本项留在**本树写入目录**里的远端 .part。
 	//
-	// 清理边界（2026-10-10 修复轮 2，Important-1）：rootRemote 现在是**最终目标目录**，可能是
-	// 用户已有目录（此前它是一个为本棵树新建的 <remote>/<base> 专用目录）。因此扫描面必须是
-	// 「本树实际会写到的目录集合」（由 files 的 rel 推导出的父目录 + 目标根，见
-	// putTreeCleanupDirs）：只在这些目录里各做**一次** ReadDir，绝不递归整棵既有子树。
+	// 清理边界（2026-10-10 复核轮 2，Important-1 + Minor-4）：rootRemote 现在是**最终目标目录**，
+	// 可能是用户已有目录（此前它是一个为本棵树新建的 <remote>/<base> 专用目录）。因此扫描面必须是
+	// 「本树实际会写到的 目录 × 该目录里本树会写的 basename」（由 files 的 rel 推导，见
+	// putTreeCleanupScope）：每个单元各做**一次** ReadDir，绝不递归整棵既有子树。
 	// 改前那种递归有两个问题：(a) 往返次数随用户既有子树规模线性增长（每个目录一次 ReadDir）；
 	// (b) shortID 只截 8 rune，碰撞时会扫到与本树无关的分支。判据仍是 isPartForTarget 的
-	// 双重命中（目标 basename 前缀 + 本次 id 短前缀）；清理**不含** backup-swap 的 .bak。
-	g.cleanupRemoteTreeParts(ctx, s, rootRemote, putTreeCleanupDirs(files), treeFileTargets(files), req.ID)
+	// 双重命中（目标 basename 前缀 + 本次 id 短前缀），再加上「只认本目录自己的目标」，
+	// 于是跨任务误删的必要条件收敛为「同一目录 + 同一 basename」= 同一最终目标路径。
+	// 清理**不含** backup-swap 的 .bak。
+	g.cleanupRemoteTreeParts(ctx, s, rootRemote, putTreeCleanupScope(files), req.ID)
 	tp.begin()
 
 	for _, f := range files {
@@ -1875,29 +1877,66 @@ func (g *GoBackend) cleanupTreeParts(s *Session, localRoot string, targets []str
 	return removed
 }
 
-// putTreeCleanupDirs 返回本棵树**实际会写到**的远端目录集合（相对 rootRemote 的 POSIX 相对
-// 路径，"." 表示 rootRemote 自身；顺序稳定：根在前，其余字典序）。
+// cleanupScope 是远端 .part 清理的一个扫描单元：本棵树**实际会写到**的目录，以及
+// **该目录里**本树会写的目标 basename（去重、字典序）。
+type cleanupScope struct {
+	dir     string   // 相对 rootRemote 的 POSIX 相对路径，"." 表示 rootRemote 自身
+	targets []string // 该目录里本树会写的文件 basename
+}
+
+// putTreeCleanupScope 由本次要传的 files 推导出清理扫描面：每个文件贡献
+// { path.Dir(rel) → path.Base(rel) }。顺序稳定（根在前，其余目录字典序），便于断言与复现。
 //
-// 完备性论证（这是「收窄扫描面」不会漏清的依据）：本树的 .part 只可能落在**某个待写文件的
+// 完备性论证（「收窄扫描面」不会漏清的依据）：本树的 .part 只可能落在**某个待写文件的
 // 父目录**里 —— PartNameRemote 把 .part 放在目标同目录（<target><marker>…），名字过长退化时
-// 落 path.Dir(target)，也还是同一目录。所以 { 各文件 rel 的父目录 } ∪ { 目标根 } 就是本树
-// .part 的完备扫描面；本树不会写到的目录里的 .part 一定不是本树留下的。
+// 落 path.Dir(target)，也还是同一目录。所以「各文件 rel 的父目录 × 该目录里本树的 basename」
+// 就是本树 .part 的完备扫描面；本树不会写到的目录/名字里的 .part 一定不是本树留下的。
+//
+// 为什么每个目录只带**该目录**的目标（而不是全树 basename 并集）：并集判据下，只要某个
+// basename 在本树任意位置出现，本树写到的任何目录里同名 .part 都会被删 —— 于是除了
+// 「同一最终目标路径」之外还可能删到别的任务的锚点（配合 shortID 的 8 rune 截断碰撞）。
+// 按目录切分后，误删的必要条件正好收敛为「同一目录 + 同一 basename = 同一最终路径」。
+// 详见 TestGoBackendPutTreeCleanupTargetsArePerDir。
 //
 // 依据（2026-10-10 复核轮 2 / Important-1）：新语义下 rootRemote 是「用户可能已有内容的最终
 // 目录」。改前的递归遍历会随既有子树规模线性增加 SFTP 往返（每个目录一次 ReadDir），并在
-// shortID 只截 8 rune 发生碰撞时扩大到与本树无关的分支。
-func putTreeCleanupDirs(files []treeFile) []string {
-	seen := map[string]bool{".": true}
-	out := []string{"."}
+// shortID 截断碰撞时扩大到与本树无关的分支。
+func putTreeCleanupScope(files []treeFile) []cleanupScope {
+	order := []string{"."}
+	byDir := map[string]map[string]bool{".": {}}
 	for _, f := range files {
-		rel := path.Dir(f.rel) // f.rel 是 POSIX 相对路径，父目录同样用 path 家族
-		if rel == "" || rel == "." || seen[rel] {
+		dir := path.Dir(f.rel) // f.rel 是 POSIX 相对路径，父目录同样用 path 家族
+		if dir == "" {
+			dir = "."
+		}
+		name := path.Base(f.rel)
+		if name == "" || name == "." || name == "/" {
 			continue
 		}
-		seen[rel] = true
-		out = append(out, rel)
+		m, ok := byDir[dir]
+		if !ok {
+			m = map[string]bool{}
+			byDir[dir] = m
+			order = append(order, dir)
+		}
+		m[name] = true
 	}
-	sort.Strings(out) // "." 排最前（'.' < 字母/数字）；确定性顺序便于断言与复现
+	sort.Strings(order) // "." 排最前（'.' < 字母/数字）
+	out := make([]cleanupScope, 0, len(order))
+	for _, dir := range order {
+		names := byDir[dir]
+		if len(names) == 0 {
+			// 该目录里没有本树会写的文件（例如所有文件都在子目录）：本树的 .part 不可能落在
+			// 这里，连 ReadDir 都不必发。
+			continue
+		}
+		ts := make([]string, 0, len(names))
+		for n := range names {
+			ts = append(ts, n)
+		}
+		sort.Strings(ts)
+		out = append(out, cleanupScope{dir: dir, targets: ts})
+	}
 	return out
 }
 
@@ -1908,26 +1947,31 @@ var readRemoteDir = func(c *sftp.Client, ctx context.Context, dir string) ([]os.
 	return c.ReadDirContext(ctx, dir)
 }
 
-// cleanupRemoteTreeParts 删除远端**本树会写到的目录**里的目标 .part（上传方向的失败锚点）。
+// cleanupRemoteTreeParts 删除远端**本树会写到的目录里、本树会写的目标**的 .part（上传方向的
+// 失败锚点）。
 //
-// 扫描面由 dirs 显式给定（生产调用点传 putTreeCleanupDirs(files)）：对 dirs 里每个目录恰好做
+// 扫描面由 scope 显式给定（生产调用点传 putTreeCleanupScope(files)）：对每个扫描单元恰好做
 // **一次** ReadDir，**不递归** —— 因此目录数/往返次数只跟本树写入目录集合同阶，绝不随既有
-// 目标子树规模增长，也就不会在 shortID 碰撞时扫到本树无关的分支。
-// dirs 里的目录可能还不存在（根目录建失败等）：os.IsNotExist 是正常路径，不 warn。
+// 目标子树规模增长；每个目录只用自己的目标集合判定，因此跨任务误删的必要条件收敛为
+// 「同一目录 + 同一 basename」= 同一最终目标路径（见 putTreeCleanupScope）。
+// scope 里的目录可能还不存在（根目录建失败等）：os.IsNotExist 是正常路径，不 warn。
 // 其它错误（目录不可读等）都只 warn —— 尽力而为，绝不让重试失败。
-func (g *GoBackend) cleanupRemoteTreeParts(ctx context.Context, s *Session, remoteRoot string, dirs []string, targets []string, id string) int {
-	if s.Conn == nil || remoteRoot == "" || len(targets) == 0 || len(dirs) == 0 {
+func (g *GoBackend) cleanupRemoteTreeParts(ctx context.Context, s *Session, remoteRoot string, scope []cleanupScope, id string) int {
+	if s.Conn == nil || remoteRoot == "" || len(scope) == 0 {
 		return 0
 	}
-	target := map[string]bool{}
-	for _, x := range targets {
-		if x != "" {
-			target[path.Base(x)] = true
-		}
-	}
 	removed := 0
-	for _, rel := range dirs {
-		dir := path.Join(remoteRoot, rel)
+	for _, unit := range scope {
+		target := map[string]bool{}
+		for _, x := range unit.targets {
+			if x != "" {
+				target[path.Base(x)] = true
+			}
+		}
+		if len(target) == 0 {
+			continue
+		}
+		dir := path.Join(remoteRoot, unit.dir)
 		infos, rerr := readRemoteDir(s.Conn, ctx, dir)
 		if rerr != nil {
 			// 目录不存在（还没建出来 / 本树没写到）是正常路径，不 warn。

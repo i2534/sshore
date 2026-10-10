@@ -93,7 +93,7 @@ func TestCleanupRemoteTreePartsRemovesOnlyKnownRemoteParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer g.pool.Release(s, false)
-	n := g.cleanupRemoteTreeParts(context.Background(), s, "sub", []string{"."}, []string{"a.bin"}, "t17")
+	n := g.cleanupRemoteTreeParts(context.Background(), s, "sub", []cleanupScope{{dir: ".", targets: []string{"a.bin"}}}, "t17")
 	if n != 1 {
 		t.Fatalf("应恰好删掉 1 个本项远端 .part，got %d", n)
 	}
@@ -106,7 +106,7 @@ func TestCleanupRemoteTreePartsRemovesOnlyKnownRemoteParts(t *testing.T) {
 		}
 	}
 	// 根目录不存在（PutTree 尚未 MkdirAll）：安静返回 0，绝不报错/阻塞。
-	if n := g.cleanupRemoteTreeParts(context.Background(), s, "no-such-dir", []string{"."}, []string{"a.bin"}, "t17"); n != 0 {
+	if n := g.cleanupRemoteTreeParts(context.Background(), s, "no-such-dir", []cleanupScope{{dir: ".", targets: []string{"a.bin"}}}, "t17"); n != 0 {
 		t.Fatalf("根不存在时应返回 0，got %d", n)
 	}
 }
