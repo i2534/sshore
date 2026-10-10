@@ -485,3 +485,171 @@ func TestSftpTransportNormalizeAndDefault(t *testing.T) {
 		t.Fatalf("非法值应回落空串，got %q", c.App.SftpTransport)
 	}
 }
+
+// --- Task 1: [sftp_ui] 配置段与归一 ---
+
+// SftpUIState.Normalize 兜底非法排序状态：两个 key 走白名单 name|size|modTime
+// （非法/空 → name），两个 dir 归一为 ±1（<0 → -1，否则 → 1），LastRemoteDirs
+// 为 nil 时必须变成非 nil 空 map —— 前端不能从绑定拿到 null。
+func TestSftpUIStateNormalize(t *testing.T) {
+	cases := []struct {
+		name    string
+		key     string
+		dir     int
+		wantKey string
+		wantDir int
+	}{
+		{name: "空键零方向", key: "", dir: 0, wantKey: "name", wantDir: 1},
+		{name: "非法键正方向", key: "bogus", dir: 7, wantKey: "name", wantDir: 1},
+		{name: "合法键负方向", key: "modTime", dir: -7, wantKey: "modTime", wantDir: -1},
+		{name: "合法键正方向", key: "size", dir: 2, wantKey: "size", wantDir: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := SftpUIState{
+				SortLocalKey:  tc.key,
+				SortLocalDir:  tc.dir,
+				SortRemoteKey: tc.key,
+				SortRemoteDir: tc.dir,
+			}
+			s.Normalize()
+			if s.SortLocalKey != tc.wantKey || s.SortRemoteKey != tc.wantKey {
+				t.Fatalf("排序键应为 %q，得到 local=%q remote=%q", tc.wantKey, s.SortLocalKey, s.SortRemoteKey)
+			}
+			if s.SortLocalDir != tc.wantDir || s.SortRemoteDir != tc.wantDir {
+				t.Fatalf("排序方向应为 %d，得到 local=%d remote=%d", tc.wantDir, s.SortLocalDir, s.SortRemoteDir)
+			}
+		})
+	}
+
+	// nil map → 非 nil 空 map。
+	var nilMap SftpUIState
+	nilMap.Normalize()
+	if nilMap.LastRemoteDirs == nil {
+		t.Fatal("LastRemoteDirs 为 nil 时 Normalize 必须补成非 nil 空 map（前端不能拿到 null）")
+	}
+	if len(nilMap.LastRemoteDirs) != 0 {
+		t.Fatalf("补出的 map 必须为空，得到 %#v", nilMap.LastRemoteDirs)
+	}
+
+	// 已有条目必须原样保留（Normalize 不是"清空"）。
+	keep := SftpUIState{LastRemoteDirs: map[string]string{"prod-db": "/srv/app"}}
+	keep.Normalize()
+	if len(keep.LastRemoteDirs) != 1 || keep.LastRemoteDirs["prod-db"] != "/srv/app" {
+		t.Fatalf("既有 last_remote_dirs 条目必须保留，得到 %#v", keep.LastRemoteDirs)
+	}
+}
+
+// [sftp_ui] 必须能穿过 TOML 编码/解码：键含点、空格、引号、中文时也要逐字段相等
+// （只断言解码后的值，不锁定落盘字节形态），且不得影响其它配置段。
+func TestSftpUITOMLRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sshore.toml")
+	// Windows 风格路径必须用反引号 raw string：双引号串里的 \工 是非法转义。
+	want := SftpUIState{
+		LastLocalDir: `D:\工作\虚拟 共享`,
+		LastRemoteDirs: map[string]string{
+			"10.99.152.18":   "/var/log/nginx",
+			"prod db":        "/srv/app",
+			"中文主机":           "/data/中文 目录",
+			`quote"host`:     "/tmp/q",
+			"host.with.dots": "/tmp/d",
+			"prod-db":        "/srv/prod",
+		},
+		SortLocalKey:  "modTime",
+		SortLocalDir:  -1,
+		SortRemoteKey: "size",
+		SortRemoteDir: 1,
+	}
+	cfg := DefaultAppConfig()
+	cfg.App.Theme = "light"
+	cfg.App.FontScale = 1.15
+	cfg.SftpUI = want
+	if err := SaveConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 其它段不受影响。
+	if got.App.Theme != "light" || got.App.FontScale != 1.15 {
+		t.Fatalf("往返不得影响 [app]：%+v", got.App)
+	}
+	g := got.SftpUI
+	if g.LastLocalDir != want.LastLocalDir {
+		t.Fatalf("last_local_dir 往返不符：want %q got %q", want.LastLocalDir, g.LastLocalDir)
+	}
+	if len(g.LastRemoteDirs) != len(want.LastRemoteDirs) {
+		t.Fatalf("last_remote_dirs 条数不符：want %d got %d (%#v)", len(want.LastRemoteDirs), len(g.LastRemoteDirs), g.LastRemoteDirs)
+	}
+	for k, v := range want.LastRemoteDirs {
+		if g.LastRemoteDirs[k] != v {
+			t.Fatalf("last_remote_dirs[%q] 往返不符：want %q got %q", k, v, g.LastRemoteDirs[k])
+		}
+	}
+	if g.SortLocalKey != "modTime" || g.SortLocalDir != -1 || g.SortRemoteKey != "size" || g.SortRemoteDir != 1 {
+		t.Fatalf("排序字段往返不符：%+v", g)
+	}
+}
+
+// 手改配置写进非法排序值时，LoadConfig 必须经 normalize() 兜底，不能让非法值飘到 UI。
+func TestLoadConfigNormalizesSftpUISection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sshore.toml")
+	body := "[app]\nauto_reconnect_default = true\n" +
+		"\n[sftp_ui]\n" +
+		"last_local_dir = \"/home/lan/work\"\n" +
+		"sort_local_key = \"bogus\"\n" +
+		"sort_local_dir = 7\n" +
+		"\n[sftp_ui.last_remote_dirs]\n" +
+		"\"10.99.152.18\" = \"/var/log/nginx\"\n"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SftpUI.SortLocalKey != "name" {
+		t.Fatalf("非法 sort_local_key 应归一为 name，得到 %q", cfg.SftpUI.SortLocalKey)
+	}
+	if cfg.SftpUI.SortLocalDir != 1 {
+		t.Fatalf("sort_local_dir 7 应归一为 1，得到 %d", cfg.SftpUI.SortLocalDir)
+	}
+	// 缺键的两个远端排序字段同样兜底。
+	if cfg.SftpUI.SortRemoteKey != "name" || cfg.SftpUI.SortRemoteDir != 1 {
+		t.Fatalf("缺键的远端排序应兜底为 name/1，得到 %q/%d", cfg.SftpUI.SortRemoteKey, cfg.SftpUI.SortRemoteDir)
+	}
+	if cfg.SftpUI.LastLocalDir != "/home/lan/work" {
+		t.Fatalf("last_local_dir 不应被动过，得到 %q", cfg.SftpUI.LastLocalDir)
+	}
+	if cfg.SftpUI.LastRemoteDirs["10.99.152.18"] != "/var/log/nginx" {
+		t.Fatalf("last_remote_dirs 条目丢失：%#v", cfg.SftpUI.LastRemoteDirs)
+	}
+}
+
+// 老配置完全没有 [sftp_ui] 段：零值必须被补成可用默认，无需迁移。
+func TestLoadConfigWithoutSftpUISection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sshore.toml")
+	if err := os.WriteFile(path, []byte("[app]\nauto_reconnect_default = true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SftpUI.SortLocalKey != "name" || cfg.SftpUI.SortLocalDir != 1 {
+		t.Fatalf("缺段时本地排序应兜底为 name/1，得到 %q/%d", cfg.SftpUI.SortLocalKey, cfg.SftpUI.SortLocalDir)
+	}
+	if cfg.SftpUI.SortRemoteKey != "name" || cfg.SftpUI.SortRemoteDir != 1 {
+		t.Fatalf("缺段时远端排序应兜底为 name/1，得到 %q/%d", cfg.SftpUI.SortRemoteKey, cfg.SftpUI.SortRemoteDir)
+	}
+	if cfg.SftpUI.LastRemoteDirs == nil {
+		t.Fatal("缺段时 LastRemoteDirs 必须是非 nil 空 map")
+	}
+	if len(cfg.SftpUI.LastRemoteDirs) != 0 {
+		t.Fatalf("缺段时 LastRemoteDirs 应为空，得到 %#v", cfg.SftpUI.LastRemoteDirs)
+	}
+	if cfg.LegacyMigrated {
+		t.Fatal("LoadConfig 不得触碰 LegacyMigrated（迁移由 MigrateLegacyRecents 负责）")
+	}
+}
