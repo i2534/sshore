@@ -481,6 +481,23 @@ async function loadLocal() {
   finally { if (seq === localSeq) localLoading.value = false }
 }
 
+// 工具栏「刷新」刷**两侧**（spec §5.1）：本地半边总能刷 —— 未连接时也要能刷出本地变化（§5.4），
+// 所以工具栏按钮上的 :disabled 必须去掉（本地面板不依赖远程连接）。远程半边只在已连接时刷。
+// Promise.all 并发；两侧各自的 localSeq/remoteSeq 继续负责丢弃过期响应（连点不会串）。
+async function refreshAll() {
+  const jobs = [loadLocal()]
+  if (connected.value) jobs.push(loadRemote())
+  await Promise.all(jobs)
+}
+
+// 右键「刷新」只刷**本面板**（spec §5.1）：两个面板共用这一个函数，面板由 menu.pane 带进来。
+// 远程面板未连接时静默跳过（与 refreshAll 的远程半边同语义）。
+async function refreshPane(pane) {
+  if (pane === 'local') return loadLocal()
+  if (!connected.value) return
+  return loadRemote()
+}
+
 function openRemote(it) {
   if (it.name === '..') { remotePath.value = posixParentOf(remotePath.value); loadRemote(); sel.clear(remoteSelection); return }
   if (!it.isDir) return
@@ -509,6 +526,9 @@ function posixParentOf(p) {
   return trimmed.slice(0, idx)
 }
 
+// item === null 表示"空白/面板级"右键（FilePane 的空白背景与 '..' 行都发 null），
+// 菜单矩阵由下面的 menuHasItem 单一判据切换。这里**不动选中集合**：
+// 空白右键不清空已有选中（spec §5.3 / 验收 B1），刷新也不改选中（§5.1）。
 function showMenu(pane, { item, event }) {
   const rect = window.innerWidth
   menu.value = {
@@ -518,6 +538,18 @@ function showMenu(pane, { item, event }) {
     pane,
     item,
   }
+}
+
+// 菜单矩阵的**唯一**选中判据（spec §5.3）：'..' 行按"无选中"处理（走面板级菜单）。
+// 模板只用它切"空白/面板级"与"文件行"两个分支，不得在模板里散算 menu.item。
+const menuHasItem = computed(() => !!(menu.value.item && menu.value.item.name !== '..'))
+
+// 置灰的**唯一**判据（spec §5.3 / 审核 F3、FF5）：某动作是否需要远程连接 —— 判据是"动作"
+// 而不是"面板"，因为本地面板的「上传文件…/上传到远程」落点同样是 remotePath。
+// 模板里以 v-for 把返回值接成别名 remoteDep，统一写 `remoteDep && !connected`
+// （模板内 ref 自动解包；写成 connected.value 会恒为 undefined ⇒ 置灰静默失效）。
+function remoteDepFor(name) {
+  return menu.value.pane === 'remote' || name === 'upload' || name === 'upload-picked'
 }
 
 function itemsFor(pane) { return pane === 'remote' ? remoteItems.value : localItems.value }
@@ -546,7 +578,11 @@ function actionsFor(pane) {
   if (n === 0 && pane === 'remote') return tail
   const head = pane === 'remote'
     ? [{ name: 'download', label: '下载到本地 (' + n + ')' }]
-    : [{ name: 'upload', label: '上传到远程 (' + n + ')' }, { name: 'upload-picked', label: '上传文件…' }]
+    // 第三个入口也要与右键菜单同口径（spec §5.3 / 审核 FF5/F3）：本地面板的 upload/upload-picked
+    // 落点是 remotePath，未连接时置灰。`connected` 在 script 里是 ref —— 必须写 .value，
+    // 写 `!connected` 恒 false（ref 对象恒真），置灰会静默失效。
+    : [{ name: 'upload', label: '上传到远程 (' + n + ')', disabled: !connected.value },
+       { name: 'upload-picked', label: '上传文件…', disabled: !connected.value }]
   return head.concat(tail)
 }
 
@@ -754,13 +790,23 @@ async function uploadPicked() {
   }
 }
 
+// 空选择防御只约束**依赖选中**的动作（spec §5.3 / 审核 FF2）：写成"除 refresh/mkdir 外一律
+// return"会误伤空白菜单的 upload-picked（它天然没有选中，点了永远没反应）；把防御挪到单项选中
+// 之前，又会让"右键一个未选中行"的整条行菜单变 no-op。upload 留在集合里是因为它在**本地面板
+// 行菜单**中是"上传选中项"；远程面板的同名项走 uploadPicked，不依赖选中。
+const SELECTION_DEPENDENT = ['download', 'upload', 'remove', 'rename']
+
 // 右键菜单：download/upload/remove 走批量入口（右键项不在集合内时先 single()，与 §3 决策 5 一致）。
 async function doAction(name) {
   const pane = menu.value.pane
+  // refresh 必须最先返回（spec §5.1 / 审核 FF6）：若走下面的单项选中，多选会被悄悄收成一项，
+  // 直接违反"刷新保留选中"。这里不读 item、也不改 names。
+  if (name === 'refresh') { closeMenu(); return refreshPane(pane) }
   const s = selectionFor(pane)
   const it = menu.value.item
   if (it && it.name !== '..' && !sel.isSelected(s, it.name)) sel.single(s, it.name)
   const names = [...s.keys]
+  if (SELECTION_DEPENDENT.includes(name) && !names.length) return
   const sourceDir = pane === 'remote' ? remotePath.value : (localPath.value || '/')
   const targetDir = pane === 'remote' ? (localPath.value || '/') : remotePath.value
   const sourceItems = itemsFor(pane)
@@ -1116,7 +1162,8 @@ onUnmounted(() => {
       </select>
       <button v-if="!connected" @click="connect" :disabled="!host">🔌 连接</button>
       <button v-else @click="disconnect">⏏ 断开</button>
-      <button @click="loadRemote" :disabled="!connected">刷新</button>
+      <!-- 工具栏刷新刷两侧，本地半边未连接也能刷 ⇒ 这里**刻意不带 :disabled**（spec §5.1/§5.4） -->
+      <button @click="refreshAll">🔄 刷新</button>
       <label class="hidden-toggle">
         <input type="checkbox" v-model="showAll" /> 显示隐藏文件
       </label>
@@ -1159,19 +1206,42 @@ onUnmounted(() => {
       tabindex="0" title="拖动调整日志高度" @mousedown="onSplitterDown" @keydown="onSplitterKey"></div>
     <div class="logpane ui-panel" :style="{ height: logHeight + 'px' }"><LogPanel :source-types="['sftp', 'system']" /></div>
 
+    <!-- 菜单矩阵（spec §5.3）：只以 menuHasItem 一个判据切"空白/面板级"与"文件行"两支；
+         每项的置灰统一写 `remoteDep && !connected` —— remoteDep 是 remoteDepFor(name) 经
+         v-for 接进来的别名，保证模板里只有一种置灰表达式（模板内 ref 自动解包，不能写 .value）。 -->
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
-      <template v-if="menu.pane === 'remote'">
-        <button @click="doAction('download')"><span class="ic">⬇</span>下载…</button>
-        <button @click="doAction('upload')"><span class="ic">⬆</span>上传…</button>
-        <button @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
-        <button class="sep" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
-        <button @click="doAction('mkdir')"><span class="ic">📁</span>新建文件夹</button>
+      <template v-if="!menuHasItem">
+        <!-- 空白/面板级（列头与过滤栏背景同此）：🔄 刷新 · 📁 新建文件夹 · ⬆ 上传文件… -->
+        <template v-for="remoteDep in [remoteDepFor('refresh')]" :key="'blank-pane'">
+          <button :disabled="remoteDep && !connected" @click="doAction('refresh')"><span class="ic">🔄</span>刷新</button>
+          <button :disabled="remoteDep && !connected" @click="doAction('mkdir')"><span class="ic">📁</span>新建文件夹</button>
+        </template>
+        <template v-for="remoteDep in [remoteDepFor('upload-picked')]" :key="'blank-picked'">
+          <button :disabled="remoteDep && !connected" @click="doAction('upload-picked')"><span class="ic">⬆</span>上传文件…</button>
+        </template>
       </template>
       <template v-else>
-        <button @click="doAction('upload')"><span class="ic">⬆</span>上传到远程</button>
-        <button @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
-        <button class="sep" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
-        <button @click="doAction('mkdir')"><span class="ic">📁</span>新建文件夹</button>
+        <!-- 远程面板 · 文件行：⬇ 下载… · ⬆ 上传… · ✏ 重命名 · 🗑 删除 · ── · 🔄 刷新（不含 mkdir） -->
+        <template v-if="menu.pane === 'remote'">
+          <template v-for="remoteDep in [remoteDepFor('download')]" :key="'row-remote'">
+            <button :disabled="remoteDep && !connected" @click="doAction('download')"><span class="ic">⬇</span>下载…</button>
+            <button :disabled="remoteDep && !connected" @click="doAction('upload')"><span class="ic">⬆</span>上传…</button>
+            <button :disabled="remoteDep && !connected" @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
+            <button :disabled="remoteDep && !connected" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
+            <button class="sep" :disabled="remoteDep && !connected" @click="doAction('refresh')"><span class="ic">🔄</span>刷新</button>
+          </template>
+        </template>
+        <!-- 本地面板 · 文件行：⬆ 上传到远程 · ✏ 重命名 · 🗑 删除 · ── · 🔄 刷新（不含 mkdir） -->
+        <template v-else>
+          <template v-for="remoteDep in [remoteDepFor('upload')]" :key="'row-local-remote'">
+            <button :disabled="remoteDep && !connected" @click="doAction('upload')"><span class="ic">⬆</span>上传到远程</button>
+          </template>
+          <template v-for="remoteDep in [remoteDepFor('rename')]" :key="'row-local'">
+            <button :disabled="remoteDep && !connected" @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
+            <button :disabled="remoteDep && !connected" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
+            <button class="sep" :disabled="remoteDep && !connected" @click="doAction('refresh')"><span class="ic">🔄</span>刷新</button>
+          </template>
+        </template>
       </template>
     </ContextMenu>
 
