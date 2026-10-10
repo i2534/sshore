@@ -503,3 +503,36 @@ func TestPoolProbeStillFailsForBrokenSession(t *testing.T) {
 		t.Fatal("探活失败的会话必须被 Release(s,false) 丢弃（否则死会话会留在池里）")
 	}
 }
+
+// TestPoolProbeSlowDialBrokenSessionStillFails 是上面两条的交叉对照（T2 复核 Important）：
+// 「慢拨号 + 健康」只钉住「不得把健康连接判死」，「快拨号 + 坏」的 cctx 又没过期、根本走不到
+// 复核分支 —— 于是「cctx 过期即 return true、不复核」这个错法两条用例都绿。本用例把两个条件
+// 叠起来：拨号吃满 probeTimeout（回到 Probe 时 cctx 已过期）**且**远端真的不可用。此时第一次
+// ReadDirContext 只会拿到「预算没了」，必须用新预算复核后答 false，并把这条坏会话
+// Release(s,false) 丢弃（否则死会话留在池里坑后续操作）。
+func TestPoolProbeSlowDialBrokenSessionStillFails(t *testing.T) {
+	root := t.TempDir()
+	var dialed *Session
+	p := NewPool(func(host, user string) (*Session, error) {
+		s, _ := newPipeSession(t, host, user, root)
+		// 会话建出之后再让远端不可用（手法同 TestPoolProbeStillFailsForBrokenSession）：
+		// 新预算复核时 ReadDirContext 拿到的是真实协议错误，而不是「预算没了」。
+		if err := os.RemoveAll(root); err != nil {
+			t.Fatalf("造不可用远端失败: %v", err)
+		}
+		time.Sleep(probeTimeout + 300*time.Millisecond) // 拨号吃满预算：Probe 拿到的 cctx 已过期
+		dialed = s
+		return s, nil
+	})
+	defer p.CloseAll()
+
+	if p.Probe(context.Background(), "h", "u") {
+		t.Fatal("慢拨号（cctx 已过期）但远端真的不可用：必须用新预算复核后答 false，不得「过期即 true」")
+	}
+	if dialed == nil {
+		t.Fatal("测试前提错误：探活必须真的拨号")
+	}
+	if !dialed.Closed() {
+		t.Fatal("复核失败的坏会话必须被 Release(s,false) 丢弃（否则死会话会留在池里）")
+	}
+}
