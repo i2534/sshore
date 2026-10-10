@@ -1,0 +1,81 @@
+make[1]: Entering directory '/home/lan/workspace/scripts/sshkit'
+cd frontend && npm run build
+
+> frontend@0.0.0 build
+> vite build
+
+vite v7.3.6 building client environment for production...
+transforming...
+✓ 75 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                        0.37 kB │ gzip:  0.26 kB
+dist/assets/nunito-v16-latin-regular-CSmEcOMa.woff2   18.97 kB
+dist/assets/index-B-6adcTQ.css                        26.88 kB │ gzip:  5.32 kB
+dist/assets/index-jXilTgA8.js                        186.86 kB │ gzip: 66.68 kB
+✓ built in 1.20s
+go vet ./...
+go test ./... -race -count=1
+ok  	sshore	1.861s
+ok  	sshore/internal/config	1.350s
+ok  	sshore/internal/forward	1.883s
+ok  	sshore/internal/importer	1.017s
+ok  	sshore/internal/localfs	1.024s
+ok  	sshore/internal/namepattern	1.016s
+ok  	sshore/internal/osutil	11.527s
+ok  	sshore/internal/preset	1.024s
+ok  	sshore/internal/sftp	19.603s
+ok  	sshore/internal/sshconn	1.018s
+ok  	sshore/internal/sync	16.276s
+ok  	sshore/internal/update	14.817s
+ok  	sshore/internal/watch	6.825s
+cd frontend && npx vitest run
+
+ RUN  v4.1.11 /home/lan/workspace/scripts/sshkit/frontend
+
+ ✓ src/components/filePaneWiring.test.js (35 tests) 18ms
+ ✓ src/views/sftpMenuWiring.test.js (12 tests) 15ms
+ ✓ src/views/sftpDropWiring.test.js (6 tests) 9ms
+ ✓ src/views/sftpSplitterWiring.test.js (6 tests) 7ms
+ ✓ src/views/sftpRecoverWiring.test.js (20 tests) 18ms
+ ✓ src/styleTokens.test.js (7 tests) 6ms
+ ✓ src/components/contextMenuWiring.test.js (4 tests) 6ms
+ ✓ src/components/logPanel.test.js (2 tests) 4ms
+ ✓ src/utils/update.test.js (36 tests) 14ms
+ ✓ src/views/sftpRestoreWiring.test.js (14 tests) 10ms
+ ✓ src/utils/queue.test.js (63 tests) 28ms
+ ✓ src/utils/searchbox.test.js (3 tests) 4ms
+ ✓ src/utils/keys.test.js (10 tests) 6ms
+ ✓ src/utils/forward.test.js (3 tests) 6ms
+ ✓ src/utils/pathbar.test.js (15 tests) 11ms
+ ✓ src/utils/localpath.test.js (7 tests) 10ms
+ ✓ src/utils/positions.test.js (10 tests) 14ms
+ ✓ src/utils/remotepath.test.js (9 tests) 8ms
+ ✓ src/utils/sort.test.js (5 tests) 6ms
+ ✓ src/utils/selection.test.js (17 tests) 9ms
+ ✓ src/utils/systemDrop.test.js (5 tests) 9ms
+ ✓ src/utils/logpane.test.js (3 tests) 5ms
+ ✓ src/utils/dnd.test.js (15 tests) 9ms
+ ✓ src/utils/sync.test.js (25 tests) 12ms
+ ✓ src/utils/panefooter.test.js (7 tests) 4ms
+ ✓ src/utils/batch.test.js (9 tests) 6ms
+ ✓ src/utils/time.test.js (4 tests) 4ms
+ ✓ src/stores/logs.test.js (3 tests) 9ms
+ ✓ src/views/updateWiring.test.js (13 tests) 15ms
+ ✓ src/stores/settings.test.js (17 tests) 16ms
+ ✓ src/stores/sftpui.test.js (13 tests) 18ms
+ ✓ src/stores/locations.test.js (19 tests) 23ms
+ ✓ src/stores/update.test.js (29 tests) 25ms
+ ✓ src/components/searchOverlay.test.js (4 tests) 13ms
+ ✓ src/components/TransferQueue.render.test.js (11 tests) 19ms
+ ✓ src/components/filePane.render.test.js (6 tests) 32ms
+ ✓ src/components/updateSection.test.js (19 tests) 34ms
+ ✓ src/views/sync-smoke.test.js (3 tests) 5ms
+
+ Test Files  38 passed (38)
+      Tests  489 passed (489)
+   Start at  18:37:09
+   Duration  732ms (transform 7.23s, setup 0ms, import 10.70s, tests 468ms, environment 19ms)
+
+make[1]: Leaving directory '/home/lan/workspace/scripts/sshkit'
+EXIT=0

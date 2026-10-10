@@ -37,6 +37,8 @@ OS 架构: AMD64
 
 证据：`c-win-ssh-not-found.jpg`
 
+已在 commit `cf9eb92` 修复（见 `windows-386-ssh-path-fix.md`）：按 `SSHORE_SSH_PATH` / `SSHORE_SFTP_PATH` → `exec.LookPath` → 仅 Windows 的 `%SystemRoot%\Sysnative\OpenSSH` → `System32\OpenSSH` → `%ProgramFiles%\OpenSSH` → 裸名 的顺序解析 OpenSSH 客户端，`Sysnative` 排在 `System32` 之前；接线只改真实 exec 的那一层（`osutil` 的 Runner / CtxRunner / Spawner / StartPipes 与 `config.defaultSSHGRun`），参数列表逐字未改。
+
 ## 3. 未验证（照实记录）
 
 - **原生文件选择器**：`上传文件…` 需先连上远端才启用，而连接被 §2 阻断 ⇒ 未取到 Windows 原生对话框证据（Linux 侧已验过等价功能）。
