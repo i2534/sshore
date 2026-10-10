@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -10,9 +11,11 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -1313,6 +1316,248 @@ func TestSftpBindingsFailFastBeforeInit(t *testing.T) {
 	if a.sftpAtomic() {
 		t.Fatal("未就绪时不得声明原子提交能力")
 	}
+
+	// T3（规格 §6.3.4 红线 1 的 BF13）：cfg 尚未加载时 GetSftpUI/SaveSftpUI 同样
+	// 不得 panic。顺序是硬约束 —— **先 Get 后 Save**：SaveSftpUI 写锁内的 nil 守卫会
+	// 把 a.cfg 造出来，一旦先 Save，下面的 nil-cfg 分支就永不被执行（审核 I6）。
+	if a.cfg != nil {
+		t.Fatal("前置条件被破坏：此刻 a.cfg 必须仍为 nil，否则本用例的 nil-cfg 分支是假绿")
+	}
+	zero := a.GetSftpUI()
+	if zero.SortLocalKey != "name" || zero.SortLocalDir != 1 {
+		t.Fatalf("未加载配置时 GetSftpUI 必须返回归一化零值（本地排序 name/1），得到 %q/%d",
+			zero.SortLocalKey, zero.SortLocalDir)
+	}
+	if zero.SortRemoteKey != "name" || zero.SortRemoteDir != 1 {
+		t.Fatalf("未加载配置时 GetSftpUI 必须返回归一化零值（远端排序 name/1），得到 %q/%d",
+			zero.SortRemoteKey, zero.SortRemoteDir)
+	}
+	if zero.LastRemoteDirs == nil {
+		t.Fatal("未加载配置时 GetSftpUI 的 LastRemoteDirs 必须非 nil（前端不能拿到 null）")
+	}
+	// SaveSftpUI：要么成功、要么返回明确错误，但绝不能 panic（panic 会被 Wails
+	// dispatcher 静默 recover，前端只看到「点了没反应」）。锁内 nil 守卫必须
+	// 把 a.cfg 造出来，所以调用后 a.cfg 不允许仍为 nil。
+	terr := a.SaveSftpUI(config.SftpUIState{
+		LastLocalDir:   "/tmp/last",
+		LastRemoteDirs: map[string]string{"prod": "/srv"},
+		SortLocalKey:   "size", SortLocalDir: -1,
+		SortRemoteKey: "modTime", SortRemoteDir: -1,
+	})
+	if a.cfg == nil {
+		t.Fatal("SaveSftpUI 的锁内 nil 守卫必须建立 a.cfg（否则下一行就是空指针）")
+	}
+	if terr != nil {
+		t.Logf("未 Init 时 SaveSftpUI 返回明确错误（可接受，不得 panic）: %v", terr)
+	}
+	if a.cfg.SftpUI.LastLocalDir != "/tmp/last" || a.cfg.SftpUI.SortLocalDir != -1 {
+		t.Fatalf("SaveSftpUI 必须完成整结构赋值，得到 %#v", a.cfg.SftpUI)
+	}
+}
+
+// --- Task 3: SFTP 视图状态（[sftp_ui]）读写绑定 ---
+
+// 六个键必须逐字命中 config.SftpUIState 的 json tag：SaveSftpUI 由 Wails 按
+// json tag 精确解码，前端写成 lastLocalDir 这类 camelCase 会被**静默忽略**
+// ⇒ 字段被清零（规格 §6.3.3 红线）。此用例把键名钉死，改名即红。
+func TestSftpUIStateJSONKeysAreVerbatim(t *testing.T) {
+	raw, err := json.Marshal(config.SftpUIState{LastRemoteDirs: map[string]string{"prod-01": "/srv"}})
+	if err != nil {
+		t.Fatalf("json.Marshal(SftpUIState) 失败: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("反解 SftpUIState 的 JSON 失败: %v", err)
+	}
+	want := []string{
+		"last_local_dir", "last_remote_dirs",
+		"sort_local_key", "sort_local_dir",
+		"sort_remote_key", "sort_remote_dir",
+	}
+	if len(m) != len(want) {
+		t.Fatalf("SftpUIState 的 JSON 键应恰为 %d 个，得到 %d 个：%s", len(want), len(m), raw)
+	}
+	for _, k := range want {
+		if _, ok := m[k]; !ok {
+			t.Fatalf("SftpUIState 缺少逐字 JSON 键 %q（前端按此键名提交，写错即静默清零）: %s", k, raw)
+		}
+	}
+}
+
+// SaveSftpUI 必须把六字段整段落盘，且绝不动其它配置段。回读一律走
+// config.LoadConfig（只信磁盘），不只看内存。
+func TestSaveSftpUIPersistsAndKeepsOtherSections(t *testing.T) {
+	a := newTestApp(t)
+
+	// 夹具：四条其它段的条目。SyncRule **写全字段** —— LoadConfig 会归一 Syncs
+	// （Kind 空→dir、PollIntervalS 0→5、Excludes nil→默认集、AutoReconnect nil→全局默认），
+	// 只设部分字段会让本用例因与被测行为无关的归一面必红（审核 M2）。
+	autoReconnect := true
+	tunnels := []config.Tunnel{{
+		ID: "tun-1", Name: "prod", Mode: "local", Host: "prod-01",
+		ListenBind: "127.0.0.1", ListenPort: 18080,
+		TargetHost: "127.0.0.1", TargetPort: 8080,
+		AutoReconnect: true, Enabled: true,
+	}}
+	syncs := []config.SyncRule{{
+		ID: "sync-1", Name: "logs", Host: "prod-01", Kind: "file",
+		RemotePath: "/var/log/app.log", LocalPath: "/tmp/logs", MaxDepth: 2,
+		Excludes: []string{"*.tmp"}, MirrorDelete: true, ForcePoll: true,
+		PollIntervalS: 30, AutoReconnect: &autoReconnect, Enabled: true,
+	}}
+	bookmarks := []config.Bookmark{{Name: "日志目录", Scope: "remote", Host: "prod-01", Path: "/var/log"}}
+	remoteRecent := []config.RecentRemote{{Host: "prod-01", Path: "/srv", TS: "2026-10-10T01:02:03Z"}}
+	a.cfg.Tunnels = tunnels
+	a.cfg.Syncs = syncs
+	a.cfg.Bookmarks = bookmarks
+	a.cfg.RemoteRecent = remoteRecent
+
+	want := config.SftpUIState{
+		LastLocalDir:   "/home/lan/work",
+		LastRemoteDirs: map[string]string{"prod-01": "/var/log", "10.99.152.18": "/srv/app"},
+		SortLocalKey:   "size",
+		SortLocalDir:   -1,
+		SortRemoteKey:  "modTime",
+		SortRemoteDir:  1,
+	}
+	if err := a.SaveSftpUI(want); err != nil {
+		t.Fatalf("SaveSftpUI 失败: %v", err)
+	}
+
+	got, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if !reflect.DeepEqual(got.SftpUI, want) {
+		t.Fatalf("落盘后 [sftp_ui] 六字段必须逐字相等：\nwant %#v\n got %#v", want, got.SftpUI)
+	}
+	if !reflect.DeepEqual(got.Tunnels, tunnels) {
+		t.Fatalf("Tunnels 被 SaveSftpUI 影响：\nwant %#v\n got %#v", tunnels, got.Tunnels)
+	}
+	if !reflect.DeepEqual(got.Syncs, syncs) {
+		t.Fatalf("Syncs 被 SaveSftpUI 影响：\nwant %#v\n got %#v", syncs, got.Syncs)
+	}
+	if !reflect.DeepEqual(got.Bookmarks, bookmarks) {
+		t.Fatalf("Bookmarks 被 SaveSftpUI 影响：\nwant %#v\n got %#v", bookmarks, got.Bookmarks)
+	}
+	if !reflect.DeepEqual(got.RemoteRecent, remoteRecent) {
+		t.Fatalf("RemoteRecent 被 SaveSftpUI 影响：\nwant %#v\n got %#v", remoteRecent, got.RemoteRecent)
+	}
+	// 内存态同样只动了 SftpUI（其余段是整结构落盘的副本，未被重建）
+	if !reflect.DeepEqual(a.cfg.Tunnels, tunnels) || !reflect.DeepEqual(a.cfg.Syncs, syncs) {
+		t.Fatal("SaveSftpUI 不得改写内存中的 Tunnels/Syncs")
+	}
+}
+
+// 非法排序值必须在落盘前就被归一（前端拿不到 bogus/7），且 LastRemoteDirs
+// 归一后是**非 nil 空 map**（Normalize 对前端的承诺：不能拿到 null）。
+func TestSaveSftpUINormalizesInvalidSort(t *testing.T) {
+	a := newTestApp(t)
+	if err := a.SaveSftpUI(config.SftpUIState{SortLocalKey: "bogus", SortLocalDir: 7}); err != nil {
+		t.Fatalf("SaveSftpUI 失败: %v", err)
+	}
+	got, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if got.SftpUI.SortLocalKey != "name" || got.SftpUI.SortLocalDir != 1 {
+		t.Fatalf("非法 sort_local_* 必须归一为 name/1，得到 %q/%d",
+			got.SftpUI.SortLocalKey, got.SftpUI.SortLocalDir)
+	}
+	if got.SftpUI.SortRemoteKey != "name" || got.SftpUI.SortRemoteDir != 1 {
+		t.Fatalf("缺省 sort_remote_* 必须兜底为 name/1，得到 %q/%d",
+			got.SftpUI.SortRemoteKey, got.SftpUI.SortRemoteDir)
+	}
+	if got.SftpUI.LastRemoteDirs == nil {
+		t.Fatal("LastRemoteDirs 必须归一为非 nil 空 map（前端不得拿到 null），得到 nil")
+	}
+	if len(got.SftpUI.LastRemoteDirs) != 0 {
+		t.Fatalf("空 LastRemoteDirs 必须落成空 map，得到 %#v", got.SftpUI.LastRemoteDirs)
+	}
+}
+
+// 并发红线（规格 §6.3.4 红线 2）：GetSftpUI 绝不能把归一写回共享结构。
+// 本用例钉的是「经 a.cfg.SftpUI 原地归一」这一危险形状（`a.cfg.SftpUI.Normalize()`，
+// 已实测变红）；本实现是「值拷贝 + 解锁后归一」，天然不写 a.cfg。
+// 注意判别力边界：把 Normalize 挪进读锁但**仍作用于值拷贝 s** 的变体本用例抓不到
+// （值拷贝本就写不到共享结构），那一侧由 -race 用例覆盖并发写。
+func TestGetSftpUIDoesNotMutateSharedState(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.SftpUI.LastRemoteDirs = nil
+
+	got := a.GetSftpUI()
+	if got.LastRemoteDirs == nil {
+		t.Fatal("GetSftpUI 必须返回非 nil 的 LastRemoteDirs（Normalize 承诺）")
+	}
+	if a.cfg.SftpUI.LastRemoteDirs != nil {
+		t.Fatal("GetSftpUI 不得原地改写共享状态：a.cfg.SftpUI.LastRemoteDirs 必须仍为 nil")
+	}
+}
+
+// 契约固化（规格 §6.3.3 / §11.1）：SaveSftpUI 是**整结构覆盖** —— 只给 sort 四字段的
+// state 会把路径字段清零。这不是缺陷而是既定语义，与前端 saveSnapshot()「先 GetSftpUI
+// 读回、只覆盖 sort 四字段再整结构写回」的 T7 红线互为对照。本用例把该危险语义钉死：
+// 若有人把它"顺手"改成字段级合并，这里会红并提醒同步改前端契约。
+func TestSaveSftpUIWholeStructOverwriteIsPinned(t *testing.T) {
+	a := newTestApp(t)
+	full := config.SftpUIState{
+		LastLocalDir:   "/keep",
+		LastRemoteDirs: map[string]string{"prod-01": "/keep/remote"},
+		SortLocalKey:   "name", SortLocalDir: 1,
+		SortRemoteKey: "name", SortRemoteDir: 1,
+	}
+	if err := a.SaveSftpUI(full); err != nil {
+		t.Fatalf("首次 SaveSftpUI 失败: %v", err)
+	}
+
+	// 只给 sort 四字段：路径字段是零值。
+	sortOnly := config.SftpUIState{SortLocalKey: "size", SortLocalDir: -1, SortRemoteKey: "modTime", SortRemoteDir: -1}
+	if err := a.SaveSftpUI(sortOnly); err != nil {
+		t.Fatalf("二次 SaveSftpUI 失败: %v", err)
+	}
+
+	got, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if got.SftpUI.LastLocalDir != "" {
+		t.Fatalf("整结构覆盖必须清零 LastLocalDir（危险但既定），得到 %q", got.SftpUI.LastLocalDir)
+	}
+	if len(got.SftpUI.LastRemoteDirs) != 0 {
+		t.Fatalf("整结构覆盖必须清空 LastRemoteDirs，得到 %#v", got.SftpUI.LastRemoteDirs)
+	}
+	if got.SftpUI.SortLocalKey != "size" || got.SftpUI.SortLocalDir != -1 ||
+		got.SftpUI.SortRemoteKey != "modTime" || got.SftpUI.SortRemoteDir != -1 {
+		t.Fatalf("sort 四字段必须被本次整结构覆盖写入，得到 %#v", got.SftpUI)
+	}
+}
+
+// 并发：读绑定（每次都会 Normalize）与写绑定（整结构赋值 + 落盘）并发时，
+// -race 下必须无 DATA RACE 报告。专门抓「读锁内就地 Normalize」这类实现。
+func TestGetSftpUIAndSaveSftpUIRaceFree(t *testing.T) {
+	a := newTestApp(t) // cfgPath 在 t.TempDir()，绝不写用户真实配置
+	state := config.SftpUIState{
+		LastLocalDir:   "/home/lan/work",
+		LastRemoteDirs: map[string]string{"prod-01": "/var/log", "prod-02": "/srv"},
+		SortLocalKey:   "size", SortLocalDir: -1,
+		SortRemoteKey: "modTime", SortRemoteDir: -1,
+	}
+	const n = 100
+	var wg stdsync.WaitGroup
+	wg.Add(2 * n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			_ = a.GetSftpUI()
+		}()
+		go func() {
+			defer wg.Done()
+			if err := a.SaveSftpUI(state); err != nil {
+				t.Errorf("并发 SaveSftpUI 失败: %v", err) // t.Errorf 可跨 goroutine，Fatal 不可以
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // 回归：与 SFTP 同一条铁律 —— 控制器未装配（app.Init 还没跑）时 forward/sync 绑定
