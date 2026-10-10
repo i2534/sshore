@@ -391,7 +391,16 @@ actions:
 
 - `internal/sftp`：新增 `func (c *Ctrl) Probe(ctx context.Context, host, user string) bool`：
   - `*GoBackend` → `g.pool.Probe(ctx, host, user)`（真实往返 + `probeTimeout=5s` + 失败丢弃死会话，`session.go:288-305`），但**必须先修 `Pool.Probe` 的预算缺陷**（见下条）。
-  - 其它后端（legacy batch）→ 退化为一次真实列目录（`c.List(host, user, "/")` 成功即 true）。**但这条路径必须有活性上界**：`BatchBackend.List` 经 `osutil.Runner` = `cmd.Run()`（无超时，`internal/osutil/runner.go:21-33`）⇒ 用仓库已有的 `osutil.NewCtxRunner()`（`runner.go:36-42`，`app.go:212` 已在 sync 装配里用它）并把 ctx 传进 batch 路径；否则见 §8.3 的客户端超时兜底。
+  - 其它后端（legacy batch）→ 一次真实列目录（`c.List(host, user, "/")` 成功即 true），但**必须给调用方一个上界**：`BatchBackend.runner` 是**无 ctx** 的 `osutil.Runner`（`batch.go:23`，`app.go:205` 传 `osutil.NewRunner()`），而 `CtxRunner` 是另一种类型并带进程组隔离 ⇒ 为探针改 batch 传输的 runner 装配**不成比例**（legacy 回退路径）。实现改为在 `Ctrl.Probe` 里**goroutine + `ctx` select**：
+    ```go
+    done := make(chan bool, 1)
+    go func() { _, err := c.List(host, user, "/"); done <- err == nil }()
+    select {
+    case ok := <-done: return ok
+    case <-ctx.Done(): return false
+    }
+    ```
+    **再加每 host 单飞去重**（`map[string]bool` + mutex）：前一次 batch 探针还挂着时直接返回 `false`，不重复起 goroutine —— 否则反复切标签会按次泄漏 goroutine + 子进程。残留（子进程本身的回收）由 ssh 自身超时约束，记在 R8。
   - **不改** `Backend` 接口 —— 理由照 `RecoverSwaps`/`CleanupParts` 的既有先例（`ctrl.go:118-130`：只有 GoBackend 有的能力就在 `Ctrl` 层做类型断言，不进接口）。**审核 BF12 更正**：v1.1 写的"会波及全部测试替身"是夸大 —— 替身只有 2 个，`ctrl_test.go:658-712` 的 `fakeBackend`（逐方法实现，加接口方法会编译失败）与 `app_test.go:1472-1473` 的 `recordingBackend`（嵌入接口，不会编译失败但调用会 panic）。
 - **`Pool.Probe` 的预算缺陷与修法（审核 BF5，Important）**：`AcquireList`（`session.go:182-210`）**完全不用 ctx**，池里没有 idle 会话时会真拨号，最长吃 `ConnectTimeout=10`（`gosftp.go:182`）；一旦拨号耗时超过 5s，随后的 `ReadDirContext(cctx, ".")` 面对**已过期**的 cctx 会立即返回 `ctx.Err()` ⇒ **一条健康连接被判失效**，还会把刚建好的健康会话 `Release(s, false)` 关掉，并触发 §8.3 的断开+重连（无辜 teardown）。修法：`AcquireList` 返回后先查 `cctx.Err()`，若已过期但**会话确实建出来了**（`markSessionConnected` 已跑），则用**新预算**复核一次（`context.WithTimeout(ctx, probeTimeout)`）再判，而不是直接 false。
 - **探针的未声明副作用（必须写进实现注释）**：`Probe` 经 `AcquireList` → `markSessionConnected` 会把**粘性** `connected[host]` 置 `true`（`session.go:167-176`、`gosftp.go:157-167`）。因此"探针说失效（false）"与"粘性已置位（true）"会同时成立 —— 这正是 §8.3 降级时必须调用 `SftpDisconnect` 清意图的原因，后续实现者不得把 `Probe` 当纯只读。
@@ -591,7 +600,7 @@ async function verifyRemote() {
 | R5 | `snapshotConfig()` 浅拷贝 + **map/slice 原地写** ⇒ 与锁外 TOML 编码并发读写 | §6.3.4 三条红线（map 整结构替换、slice 改新数组、锁内不 Normalize）+ §11.1 三条 `-race` 用例 + 结构性源码断言（BF14：`-race` 绿不能证明无原地写） |
 | R6 | 排序每次点列头写一次全量配置（含编码 + rename） | 已做"值未变短路"；`saveSnapshot()` 现在是"读回 + 合并 + 写"，多一次 IPC，但排序点击是低频操作；若实测不可接受，再引入节流（本轮按 D11 不节流） |
 | R7 | `SftpProbe` 的 user 恒 `""`：若某次会话是用非空 user 建的（sync/watch 会用 `rule.User`），探针会另建会话 | 不影响正确性（探针是真实往返）；已在 §6.1 声明"host 唯一标识远端位置"这一前提 |
-| R8 | **legacy batch 探针的活性上界缺失**（原 v1.1 只说"无 ctx 上界"）：`BatchBackend.List` 经 `osutil.Runner`=`cmd.Run()` 无超时，探针一旦挂住 ⇒ `await` 永不返回 ⇒ `probing` 恒 true ⇒ **此后所有切标签探活被静默短路（自愈永久失效且无报错）** | 双保险：§8.2 的 batch 分支改用 `osutil.NewCtxRunner()`（仓库已有）＋ §8.3 的 `probeTimed` 客户端超时（超时=未知，且 `finally` 复位 `probing`）；§11.3 F2 验收 |
+| R8 | **legacy batch 探针的活性上界缺失**（原 v1.1 只说"无 ctx 上界"）：`BatchBackend.List` 经 `osutil.Runner`=`cmd.Run()` 无超时，探针一旦挂住 ⇒ `await` 永不返回 ⇒ `probing` 恒 true ⇒ **此后所有切标签探活被静默短路（自愈永久失效且无报错）** | 三层：§8.2 的 `Ctrl.Probe` batch 分支用 goroutine + `ctx` select **+ 每 host 单飞**；§8.3 的 `probeTimed` 客户端超时（超时=未知，`finally` 复位 `probing`）；§11.3 F2 验收。**残留**：挂死的 batch 子进程本身仍靠 ssh 自身超时回收（不为 legacy 后端改 runner 装配，见 §8.2 理由） |
 | R9 | 空白右键在 `.pane` 根上接管 `contextmenu`，可能误伤其它原生菜单需求（比如未来新增可编辑控件） | handler 里对 `input/textarea/[contenteditable]:not([contenteditable="false"])` 放行、对 `.pos-wrap` 收起弹层不弹菜单；新增可编辑控件时补进该选择器（注释写明） |
 | R10 | 行菜单去掉「新建文件夹」是行为变更，老用户肌肉记忆会失效 | 已与用户确认（D6）；若实机反馈不便，一行加回 |
 | R11 | `remoteOpFailed` 的替换点漏一个远程 catch，则那一类失败不会自愈 | §11.2 的**分类型覆盖口径**钉死（纯远程函数 / 混合面板函数 / 新增的 `:767` 与 `:163`）；实施时逐个核对 §8.4 的 12 项清单 |
@@ -679,7 +688,7 @@ async function verifyRemote() {
 | BF3 | Important | `GetSftpUI` 若在读锁内 `Normalize()`（会给 nil map 赋新头）⇒ 与并发写共享结构竞争，且 `-race` 用例抓不到 | 接受。§9 写死"锁内只值拷贝、解锁后 Normalize"；§11.1 加 `GetSftpUI ‖ SaveSftpUI` 竞态用例 |
 | BF4 | Important | 规格说"slice 改动保持原样"，但 `kept := cfg.X[:0]` 与浅拷贝共享底层数组 ⇒ 真 `-race` | 接受。§6.3.4 第 3 条：改新数组 + 整段进写锁；**范围经用户 2026-10-10 决定扩大** —— `AddBookmark`/`RemoveBookmark` 一并修（R13/§15 D21），`-race` 加 4 条写入用例 |
 | BF5 | Important | `AcquireList` 不用 ctx ⇒ 拨号 ≥5s 时健康连接被判失效、健康会话被关、误触发重连；且探针会置粘性 `Connected`（未声明副作用） | 接受。§8.2 修 `Pool.Probe`（过期但会话建出 ⇒ 新预算复核）+ 文档化副作用；§11.1 加 slow-dial 回归；R1 重写、F1 实测 |
-| BF6 | Important | legacy batch 探针无活性上界 ⇒ `await` 永不返回 ⇒ `probing` 恒 true ⇒ 自愈永久静默失效 | 接受。§8.2 batch 分支用 `osutil.NewCtxRunner()`（仓库已有）+ §8.3 `probeTimed` 客户端超时（超时=未知、`finally` 复位）；R8 重写、F2 验收 |
+| BF6 | Important | legacy batch 探针无活性上界 ⇒ `await` 永不返回 ⇒ `probing` 恒 true ⇒ 自愈永久静默失效 | 接受。§8.2 batch 分支用 goroutine + `ctx` select + 每 host 单飞（**v1.4 修订**：原先写的"改用 `osutil.NewCtxRunner()`"会牵动 batch 的 runner 装配，与 legacy 回退路径不成比例）+ §8.3 `probeTimed` 客户端超时（超时=未知、`finally` 复位）；R8 重写、F2 验收 |
 | BF7 | Important | §11.1 的两条判据互相矛盾（既有用例构造下 map 为空，"短路⇒不写 map"又与意图冲突） | 接受。§11.1 判据重写为"无论队首是否同值，last path 必须 == path" |
 | BF8 | Important | 启动顺序未写 ⇒ `sftpui.load()` 若排在 `loadLocal()` 之后，本地最后路径每次启动被抹成 cwd；且 `connect()` 未被 `loaded` 兜住 | 接受。§6.4 新增 B3（顺序硬约束）与 B4（`loaded` gate） |
 | BF9 | Minor | 验收 C3 的配置路径写成 `config.toml`（不存在） | 接受。§11.3 C3 改为 `~/.config/sshore/sshore.toml` |
