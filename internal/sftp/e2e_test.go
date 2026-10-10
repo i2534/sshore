@@ -583,6 +583,8 @@ func e2eEnv(t *testing.T) (host, remote string, ok bool) {
 //   - PutTree 上传本地树 a/（含 a/b/c 与空目录）到**最终目录** target（batch = 逐文件 put；
 //     gosftp = 逐文件 .part + 提交）—— 2026-10-10 起两个后端都不得再套一层源目录名；
 //   - 第二次 PutTree 验证 D11 合并语义（并入而非嵌套出 target/a，远端独有文件保留）；
+//   - 第三次 PutTree 的目标中间层不存在（target/missing-mid/leaf）：两个后端都必须自己补齐
+//     祖先目录并落盘（2026-10-10 复核轮 2 / Minor-2 的真机证据）；
 //   - GetTree 下载回新目录，逐文件逐字节比对；
 //   - 成功后远端树内不得残留 .part/.bak。
 //
@@ -678,7 +680,21 @@ func TestTreeE2E(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("目录往返完成：3 个文件 + 空目录 + 合并语义（backend=%v, Atomic=%v）", be, atomic)
+	// 祖先缺失阶段（2026-10-10 复核轮 2 / Minor-2）：目标是 target/missing-mid/leaf，其中
+	// target/missing-mid **不存在**。GoBackend 走 MkdirAll 本就能补；batch 只 -mkdir 叶子时
+	// OpenSSH 的 mkdir 是单级语义 —— 实测父目录缺失会报 "No such file or directory" 且被
+	// `-` 前缀抑制，随后 put 落到不存在的父目录上让整批 EXIT=1。本阶段在真 sshd 上钉住两个
+	// 后端都能自己补齐中间层并落盘。
+	deep := filepath.Join(target, "missing-mid", "leaf")
+	if err := ctrl.TransferPutTree(TransferRequest{ID: "t12-put-deep", Host: host, Remote: deep, Local: localRoot, Atomic: atomic}, nil); err != nil {
+		t.Fatalf("祖先目录缺失时 PutTree 必须自己补齐（batch 逐级 -mkdir / gosftp MkdirAll）: %v", err)
+	}
+	for _, p := range []string{"x.txt", "b/y.txt", "b/c/z.txt"} {
+		if b, err := os.ReadFile(filepath.Join(deep, filepath.FromSlash(p))); err != nil || string(b) != "payload:a/"+p {
+			t.Fatalf("祖先缺失场景的落点必须是最终路径 deep/%s: err=%v content=%q", p, err, string(b))
+		}
+	}
+	t.Logf("目录往返完成：3 个文件 + 空目录 + 合并语义 + 祖先缺失补齐（backend=%v, Atomic=%v）", be, atomic)
 }
 
 // writeTemp 在临时目录写一个内容确定的小文件（能力用例的本地源）。
