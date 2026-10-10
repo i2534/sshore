@@ -631,25 +631,64 @@ func TestRemoveRecursiveRejectsGlobPaths(t *testing.T) {
 	}
 }
 
+// TestBuildBatchPutRecursive（2026-10-10 契约统一，RED→GREEN）：递归上传的批处理脚本必须
+// 逐文件 `put` 到**最终路径** `<remoteDir>/<相对源根>`，而不是旧的 `put -r <local> <remoteDir>`
+// —— OpenSSH 的 put -r 把 remoteDir 当父目录、再追加源目录名，正是「多套一层」的来源。
+// 目标目录（含空目录）先逐级 `-mkdir`：`-b` 模式下未加 `-` 前缀的命令失败会中止整批，
+// 而「目录已存在」是并入语义下必须容忍的（与 RemoveRecursive 的 -rm/-rmdir 同一手法）。
 func TestBuildBatchPutRecursive(t *testing.T) {
+	src := t.TempDir()
+	makeLocalTree(t, src, map[string]string{"x.txt": "X", "sub/y.txt": "Y"})
+	if err := os.MkdirAll(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	c := NewBatchBackend(nil, nil)
-	b, err := c.buildBatch("putr", "/remote/dir", "/local/dir")
+	b, err := c.buildBatch("putr", "/remote/dir", src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(b); got != "put -r \"/local/dir\" \"/remote/dir\"\n" {
-		t.Fatalf("putr batch = %q", got)
+	q := func(p string) string {
+		t.Helper()
+		s, qerr := quoteArg(p)
+		if qerr != nil {
+			t.Fatal(qerr)
+		}
+		return s
+	}
+	// 目录行按 WalkDir 的字典序（父先于子），随后是逐文件 put（put 不建父目录）。
+	want := strings.Join([]string{
+		`-mkdir "/remote/dir"`,
+		`-mkdir "/remote/dir/empty"`,
+		`-mkdir "/remote/dir/sub"`,
+		"put " + q(filepath.Join(src, "sub", "y.txt")) + ` "/remote/dir/sub/y.txt"`,
+		"put " + q(filepath.Join(src, "x.txt")) + ` "/remote/dir/x.txt"`,
+	}, "\n") + "\n"
+	if got := string(b); got != want {
+		t.Fatalf("putr batch =\n%q\nwant\n%q", got, want)
+	}
+	if strings.Contains(string(b), "put -r ") {
+		t.Fatalf("递归上传不得再走 put -r（父目录约定会多套一层）: %q", string(b))
 	}
 }
 
 func TestPutRecursiveRunsSftp(t *testing.T) {
+	src := t.TempDir()
+	makeLocalTree(t, src, map[string]string{"x.txt": "X"})
 	fr := &fakeRunner{}
 	c := NewBatchBackend(fr.run, nil)
-	if err := c.PutRecursive("h", "", "/local/dir", "/remote/dir"); err != nil {
+	if err := c.PutRecursive("h", "", src, "/remote/dir"); err != nil {
 		t.Fatalf("PutRecursive: %v", err)
 	}
 	if len(fr.calls) != 1 || fr.calls[0].name != "sftp" {
 		t.Fatalf("calls = %+v", fr.calls)
+	}
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if len(fr.batches) != 1 {
+		t.Fatalf("必须恰好一条批处理脚本, got %d", len(fr.batches))
+	}
+	if got := string(fr.batches[0]); !strings.Contains(got, `"/remote/dir/x.txt"`) || !strings.Contains(got, "-mkdir ") {
+		t.Fatalf("批处理脚本必须建目录 + 逐文件 put 到最终路径, got %q", got)
 	}
 }
 

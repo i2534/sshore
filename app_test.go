@@ -1997,6 +1997,12 @@ func TestEmitProgressWithoutContextIsNoop(t *testing.T) {
 func TestSftpOutputBindingsUsableUnderBatch(t *testing.T) {
 	// batch 的 Transfer* 是「真执行」：假 runner 对 sftp 批处理一律返回成功。
 	a := appWithFakeSFTP(t, "")
+	// 递归上传现在**真实遍历本地源树**（逐文件 put 到最终路径；2026-10-10 起不再依赖
+	// `put -r`，见 internal/sftp.PutRecursive），所以源目录必须真实存在。
+	localDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localDir, "a.txt"), []byte("A"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name string
 		run  func() error
@@ -2004,7 +2010,7 @@ func TestSftpOutputBindingsUsableUnderBatch(t *testing.T) {
 		{"SftpGet", func() error { return a.SftpGet("t1", "h", "u", "/r/a", "/l/a", true, "/l/a.part") }},
 		{"SftpGetDir", func() error { return a.SftpGetDir("t2", "h", "u", "/r/d", "/l/d", false, "") }},
 		{"SftpPut", func() error { return a.SftpPut("t3", "h", "u", "/l/a", "/r/a", false, "") }},
-		{"SftpPutRecursive", func() error { return a.SftpPutRecursive("t4", "h", "u", "/l/d", "/r/d", true, "/r/d.part") }},
+		{"SftpPutRecursive", func() error { return a.SftpPutRecursive("t4", "h", "u", localDir, "/r/d", true, "/r/d.part") }},
 	}
 	for _, tc := range cases {
 		if err := tc.run(); err != nil {

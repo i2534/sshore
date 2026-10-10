@@ -580,8 +580,9 @@ func e2eEnv(t *testing.T) (host, remote string, ok bool) {
 }
 
 // TestTreeE2E 是 Task 12 的目录往返 e2e（harness 的 batch/gosftp 双迭代都会真跑）：
-//   - PutTree 上传本地树 a/b/c（batch = sftp put -r；gosftp = 逐文件 .part + 提交）；
-//   - 第二次 PutTree 验证 D11 合并语义（并入而非嵌套出 a/a，远端独有文件保留）；
+//   - PutTree 上传本地树 a/（含 a/b/c 与空目录）到**最终目录** target（batch = 逐文件 put；
+//     gosftp = 逐文件 .part + 提交）—— 2026-10-10 起两个后端都不得再套一层源目录名；
+//   - 第二次 PutTree 验证 D11 合并语义（并入而非嵌套出 target/a，远端独有文件保留）；
 //   - GetTree 下载回新目录，逐文件逐字节比对；
 //   - 成功后远端树内不得残留 .part/.bak。
 //
@@ -618,10 +619,9 @@ func TestTreeE2E(t *testing.T) {
 		}
 	}
 	target := filepath.Join(remote, "tree")
-	// 目标父目录先建好：batch 的 sftp put -r 的合并语义要求 remoteDir 已存在（gosftp 会自行 MkdirAll）。
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// 目标目录**故意不预建**：契约里 Remote 就是最终目录，两个后端都必须自己把它建出来
+	// （gosftp 走 MkdirAll，batch 走批处理里的 `-mkdir`）。旧实现把 Remote 当父目录，会在
+	// 它下面多套一层源目录名（target/a/...），下面按最终路径逐条断言。
 	defer func() { _ = os.RemoveAll(target) }()
 
 	localRoot := filepath.Join(src, "a")
@@ -633,33 +633,38 @@ func TestTreeE2E(t *testing.T) {
 	}
 	put("t12-put1")
 	// 远端独有文件：第二次并入不得删掉它（D11 不做整树替换）。
-	stale := filepath.Join(target, "a", "keep.txt")
+	stale := filepath.Join(target, "keep.txt")
 	if err := os.WriteFile(stale, []byte("KEEP"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	put("t12-put2")
-	if _, err := os.Stat(filepath.Join(target, "a", "a")); !os.IsNotExist(err) {
-		t.Fatalf("put -r 必须并入而非嵌套（不应出现 target/a/a），stat err=%v", err)
+	if _, err := os.Stat(filepath.Join(target, "a")); !os.IsNotExist(err) {
+		t.Fatalf("Remote 是最终目录：必须并入而非嵌套（不应出现 target/a），stat err=%v", err)
 	}
 	if b, err := os.ReadFile(stale); err != nil || string(b) != "KEEP" {
 		t.Fatalf("并入不得清理远端独有文件: err=%v content=%q", err, string(b))
 	}
-	if st, err := os.Stat(filepath.Join(target, "a", "emptydir")); err != nil || !st.IsDir() {
+	if st, err := os.Stat(filepath.Join(target, "emptydir")); err != nil || !st.IsDir() {
 		t.Fatalf("递归上传必须建出空目录: err=%v st=%v", err, st)
+	}
+	for _, p := range []string{"x.txt", "b/y.txt", "b/c/z.txt"} {
+		if b, err := os.ReadFile(filepath.Join(target, filepath.FromSlash(p))); err != nil || string(b) != "payload:a/"+p {
+			t.Fatalf("上传落点必须是最终路径 target/%s: err=%v content=%q", p, err, string(b))
+		}
 	}
 
 	dst := t.TempDir()
 	if err := ctrl.TransferGetTree(TransferRequest{ID: "t12-get", Host: host, Remote: target, Local: filepath.Join(dst, "tree"), Atomic: atomic}, nil); err != nil {
 		t.Fatalf("GetTree: %v", err)
 	}
-	for _, p := range []string{"a/x.txt", "a/b/y.txt", "a/b/c/z.txt"} {
-		want, _ := os.ReadFile(filepath.Join(src, filepath.FromSlash(p)))
+	for _, p := range []string{"x.txt", "b/y.txt", "b/c/z.txt"} {
+		want, _ := os.ReadFile(filepath.Join(src, "a", filepath.FromSlash(p)))
 		got, err := os.ReadFile(filepath.Join(dst, "tree", filepath.FromSlash(p)))
 		if err != nil || !bytes.Equal(want, got) {
 			t.Fatalf("文件不一致: %s err=%v got=%d want=%d", p, err, len(got), len(want))
 		}
 	}
-	if st, err := os.Stat(filepath.Join(dst, "tree", "a", "emptydir")); err != nil || !st.IsDir() {
+	if st, err := os.Stat(filepath.Join(dst, "tree", "emptydir")); err != nil || !st.IsDir() {
 		t.Fatalf("递归下载必须建出空目录: err=%v st=%v", err, st)
 	}
 	if err := filepath.WalkDir(target, func(p string, d os.DirEntry, werr error) error {
