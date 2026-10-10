@@ -31,6 +31,19 @@
 1. 传输队列面板一出现，两侧面板会**整体上移**（过滤框 y 从 510 → 460、行同步上移）—— 这是本验收工作台的坐标标定问题（自动化点击要重新截图定位），与应用行为无关；也解释了本报告早期"点空"的几次。
 2. 我把远程路径栏误指向 `/C:/vbox-agent` 时，日志给出 `[ERROR] Error: sftp ls /C:/vbox-agent: file does not exist` + `[INFO] 探活耗时 813ms / 17ms`，**没有**触发断开/重连 —— 与 D3（非链路错误不重连）在 Windows 上同样成立。
 
+## 1c. 发布目标 `windows/amd64` 复核（2026-10-10 追加）
+
+本机可直接交叉构建 amd64（见文首更正，**无需 mingw**）。用 `wails build -platform windows/amd64` 的产物（`Version=v0.7.2-81-gb1f0276`，`PE32+ executable (GUI) x86-64`）在同一台 Windows 客户机上经同一条 RDP 真实输入通道复跑：
+
+| # | 项 | 结果 | 关键观察 | 证据 |
+|---|---|---|---|---|
+| A-1 | **SFTP 连接（发布目标）** | **PASS** | 点「连接」随即列出 `/C:/Users/lan` 共 **86 项**（`「开始」菜单`/`3D Objects`/`AppData`/`bin`/…）⇒ **amd64 上不存在 §2 的 WOW64 问题** | `amd64-connected.jpg` |
+| A-2 | 远端行菜单 | **PASS** | 右键远端行 ⇒ `下载… / 上传… / 重命名 / 删除 / ── / 刷新` | `amd64-remote-rowmenu.jpg` |
+| A-3 | 真实下载 + 哈希核对 | **PASS** | `C:\Users\lan\dl-src.bin`（300 000 B）→ 本地；`批量download 1 项：成功 1`；宿主 sha256 `886715E4…E30` = 客户机 | `amd64-download-verified.jpg` |
+| A-4 | 真实上传 + 哈希核对 | **PASS** | `up-src.bin`（1 048 576 B）→ `C:\Users\lan`；`批量upload 1 项：成功 1`；客户机 md5 `AF316DDC…3D7` = 宿主 | `amd64-upload-verified.jpg` |
+
+结论：**发布目标（amd64）在真 Windows 上端到端可用**；此前 386 轮撞到的 WOW64 问题只是 386 目标的架构性后果，不影响发布。
+
 ## 2. 曾发现并已修复：`windows/386` 构建下 SFTP 连接不可用（WOW64）
 
 真机点击「连接」（主机 `winlocal`）后日志：
