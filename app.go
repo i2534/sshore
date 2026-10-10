@@ -34,11 +34,27 @@ type App struct {
 	cfgPath string
 	sync    *sync.Ctrl
 
-	// cfgMu 保护 cfg.App：更新服务 goroutine（Config/Save 回调）读、
-	// Wails 调用线程（GetSettings/SetSettings）写。setAppSettings 是**整结构赋值**，
-	// 因此任何对 a.cfg.App 子字段的裸读都会与它构成数据竞争 —— 所有读点都必须
-	// 经过受锁的 appSettings / autoStartOnLaunch / sftpTransport（Task 11 fix round 1；
+	// cfgMu 保护 cfg.App 与 cfg.SftpUI。
+	//
+	// cfg.App：更新服务 goroutine（Config/Save 回调）读、Wails 调用线程
+	// （GetSettings/SetSettings）写。setAppSettings 是**整结构赋值**，因此任何对
+	// a.cfg.App 子字段的裸读都会与它构成数据竞争 —— 所有读点都必须经过受锁的
+	// appSettings / autoStartOnLaunch / sftpTransport（Task 11 fix round 1；
 	// 裸读 sftpTransport / AutoStartOnLaunch 由最终评审 I-3 收口）。
+	//
+	// cfg.SftpUI 与 locations 三段（Bookmarks/LocalRecent/RemoteRecent）的锁规约
+	// （规格 §6.3.4 红线 3 / §6.3.5）：四个写入函数 AddBookmark / RemoveBookmark /
+	// AddLocalRecent / AddRemoteRecent（含内部 recordRecentSFTP）一律
+	//   ① 写锁内**只构造新值**（新 slice / 新 map 后整结构赋值），锁内绝不做 IO；
+	//   ② 解锁后再 saveConfig()；changed == false 时直接 return nil（不写盘）。
+	// 为什么必须构造新值：snapshotConfig() 是**浅拷贝**（`cp := *a.cfg`），slice 的
+	// 底层数组与 map 的内容会被锁外的 TOML 编码共享 —— 原地复用 `x[:0]` /
+	// `append(a.cfg.X, ...)` / 原地写 `LastRemoteDirs[host]` 都与该编码并发，
+	// 是真的数据竞争（-race 可复现），裸 `&config.AppConfig{}` 上还是 nil map panic。
+	//
+	// 铁律：锁内只允许调 *Locked 系列私有 helper，**禁止调公开绑定**
+	// （AddRemoteRecent 等）。cfgMu 是不可重入的 RWMutex，同锁重入即死锁 ——
+	// 表现是测试 hang 到 timeout，而不是报错。
 	cfgMu stdsync.RWMutex
 
 	// H2: startup 早于 Init 注入 emit，加载错误先记录于此，Init 时补发事件
@@ -853,7 +869,7 @@ func (a *App) SftpGet(id, host, user, remote, local string, resume bool, partPat
 	if err := c.TransferGet(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
-	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
+	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local), false)
 	return nil
 }
 
@@ -866,7 +882,7 @@ func (a *App) SftpGetDir(id, host, user, remote, local string, resume bool, part
 	if err := c.TransferGetTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
-	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
+	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local), false)
 	return nil
 }
 
@@ -879,7 +895,7 @@ func (a *App) SftpPut(id, host, user, local, remote string, resume bool, partPat
 	if err := c.TransferPut(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remote, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
-	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local))
+	a.recordRecentSFTP(host, path.Dir(remote), filepath.Dir(local), false)
 	return nil
 }
 func (a *App) SftpRemove(host, user, path string) error {
@@ -925,7 +941,7 @@ func (a *App) SftpPutRecursive(id, host, user, local, remoteDir string, resume b
 	if err := c.TransferPutTree(sftp.TransferRequest{ID: id, Host: host, User: user, Remote: remoteDir, Local: local, Resume: resume, PartPath: partPath, Atomic: a.sftpAtomic()}, a.emitProgress); err != nil {
 		return err
 	}
-	a.recordRecentSFTP(host, path.Dir(remoteDir), filepath.Dir(local))
+	a.recordRecentSFTP(host, path.Dir(remoteDir), filepath.Dir(local), false)
 	return nil
 }
 
@@ -1185,7 +1201,7 @@ func (a *App) SftpHome(host string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	a.recordRecentSFTP(host, home, "")
+	a.recordRecentSFTP(host, home, "", false)
 	return home, nil
 }
 
@@ -1349,14 +1365,28 @@ func (a *App) ListPresets() Presets {
 	return Presets{Local: local, LocalDisks: disks, Remote: remote, Err: perr}
 }
 
+// ListLocations 返回收藏与两侧最近位置。
+//
+// 并发（规格 §6.3.4 第 3 条 / 审核 M8）：Wails 每次绑定调用起一个 goroutine，而
+// Bookmarks/LocalRecent/RemoteRecent 会被上文的四个写入函数改写 —— 因此读锁内
+// **只取三个切片头**（写方现在一律构造新 slice 后整结构赋值，切片头一旦发布就不再
+// 被原地改写），解锁后再做 nil→空切片的兜底组装。锁内不做任何组装/转换。
 func (a *App) ListLocations() Locations {
-	if a.cfg == nil {
-		return Locations{Bookmarks: []config.Bookmark{}, LocalRecents: []config.RecentLocal{}, RemoteRecents: []config.RecentRemote{}}
+	a.cfgMu.RLock()
+	var bookmarks []config.Bookmark
+	var localRecents []config.RecentLocal
+	var remoteRecents []config.RecentRemote
+	if a.cfg != nil {
+		bookmarks = a.cfg.Bookmarks
+		localRecents = a.cfg.LocalRecent
+		remoteRecents = a.cfg.RemoteRecent
 	}
+	a.cfgMu.RUnlock()
+
 	out := Locations{
-		Bookmarks:     a.cfg.Bookmarks,
-		LocalRecents:  a.cfg.LocalRecent,
-		RemoteRecents: a.cfg.RemoteRecent,
+		Bookmarks:     bookmarks,
+		LocalRecents:  localRecents,
+		RemoteRecents: remoteRecents,
 	}
 	if out.Bookmarks == nil {
 		out.Bookmarks = []config.Bookmark{}
@@ -1370,27 +1400,50 @@ func (a *App) ListLocations() Locations {
 	return out
 }
 
+// AddBookmark 追加一条收藏；同 scope/host/path 已存在则直接返回（不写盘）。
+//
+// 并发（规格 §6.3.4 红线 3）：**不能**只写 `append(a.cfg.Bookmarks, b)` —— cap 有余量
+// 时仍会写进 snapshotConfig 浅拷贝所共享的底层数组，与锁外的 TOML 编码并发即数据竞争。
+// 因此构造新数组（拷旧 + 追加）后整结构赋值；写锁内只赋值、无 IO，解锁后再落盘。
 func (a *App) AddBookmark(b config.Bookmark) error {
 	if b.Path == "" || (b.Scope != "local" && b.Scope != "remote") {
 		return errors.New("invalid bookmark")
 	}
+	a.cfgMu.Lock()
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
 	}
+	dup := false
 	for _, e := range a.cfg.Bookmarks {
 		if e.Scope == b.Scope && e.Host == b.Host && e.Path == b.Path {
-			return nil
+			dup = true
+			break
 		}
 	}
-	a.cfg.Bookmarks = append(a.cfg.Bookmarks, b)
+	if !dup {
+		nb := make([]config.Bookmark, 0, len(a.cfg.Bookmarks)+1)
+		nb = append(nb, a.cfg.Bookmarks...)
+		nb = append(nb, b)
+		a.cfg.Bookmarks = nb
+	}
+	a.cfgMu.Unlock()
+	if dup {
+		return nil // 去重语义不变：命中即不追加、也不写盘
+	}
 	return a.saveConfig()
 }
 
+// RemoveBookmark 按 scope/host/path 精确删除一条收藏（匹配规则与改造前逐字一致）。
+//
+// 并发：同 AddBookmark —— 构造新数组逐项过滤，绝不 `a.cfg.Bookmarks[:0]` 原地复用
+// 底层数组（那是与锁外 TOML 编码的真数据竞争）。
 func (a *App) RemoveBookmark(scope, host, path string) error {
+	a.cfgMu.Lock()
 	if a.cfg == nil {
+		a.cfgMu.Unlock()
 		return nil
 	}
-	kept := a.cfg.Bookmarks[:0]
+	kept := make([]config.Bookmark, 0, len(a.cfg.Bookmarks))
 	for _, e := range a.cfg.Bookmarks {
 		if e.Scope == scope && e.Host == host && e.Path == path {
 			continue
@@ -1398,56 +1451,144 @@ func (a *App) RemoveBookmark(scope, host, path string) error {
 		kept = append(kept, e)
 	}
 	a.cfg.Bookmarks = kept
+	a.cfgMu.Unlock()
 	return a.saveConfig()
 }
 
-func (a *App) AddLocalRecent(path string) error {
+// —— locations 四个写入点的私有实现（规格 §6.3.1 / §6.3.2 / §6.3.4 / §6.3.5）——
+//
+// 以下 *Locked 系列**要求调用方已持 cfgMu 写锁**：锁内只构造新值 + 整结构赋值，绝不
+// 做 IO，也**绝不调公开绑定**（AddRemoteRecent 等）—— cfgMu 不可重入，同锁重入即死锁。
+// 落盘一律由调用方在解锁之后负责。
+
+// rememberRemotePathLocked 把 host 的最后远端目录记为 path，返回内存态是否真的变了。
+// 这个读比较只用于短路（省一次落盘），**是否调用本函数由调用方的 rememberLast 门控决定**：
+// 若把比较放在门控之外，rememberLast == false 的内部路径会因 map 永不更新而永远判
+// changed ⇒ 每个文件一次全量 TOML 编码 + rename（规格 §6.3.2 要避免的写放大回归）。
+//
+// map 一律**构造新的**（而不是原地 `LastRemoteDirs[host] = path`）：既与锁外 TOML 编码
+// 共享不到底层 bucket，也能在裸 `&config.AppConfig{}`（LastRemoteDirs == nil）上安全工作；
+// 最后对整个 SftpUI **整结构赋值**（规格 §6.3.4 红线 1）。
+func (a *App) rememberRemotePathLocked(host, path string) (changed bool) {
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
 	}
-	// 队首已是同一路径 ⇒ 直接返回：语义与"去重置顶"完全一致（它本来就会落到队首），
-	// 但省掉一次 TOML 全量编码 + tmp + rename。前端 store 有同构短路（T10）。
-	if len(a.cfg.LocalRecent) > 0 && a.cfg.LocalRecent[0].Path == path {
-		return nil
+	s := a.cfg.SftpUI
+	if s.LastRemoteDirs[host] == path { // nil map 的读是安全的
+		return false
 	}
-	rec := config.RecentLocal{Path: path, TS: time.Now().Format(time.RFC3339)}
-	kept := a.cfg.LocalRecent[:0]
-	for _, e := range a.cfg.LocalRecent {
-		if e.Path == path {
-			continue
-		}
-		kept = append(kept, e)
+	dirs := make(map[string]string, len(s.LastRemoteDirs)+1)
+	for k, v := range s.LastRemoteDirs {
+		dirs[k] = v
 	}
-	a.cfg.LocalRecent = append([]config.RecentLocal{rec}, kept...)
-	if len(a.cfg.LocalRecent) > 20 {
-		a.cfg.LocalRecent = a.cfg.LocalRecent[:20]
-	}
-	return a.saveConfig()
+	dirs[host] = path
+	s.LastRemoteDirs = dirs
+	a.cfg.SftpUI = s
+	return true
 }
 
-func (a *App) AddRemoteRecent(host, path string) error {
+// rememberLocalPathLocked 同构：写 LastLocalDir（字符串字段，整结构赋值同样一次到位）。
+func (a *App) rememberLocalPathLocked(path string) (changed bool) {
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	s := a.cfg.SftpUI
+	if s.LastLocalDir == path {
+		return false
+	}
+	s.LastLocalDir = path
+	a.cfg.SftpUI = s
+	return true
+}
+
+// addRemoteRecentLocked 是 AddRemoteRecent 的锁内实现。rememberLast 为 true 时才写
+// last path —— 门控**必须在 rememberRemotePathLocked 之外**（见其注释的写放大成因）。
+// 返回值 changed = 内存态是否真的变了，调用方据此决定要不要落盘。
+// 入参守卫（host/path 为空直接返回）、去重置顶与 20 条上限一律照旧。
+func (a *App) addRemoteRecentLocked(host, path string, rememberLast bool) (changed bool) {
 	if host == "" || path == "" {
-		return nil
+		return false
 	}
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
 	}
-	// 同上：队首已是同一 (host, path) 时不再写盘。一次成功传输最多触发两次保存，
+	// last path 的写入**不受队首短路约束**（规格 §6.3.2）：队首同值只说明 recents 不必
+	// 重排，不说明 last path 已正确（升级场景：老配置根本没有 last path）。
+	if rememberLast {
+		changed = a.rememberRemotePathLocked(host, path)
+	}
+	// 队首已是同一 (host, path) ⇒ 不再重排/刷新 TS。一次成功传输最多触发两次保存，
 	// 批量传输时这是主要写放大来源（100 个文件约 200 次磁盘写）。
 	if len(a.cfg.RemoteRecent) > 0 && a.cfg.RemoteRecent[0].Host == host && a.cfg.RemoteRecent[0].Path == path {
-		return nil
+		return changed
 	}
 	rec := config.RecentRemote{Host: host, Path: path, TS: time.Now().Format(time.RFC3339)}
-	kept := a.cfg.RemoteRecent[:0]
+	kept := make([]config.RecentRemote, 0, len(a.cfg.RemoteRecent))
 	for _, e := range a.cfg.RemoteRecent {
 		if e.Host == host && e.Path == path {
 			continue
 		}
 		kept = append(kept, e)
 	}
-	a.cfg.RemoteRecent = append([]config.RecentRemote{rec}, kept...)
-	if len(a.cfg.RemoteRecent) > 20 {
-		a.cfg.RemoteRecent = a.cfg.RemoteRecent[:20]
+	next := append([]config.RecentRemote{rec}, kept...)
+	if len(next) > 20 {
+		next = next[:20]
+	}
+	a.cfg.RemoteRecent = next
+	return true
+}
+
+// addLocalRecentLocked 是 AddLocalRecent 的锁内实现（同构）。本地侧与改造前一致：
+// **没有** path 空值守卫，语义不做任何收紧。
+func (a *App) addLocalRecentLocked(path string, rememberLast bool) (changed bool) {
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	if rememberLast {
+		changed = a.rememberLocalPathLocked(path)
+	}
+	// 队首已是同一路径 ⇒ 语义与"去重置顶"完全一致（它本来就会落到队首），
+	// 但省掉一次 TOML 全量编码 + tmp + rename。前端 store 有同构短路（T10）。
+	if len(a.cfg.LocalRecent) > 0 && a.cfg.LocalRecent[0].Path == path {
+		return changed
+	}
+	rec := config.RecentLocal{Path: path, TS: time.Now().Format(time.RFC3339)}
+	kept := make([]config.RecentLocal, 0, len(a.cfg.LocalRecent))
+	for _, e := range a.cfg.LocalRecent {
+		if e.Path == path {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	next := append([]config.RecentLocal{rec}, kept...)
+	if len(next) > 20 {
+		next = next[:20]
+	}
+	a.cfg.LocalRecent = next
+	return true
+}
+
+// AddLocalRecent 记录一次导航到的本地目录：去重置顶、上限 20，并写 LastLocalDir。
+// 公开绑定就是「写锁内 *Locked(..., true) → 解锁 → 仅当 changed 时才 saveConfig()」
+// （规格 §6.3.5：锁内无 IO，changed == false 不写盘）。
+func (a *App) AddLocalRecent(path string) error {
+	a.cfgMu.Lock()
+	changed := a.addLocalRecentLocked(path, true)
+	a.cfgMu.Unlock()
+	if !changed {
+		return nil
+	}
+	return a.saveConfig()
+}
+
+// AddRemoteRecent 记录一次导航到的远端目录：去重置顶、上限 20，并写
+// LastRemoteDirs[host]。只有**面向用户的导航绑定**能写 last path（规格 §6.3.1）。
+func (a *App) AddRemoteRecent(host, path string) error {
+	a.cfgMu.Lock()
+	changed := a.addRemoteRecentLocked(host, path, true)
+	a.cfgMu.Unlock()
+	if !changed {
+		return nil
 	}
 	return a.saveConfig()
 }
@@ -1455,19 +1596,37 @@ func (a *App) AddRemoteRecent(host, path string) error {
 // recordRecentSFTP 记录一次成功的 SFTP 操作：远端目录进 RemoteRecent、本地目录进
 // LocalRecent（各自去重置顶、上限 20，见 AddRemoteRecent/AddLocalRecent）；
 // 落盘沿用 saveConfig 的 fire-and-forget 模式（见 OnShutdown）。
+//
+// rememberLast **必须为 false**（规格 §6.3.1，审核 BF1/Blocking）：本函数是后端内部
+// 路径，全部调用点是传输完成 4 处与 SftpHome。SftpHome 每次 connect 都被调用，若它顺带
+// 写 last path，单主机用户的"最后路径"会被静默改写成 home —— 而前端 store 的队首短路
+// 会让紧接着的 addRemoteRecent(记忆路径) 不发 IPC，于是本次会话落点仍正确、盘上已是
+// home，验收看不出来（最坏一类静默损坏）。只有面向用户的导航绑定传 true。
+//
+// 两次 *Locked 在**同一个写锁段**内完成（持锁调 *Locked，不重入公开绑定 ⇒ 不死锁），
+// 解锁后按**合并结果**决定是否落盘一次：changed == false ⇒ 直接返回、不写盘
+// （§6.3.2 的写盘合并；rememberLast == false 的内部路径因此不会产生任何落盘）。
+//
 // remoteDir 必须是 **POSIX 语义**的远端目录（调用方用 path.Dir —— 远端没有 Windows
 // 反斜杠概念，Windows 上 filepath.Dir("/a/x") 会得到 "\a"）；localDir 是本机目录
 // （调用方用 filepath.Dir，Windows 上自然得到反斜杠）。
-func (a *App) recordRecentSFTP(host, remoteDir, localDir string) {
+func (a *App) recordRecentSFTP(host, remoteDir, localDir string, rememberLast bool) {
+	a.cfgMu.Lock()
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
 	}
+	changed := false
 	if host != "" && remoteDir != "" {
-		_ = a.AddRemoteRecent(host, remoteDir)
+		changed = a.addRemoteRecentLocked(host, remoteDir, rememberLast)
 	}
-	if localDir != "" {
-		_ = a.AddLocalRecent(localDir)
+	if localDir != "" && a.addLocalRecentLocked(localDir, rememberLast) {
+		changed = true
 	}
+	a.cfgMu.Unlock()
+	if !changed {
+		return
+	}
+	_ = a.saveConfig()
 }
 
 func (a *App) OnShutdown() {
