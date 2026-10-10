@@ -10,7 +10,9 @@ const props = defineProps({
   host: { type: String, default: '' },
   root: { type: String, default: '/' },
 })
-const emit = defineEmits(['close', 'open-hit'])
+// 'failed'：搜索（远程操作）失败也要通知父层 —— 深搜失败原来只写浮层内的 errorText，
+// 死链下面板仍显示「已连接」，正是本次要消灭的"假已连接"（spec §8.4 第 13 项）。
+const emit = defineEmits(['close', 'open-hit', 'failed'])
 
 const pattern = ref('')
 const running = ref(false)
@@ -61,7 +63,11 @@ async function run() {
     truncated.value = !!(out && out.truncated)
     cancelled.value = !!(out && out.cancelled)
   } catch (e) {
-    if (id === 's' + seq) errorText.value = String(e)
+    if (id === 's' + seq) {
+      errorText.value = String(e)
+      // 浮层内保留原文（用户看得见），同时上抛给 SftpView 走连接失效复核（统一归口 remoteOpFailed）
+      emit('failed', e)
+    }
   } finally {
     if (id === 's' + seq) running.value = false // 过期响应不得清掉新搜索的运行态
   }

@@ -1,6 +1,6 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpProbe, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import { useLocationsStore } from '../stores/locations'
 import { useSftpUIStore } from '../stores/sftpui'
@@ -101,6 +101,9 @@ async function dispatchTransfer(rec) {
   rec.filesDone = undefined
   rec.filesTotal = undefined
   rec.phase = ''
+  // 主机身份快照（审核 F21）：回同步 connected 必须带守卫 —— await 期间用户可能已经切了主机，
+  // 把新主机写成"已连接"就是撒谎。
+  const h = host.value
   rec.startedAt = Date.now()
   try {
     if (rec.direction === 'download') {
@@ -112,11 +115,17 @@ async function dispatchTransfer(rec) {
     // 即使 Cancel 返回过 true（提交已完成的窄窗口，Task 10 评审有真协议探测），也必须渲染为
     // 完成（"取消过晚"），绝不删掉已安装的目标文件。
     applyOutcome(rec, { ok: true })
+    // §8.5 一致性回同步（审核 FF16）：后端传输按需拨号 ⇒ 传输成功即"链路真的可用"，
+    // 回写 connected 让行菜单/工具栏刷新不再被置灰规则跳过。守卫见上面的快照注释。
+    if (host.value === h && !connected.value) connected.value = true
   } catch (e) {
     // 抛错时是否算「取消」由 cancelFailed 区分：Cancel 明确返回 false（未能取消）之后，
     // 这次失败是无关失败，绝不栽给取消（评审 I3）。
     applyOutcome(rec, { ok: false, error: e })
-    err(e)
+    // 取消语义优先（审核 FF15a）：用户主动取消导致的失败不该被归因为"连接已失效"，
+    // 否则会白跑一次探活，真断链时还会把"取消"也拖进重连。其余失败归口复核（D14）。
+    if (rec.cancelRequested) err(e)
+    else await remoteOpFailed(e)
   }
   rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
   return rec.status
@@ -171,7 +180,11 @@ async function cleanItem(rec) {
     rec.partPath = ''
     logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'info', ts: new Date().toISOString(), message: '已清理临时文件 ' + rec.src })
   } catch (e) {
-    err('清理临时文件失败：' + String((e && e.message) || e))
+    // §8.4 第 12 项（审核 FF3）：SftpRemove 的失败原来被包成字符串「清理临时文件失败：」，
+    // 任何"函数里有没有裸 err(e)"的口径都看不见它。按 rec.direction 分派：
+    // download = 本地的 DeleteLocal（保持既有文案），upload = 远程 ⇒ 归口复核。
+    if (rec.direction === 'download') err('清理临时文件失败：' + String((e && e.message) || e))
+    else await remoteOpFailed(e)
   }
 }
 
@@ -228,6 +241,104 @@ async function warn(msg) {
 }
 async function info(msg) {
   logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'info', message: String(msg), ts: new Date().toISOString() })
+}
+
+// ===== 连接失效自愈（spec §8.3 / §8.4 / §8.5）=====
+// 根因：Connected(host) 是**粘性连接意图**（握手成功即 true，只有显式 Disconnect 才清）⇒
+// 主机休眠唤醒后链路已死但后端仍回答 true，UI 永远停在"已连接"，且期间的操作全部失败。
+// probing / recovering 必须是**普通 let 变量（非 ref）**（审核 F15）：接线测试按 `probing = false`
+// 这类赋值形态匹配，写成 ref 会红，而 ref 恒真的误用会让探活/重连被静默短路。
+let probing = false // 只防"探针并发"（管探活那一段）
+let recovering = false // 防"反复切标签叠加重连"（管重连那一段）；两个标志各管一段，缺一不可
+// 客户端超时兜底（spec §8.3，15s：覆盖后端最坏预算并留余量）
+const PROBE_TIMEOUT_MS = 15000
+
+// 探活三态：绝不能用布尔表示"未知"，否则超时/绑定抛错会被当成"链路已失效"、对可能健康的
+// 链路做无谓 teardown（违反 D14「探针说失效才算失效」）。
+//   'ok'      = 后端探针确认可用
+//   'lost'    = 后端探针明确回答 false（链路确实不可用）
+//   'unknown' = 超时或探针自身抛错（不改状态、不重连、不记 error）
+// 客户端超时不是锦上添花：legacy batch 后端挂在无 ctx 的 cmd.Run() 上时 await SftpProbe 永不返回，
+// probing 若不靠 finally 复位，该视图此后**任何**切标签探活都会被静默短路（自愈永久失效且无报错）。
+async function probeTimed(h) {
+  const started = performance.now()
+  let timer = null
+  let state = 'unknown'
+  try {
+    state = await Promise.race([
+      Promise.resolve(SftpProbe(h)).then((ok) => (ok ? 'ok' : 'lost')),
+      new Promise((resolve) => { timer = setTimeout(() => resolve('unknown'), PROBE_TIMEOUT_MS) }),
+    ])
+  } catch (e) {
+    // 探针自身抛错：工具坏了不等于链路坏了 ⇒ 未知，既不重连也不改状态
+    state = 'unknown'
+  } finally {
+    if (timer !== null) clearTimeout(timer) // 不 clear 就每次探活都留一个挂着的句柄
+  }
+  // spec §10 / 审核 F12：每次探活一条 info 级耗时日志，§11.3 F1 的耗时分布靠它观测
+  await info('探活耗时 ' + Math.round(performance.now() - started) + 'ms')
+  return state
+}
+
+// 远程操作失败后的复核（spec §8.4 / D14）：只回答"链路是不是真的没了"。
+// `!connected.value` 早退（自审修正 7）：那是"连接本身刚失败"的场景（例如自愈过程中重连失败），
+// 此时再探活/再重连只会打出第二轮无意义尝试。probing 只管探针并发，管不住
+// "探针 A 失败后重连还在跑、探针 B 又失败"的重入 —— 那一段由 recovering 管。
+async function verifyRemote() {
+  const h = host.value
+  if (!h || !connected.value || probing) return
+  probing = true
+  try {
+    // === 'lost' 是硬要求（本计划最重要的 Blocking 修正）：三态是字符串，把探活结果当布尔取反
+    // 再判断（在 'ok'/'lost'/'unknown' 下恒为 false）会让自愈永不触发。
+    if ((await probeTimed(h)) === 'lost') await recoverConnection(h)
+  } finally {
+    probing = false
+  }
+}
+
+// 远程操作失败的统一归口：先记后端原始报错原文（绝不丢 e），再复核链路（可能触发一次自愈）。
+// **自身永不 reject**：loadRemote 里是浮动调用（void Promise.resolve().then(...)），
+// 这里一旦抛出就是 unhandled rejection —— 视图没有任何调用点能接住它。故两级兜错。
+async function remoteOpFailed(e) {
+  try {
+    await err(e)
+  } catch {
+    // 日志系统自身故障也不能因此跳过链路复核
+  }
+  try {
+    await verifyRemote()
+  } catch (e2) {
+    try { await err(e2) } catch { /* 连补记都失败就只能沉默：绝不外泄 rejection */ }
+  }
+}
+
+// 自愈（spec §8.3 步骤 1-7）：先断开（清粘性意图 + 丢死会话），再走既有握手流程重连**一次**。
+// 只重连一次：不循环、不起定时器；recovering 幂等，防反复切标签叠加出多轮重连。
+async function recoverConnection(h) {
+  if (recovering) return
+  recovering = true
+  try {
+    await warn('远端连接已失效（主机休眠或网络中断），正在重连…')
+    // 清粘性意图是必须的（spec §8.2）：后端探针经 AcquireList → markSessionConnected 会把
+    // 粘性 Connected 置 true，"探针说失效"与"粘性已置位"会同时成立，不清就会翻回"已连接"。
+    // 断开失败静默（§10）：它的失败不影响后面的重新握手。
+    try { await SftpDisconnect(h) } catch { /* 清理失败不中断自愈 */ }
+    connected.value = false
+    remoteItems.value = []
+    sel.clear(remoteSelection) // 与 disconnect() 的降级形态一致 ⇒ §5.3 置灰规则自动生效
+    // 不写 pendingPath（v1.7 修正 / 审核 F6）：pendingPath 是落点优先级 1，把记忆值塞进去会让
+    // resolveRemoteTarget 返回 fromMemory === false ⇒ §6.5「仅来自记忆才回落 home」在自愈路径
+    // 永不触发（R3 承诺失效）。什么都不设才对：下面的重连会在优先级 3 自取同一记忆值。
+    await connect()
+    // 用户已切主机：静默早退，不记「重连失败」（那条日志是噪音且误导，spec §8.3 步骤 6 例外）
+    if (host.value !== h) return
+    // connect() 不返回值也不 rethrow ⇒ 成功/失败判据只能是 connected.value（审核 FF14）
+    if (connected.value) await info('已重新连接 ' + h)
+    else await err('重连失败：连接未建立，请手动点「连接」')
+  } finally {
+    recovering = false
+  }
 }
 
 // 取列表的**裸函数**：只做「取列表 + 抛错」（spec §6.5）。
@@ -371,7 +482,8 @@ async function goRemote(target) {
     if (seq !== remoteSeq) return
     remotePath.value = prevPath
     remoteItems.value = prevItems
-    err('无法打开 ' + target + '：' + String((e && e.message) || e))
+    // §8.4 第 4 项：远程导航失败是"链路可能已失效"的信号之一（D14）⇒ 交给统一归口记原文 + 复核。
+    await remoteOpFailed(e)
   } finally { if (seq === remoteSeq) remoteLoading.value = false }
 }
 
@@ -382,7 +494,8 @@ async function goRemoteHome() {
   if (!host.value) { err('请先选择主机'); return }
   if (!connected.value) { pendingHome.value = true; await connect(); return }
   let home = '/'
-  try { home = await SftpHome(host.value) } catch (e) { err(e); return }
+  // §8.4 第 5 项：SftpHome 是纯远程调用，失败同样要复核（它是用户点的动作，不是状态查询）。
+  try { home = await SftpHome(host.value) } catch (e) { await remoteOpFailed(e); return }
   return goRemote(home)
 }
 
@@ -717,7 +830,10 @@ async function removeSelected(pane) {
     } catch (e) {
       rec.status = '失败'
       rec.reason = String((e && e.message) || e)
-      err(e)
+      // 混合面板（§8.4 第 6 项）：本地分支保留裸 err(e)，远程分支才归口复核
+      // —— 本地 IO 失败不是链路信号，混进去会白跑一次探活/重连。
+      if (pane === 'local') err(e)
+      else await remoteOpFailed(e)
     }
     rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
   }
@@ -740,7 +856,12 @@ async function renameItem(pane, it) {
       await SftpRename(host.value, '', posixJoin(remotePath.value, it.name), posixJoin(remotePath.value, newName))
       await loadRemote()
     }
-  } catch (e) { err(e) }
+  } catch (e) {
+    // 混合面板（§8.4 第 7 项）：本地重命名失败是本地面板的 IO 问题，不归口；
+    // 远程 SftpRename 失败才是链路信号。
+    if (pane === 'local') err(e)
+    else await remoteOpFailed(e)
+  }
   closeMenu()
 }
 
@@ -760,7 +881,11 @@ async function mkdirIn(pane) {
       await SftpMkdir(host.value, '', posixJoin(remotePath.value, name))
       await loadRemote()
     }
-  } catch (e) { err(e) }
+  } catch (e) {
+    // 混合面板（§8.4 第 8 项）：同上，只有远程分支归口。
+    if (pane === 'local') err(e)
+    else await remoteOpFailed(e)
+  }
 }
 
 // uploadPicked = 既有 upload() 的"选文件上传"分支：右键上传已由批量入口 runBatch 承接
@@ -779,7 +904,9 @@ async function uploadPicked() {
     await dispatchTransfer(t)
     await loadRemote()
   } catch (e) {
-    err(e)
+    // §8.4 第 9 项：uploadPicked 整条链路都是远程操作（PickLocalFile 失败也由这里兜底），
+    // 归口复核保证"面板仍显示已连接但上传一直报错"能被自愈。
+    await remoteOpFailed(e)
     if (t) {
       // 外层兜底：不得自己写终态（e-weak 结构性 pin），仍走共享终态落点。
       // t 有 id、正常已经过 dispatchTransfer/applyOutcome；这里只覆盖 dispatchTransfer
@@ -891,21 +1018,34 @@ async function onMoveDrop(pane, { item, event }) {
   }
   // 目标子目录内容未加载 → 先按需加载一次再判重（spec 决策 25）；Windows 上
   // os.Rename 目标存在会直接失败，所以必须走同一套冲突策略而不是硬干。
-  const targetItems = pane === 'local'
-    ? await ListLocal(targetDir)
-    : await SftpList(host.value, '', targetDir)
-  const existing = (targetItems || []).map((it) => it.name)
-  const prefix = base.replace(/\/+$/, '')
-  const planned = payload.names.map((n) => ({ name: n, src: prefix + '/' + n, dst: targetDir + '/' + n }))
-  const { clean, conflicts } = classify(planned, existing)
-  let run = clean
-  let skipped = conflicts
-  if (conflicts.length) {
-    const policy = await askConflict({ conflicts, total: planned.length, target: targetDir, hiddenSelected: 0 }, 0)
-    if (policy === null) return
-    const applied = applyPolicy(conflicts, policy, existing)
-    run = clean.concat(applied.run)
-    skipped = applied.skipped
+  //
+  // §8.4 第 10 项（审核 FF2）：这段加载原本在 try **之外**（唯一的 try 在下面的移动循环里）
+  // ⇒ 死链时 onMoveDrop 直接 reject，没有任何调用点接住它：无日志、无自愈、unhandled rejection。
+  // 把"目标子目录列表加载 + 冲突询问"一起纳入 try。
+  let run = []
+  let skipped = []
+  try {
+    const targetItems = pane === 'local'
+      ? await ListLocal(targetDir)
+      : await SftpList(host.value, '', targetDir)
+    const existing = (targetItems || []).map((it) => it.name)
+    const prefix = base.replace(/\/+$/, '')
+    const planned = payload.names.map((n) => ({ name: n, src: prefix + '/' + n, dst: targetDir + '/' + n }))
+    const cls = classify(planned, existing)
+    run = cls.clean
+    skipped = cls.conflicts
+    if (cls.conflicts.length) {
+      const policy = await askConflict({ conflicts: cls.conflicts, total: planned.length, target: targetDir, hiddenSelected: 0 }, 0)
+      if (policy === null) return
+      const applied = applyPolicy(cls.conflicts, policy, existing)
+      run = cls.clean.concat(applied.run)
+      skipped = applied.skipped
+    }
+  } catch (e) {
+    // 混合面板：本地分支保留裸 err(e)，远程分支归口复核（本地 IO 失败不是链路信号）
+    if (pane === 'local') err(e)
+    else await remoteOpFailed(e)
+    return
   }
   for (const t of skipped) {
     transfers.value.push({ direction: 'move', name: t.name, src: t.src, dst: t.dst, size: 0, status: '跳过', elapsed: 0 })
@@ -922,7 +1062,9 @@ async function onMoveDrop(pane, { item, event }) {
     } catch (e) {
       rec.status = '失败'
       rec.reason = String((e && e.message) || e)
-      err(e)
+      // §8.4 第 11 项：移动循环的失败同样按面板分派（本地 = 本地面板 IO，远程 = 链路信号）
+      if (pane === 'local') err(e)
+      else await remoteOpFailed(e)
     }
     rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
   }
@@ -1044,7 +1186,19 @@ function stopClock() {
 // 不再销毁视图，但首次挂载/后端 ControlPersist 过期时 UI 可能与真实连接不符。
 async function syncConnection() {
   const h = host.value
-  if (!h || connected.value) return
+  if (!h) return
+  if (connected.value) {
+    // 已连接：真探活复核（spec §8.3）。**不重置路径、不重载列表** —— 每次切标签跳目录
+    // 是不可接受的。probing 复用同一个去重标志：探针在飞时不并发第二次探活。
+    if (probing) return
+    probing = true
+    try {
+      // === 'lost' 是硬要求（审核 F1）：三态字符串配 !(await ...) 恒 false ⇒ 自愈永不触发。
+      if ((await probeTimed(h)) === 'lost') await recoverConnection(h)
+    } catch { /* 探针本身失败不改变现状（未知不是失效） */ }
+    finally { probing = false }
+    return
+  }
   try {
     const ok = await SftpConnected(h)
     if (host.value !== h || connected.value) return // await 期间状态已变
@@ -1265,8 +1419,9 @@ onUnmounted(() => {
       :hidden-selected="conflict.hiddenSelected" @confirm="onConflictConfirm" @cancel="onConflictCancel" />
 
     <!-- 只挂一个实例，用 :scope 切换面板（组件内用全局 querySelector 聚焦，两个实例会打架） -->
+    <!-- @failed：深搜是远程操作，失败必须进连接失效复核的同一个归口（spec §8.4 第 13 项） -->
     <SearchOverlay :visible="search.visible" :scope="search.pane" :host="host" :root="search.pane === 'local' ? localPath : remotePath"
-      @close="search.visible = false" @open-hit="openHit" />
+      @close="search.visible = false" @open-hit="openHit" @failed="remoteOpFailed" />
   </div>
 </template>
 
