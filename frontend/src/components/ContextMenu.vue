@@ -17,6 +17,12 @@ defineEmits(['action', 'close'])
    不补 flex-start 会让「图标 + 文字」整行居中、图标列错位。 */
 .menu :deep(button) { display: flex; justify-content: flex-start; width: 100%; height: auto; align-items: center; gap: 8px; text-align: left; background: none; border: none; padding: 6px 10px; color: var(--text); cursor: pointer; }
 .menu :deep(button:hover) { background: var(--surface-hover); }
+/* 禁用态（T10 / spec §5.4）：置灰 + 不可点。T12 的菜单矩阵用 `remoteDep && !connected`
+   把远依赖项置灰；没有这两条规则时 disabled 按钮看起来仍与可点项一模一样。
+   `cursor: default` 与 `:hover { background: none }` 都必须显式写：既有 `button:hover`
+   会把鼠标划过的禁用项照样点亮，与「灰＝不可点」的语义直接冲突。 */
+.menu :deep(button:disabled) { color: var(--text-faint); cursor: default; }
+.menu :deep(button:disabled:hover) { background: none; }
 .menu :deep(button.sep) { border-top: 1px solid var(--border); margin-top: 2px; }
 .menu :deep(.ic) { display: inline-block; width: 20px; text-align: center; flex-shrink: 0; }
 </style>
