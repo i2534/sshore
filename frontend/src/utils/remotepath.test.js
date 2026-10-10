@@ -65,7 +65,9 @@ describe('remotepath · resolveRemoteTarget', () => {
   })
 
   it('home 为 undefined 不崩，原样返回（调用方自己有 SftpHome 的 "/" 回落）', () => {
-    expect(resolveRemoteTarget()).toEqual({ path: undefined, fromMemory: false })
+    const noArg = resolveRemoteTarget()
+    expect('path' in noArg).toBe(true) // toEqual 忽略 undefined 属性 ⇒ 这条钉住「键必须存在」（T6 复核 Minor）
+    expect(noArg).toEqual({ path: undefined, fromMemory: false })
     expect(resolveRemoteTarget({})).toEqual({ path: undefined, fromMemory: false })
     expect(resolveRemoteTarget({ pendingHome: true })).toEqual({ path: undefined, fromMemory: false })
     expect(resolveRemoteTarget({ remembered: '/r' })).toEqual({ path: '/r', fromMemory: true })

@@ -48,6 +48,8 @@ export const useSftpUIStore = defineStore('sftpui', {
       return this.lastRemoteDirs[host] || ''
     },
     async setSort(pane, key, dir) {
+      // 非法 pane 直接忽略：否则会给 sort 增加垃圾键并多打一次「读回 + 写盘」（T7 复核 Minor）。
+      if (pane !== 'local' && pane !== 'remote') return
       const next = normalizeSort({ key, dir })
       const cur = this.sort[pane]
       // 无变化短路要覆盖**整条** setSort：连 saveSnapshot() 里的"读回"都不该发生，

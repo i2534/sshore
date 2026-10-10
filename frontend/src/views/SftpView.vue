@@ -105,6 +105,7 @@ async function dispatchTransfer(rec) {
   // 把新主机写成"已连接"就是撒谎。
   const h = host.value
   rec.startedAt = Date.now()
+  let endedAt = 0 // 终态时刻在 catch 首行锁定：探活/重连最长约 15s，不得算进「耗时」（T13 复核 Minor）
   try {
     if (rec.direction === 'download') {
       await (rec.isDir ? SftpGetDir(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath) : SftpGet(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath))
@@ -119,6 +120,7 @@ async function dispatchTransfer(rec) {
     // 回写 connected 让行菜单/工具栏刷新不再被置灰规则跳过。守卫见上面的快照注释。
     if (host.value === h && !connected.value) connected.value = true
   } catch (e) {
+    endedAt = Date.now()
     // 抛错时是否算「取消」由 cancelFailed 区分：Cancel 明确返回 false（未能取消）之后，
     // 这次失败是无关失败，绝不栽给取消（评审 I3）。
     applyOutcome(rec, { ok: false, error: e })
@@ -127,7 +129,7 @@ async function dispatchTransfer(rec) {
     if (rec.cancelRequested) err(e)
     else await remoteOpFailed(e)
   }
-  rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
+  rec.elapsed = Math.floor(((endedAt || Date.now()) - rec.startedAt) / 1000)
   return rec.status
 }
 
@@ -427,7 +429,9 @@ async function connect() {
       }
     }
     await loadRemote()
-    await locations.addRemoteRecent(h, remotePath.value)
+    // 记账（配置写盘）失败不得被外层 catch 判成「连接失败」：只记日志，不改 connected/pending
+    // 语义（T11 复核 out-of-scope 观察；与 loadRemote 内的记账同形）。
+    try { await locations.addRemoteRecent(h, remotePath.value) } catch (e) { err(e) }
   } catch (e) {
     err(e)
     // 失败路径也要消费掉两个 pending 标志（onNavigate 对 pendingPath 的补偿只覆盖它自己那条
@@ -456,7 +460,8 @@ async function goLocal(target) {
     if (seq !== localSeq) return
     localItems.value = items
     sel.clear(localSelection)
-    await locations.addLocalRecent(target)
+    // 同 goRemote：记账失败不得触发本地面板回滚。
+    try { await locations.addLocalRecent(target) } catch (e) { err(e) }
   } catch (e) {
     if (seq !== localSeq) return
     localPath.value = prevPath
@@ -477,7 +482,8 @@ async function goRemote(target) {
     if (seq !== remoteSeq) return
     remoteItems.value = items
     sel.clear(remoteSelection)
-    await locations.addRemoteRecent(host.value, target)
+    // 同 connect：记账失败不得触发导航回滚或探活（否则「写盘失败」会被记成「导航失败 + 链路失效」）。
+    try { await locations.addRemoteRecent(host.value, target) } catch (e) { err(e) }
   } catch (e) {
     if (seq !== remoteSeq) return
     remotePath.value = prevPath

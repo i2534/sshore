@@ -220,4 +220,18 @@ describe('sftpui store', () => {
     // 不触碰 loaded / sort 等其它状态
     expect(JSON.stringify({ loaded: s.loaded, sort: s.sort })).toBe(meta)
   })
+
+  it('setSort 忽略非法 pane：不改 state、一次 IPC 都不发（T7 复核 Minor）', async () => {
+    const s = useSftpUIStore()
+    await s.load()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+    const before = JSON.stringify(s.sort)
+
+    await s.setSort('bogus', 'size', -1)
+
+    expect(JSON.stringify(s.sort)).toBe(before)
+    expect(GetSftpUI).not.toHaveBeenCalled()
+    expect(SaveSftpUI).not.toHaveBeenCalled()
+  })
 })
