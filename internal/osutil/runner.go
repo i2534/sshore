@@ -21,9 +21,13 @@ type Outcome struct {
 type Runner func(name string, args ...string) (Outcome, error)
 
 // NewRunner returns a Runner backed by os/exec. Blocking (cmd.Run); for short-lived commands only.
+//
+// 真实 exec 的**唯一一层**：只有这里（以及 NewCtxRunner / realSpawner / StartPipes）
+// 把命令名交给 resolveOpenSSH 解析（见 execpath.go）。调用方仍然传字面 "ssh"/"sftp"，
+// 所以注入假 Runner/Spawner 的既有测试看到的仍是裸名，行为不受影响。
 func NewRunner() Runner {
 	return func(name string, args ...string) (Outcome, error) {
-		cmd := exec.Command(name, args...)
+		cmd := exec.Command(resolveExecName(name), args...)
 		procAttrHideConsole(cmd)
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
@@ -39,7 +43,7 @@ type CtxRunner func(ctx context.Context, name string, args ...string) (Outcome, 
 
 func NewCtxRunner() CtxRunner {
 	return func(ctx context.Context, name string, args ...string) (Outcome, error) {
-		cmd := exec.CommandContext(ctx, name, args...)
+		cmd := exec.CommandContext(ctx, resolveExecName(name), args...)
 		procAttrHideConsole(cmd)
 		isolateAndCancel(cmd)
 		var stdout, stderr bytes.Buffer
@@ -110,7 +114,7 @@ func (realSpawner) Start(name string, args []string, onLine func(string)) (*Proc
 }
 
 func (realSpawner) StartStream(name string, args []string, h StreamHandlers) (*Process, error) {
-	cmd := exec.Command(name, args...)
+	cmd := exec.Command(resolveExecName(name), args...)
 	procAttrHideConsole(cmd)
 	p := &Process{cmd: cmd, done: make(chan Outcome, 1)}
 
@@ -234,7 +238,7 @@ const pipedStderrKeep = 16 * 1024
 // StartPipes 起一个长驻子进程并交出三路裸管道。
 // stderr 必须由本原语自己 drain —— 调用方不读也不会把 64KB 管道写满而假死。
 func StartPipes(name string, args ...string) (*PipedProcess, error) {
-	cmd := exec.Command(name, args...)
+	cmd := exec.Command(resolveExecName(name), args...)
 	procAttrHideConsole(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
