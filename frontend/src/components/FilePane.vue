@@ -3,6 +3,7 @@ import { ref, computed, watch, onUnmounted } from 'vue'
 import { positionGroups } from '../utils/positions'
 import { isImeCommit } from '../utils/pathbar'
 import { selectionLabel, filterClearVisible, EMPTY_FILTER_HINT } from '../utils/panefooter'
+import { nextSort } from '../utils/sort'
 
 const props = defineProps({
   title: String,
@@ -25,8 +26,13 @@ const props = defineProps({
   // 位置下拉里的固定预设与 Windows 盘符，由父组件按面板给出（内容来自 ListPresets）。
   presets: { type: Array, default: () => [] },
   disks: { type: Array, default: () => [] },
+  // 排序状态已上收（规格 §7.3）：本组件不再持有 sortKey/sortDir，只按 props 渲染、
+  // 点列头时用 utils/sort.nextSort 算好「下一个方向」emit 出去，由父组件（T11 起是 sftpui store）持久化。
+  // 默认值是硬要求：父层接线前不传这两个 prop，缺省必须能正常渲染。
+  sortKey: { type: String, default: 'name' },
+  sortDir: { type: Number, default: 1 },
 })
-const emit = defineEmits(['select', 'open', 'context', 'visible', 'focus', 'dragstart', 'dropon', 'clear', 'action', 'pick-position', 'toggle-bookmark', 'search', 'navigate'])
+const emit = defineEmits(['select', 'open', 'context', 'visible', 'focus', 'dragstart', 'dropon', 'clear', 'action', 'pick-position', 'toggle-bookmark', 'search', 'navigate', 'sort'])
 const menuOpen = ref(false)
 
 // ===== 路径栏（可编辑）=====
@@ -120,25 +126,20 @@ function onListBlankClick() { upActive.value = false; emit('clear') }
 
 function pick(name) { menuOpen.value = false; emit('action', name) }
 
-// Sort state: key in 'name' | 'size' | 'modTime'; dir 1 = asc, -1 = desc.
-const sortKey = ref('name')
-const sortDir = ref(1)
+// Sort state（上收为 props）: key in 'name' | 'size' | 'modTime'; dir 1 = asc, -1 = desc.
 // 面板聚焦态：仅用于视觉提示；父组件凭 focus 事件决定键盘作用于哪个面板。
 const focus = ref(false)
 
+// 只负责算「下一个方向」并上抛：同列取反、换列归升序（语义与旧内部 ref 版逐字一致），
+// 实现唯一来源是 utils/sort.nextSort（T6），这里绝不复制一份取反逻辑。
 function sortBy(key) {
-  if (sortKey.value === key) {
-    sortDir.value *= -1 // same column: toggle direction
-  } else {
-    sortKey.value = key
-    sortDir.value = 1 // new column: default ascending
-  }
+  emit('sort', nextSort({ key: props.sortKey, dir: props.sortDir }, key))
 }
 
 const visible = computed(() => {
   let list = props.showHidden ? props.items : props.items.filter(it => !it.name.startsWith('.'))
-  const key = sortKey.value
-  const dir = sortDir.value
+  const key = props.sortKey
+  const dir = props.sortDir
   const sorted = [...list].sort((a, b) => {
     let cmp
     if (key === 'size') {
@@ -177,8 +178,10 @@ function hit(text) {
   return { pre: text.slice(0, i), mid: text.slice(i, i + q.length), post: text.slice(i + q.length) }
 }
 
+// 列头箭头读源必须是 props（审核 FF1）：它与 visible() 同时不持有状态，
+// 只要漏改一处就是渲染期 ReferenceError、整块面板白屏。
 function arrow(key) {
-  return sortKey.value === key ? (sortDir.value === 1 ? '▲' : '▼') : ''
+  return props.sortKey === key ? (props.sortDir === 1 ? '▲' : '▼') : ''
 }
 
 function fmtSize(bytes) {

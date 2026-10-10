@@ -198,6 +198,37 @@ describe('面板四段结构与列共轨', () => {
   })
 })
 
+describe('排序状态上收（props + emit sort）', () => {
+  it('排序读 props：无本地 ref、无 *.value 残留、emits 含 sort', () => {
+    expect(filePane).not.toContain('const sortKey = ref(')
+    expect(filePane).not.toContain('const sortDir = ref(')
+    // 审核 FF1（Blocking）：arrow() 与 visible() 同作用域，删 ref 只改其一 ⇒ 渲染期 ReferenceError、
+    // 整块面板白屏。这条断言专门抓漏改的 *.value 残留（渲染测试只能覆盖到 visible/arrow 都被调用到的路径）。
+    expect(filePane).not.toMatch(/sortKey\.value|sortDir\.value/)
+    expect(filePane).toMatch(/defineEmits\(\[[^\]]*'sort'/)
+    expect(filePane).toContain("from '../utils/sort'")
+  })
+
+  it('props 声明带安全默认值，模板 active 直接读 props 名', () => {
+    // 默认值是硬要求：T11 接线前 SftpView 不传这两个 prop，缺省必须能正常渲染而不是 undefined 排序
+    expect(filePane).toMatch(/sortKey:\s*\{\s*type:\s*String,\s*default:\s*'name'\s*\}/)
+    expect(filePane).toMatch(/sortDir:\s*\{\s*type:\s*Number,\s*default:\s*1\s*\}/)
+    expect(filePane).toContain(":class=\"{ active: sortKey === 'name' }\"")
+    expect(filePane).toContain(":class=\"{ active: sortKey === 'size' }\"")
+    expect(filePane).toContain(":class=\"{ active: sortKey === 'modTime' }\"")
+  })
+
+  it('点列头 = 用 T6 的 nextSort 算好「下一个方向」再 emit（不在组件里复制取反实现）', () => {
+    expect(filePane).toMatch(/function sortBy\(key\)\s*\{\s*emit\('sort',\s*nextSort\(\{\s*key:\s*props\.sortKey,\s*dir:\s*props\.sortDir\s*\},\s*key\)\)\s*\}/)
+    expect(filePane).not.toMatch(/sortDir\s*\*=\s*-1/) // 旧实现残留即红
+  })
+
+  it('arrow() 与 visible() 的读源都是 props（两处必须同改）', () => {
+    expect(filePane).toMatch(/function arrow\(key\)\s*\{\s*return\s+props\.sortKey === key \? \(props\.sortDir === 1 \? '▲' : '▼'\) : ''\s*\}/)
+    expect(filePane).toMatch(/const visible = computed\(\(\)\s*=>\s*\{[\s\S]*?props\.sortKey[\s\S]*?props\.sortDir/)
+  })
+})
+
 describe('过滤栏的多选入口', () => {
   it('三个按钮都在过滤栏里，且都 emit(action, ...)', () => {
     const bar = filePane.split('data-role="filterbar"')[1]
