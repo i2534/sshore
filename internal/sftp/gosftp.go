@@ -1769,8 +1769,13 @@ func (g *GoBackend) Cancel(id string) bool {
 // 退出（CloseAll 的登记表）或本地 7 天陈旧清理（CleanupStaleLocalParts，仅本地）。
 //
 // 这里做**有界、尽力而为**的清理：只删「名字是内部临时文件，且与本次目标同名或本次 id 的
-// 退化短名」的条目，绝不误删同一子树里另一条传输的 .part（isPartForTarget 的判据）。
-// 超出预算或删不掉都只发 warn，绝不让重试失败（清理是补偿动作，不是提交前置）。
+// 退化短名」的条目，绝不误删同一目录里另一条传输的 .part（isPartForTarget 的判据）。
+// 删不掉都只发 warn，绝不让重试失败（清理是补偿动作，不是提交前置）。
+// 本地侧（cleanupTreeParts）按整棵本地子树遍历，条目数/深度有硬上限；远端侧
+// （cleanupRemoteTreeParts）自 2026-10-10 复核轮 2 起只扫本树会写到的目录集合，不再递归。
+//
+// 清理的**不是** backup-swap 的 .bak：bak 名后缀是 "bak-" 而非 "<shortID>-"，过不了
+// isPartForTarget（见该函数注释；由 TestBakFilesAreNotCleaned 钉住）。
 //
 // 调用点：GetTree / PutTree 在**扫描成功之后、第一个文件开始传送之前**（此时已知根目录真实
 // 存在，也已知本次枚举出的每个目标名）。扫描本身失败时没有已知目标，不做清理。
@@ -1797,7 +1802,12 @@ func isPartForTarget(basename, target, id string) bool {
 	}
 	// 命名规则（partname.go）：
 	//   常规名  <target><marker><shortID(id)>-<rand>   ⇒ marker 不在开头
-	//   退化名  <marker><shortID(id)>-<rand>            ⇒ marker 在开头（bak 同理但前缀是 bak-）
+	//   退化名  <marker><shortID(id)>-<rand>            ⇒ marker 在开头
+	// backup-swap 的 bak（<target><marker>bak-<rand> / <marker>bak-<rand>）**两个分支都不命中**：
+	// 它的后缀是 "bak-"，不是 "<shortID>-"。也就是说本函数与调用它的清理都**不删 .bak**
+	// （2026-10-10 复核轮 2 / Minor-3：旧注释写成「.part/.bak 都清」是与实现不符的误导）。
+	// 要清 bak 必须新加判据 —— 那会扩大删除面：bak 名里没有 id，无法区分「我们这次留下的」
+	// 与「别人/别的时刻留下的」。故本轮只改注释、加断言，不动实现（不为对齐注释而扩大删除面）。
 	// marker 之后必须是本次 id 的短前缀：只比对 <target> 会把同目录里**别的 id** 的
 	// 临时文件一并算成自己的（那正是误删风险）。
 	suffix := basename[idx+len(PartMarker):]
