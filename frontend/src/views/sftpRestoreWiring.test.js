@@ -48,6 +48,14 @@ describe('SFTP 启动恢复 / 落点决策 / 失效回落接线', () => {
     expect(src).toMatch(/sftpui\.load\(\)\.catch\(err\)|try\s*\{[^}]*sftpui\.load\(\)/)
   })
 
+  it('loadRemote 的 catch 不外泄 rejection（F1：openRemote/工具栏刷新都不接住它）', () => {
+    const fn = src.match(/async function loadRemote\(\)[\s\S]*?\n\}/)[0]
+    const tail = fn.slice(fn.lastIndexOf('catch (e) {'))
+    expect(tail).toMatch(/remoteOpFailed\(e\)/)
+    // 中间态（T13 未落地 remoteOpFailed）与 T13 落地后都必须把 rejection 终结在链内
+    expect(tail).toMatch(/\.catch\(err\)/)
+  })
+
   it('排序接线（审核 F9，最后一米）', () => {
     expect((src.match(/@sort="onSort\('/g) || []).length).toBe(2)
     expect(src).toContain(':sort-key="sftpui.sort.local.key"')
@@ -66,6 +74,31 @@ describe('SFTP 启动恢复 / 落点决策 / 失效回落接线', () => {
     expect(fn).toContain('fromMemory')
     expect(fn).toMatch(/if \([^)]*fromMemory/) // 回落必须被 fromMemory 守卫（B2：显式指定的路径不许偷偷改道）
     expect(fn).toMatch(/warn\('上次的远程目录/) // 审核 F7：级别是 warn，不是 err()
+  })
+
+  it('connect 失败路径清掉两个 pending 标志（F3：残留会让下一次「连接」落错点）', () => {
+    const fn = src.match(/async function connect\(\)\s*\{([\s\S]*?)\n\}/)[1]
+    const tail = fn.slice(fn.lastIndexOf('catch (e) {'))
+    expect(tail).toContain("pendingPath.value = ''")
+    expect(tail).toContain('pendingHome.value = false')
+  })
+
+  it('syncConnection 回落 home 的第二发不落进静默 catch（F2：零日志 + remotePath 与 items 脱节）', () => {
+    const fn = src.match(/async function syncConnection\(\)\s*\{([\s\S]*?)\n\}/)[1]
+    expect(fn).toMatch(/catch \(e2\)/) // 第二发有自己的兜错
+    expect(fn).toMatch(/err\(e2\)/) // 且必须记原文（§6.5 明写要记日志）
+    const iCatch2 = fn.indexOf('catch (e2)')
+    const iCommit = fn.indexOf('remotePath.value = home')
+    const iReturn = fn.indexOf('return', iCatch2)
+    expect(iCommit).toBeGreaterThan(iCatch2) // 失败分支 return 之后才允许提交 home
+    expect(iCommit).toBeGreaterThan(iReturn)
+  })
+
+  it('warn()/info() helper 的 level 必须是 warn/info（F7 本体：err() 硬编码 error）', () => {
+    const warnFn = src.match(/async function warn\(msg\)\s*\{([\s\S]*?)\n\}/)[1]
+    const infoFn = src.match(/async function info\(msg\)\s*\{([\s\S]*?)\n\}/)[1]
+    expect(warnFn).toContain("level: 'warn'")
+    expect(infoFn).toContain("level: 'info'")
   })
 
   it('取列表函数抽取：loadRemote/loadLocal 包装会抛错的 fetch*', () => {

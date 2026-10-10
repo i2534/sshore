@@ -248,11 +248,18 @@ async function loadRemote() {
     // 审核 F10：双击进目录（openRemote）与工具栏刷新都只经这里，不补记则最常用的手势
     // 永远不写 last_remote_dirs（本地侧 loadLocal 本来就记，这正是两侧不对称的来源）。
     // 不增加写盘：locations.addRemoteRecent 有队首短路，记录无变化时不发 IPC。
-    if (seq === remoteSeq) await locations.addRemoteRecent(host.value, remotePath.value)
+    // 记账独立兜错（顺序不变：取列表成功后才记，且同受 seq 守卫）：写盘失败是本地 IO
+    // 故障、不是链路信号，混进外层 catch 会把"后端写盘失败"误诊成"连接已断"，白跑一次探活/重连。
+    if (seq === remoteSeq) {
+      try { await locations.addRemoteRecent(host.value, remotePath.value) } catch (e) { err(e) }
+    }
   }
   // 审核 F5：本轮语义变更 —— 记原文 + 一次探活复核（可能自愈），不再只是 err(e)。
   // 故意不 await：探活最多 15s，await 会把 loading 与调用方（如 runBatch 收尾）一起拖住。
-  catch (e) { remoteOpFailed(e) }
+  // 但"不 await"绝不能变成"外泄 rejection"：调用点（openRemote / 工具栏刷新 / removeSelected…）
+  // 都不接住 loadRemote()，这里同步抛出（T13 落地 remoteOpFailed 之前它是未定义标识符）就会
+  // 直接变成 unhandled rejection。故把调用放进一条内部已终结的 Promise 链，rejection 一律落进 err。
+  catch (e) { void Promise.resolve().then(() => remoteOpFailed(e)).catch(err) }
   finally { if (seq === remoteSeq) remoteLoading.value = false }
 }
 
@@ -312,6 +319,11 @@ async function connect() {
     await locations.addRemoteRecent(h, remotePath.value)
   } catch (e) {
     err(e)
+    // 失败路径也要消费掉两个 pending 标志（onNavigate 对 pendingPath 的补偿只覆盖它自己那条
+    // 调用链；连接按钮 / 位置下拉 / goRemoteHome 留下的标志无人清）：残留会让**下一次**
+    // 「连接」落到上一次没成功的 home 或目录，正是 B1/SF4 那类静默失效。
+    pendingPath.value = ''
+    pendingHome.value = false
     if (host.value === h) connected.value = false
   }
 }
@@ -1007,8 +1019,20 @@ async function syncConnection() {
       try {
         await fetchRemote(target.path)
       } catch (e) {
+        // 第二发（回落 home）单独兜错：这里是 syncConnection 的外层静默 catch（状态查询语义）
+        // 之外的用户可见失败，落进外层就**零日志**（§6.5 明写要记日志），还会跳过 loadRemote()
+        // 而把 remotePath 改成 home、items 仍是上一个主机的旧值。
+        try {
+          await fetchRemote(home)
+        } catch (e2) {
+          // 回落本身也失败（§6.5：不做二次回落）：1) 必须记原文（不许落进外层静默 catch）；
+          // 2) connected/loading 与 connect 的失败路径同语义（不谎报已连接，也不再跑 loadRemote）；
+          // 3) 不提交 home —— 列不出来的目录不该成为 remotePath（保持与 items 同源）。
+          err(e2)
+          if (host.value === h) connected.value = false
+          return
+        }
         remotePath.value = home
-        await fetchRemote(home)
         warn('上次的远程目录 ' + target.path + ' 已不可用，已回到 ' + home)
       }
     }
