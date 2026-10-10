@@ -2,7 +2,8 @@
 
 - 仓库 / 分支：`sshkit` @ `feat/sftp-refresh-persist-connloss`（未切分支、未 push）
 - 代码修复提交：`a5a6702`（GoBackend.PutTree）、`2420121`（BatchBackend.PutRecursive）
-- 文档/报告提交：`0ceb67f`（本报告首版入库；此后只补记短 SHA，实现与测量未再变动）
+- 文档/报告提交：`0ceb67f`（本报告首版入库）；其后仅 `eb06494` 调整了一个测试期望值的构造方式
+  （`putr` 脚本断言的本地路径按 `EvalSymlinks` 后构造，避免 Windows 上的大小写差异；**无行为变化**）
 - 触发证据：`real/REGRESSION-B.md` B-9（真机复现：`updir/` → `/home/lan/acc-b` 落成 `/home/lan/acc-b/updir/updir/a.txt`）
 - 本轮未改前端、未改刷新/持久化/自愈代码
 
