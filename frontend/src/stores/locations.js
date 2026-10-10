@@ -2,6 +2,9 @@ import { defineStore } from 'pinia'
 import {
   ListLocations, ListPresets, AddBookmark, RemoveBookmark, AddLocalRecent, AddRemoteRecent,
 } from '../../wailsjs/go/main/App'
+// 依赖方向单向：locations.js → sftpui.js（sftpui.js 绝不反向 import，避免成环）。
+// 镜像用到的 noteLocalPath/noteRemotePath 是纯内存 action，内部不发任何 IPC。
+import { useSftpUIStore } from './sftpui'
 
 export const useLocationsStore = defineStore('locations', {
   state: () => ({
@@ -43,15 +46,27 @@ export const useLocationsStore = defineStore('locations', {
     async addLocalRecent(path) {
       // 短路：队首已是同一路径 ⇒ 直接返回，不做 IPC、也不改列表。
       // 否则每次目录导航/刷新/批量重载都会写一次配置（后端 AddLocalRecent 每次 saveConfig）。
-      if (this.localRecents[0]?.path === path) return
+      if (this.localRecents[0]?.path === path) {
+        // 短路也要对齐镜像（幂等、无害）：sftpui.load() 失败时镜像是空串而这里队首非空，
+        // 此时短路正是唯一能修正镜像的机会（规格 §7.2 / 审核 FF17）。纯内存，零新增 IPC。
+        useSftpUIStore().noteLocalPath(path)
+        return
+      }
       await AddLocalRecent(path)
+      // 后端才是最后路径的唯一落盘出口（§6.3.3；失败会抛出、走不到这里，故不镜像）。
+      // 前端镜像只为让**同会话内**的"断开→重连"立刻拿到正确路径，不发任何绑定调用。
+      useSftpUIStore().noteLocalPath(path)
       this.localRecents = [{ path, ts: new Date().toISOString() }]
         .concat(this.localRecents.filter((r) => r.path !== path)).slice(0, 20)
     },
     async addRemoteRecent(host, path) {
-      // 同上：同一 (host, path) 已经在队首时不再写盘。
-      if (this.remoteRecents[0]?.host === host && this.remoteRecents[0]?.path === path) return
+      // 同上：同一 (host, path) 已经在队首时不再写盘，但镜像仍要对齐。
+      if (this.remoteRecents[0]?.host === host && this.remoteRecents[0]?.path === path) {
+        useSftpUIStore().noteRemotePath(host, path)
+        return
+      }
       await AddRemoteRecent(host, path)
+      useSftpUIStore().noteRemotePath(host, path)
       this.remoteRecents = [{ host, path, ts: new Date().toISOString() }]
         .concat(this.remoteRecents.filter((r) => !(r.host === host && r.path === path))).slice(0, 20)
     },
