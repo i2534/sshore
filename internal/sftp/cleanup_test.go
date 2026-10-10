@@ -152,6 +152,11 @@ func TestGoBackendGetTreeRetryCleansStaleParts(t *testing.T) {
 }
 
 // TestGoBackendPutTreeRetryCleansStaleRemoteParts：上传侧对称（远端登记的是 path 家族）。
+//
+// 2026-10-10 之后本用例还承担「清理边界」的取证：Remote 是**最终目标目录**，很可能是用户
+// 已有目录（此前它是 <remote>/<base> 这个为本棵树新建的专用目录）。因此重试前的清理
+// **只能**删「本树目标 basename + 本次 id」命中的临时文件：同目录里别的 id 的 .part 与
+// 同名普通业务文件都必须原样留下（判据见 isPartForTarget）。
 func TestGoBackendPutTreeRetryCleansStaleRemoteParts(t *testing.T) {
 	remoteRoot, src := t.TempDir(), t.TempDir()
 	makeLocalTree(t, src, map[string]string{"a/big.bin": string(bytes.Repeat([]byte("x"), 300<<10)), "a/b.bin": "bb"})
@@ -161,7 +166,7 @@ func TestGoBackendPutTreeRetryCleansStaleRemoteParts(t *testing.T) {
 	swapCopyStream(t, func(dstW io.Writer, srcR io.Reader) (int64, error) {
 		return io.Copy(dstW, io.LimitReader(srcR, 10))
 	})
-	err := g.PutTree(TransferRequest{ID: id, Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, nil)
+	err := g.PutTree(TransferRequest{ID: id, Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, nil)
 	if err == nil {
 		t.Fatal("短传必须报错（第一次）")
 	}
@@ -174,12 +179,21 @@ func TestGoBackendPutTreeRetryCleansStaleRemoteParts(t *testing.T) {
 	if err := os.WriteFile(foreign, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_ = g.PutTree(TransferRequest{ID: id, Host: "h", Remote: ".", Local: filepath.Join(src, "a"), Atomic: true}, nil)
+	// 普通业务文件，名字与「本树的一个目标」相同（不带 marker）：清理绝不可能碰它，
+	// 否则「按 basename 批量删除」的实现会在用户已有目录里误删业务文件。
+	business := filepath.Join(rootRemote, "big.bin")
+	if err := os.WriteFile(business, []byte("BIZ"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = g.PutTree(TransferRequest{ID: id, Host: "h", Remote: "a", Local: filepath.Join(src, "a"), Atomic: true}, nil)
 	if _, serr := os.Stat(stale); !os.IsNotExist(serr) {
 		t.Fatalf("重试前必须清掉本项遗留远端 .part, stat err=%v", serr)
 	}
 	if _, serr := os.Stat(foreign); serr != nil {
 		t.Fatalf("别的 id 的远端 .part 不得被误删: %v", serr)
+	}
+	if b, serr := os.ReadFile(business); serr != nil || string(b) != "BIZ" {
+		t.Fatalf("同名普通业务文件不得被清理逻辑删掉/改写: err=%v content=%q", serr, string(b))
 	}
 }
 
