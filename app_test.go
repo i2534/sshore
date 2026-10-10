@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -10,9 +11,11 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strings"
+	stdsync "sync"
 	"testing"
 	"time"
 
@@ -1109,6 +1112,311 @@ func TestAddRemoteRecentDedupesAndCaps(t *testing.T) {
 	}
 }
 
+// 规格 §6.3.2（审核 BF7 重写的判据）：last path 的写入**不受 recents 队首短路约束**。
+// 升级场景 = 老配置没有 last path（或值已过期）+ 队首恰好已是同一项：此时短路只能省掉
+// recents 的重排/刷新 TS，**不能**连 last path 一起省掉，否则用户的最后路径永远补不上。
+func TestAddRemoteRecentRecordsLastPathEvenWhenRecentHeadMatches(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.RemoteRecent = []config.RecentRemote{{Host: "prod", Path: "/r", TS: "2000-01-01T00:00:00Z"}}
+	a.cfg.SftpUI.LastRemoteDirs = nil // 老配置：没有 last path
+
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod"]; got != "/r" {
+		t.Fatalf("队首同值也必须写 last path（§6.3.2），得到 %q", got)
+	}
+	if got := a.cfg.RemoteRecent[0].TS; got != "2000-01-01T00:00:00Z" {
+		t.Fatalf("队首同值必须短路（TS 不得刷新），得到 %q", got)
+	}
+	if len(a.cfg.RemoteRecent) != 1 {
+		t.Fatalf("短路不得产生重复项: %+v", a.cfg.RemoteRecent)
+	}
+	// last path 变了 ⇒ 必须落盘一次（§6.3.2「其余情况 ⇒ 一次 saveConfig」）。
+	onDisk, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if got := onDisk.SftpUI.LastRemoteDirs["prod"]; got != "/r" {
+		t.Fatalf("last path 变化后必须落盘，磁盘上得到 %q", got)
+	}
+
+	// last path 存在但是旧值 ⇒ 同样必须更新，队首仍然短路。
+	a.cfg.SftpUI.LastRemoteDirs = map[string]string{"prod": "/old"}
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod"]; got != "/r" {
+		t.Fatalf("last path 旧值必须被更新为 %q，得到 %q", "/r", got)
+	}
+	if got := a.cfg.RemoteRecent[0].TS; got != "2000-01-01T00:00:00Z" {
+		t.Fatalf("队首同值必须短路（TS 不得刷新），得到 %q", got)
+	}
+}
+
+// 同构：本地侧的 LastLocalDir 不受 AddLocalRecent 的队首短路约束。
+func TestAddLocalRecentRecordsLastPathEvenWhenHeadMatches(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.LocalRecent = []config.RecentLocal{{Path: "/l", TS: "2000-01-01T00:00:00Z"}}
+	a.cfg.SftpUI.LastLocalDir = "" // 老配置：没有 last path
+
+	if err := a.AddLocalRecent("/l"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("队首同值也必须写 LastLocalDir（§6.3.2），得到 %q", got)
+	}
+	if got := a.cfg.LocalRecent[0].TS; got != "2000-01-01T00:00:00Z" {
+		t.Fatalf("队首同值必须短路（TS 不得刷新），得到 %q", got)
+	}
+	if len(a.cfg.LocalRecent) != 1 {
+		t.Fatalf("短路不得产生重复项: %+v", a.cfg.LocalRecent)
+	}
+	onDisk, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if got := onDisk.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("LastLocalDir 变化后必须落盘，磁盘上得到 %q", got)
+	}
+
+	a.cfg.SftpUI.LastLocalDir = "/old"
+	if err := a.AddLocalRecent("/l"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("LastLocalDir 旧值必须被更新为 %q，得到 %q", "/l", got)
+	}
+}
+
+// 空路径 = 无操作（收尾复核 Minor：AddLocalRecent 缺了 AddRemoteRecent 那条 host/path
+// 空值守卫，是真实的不对称）。
+//
+// 修前行为：AddLocalRecent("") 会把 LastLocalDir 清成 ""，并把一条 {Path: ""} 置顶进
+// LocalRecent，然后整份配置落盘 —— 即"一次误传的空路径可以静默清掉用户的最后本地目录"。
+// 修后行为：与 AddRemoteRecent(host == "" || path == "") 一致，两条入口（公开绑定
+// AddLocalRecent 与内部 addLocalRecentLocked）都直接返回 false ⇒ 内存态不动、绝不落盘。
+//
+// 同时钉住不回归：recordRecentSFTP 的 SftpHome 调用点传 localDir == ""（其守卫在调用点，
+// 与本守卫是两层），该路径修后照样不报错、不写空条目。
+func TestAddLocalRecentEmptyPathIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	a := NewApp()
+	a.cfgPath = filepath.Join(dir, "sshore.toml") // 绝不碰用户真实配置
+	a.cfg = config.DefaultAppConfig()
+	a.cfg.SftpUI.LastLocalDir = "/keep"
+	a.cfg.LocalRecent = []config.RecentLocal{{Path: "/l", TS: "2000-01-01T00:00:00Z"}}
+
+	if err := a.AddLocalRecent(""); err != nil {
+		t.Fatalf("空路径必须是无操作、不得报错: %v", err)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/keep" {
+		t.Fatalf("空路径不得改写 LastLocalDir，得到 %q（修前会被清成 \"\"）", got)
+	}
+	if len(a.cfg.LocalRecent) != 1 || a.cfg.LocalRecent[0].Path != "/l" {
+		t.Fatalf("空路径不得往 LocalRecent 追加空条目: %+v", a.cfg.LocalRecent)
+	}
+	// 不落盘：修前这里已经写出 LastLocalDir="" + 空条目
+	if _, err := os.Stat(a.cfgPath); !os.IsNotExist(err) {
+		onDisk, lerr := config.LoadConfig(a.cfgPath)
+		t.Fatalf("空路径不得落盘，磁盘上却是 LastLocalDir=%q LocalRecent=%+v (stat err=%v, load err=%v)",
+			onDisk.SftpUI.LastLocalDir, onDisk.LocalRecent, err, lerr)
+	}
+
+	// recordRecentSFTP 自身对空 localDir 的守卫（SftpHome 那条路径）：不得报错、不得写空条目、
+	// 不得清 last path。注意：这条在"给 AddLocalRecent 补空路径守卫"**之前也是绿的**（守卫本来就在
+	// recordRecentSFTP 内），属不变量校验，不是本轮修复的回归判别。
+	a.recordRecentSFTP("home-host", "/home/u", "", false)
+	if len(a.cfg.LocalRecent) != 1 || a.cfg.LocalRecent[0].Path != "/l" {
+		t.Fatalf("recordRecentSFTP 的空 localDir 不得写空条目: %+v", a.cfg.LocalRecent)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/keep" {
+		t.Fatalf("recordRecentSFTP 的空 localDir 不得改写 LastLocalDir，得到 %q", got)
+	}
+}
+
+// 规格 §6.3.1（审核 BF1 回归，Blocking）：后端内部的 recordRecentSFTP 一律不写 last path。
+// SftpHome 每次 connect 都被调用，若它顺带写 last path，单主机用户的最后路径会被静默
+// 改写成 home —— 而前端 store 的队首短路会让紧接着的 addRemoteRecent(记忆路径) 不发 IPC，
+// 于是本次会话落点仍正确、盘上已是 home，验收看不出来（最坏一类静默损坏）。
+func TestRecordRecentSFTPDoesNotTouchLastPath(t *testing.T) {
+	a := newTestApp(t)
+	// 先经公开绑定建立 last path（绑定层是唯一可写 last path 的入口）。
+	if err := a.AddRemoteRecent("prod", "/a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AddLocalRecent("/l"); err != nil {
+		t.Fatal(err)
+	}
+	if a.cfg.SftpUI.LastRemoteDirs["prod"] != "/a" || a.cfg.SftpUI.LastLocalDir != "/l" {
+		t.Fatalf("前置条件被破坏：last path 未建立 %#v / %q",
+			a.cfg.SftpUI.LastRemoteDirs, a.cfg.SftpUI.LastLocalDir)
+	}
+
+	a.recordRecentSFTP("prod", "/b", "/m", false)
+
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod"]; got != "/a" {
+		t.Fatalf("内部路径不得改写 LastRemoteDirs（SftpHome 会把它改成 home），得到 %q", got)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("内部路径不得改写 LastLocalDir，得到 %q", got)
+	}
+	if len(a.cfg.RemoteRecent) == 0 || a.cfg.RemoteRecent[0].Host != "prod" || a.cfg.RemoteRecent[0].Path != "/b" {
+		t.Fatalf("内部路径仍必须更新 RemoteRecent 队首为 {prod /b}: %+v", a.cfg.RemoteRecent)
+	}
+	if len(a.cfg.LocalRecent) == 0 || a.cfg.LocalRecent[0].Path != "/m" {
+		t.Fatalf("内部路径仍必须更新 LocalRecent 队首为 /m: %+v", a.cfg.LocalRecent)
+	}
+}
+
+// 并发红线（规格 §6.3.4 红线 3 / 用户 2026-10-10 扩大范围）：四个写入点与锁外 TOML
+// 编码（saveConfig 的浅拷贝快照）并发时，-race 不得报 DATA RACE。专抓
+// `kept := a.cfg.X[:0]`（复用底层数组）与 `append(a.cfg.Bookmarks, b)`（cap 有余量时
+// 写进共享底层数组）这两种原地写形状。
+func TestConfigWritesAreRaceFreeAgainstSaveConfig(t *testing.T) {
+	a := newTestApp(t) // cfgPath 在 t.TempDir()，绝不写用户真实配置
+	const n = 50
+	var wg stdsync.WaitGroup
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if err := a.AddRemoteRecent("prod", fmt.Sprintf("/r%d", i%5)); err != nil {
+				t.Errorf("并发 AddRemoteRecent 失败: %v", err) // t.Errorf 可跨 goroutine，Fatal 不可以
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if err := a.AddLocalRecent(fmt.Sprintf("/l%d", i%5)); err != nil {
+				t.Errorf("并发 AddLocalRecent 失败: %v", err)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		b := config.Bookmark{Name: "日志", Scope: "remote", Host: "prod", Path: "/var/log"}
+		for i := 0; i < n; i++ {
+			if err := a.AddBookmark(b); err != nil {
+				t.Errorf("并发 AddBookmark 失败: %v", err)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if err := a.RemoveBookmark("remote", "prod", "/var/log"); err != nil {
+				t.Errorf("并发 RemoveBookmark 失败: %v", err)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if err := a.saveConfig(); err != nil {
+				t.Errorf("并发 saveConfig 失败: %v", err)
+			}
+		}
+	}()
+	wg.Wait()
+
+	got := a.ListLocations()
+	seenR := map[string]bool{}
+	for _, e := range got.RemoteRecents {
+		k := e.Host + "\x00" + e.Path
+		if seenR[k] {
+			t.Fatalf("RemoteRecent 出现重复项: %q (%+v)", k, got.RemoteRecents)
+		}
+		seenR[k] = true
+	}
+	seenL := map[string]bool{}
+	for _, e := range got.LocalRecents {
+		if seenL[e.Path] {
+			t.Fatalf("LocalRecent 出现重复项: %q (%+v)", e.Path, got.LocalRecents)
+		}
+		seenL[e.Path] = true
+	}
+}
+
+// nil-map 写入（审核 I1 / 规格 §11.1）：App 由 `&config.AppConfig{}` 构造时
+// `SftpUI.LastRemoteDirs` 为 nil，直接 `LastRemoteDirs[host] = path` 会 panic。
+// 实现必须在 helper 内 make 新 map，本用例钉死这条路径（含内部 rememberLast=false）。
+func TestLastPathWriteOnBareConfigDoesNotPanic(t *testing.T) {
+	a := NewApp()
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
+	a.cfg = &config.AppConfig{} // 裸零值
+	if a.cfg.SftpUI.LastRemoteDirs != nil {
+		t.Fatal("前置条件被破坏：裸零值的 LastRemoteDirs 必须为 nil")
+	}
+
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatalf("AddRemoteRecent: %v", err)
+	}
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod"]; got != "/r" {
+		t.Fatalf("nil map 上写 last path 必须由 helper 内 make 构造，得到 %q", got)
+	}
+	if err := a.AddLocalRecent("/l"); err != nil {
+		t.Fatalf("AddLocalRecent: %v", err)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("LastLocalDir = %q", got)
+	}
+	// 内部路径（rememberLast=false）也不得 panic。
+	a.recordRecentSFTP("prod2", "/r2", "/l2", false)
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod2"]; got != "" {
+		t.Fatalf("rememberLast=false 不得写 last path，得到 %q", got)
+	}
+}
+
+// 审核 I2 回归：`rememberLast == false` 的内部调用（模拟传输完成，每个文件一次）绝不
+// 额外落盘 —— 若把 last path 的比较放在 rememberLast 门控之外，map 永不更新 ⇒ 每次都判
+// changed ⇒ 每个文件一次全量 TOML 编码 + rename（正是 app.go 短路注释要避免的写放大）。
+//
+// 判据刻意不用 mtime（秒级粒度会假绿），而用**内容指纹 + 灵敏性对照**：先把磁盘写成哨兵
+// 配置，内存里放一个磁盘上没有的标记，则「任何一次 saveConfig」都会改变文件内容。
+func TestRecordRecentSFTPWithoutRememberLastDoesNotWriteConfig(t *testing.T) {
+	a := newTestApp(t)
+	if err := config.SaveConfig(a.cfgPath, config.DefaultAppConfig()); err != nil {
+		t.Fatalf("写哨兵配置失败: %v", err)
+	}
+	before, err := os.ReadFile(a.cfgPath)
+	if err != nil {
+		t.Fatalf("读哨兵配置失败: %v", err)
+	}
+	// 内存态：队首恰好同值（recents 走短路）、last path 留空（老配置升级形态）、
+	// 且带一个磁盘上没有的标记 —— 于是「有没有落盘」可由内容比对确定性地判定。
+	a.cfg.RemoteRecent = []config.RecentRemote{{Host: "prod", Path: "/r", TS: "2000-01-01T00:00:00Z"}}
+	a.cfg.SftpUI.LastRemoteDirs = nil
+	a.cfg.App.UpdateSkippedVersion = "memory-marker"
+
+	a.recordRecentSFTP("prod", "/r", "", false)
+
+	after, err := os.ReadFile(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("rememberLast=false 且队首同值的内部调用不得落盘（写放大回归）")
+	}
+	if a.cfg.SftpUI.LastRemoteDirs["prod"] != "" {
+		t.Fatalf("内部路径不得写 last path，得到 %q", a.cfg.SftpUI.LastRemoteDirs["prod"])
+	}
+
+	// 灵敏性对照：同一形态走公开绑定（rememberLast=true）时 last path 必须变 ⇒ 必落盘。
+	// 若这一段也认为「没落盘」，说明上面的内容指纹判据本身是假绿。
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatalf("AddRemoteRecent: %v", err)
+	}
+	after2, err := os.ReadFile(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if bytes.Equal(before, after2) {
+		t.Fatal("对照失败：last path 变化必须落盘，否则本用例的内容指纹判据是假绿")
+	}
+}
+
 func TestListPresetsReadsPresetsFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "presets.toml")
@@ -1313,6 +1621,255 @@ func TestSftpBindingsFailFastBeforeInit(t *testing.T) {
 	if a.sftpAtomic() {
 		t.Fatal("未就绪时不得声明原子提交能力")
 	}
+
+	// T3（规格 §6.3.4 红线 1 的 BF13）：cfg 尚未加载时 GetSftpUI/SaveSftpUI 同样
+	// 不得 panic。顺序是硬约束 —— **先 Get 后 Save**：SaveSftpUI 写锁内的 nil 守卫会
+	// 把 a.cfg 造出来，一旦先 Save，下面的 nil-cfg 分支就永不被执行（审核 I6）。
+	if a.cfg != nil {
+		t.Fatal("前置条件被破坏：此刻 a.cfg 必须仍为 nil，否则本用例的 nil-cfg 分支是假绿")
+	}
+	zero := a.GetSftpUI()
+	if zero.SortLocalKey != "name" || zero.SortLocalDir != 1 {
+		t.Fatalf("未加载配置时 GetSftpUI 必须返回归一化零值（本地排序 name/1），得到 %q/%d",
+			zero.SortLocalKey, zero.SortLocalDir)
+	}
+	if zero.SortRemoteKey != "name" || zero.SortRemoteDir != 1 {
+		t.Fatalf("未加载配置时 GetSftpUI 必须返回归一化零值（远端排序 name/1），得到 %q/%d",
+			zero.SortRemoteKey, zero.SortRemoteDir)
+	}
+	if zero.LastRemoteDirs == nil {
+		t.Fatal("未加载配置时 GetSftpUI 的 LastRemoteDirs 必须非 nil（前端不能拿到 null）")
+	}
+	// SaveSftpUI：要么成功、要么返回明确错误，但绝不能 panic（panic 会被 Wails
+	// dispatcher 静默 recover，前端只看到「点了没反应」）。锁内 nil 守卫必须
+	// 把 a.cfg 造出来，所以调用后 a.cfg 不允许仍为 nil。
+	//
+	// 落盘路径必须先指到临时目录：本 App 由 NewApp() 构造、cfgPath 为空，否则
+	// saveConfig() 会落到 config.DefaultConfigPath()。TestMain 只锚 APPDATA/
+	// XDG_CONFIG_HOME（其注释自认 darwin 未覆盖）⇒ 在 macOS 上会原子覆盖用户的
+	// 真实 ~/Library/Application Support/sshore/sshore.toml（T3 复核 Important）。
+	// 这不影响上面的 nil-cfg 覆盖：cfgPath 与 a.cfg 是两回事。
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
+	terr := a.SaveSftpUI(config.SftpUIState{
+		LastLocalDir:   "/tmp/last",
+		LastRemoteDirs: map[string]string{"prod": "/srv"},
+		SortLocalKey:   "size", SortLocalDir: -1,
+		SortRemoteKey: "modTime", SortRemoteDir: -1,
+	})
+	if a.cfg == nil {
+		t.Fatal("SaveSftpUI 的锁内 nil 守卫必须建立 a.cfg（否则下一行就是空指针）")
+	}
+	if terr != nil {
+		t.Logf("未 Init 时 SaveSftpUI 返回明确错误（可接受，不得 panic）: %v", terr)
+	}
+	if a.cfg.SftpUI.LastLocalDir != "/tmp/last" || a.cfg.SftpUI.SortLocalDir != -1 {
+		t.Fatalf("SaveSftpUI 必须完成整结构赋值，得到 %#v", a.cfg.SftpUI)
+	}
+}
+
+// --- Task 3: SFTP 视图状态（[sftp_ui]）读写绑定 ---
+
+// 六个键必须逐字命中 config.SftpUIState 的 json tag：SaveSftpUI 由 Wails 按
+// json tag 精确解码，前端写成 lastLocalDir 这类 camelCase 会被**静默忽略**
+// ⇒ 字段被清零（规格 §6.3.3 红线）。此用例把键名钉死，改名即红。
+func TestSftpUIStateJSONKeysAreVerbatim(t *testing.T) {
+	raw, err := json.Marshal(config.SftpUIState{LastRemoteDirs: map[string]string{"prod-01": "/srv"}})
+	if err != nil {
+		t.Fatalf("json.Marshal(SftpUIState) 失败: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("反解 SftpUIState 的 JSON 失败: %v", err)
+	}
+	want := []string{
+		"last_local_dir", "last_remote_dirs",
+		"sort_local_key", "sort_local_dir",
+		"sort_remote_key", "sort_remote_dir",
+	}
+	if len(m) != len(want) {
+		t.Fatalf("SftpUIState 的 JSON 键应恰为 %d 个，得到 %d 个：%s", len(want), len(m), raw)
+	}
+	for _, k := range want {
+		if _, ok := m[k]; !ok {
+			t.Fatalf("SftpUIState 缺少逐字 JSON 键 %q（前端按此键名提交，写错即静默清零）: %s", k, raw)
+		}
+	}
+}
+
+// SaveSftpUI 必须把六字段整段落盘，且绝不动其它配置段。回读一律走
+// config.LoadConfig（只信磁盘），不只看内存。
+func TestSaveSftpUIPersistsAndKeepsOtherSections(t *testing.T) {
+	a := newTestApp(t)
+
+	// 夹具：四条其它段的条目。SyncRule **写全字段** —— LoadConfig 会归一 Syncs
+	// （Kind 空→dir、PollIntervalS 0→5、Excludes nil→默认集、AutoReconnect nil→全局默认），
+	// 只设部分字段会让本用例因与被测行为无关的归一面必红（审核 M2）。
+	autoReconnect := true
+	tunnels := []config.Tunnel{{
+		ID: "tun-1", Name: "prod", Mode: "local", Host: "prod-01",
+		ListenBind: "127.0.0.1", ListenPort: 18080,
+		TargetHost: "127.0.0.1", TargetPort: 8080,
+		AutoReconnect: true, Enabled: true,
+	}}
+	syncs := []config.SyncRule{{
+		ID: "sync-1", Name: "logs", Host: "prod-01", Kind: "file",
+		RemotePath: "/var/log/app.log", LocalPath: "/tmp/logs", MaxDepth: 2,
+		Excludes: []string{"*.tmp"}, MirrorDelete: true, ForcePoll: true,
+		PollIntervalS: 30, AutoReconnect: &autoReconnect, Enabled: true,
+	}}
+	bookmarks := []config.Bookmark{{Name: "日志目录", Scope: "remote", Host: "prod-01", Path: "/var/log"}}
+	remoteRecent := []config.RecentRemote{{Host: "prod-01", Path: "/srv", TS: "2026-10-10T01:02:03Z"}}
+	a.cfg.Tunnels = tunnels
+	a.cfg.Syncs = syncs
+	a.cfg.Bookmarks = bookmarks
+	a.cfg.RemoteRecent = remoteRecent
+
+	want := config.SftpUIState{
+		LastLocalDir:   "/home/lan/work",
+		LastRemoteDirs: map[string]string{"prod-01": "/var/log", "10.99.152.18": "/srv/app"},
+		SortLocalKey:   "size",
+		SortLocalDir:   -1,
+		SortRemoteKey:  "modTime",
+		SortRemoteDir:  1,
+	}
+	if err := a.SaveSftpUI(want); err != nil {
+		t.Fatalf("SaveSftpUI 失败: %v", err)
+	}
+
+	got, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if !reflect.DeepEqual(got.SftpUI, want) {
+		t.Fatalf("落盘后 [sftp_ui] 六字段必须逐字相等：\nwant %#v\n got %#v", want, got.SftpUI)
+	}
+	if !reflect.DeepEqual(got.Tunnels, tunnels) {
+		t.Fatalf("Tunnels 被 SaveSftpUI 影响：\nwant %#v\n got %#v", tunnels, got.Tunnels)
+	}
+	if !reflect.DeepEqual(got.Syncs, syncs) {
+		t.Fatalf("Syncs 被 SaveSftpUI 影响：\nwant %#v\n got %#v", syncs, got.Syncs)
+	}
+	if !reflect.DeepEqual(got.Bookmarks, bookmarks) {
+		t.Fatalf("Bookmarks 被 SaveSftpUI 影响：\nwant %#v\n got %#v", bookmarks, got.Bookmarks)
+	}
+	if !reflect.DeepEqual(got.RemoteRecent, remoteRecent) {
+		t.Fatalf("RemoteRecent 被 SaveSftpUI 影响：\nwant %#v\n got %#v", remoteRecent, got.RemoteRecent)
+	}
+	// 内存态同样只动了 SftpUI（其余段是整结构落盘的副本，未被重建）
+	if !reflect.DeepEqual(a.cfg.Tunnels, tunnels) || !reflect.DeepEqual(a.cfg.Syncs, syncs) {
+		t.Fatal("SaveSftpUI 不得改写内存中的 Tunnels/Syncs")
+	}
+}
+
+// 非法排序值必须在落盘前就被归一（前端拿不到 bogus/7），且 LastRemoteDirs
+// 归一后是**非 nil 空 map**（Normalize 对前端的承诺：不能拿到 null）。
+func TestSaveSftpUINormalizesInvalidSort(t *testing.T) {
+	a := newTestApp(t)
+	if err := a.SaveSftpUI(config.SftpUIState{SortLocalKey: "bogus", SortLocalDir: 7}); err != nil {
+		t.Fatalf("SaveSftpUI 失败: %v", err)
+	}
+	got, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if got.SftpUI.SortLocalKey != "name" || got.SftpUI.SortLocalDir != 1 {
+		t.Fatalf("非法 sort_local_* 必须归一为 name/1，得到 %q/%d",
+			got.SftpUI.SortLocalKey, got.SftpUI.SortLocalDir)
+	}
+	if got.SftpUI.SortRemoteKey != "name" || got.SftpUI.SortRemoteDir != 1 {
+		t.Fatalf("缺省 sort_remote_* 必须兜底为 name/1，得到 %q/%d",
+			got.SftpUI.SortRemoteKey, got.SftpUI.SortRemoteDir)
+	}
+	if got.SftpUI.LastRemoteDirs == nil {
+		t.Fatal("LastRemoteDirs 必须归一为非 nil 空 map（前端不得拿到 null），得到 nil")
+	}
+	if len(got.SftpUI.LastRemoteDirs) != 0 {
+		t.Fatalf("空 LastRemoteDirs 必须落成空 map，得到 %#v", got.SftpUI.LastRemoteDirs)
+	}
+}
+
+// 并发红线（规格 §6.3.4 红线 2）：GetSftpUI 绝不能把归一写回共享结构。
+// 本用例钉的是「经 a.cfg.SftpUI 原地归一」这一危险形状（`a.cfg.SftpUI.Normalize()`，
+// 已实测变红）；本实现是「值拷贝 + 解锁后归一」，天然不写 a.cfg。
+// 注意判别力边界：把 Normalize 挪进读锁但**仍作用于值拷贝 s** 的变体本用例抓不到
+// （值拷贝本就写不到共享结构），那一侧由 -race 用例覆盖并发写。
+func TestGetSftpUIDoesNotMutateSharedState(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.SftpUI.LastRemoteDirs = nil
+
+	got := a.GetSftpUI()
+	if got.LastRemoteDirs == nil {
+		t.Fatal("GetSftpUI 必须返回非 nil 的 LastRemoteDirs（Normalize 承诺）")
+	}
+	if a.cfg.SftpUI.LastRemoteDirs != nil {
+		t.Fatal("GetSftpUI 不得原地改写共享状态：a.cfg.SftpUI.LastRemoteDirs 必须仍为 nil")
+	}
+}
+
+// 契约固化（规格 §6.3.3 / §11.1）：SaveSftpUI 是**整结构覆盖** —— 只给 sort 四字段的
+// state 会把路径字段清零。这不是缺陷而是既定语义，与前端 saveSnapshot()「先 GetSftpUI
+// 读回、只覆盖 sort 四字段再整结构写回」的 T7 红线互为对照。本用例把该危险语义钉死：
+// 若有人把它"顺手"改成字段级合并，这里会红并提醒同步改前端契约。
+func TestSaveSftpUIWholeStructOverwriteIsPinned(t *testing.T) {
+	a := newTestApp(t)
+	full := config.SftpUIState{
+		LastLocalDir:   "/keep",
+		LastRemoteDirs: map[string]string{"prod-01": "/keep/remote"},
+		SortLocalKey:   "name", SortLocalDir: 1,
+		SortRemoteKey: "name", SortRemoteDir: 1,
+	}
+	if err := a.SaveSftpUI(full); err != nil {
+		t.Fatalf("首次 SaveSftpUI 失败: %v", err)
+	}
+
+	// 只给 sort 四字段：路径字段是零值。
+	sortOnly := config.SftpUIState{SortLocalKey: "size", SortLocalDir: -1, SortRemoteKey: "modTime", SortRemoteDir: -1}
+	if err := a.SaveSftpUI(sortOnly); err != nil {
+		t.Fatalf("二次 SaveSftpUI 失败: %v", err)
+	}
+
+	got, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if got.SftpUI.LastLocalDir != "" {
+		t.Fatalf("整结构覆盖必须清零 LastLocalDir（危险但既定），得到 %q", got.SftpUI.LastLocalDir)
+	}
+	if len(got.SftpUI.LastRemoteDirs) != 0 {
+		t.Fatalf("整结构覆盖必须清空 LastRemoteDirs，得到 %#v", got.SftpUI.LastRemoteDirs)
+	}
+	if got.SftpUI.SortLocalKey != "size" || got.SftpUI.SortLocalDir != -1 ||
+		got.SftpUI.SortRemoteKey != "modTime" || got.SftpUI.SortRemoteDir != -1 {
+		t.Fatalf("sort 四字段必须被本次整结构覆盖写入，得到 %#v", got.SftpUI)
+	}
+}
+
+// 并发：读绑定（每次都会 Normalize）与写绑定（整结构赋值 + 落盘）并发时，
+// -race 下必须无 DATA RACE 报告。专门抓「读锁内就地 Normalize」这类实现。
+func TestGetSftpUIAndSaveSftpUIRaceFree(t *testing.T) {
+	a := newTestApp(t) // cfgPath 在 t.TempDir()，绝不写用户真实配置
+	state := config.SftpUIState{
+		LastLocalDir:   "/home/lan/work",
+		LastRemoteDirs: map[string]string{"prod-01": "/var/log", "prod-02": "/srv"},
+		SortLocalKey:   "size", SortLocalDir: -1,
+		SortRemoteKey: "modTime", SortRemoteDir: -1,
+	}
+	const n = 100
+	var wg stdsync.WaitGroup
+	wg.Add(2 * n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			_ = a.GetSftpUI()
+		}()
+		go func() {
+			defer wg.Done()
+			if err := a.SaveSftpUI(state); err != nil {
+				t.Errorf("并发 SaveSftpUI 失败: %v", err) // t.Errorf 可跨 goroutine，Fatal 不可以
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // 回归：与 SFTP 同一条铁律 —— 控制器未装配（app.Init 还没跑）时 forward/sync 绑定
@@ -1440,6 +1997,12 @@ func TestEmitProgressWithoutContextIsNoop(t *testing.T) {
 func TestSftpOutputBindingsUsableUnderBatch(t *testing.T) {
 	// batch 的 Transfer* 是「真执行」：假 runner 对 sftp 批处理一律返回成功。
 	a := appWithFakeSFTP(t, "")
+	// 递归上传现在**真实遍历本地源树**（逐文件 put 到最终路径；2026-10-10 起不再依赖
+	// `put -r`，见 internal/sftp.PutRecursive），所以源目录必须真实存在。
+	localDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localDir, "a.txt"), []byte("A"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name string
 		run  func() error
@@ -1447,7 +2010,7 @@ func TestSftpOutputBindingsUsableUnderBatch(t *testing.T) {
 		{"SftpGet", func() error { return a.SftpGet("t1", "h", "u", "/r/a", "/l/a", true, "/l/a.part") }},
 		{"SftpGetDir", func() error { return a.SftpGetDir("t2", "h", "u", "/r/d", "/l/d", false, "") }},
 		{"SftpPut", func() error { return a.SftpPut("t3", "h", "u", "/l/a", "/r/a", false, "") }},
-		{"SftpPutRecursive", func() error { return a.SftpPutRecursive("t4", "h", "u", "/l/d", "/r/d", true, "/r/d.part") }},
+		{"SftpPutRecursive", func() error { return a.SftpPutRecursive("t4", "h", "u", localDir, "/r/d", true, "/r/d.part") }},
 	}
 	for _, tc := range cases {
 		if err := tc.run(); err != nil {
@@ -1554,5 +2117,38 @@ func TestPresetConvertersAreSymmetric(t *testing.T) {
 	got := presetEntries([]config.Preset{{Name: "b", Path: "/y"}})
 	if len(got) != 1 || got[0].Scope != "local" || got[0].Name != "b" || got[0].Path != "/y" {
 		t.Fatalf("scope 缺省应为 local 且字段不得丢：%+v", got)
+	}
+}
+
+// —— Task 2：SftpProbe 绑定（真探活）——
+
+// probeFailingBackend 是「列目录必失败」的 sftp.Backend 替身：用来钉住规格 §11.1
+// 「未连接的 host ⇒ SftpProbe 必须答 false」（审核 I6）。嵌入接口占位，只覆写被走到的
+// 方法（未覆写的方法真被调用会 nil panic，这是有意的，不静默通过）。
+type probeFailingBackend struct{ sftp.Backend }
+
+func (b *probeFailingBackend) List(string, string, string) ([]sftp.Item, error) {
+	return nil, errors.New("connection lost")
+}
+
+// TestSftpProbeFalseWhenListFails 走完整绑定链 App.SftpProbe → Ctrl.Probe → 后端：
+// 未连接的 host（探活用的列目录失败）必须答 false。粘性的 SftpConnected 在这种情况下
+// 仍会是 true（刻意不看池），所以这条用例正是「真探活」与「假已连接」的分界。
+func TestSftpProbeFalseWhenListFails(t *testing.T) {
+	a := NewApp()
+	a.sftp = sftp.NewCtrlForcedBackend(&probeFailingBackend{})
+	if a.SftpProbe("h") {
+		t.Fatal("列目录失败的 host（未连接）：SftpProbe 必须返回 false")
+	}
+}
+
+// TestSftpProbeFalseBeforeInit：控制器未装配（app.Init 还没跑，a.sftp 仍为 nil）时，
+// SftpProbe 必须答 false 且不 panic（与 SftpConnected 同构守卫）；Wails dispatcher 会
+// 静默 recover panic，前端只会看到「点了没反应」，所以必须显式钉住。
+func TestSftpProbeFalseBeforeInit(t *testing.T) {
+	a := NewApp() // 故意不调用 startup/Init：a.sftp 保持 nil
+
+	if a.SftpProbe("h") {
+		t.Fatal("未就绪时 SftpProbe 必须返回 false（不得 panic）")
 	}
 }

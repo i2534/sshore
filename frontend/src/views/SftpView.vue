@@ -1,8 +1,9 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpProbe, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import { useLocationsStore } from '../stores/locations'
+import { useSftpUIStore } from '../stores/sftpui'
 import SearchOverlay from '../components/SearchOverlay.vue'
 import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
@@ -21,11 +22,14 @@ import { payloadFor, payloadFromDragEvent, DRAG_MIME, pickDropPane, canDropInto 
 import { setSystemDropHandler } from '../utils/systemDrop'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
 import { resolvePathInput, REMOTE_HOME } from '../utils/pathbar'
+import { resolveRemoteTarget } from '../utils/remotepath'
 // 说明：StatPaths / CopyLocal / SftpMove / ListLocal / RenameLocal 已在既有 import 行里，
 // 这里**不重复声明**（重复 import 同名标识符会让 vite build 直接 SyntaxError）。
 
 const logStore = useLogStore()
 const locations = useLocationsStore()
+// 最后路径/排序的持久化 store（T7）：启动恢复、落点决策、排序写入的唯一真源。
+const sftpui = useSftpUIStore()
 // 浮层 watch 没有 immediate ⇒ visible 初值必须是 false，只由用户动作置 true。
 const search = reactive({ visible: false, pane: 'remote' })
 const hosts = ref([])
@@ -59,6 +63,9 @@ const connected = ref(false)
 // pendingPath：位置下拉点到"未连接的主机"时先记下目标目录，由 connect() 消费
 // （同机已连接则直接跳转，不走这里）。
 const pendingPath = ref('')
+// pendingHome：「主目录」按钮的**显式意图**（§6.4 B3 / D15）。不能再靠"空 pendingPath = home"
+// 这个隐含约定 —— 一旦插入"记忆路径"优先级，"主目录"就会被送回上次的目录。
+const pendingHome = ref(false)
 
 const transfers = ref([])
 
@@ -94,7 +101,11 @@ async function dispatchTransfer(rec) {
   rec.filesDone = undefined
   rec.filesTotal = undefined
   rec.phase = ''
+  // 主机身份快照（审核 F21）：回同步 connected 必须带守卫 —— await 期间用户可能已经切了主机，
+  // 把新主机写成"已连接"就是撒谎。
+  const h = host.value
   rec.startedAt = Date.now()
+  let endedAt = 0 // 终态时刻在 catch 首行锁定：探活/重连最长约 15s，不得算进「耗时」（T13 复核 Minor）
   try {
     if (rec.direction === 'download') {
       await (rec.isDir ? SftpGetDir(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath) : SftpGet(rec.id, host.value, '', rec.src, rec.dst, rec.resume, rec.partPath))
@@ -105,13 +116,20 @@ async function dispatchTransfer(rec) {
     // 即使 Cancel 返回过 true（提交已完成的窄窗口，Task 10 评审有真协议探测），也必须渲染为
     // 完成（"取消过晚"），绝不删掉已安装的目标文件。
     applyOutcome(rec, { ok: true })
+    // §8.5 一致性回同步（审核 FF16）：后端传输按需拨号 ⇒ 传输成功即"链路真的可用"，
+    // 回写 connected 让行菜单/工具栏刷新不再被置灰规则跳过。守卫见上面的快照注释。
+    if (host.value === h && !connected.value) connected.value = true
   } catch (e) {
+    endedAt = Date.now()
     // 抛错时是否算「取消」由 cancelFailed 区分：Cancel 明确返回 false（未能取消）之后，
     // 这次失败是无关失败，绝不栽给取消（评审 I3）。
     applyOutcome(rec, { ok: false, error: e })
-    err(e)
+    // 取消语义优先（审核 FF15a）：用户主动取消导致的失败不该被归因为"连接已失效"，
+    // 否则会白跑一次探活，真断链时还会把"取消"也拖进重连。其余失败归口复核（D14）。
+    if (rec.cancelRequested) err(e)
+    else await remoteOpFailed(e)
   }
-  rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
+  rec.elapsed = Math.floor(((endedAt || Date.now()) - rec.startedAt) / 1000)
   return rec.status
 }
 
@@ -164,7 +182,11 @@ async function cleanItem(rec) {
     rec.partPath = ''
     logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'info', ts: new Date().toISOString(), message: '已清理临时文件 ' + rec.src })
   } catch (e) {
-    err('清理临时文件失败：' + String((e && e.message) || e))
+    // §8.4 第 12 项（审核 FF3）：SftpRemove 的失败原来被包成字符串「清理临时文件失败：」，
+    // 任何"函数里有没有裸 err(e)"的口径都看不见它。按 rec.direction 分派：
+    // download = 本地的 DeleteLocal（保持既有文案），upload = 远程 ⇒ 归口复核。
+    if (rec.direction === 'download') err('清理临时文件失败：' + String((e && e.message) || e))
+    else await remoteOpFailed(e)
   }
 }
 
@@ -214,17 +236,150 @@ async function loadHosts() {
 async function err(e) {
   logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'error', message: String(e), ts: new Date().toISOString() })
 }
+// 级别不能写错（spec §10 / 审核 F7）：err() 把 level 硬编码成 'error'，所以「记住的路径
+// 失效回落」这类 warn、探活这类 info 必须走独立 helper，否则验收 grep 的级别会失真。
+async function warn(msg) {
+  logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'warn', message: String(msg), ts: new Date().toISOString() })
+}
+async function info(msg) {
+  logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'info', message: String(msg), ts: new Date().toISOString() })
+}
+
+// ===== 连接失效自愈（spec §8.3 / §8.4 / §8.5）=====
+// 根因：Connected(host) 是**粘性连接意图**（握手成功即 true，只有显式 Disconnect 才清）⇒
+// 主机休眠唤醒后链路已死但后端仍回答 true，UI 永远停在"已连接"，且期间的操作全部失败。
+// probing / recovering 必须是**普通 let 变量（非 ref）**（审核 F15）：接线测试按 `probing = false`
+// 这类赋值形态匹配，写成 ref 会红，而 ref 恒真的误用会让探活/重连被静默短路。
+let probing = false // 只防"探针并发"（管探活那一段）
+let recovering = false // 防"反复切标签叠加重连"（管重连那一段）；两个标志各管一段，缺一不可
+// 客户端超时兜底（spec §8.3，15s：覆盖后端最坏预算并留余量）
+const PROBE_TIMEOUT_MS = 15000
+
+// 探活三态：绝不能用布尔表示"未知"，否则超时/绑定抛错会被当成"链路已失效"、对可能健康的
+// 链路做无谓 teardown（违反 D14「探针说失效才算失效」）。
+//   'ok'      = 后端探针确认可用
+//   'lost'    = 后端探针明确回答 false（链路确实不可用）
+//   'unknown' = 超时或探针自身抛错（不改状态、不重连、不记 error）
+// 客户端超时不是锦上添花：legacy batch 后端挂在无 ctx 的 cmd.Run() 上时 await SftpProbe 永不返回，
+// probing 若不靠 finally 复位，该视图此后**任何**切标签探活都会被静默短路（自愈永久失效且无报错）。
+async function probeTimed(h) {
+  const started = performance.now()
+  let timer = null
+  let state = 'unknown'
+  try {
+    state = await Promise.race([
+      Promise.resolve(SftpProbe(h)).then((ok) => (ok ? 'ok' : 'lost')),
+      new Promise((resolve) => { timer = setTimeout(() => resolve('unknown'), PROBE_TIMEOUT_MS) }),
+    ])
+  } catch (e) {
+    // 探针自身抛错：工具坏了不等于链路坏了 ⇒ 未知，既不重连也不改状态
+    state = 'unknown'
+  } finally {
+    if (timer !== null) clearTimeout(timer) // 不 clear 就每次探活都留一个挂着的句柄
+  }
+  // spec §10 / 审核 F12：每次探活一条 info 级耗时日志，§11.3 F1 的耗时分布靠它观测
+  await info('探活耗时 ' + Math.round(performance.now() - started) + 'ms')
+  return state
+}
+
+// 远程操作失败后的复核（spec §8.4 / D14）：只回答"链路是不是真的没了"。
+// `!connected.value` 早退（自审修正 7）：那是"连接本身刚失败"的场景（例如自愈过程中重连失败），
+// 此时再探活/再重连只会打出第二轮无意义尝试。probing 只管探针并发，管不住
+// "探针 A 失败后重连还在跑、探针 B 又失败"的重入 —— 那一段由 recovering 管。
+async function verifyRemote() {
+  const h = host.value
+  if (!h || !connected.value || probing) return
+  probing = true
+  try {
+    // === 'lost' 是硬要求（本计划最重要的 Blocking 修正）：三态是字符串，把探活结果当布尔取反
+    // 再判断（在 'ok'/'lost'/'unknown' 下恒为 false）会让自愈永不触发。
+    if ((await probeTimed(h)) === 'lost') await recoverConnection(h)
+  } finally {
+    probing = false
+  }
+}
+
+// 远程操作失败的统一归口：先记后端原始报错原文（绝不丢 e），再复核链路（可能触发一次自愈）。
+// **自身永不 reject**：loadRemote 里是浮动调用（void Promise.resolve().then(...)），
+// 这里一旦抛出就是 unhandled rejection —— 视图没有任何调用点能接住它。故两级兜错。
+async function remoteOpFailed(e) {
+  try {
+    await err(e)
+  } catch {
+    // 日志系统自身故障也不能因此跳过链路复核
+  }
+  try {
+    await verifyRemote()
+  } catch (e2) {
+    try { await err(e2) } catch { /* 连补记都失败就只能沉默：绝不外泄 rejection */ }
+  }
+}
+
+// 自愈（spec §8.3 步骤 1-7）：先断开（清粘性意图 + 丢死会话），再走既有握手流程重连**一次**。
+// 只重连一次：不循环、不起定时器；recovering 幂等，防反复切标签叠加出多轮重连。
+async function recoverConnection(h) {
+  if (recovering) return
+  recovering = true
+  try {
+    await warn('远端连接已失效（主机休眠或网络中断），正在重连…')
+    // 清粘性意图是必须的（spec §8.2）：后端探针经 AcquireList → markSessionConnected 会把
+    // 粘性 Connected 置 true，"探针说失效"与"粘性已置位"会同时成立，不清就会翻回"已连接"。
+    // 断开失败静默（§10）：它的失败不影响后面的重新握手。
+    try { await SftpDisconnect(h) } catch { /* 清理失败不中断自愈 */ }
+    connected.value = false
+    remoteItems.value = []
+    sel.clear(remoteSelection) // 与 disconnect() 的降级形态一致 ⇒ §5.3 置灰规则自动生效
+    // 不写 pendingPath（v1.7 修正 / 审核 F6）：pendingPath 是落点优先级 1，把记忆值塞进去会让
+    // resolveRemoteTarget 返回 fromMemory === false ⇒ §6.5「仅来自记忆才回落 home」在自愈路径
+    // 永不触发（R3 承诺失效）。什么都不设才对：下面的重连会在优先级 3 自取同一记忆值。
+    await connect()
+    // 用户已切主机：静默早退，不记「重连失败」（那条日志是噪音且误导，spec §8.3 步骤 6 例外）
+    if (host.value !== h) return
+    // connect() 不返回值也不 rethrow ⇒ 成功/失败判据只能是 connected.value（审核 FF14）
+    if (connected.value) await info('已重新连接 ' + h)
+    else await err('重连失败：连接未建立，请手动点「连接」')
+  } finally {
+    recovering = false
+  }
+}
+
+// 取列表的**裸函数**：只做「取列表 + 抛错」（spec §6.5）。
+// 序号守卫、loading、最近路径三项绝不塞进来（审核 F23）：goRemote/goLocal 的
+// 「旧响应丢弃 + 失败整体回滚」靠调用点自己自增序号与回滚；fetch* 若也动这些，
+// 一个过期的失败响应就会把目录回滚成旧值。
+async function fetchRemote(target) {
+  return (await SftpList(host.value, '', target || '/')) || []
+}
 
 async function loadRemote() {
   if (!host.value) return
   const seq = ++remoteSeq
   remoteLoading.value = true
   try {
-    const items = (await SftpList(host.value, '', remotePath.value || '/')) || []
+    const items = await fetchRemote(remotePath.value || '/')
     if (seq === remoteSeq) remoteItems.value = items // 已被更新请求取代则丢弃
+    // 审核 F10：双击进目录（openRemote）与工具栏刷新都只经这里，不补记则最常用的手势
+    // 永远不写 last_remote_dirs（本地侧 loadLocal 本来就记，这正是两侧不对称的来源）。
+    // 不增加写盘：locations.addRemoteRecent 有队首短路，记录无变化时不发 IPC。
+    // 记账独立兜错（顺序不变：取列表成功后才记，且同受 seq 守卫）：写盘失败是本地 IO
+    // 故障、不是链路信号，混进外层 catch 会把"后端写盘失败"误诊成"连接已断"，白跑一次探活/重连。
+    if (seq === remoteSeq) {
+      try { await locations.addRemoteRecent(host.value, remotePath.value) } catch (e) { err(e) }
+    }
   }
-  catch (e) { err(e) }
+  // 审核 F5：本轮语义变更 —— 记原文 + 一次探活复核（可能自愈），不再只是 err(e)。
+  // 故意不 await：探活最多 15s，await 会把 loading 与调用方（如 runBatch 收尾）一起拖住。
+  // 但"不 await"绝不能变成"外泄 rejection"：调用点（openRemote / 工具栏刷新 / removeSelected…）
+  // 都不接住 loadRemote()，这里同步抛出（T13 落地 remoteOpFailed 之前它是未定义标识符）就会
+  // 直接变成 unhandled rejection。故把调用放进一条内部已终结的 Promise 链，rejection 一律落进 err。
+  catch (e) { void Promise.resolve().then(() => remoteOpFailed(e)).catch(err) }
   finally { if (seq === remoteSeq) remoteLoading.value = false }
+}
+
+// 排序状态上收（§7.3）：FilePane 只 emit「下一个方向」，父层只负责持久化 ——
+// 绝不在父层再取反（T9 交接：payload.dir 已经是目标方向），否则每次点击都翻转方向。
+async function onSort(pane, { key, dir }) {
+  try { await sftpui.setSort(pane, key, dir) } catch (e) { err(e) }
 }
 
 // Host dropdown change: reset connection state, do NOT auto-connect.
@@ -238,20 +393,52 @@ function onHostChange() {
 async function connect() {
   const h = host.value
   if (!h) return
+  // B4 / 审核 F8：load() 未完成时点「连接」拿不到记忆路径（幂等重试即可）。
+  // 必须 catch：load() 会 reject，裸 await 会让这里的失败变成未捕获拒绝、
+  // 连接按钮"点了没反应"。加载失败仍继续（回落到 home）。
+  if (!sftpui.loaded) await sftpui.load().catch(err)
   try {
     await SftpConnect(h)
-    let dest = '/'
-    try { dest = await SftpHome(h) } catch { dest = '/' }
     if (host.value !== h) return // await 期间已切换主机，丢弃结果
-    // 「最近位置」预设了目标目录时优先进它，否则落到 home
-    // 只有空串才是"未指定"：把 '/' 当未指定会让「远程 根目录」预设落到 home
-    remotePath.value = pendingPath.value ? pendingPath.value : dest
+    // SftpHome 失败沿用既有回落（内层静默；外层 catch 覆盖，spec §8.4 排除清单）
+    let home = '/'
+    try { home = await SftpHome(h) } catch { home = '/' }
+    if (host.value !== h) return
+    // §6.4 B5：落点决策只有 resolveRemoteTarget 一个实现（connect 与 syncConnection 共用）。
+    // 必须传 .value（审核 F17）：传 ref 对象会恒为真值，把 ref 当路径交给后端。
+    const target = resolveRemoteTarget({
+      pendingPath: pendingPath.value,
+      pendingHome: pendingHome.value,
+      remembered: sftpui.lastPathFor('remote', h),
+      home,
+    })
+    // 消费后清空（含失败分支）：残留会让**下一次**连接落到上一次的目标（既有 :335 原则）
     pendingPath.value = ''
+    pendingHome.value = false
     connected.value = true
+    remotePath.value = target.path
+    // §6.5 前提前置（B2）：只有"本次落点来自记忆"才需要先列一次以判定要不要回落 home。
+    // 用户显式指定的路径（pendingPath/pendingHome）失败仍按既有失败语义处理，绝不偷偷改道。
+    if (target.fromMemory && target.path !== home) {
+      try {
+        await fetchRemote(target.path)
+      } catch (e) {
+        remotePath.value = home
+        await fetchRemote(home) // 回落本身也失败 ⇒ 抛给外层 catch（不二次回落）
+        warn('上次的远程目录 ' + target.path + ' 已不可用，已回到 ' + home)
+      }
+    }
     await loadRemote()
-    await locations.addRemoteRecent(h, remotePath.value)
+    // 记账（配置写盘）失败不得被外层 catch 判成「连接失败」：只记日志，不改 connected/pending
+    // 语义（T11 复核 out-of-scope 观察；与 loadRemote 内的记账同形）。
+    try { await locations.addRemoteRecent(h, remotePath.value) } catch (e) { err(e) }
   } catch (e) {
     err(e)
+    // 失败路径也要消费掉两个 pending 标志（onNavigate 对 pendingPath 的补偿只覆盖它自己那条
+    // 调用链；连接按钮 / 位置下拉 / goRemoteHome 留下的标志无人清）：残留会让**下一次**
+    // 「连接」落到上一次没成功的 home 或目录，正是 B1/SF4 那类静默失效。
+    pendingPath.value = ''
+    pendingHome.value = false
     if (host.value === h) connected.value = false
   }
 }
@@ -269,11 +456,12 @@ async function goLocal(target) {
   localPath.value = target
   localLoading.value = true
   try {
-    const items = (await ListLocal(target || '/')) || []
+    const items = await fetchLocal(target || '/')
     if (seq !== localSeq) return
     localItems.value = items
     sel.clear(localSelection)
-    await locations.addLocalRecent(target)
+    // 同 goRemote：记账失败不得触发本地面板回滚。
+    try { await locations.addLocalRecent(target) } catch (e) { err(e) }
   } catch (e) {
     if (seq !== localSeq) return
     localPath.value = prevPath
@@ -290,26 +478,30 @@ async function goRemote(target) {
   remotePath.value = target
   remoteLoading.value = true
   try {
-    const items = (await SftpList(host.value, '', target || '/')) || []
+    const items = await fetchRemote(target || '/')
     if (seq !== remoteSeq) return
     remoteItems.value = items
     sel.clear(remoteSelection)
-    await locations.addRemoteRecent(host.value, target)
+    // 同 connect：记账失败不得触发导航回滚或探活（否则「写盘失败」会被记成「导航失败 + 链路失效」）。
+    try { await locations.addRemoteRecent(host.value, target) } catch (e) { err(e) }
   } catch (e) {
     if (seq !== remoteSeq) return
     remotePath.value = prevPath
     remoteItems.value = prevItems
-    err('无法打开 ' + target + '：' + String((e && e.message) || e))
+    // §8.4 第 4 项：远程导航失败是"链路可能已失效"的信号之一（D14）⇒ 交给统一归口记原文 + 复核。
+    await remoteOpFailed(e)
   } finally { if (seq === remoteSeq) remoteLoading.value = false }
 }
 
-// 远程「主目录」：未连接时把 pendingPath 清空再 connect()（connect 的 home 分支），
-// 已连接则直接解析 SftpHome 后跳转。行为变化（有意）：home 也会记入「最近」。
+// 远程「主目录」：未连接时置**显式标志** pendingHome 再 connect()（D15：不再用
+// "清空 pendingPath"表达 home，否则记忆路径会把它截胡），已连接则直接解析 SftpHome 后跳转。
+// 行为变化（有意）：home 也会记入「最近」。
 async function goRemoteHome() {
   if (!host.value) { err('请先选择主机'); return }
-  if (!connected.value) { pendingPath.value = ''; await connect(); return }
+  if (!connected.value) { pendingHome.value = true; await connect(); return }
   let home = '/'
-  try { home = await SftpHome(host.value) } catch (e) { err(e); return }
+  // §8.4 第 5 项：SftpHome 是纯远程调用，失败同样要复核（它是用户点的动作，不是状态查询）。
+  try { home = await SftpHome(host.value) } catch (e) { await remoteOpFailed(e); return }
   return goRemote(home)
 }
 
@@ -391,16 +583,38 @@ async function disconnect() {
   remoteItems.value = []
   sel.clear(remoteSelection)
 }
+// 取列表的裸函数（与 fetchRemote 同构）：只取列表并抛错，序号/loading/recent 留在调用方。
+async function fetchLocal(target) {
+  return (await ListLocal(target || '/')) || []
+}
+
 async function loadLocal() {
   const seq = ++localSeq // 与 goLocal 共用序号：任何更新的本地加载都会先作废在途 goLocal，其失败回滚不再发生
   localLoading.value = true
   try {
-    const items = (await ListLocal(localPath.value || '/')) || []
+    const items = await fetchLocal(localPath.value || '/')
     if (seq === localSeq) localItems.value = items // 已被更新请求取代则丢弃
     if (seq === localSeq) await locations.addLocalRecent(localPath.value) // 只在成功时记；条数上限由后端负责
   }
   catch (e) { if (seq === localSeq) err(e) } // 过期请求的错误不得污染更新的导航
   finally { if (seq === localSeq) localLoading.value = false }
+}
+
+// 工具栏「刷新」刷**两侧**（spec §5.1）：本地半边总能刷 —— 未连接时也要能刷出本地变化（§5.4），
+// 所以工具栏按钮上的 :disabled 必须去掉（本地面板不依赖远程连接）。远程半边只在已连接时刷。
+// Promise.all 并发；两侧各自的 localSeq/remoteSeq 继续负责丢弃过期响应（连点不会串）。
+async function refreshAll() {
+  const jobs = [loadLocal()]
+  if (connected.value) jobs.push(loadRemote())
+  await Promise.all(jobs)
+}
+
+// 右键「刷新」只刷**本面板**（spec §5.1）：两个面板共用这一个函数，面板由 menu.pane 带进来。
+// 远程面板未连接时静默跳过（与 refreshAll 的远程半边同语义）。
+async function refreshPane(pane) {
+  if (pane === 'local') return loadLocal()
+  if (!connected.value) return
+  return loadRemote()
 }
 
 function openRemote(it) {
@@ -431,6 +645,9 @@ function posixParentOf(p) {
   return trimmed.slice(0, idx)
 }
 
+// item === null 表示"空白/面板级"右键（FilePane 的空白背景与 '..' 行都发 null），
+// 菜单矩阵由下面的 menuHasItem 单一判据切换。这里**不动选中集合**：
+// 空白右键不清空已有选中（spec §5.3 / 验收 B1），刷新也不改选中（§5.1）。
 function showMenu(pane, { item, event }) {
   const rect = window.innerWidth
   menu.value = {
@@ -440,6 +657,18 @@ function showMenu(pane, { item, event }) {
     pane,
     item,
   }
+}
+
+// 菜单矩阵的**唯一**选中判据（spec §5.3）：'..' 行按"无选中"处理（走面板级菜单）。
+// 模板只用它切"空白/面板级"与"文件行"两个分支，不得在模板里散算 menu.item。
+const menuHasItem = computed(() => !!(menu.value.item && menu.value.item.name !== '..'))
+
+// 置灰的**唯一**判据（spec §5.3 / 审核 F3、FF5）：某动作是否需要远程连接 —— 判据是"动作"
+// 而不是"面板"，因为本地面板的「上传文件…/上传到远程」落点同样是 remotePath。
+// 模板里以 v-for 把返回值接成别名 remoteDep，统一写 `remoteDep && !connected`
+// （模板内 ref 自动解包；写成 connected.value 会恒为 undefined ⇒ 置灰静默失效）。
+function remoteDepFor(name) {
+  return menu.value.pane === 'remote' || name === 'upload' || name === 'upload-picked'
 }
 
 function itemsFor(pane) { return pane === 'remote' ? remoteItems.value : localItems.value }
@@ -468,7 +697,11 @@ function actionsFor(pane) {
   if (n === 0 && pane === 'remote') return tail
   const head = pane === 'remote'
     ? [{ name: 'download', label: '下载到本地 (' + n + ')' }]
-    : [{ name: 'upload', label: '上传到远程 (' + n + ')' }, { name: 'upload-picked', label: '上传文件…' }]
+    // 第三个入口也要与右键菜单同口径（spec §5.3 / 审核 FF5/F3）：本地面板的 upload/upload-picked
+    // 落点是 remotePath，未连接时置灰。`connected` 在 script 里是 ref —— 必须写 .value，
+    // 写 `!connected` 恒 false（ref 对象恒真），置灰会静默失效。
+    : [{ name: 'upload', label: '上传到远程 (' + n + ')', disabled: !connected.value },
+       { name: 'upload-picked', label: '上传文件…', disabled: !connected.value }]
   return head.concat(tail)
 }
 
@@ -603,7 +836,10 @@ async function removeSelected(pane) {
     } catch (e) {
       rec.status = '失败'
       rec.reason = String((e && e.message) || e)
-      err(e)
+      // 混合面板（§8.4 第 6 项）：本地分支保留裸 err(e)，远程分支才归口复核
+      // —— 本地 IO 失败不是链路信号，混进去会白跑一次探活/重连。
+      if (pane === 'local') err(e)
+      else await remoteOpFailed(e)
     }
     rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
   }
@@ -626,7 +862,12 @@ async function renameItem(pane, it) {
       await SftpRename(host.value, '', posixJoin(remotePath.value, it.name), posixJoin(remotePath.value, newName))
       await loadRemote()
     }
-  } catch (e) { err(e) }
+  } catch (e) {
+    // 混合面板（§8.4 第 7 项）：本地重命名失败是本地面板的 IO 问题，不归口；
+    // 远程 SftpRename 失败才是链路信号。
+    if (pane === 'local') err(e)
+    else await remoteOpFailed(e)
+  }
   closeMenu()
 }
 
@@ -646,7 +887,11 @@ async function mkdirIn(pane) {
       await SftpMkdir(host.value, '', posixJoin(remotePath.value, name))
       await loadRemote()
     }
-  } catch (e) { err(e) }
+  } catch (e) {
+    // 混合面板（§8.4 第 8 项）：同上，只有远程分支归口。
+    if (pane === 'local') err(e)
+    else await remoteOpFailed(e)
+  }
 }
 
 // uploadPicked = 既有 upload() 的"选文件上传"分支：右键上传已由批量入口 runBatch 承接
@@ -665,7 +910,9 @@ async function uploadPicked() {
     await dispatchTransfer(t)
     await loadRemote()
   } catch (e) {
-    err(e)
+    // §8.4 第 9 项：uploadPicked 整条链路都是远程操作（PickLocalFile 失败也由这里兜底），
+    // 归口复核保证"面板仍显示已连接但上传一直报错"能被自愈。
+    await remoteOpFailed(e)
     if (t) {
       // 外层兜底：不得自己写终态（e-weak 结构性 pin），仍走共享终态落点。
       // t 有 id、正常已经过 dispatchTransfer/applyOutcome；这里只覆盖 dispatchTransfer
@@ -676,13 +923,28 @@ async function uploadPicked() {
   }
 }
 
+// 空选择防御只约束**依赖选中**的动作（spec §5.3 / 审核 FF2）：写成"除 refresh/mkdir 外一律
+// return"会误伤空白菜单的 upload-picked（它天然没有选中，点了永远没反应）；把防御挪到单项选中
+// 之前，又会让"右键一个未选中行"的整条行菜单变 no-op。upload 留在集合里是因为它在**本地面板
+// 行菜单**中是"上传选中项"；远程面板的同名项走 uploadPicked，不依赖选中。
+const SELECTION_DEPENDENT = ['download', 'upload', 'remove', 'rename']
+
 // 右键菜单：download/upload/remove 走批量入口（右键项不在集合内时先 single()，与 §3 决策 5 一致）。
 async function doAction(name) {
   const pane = menu.value.pane
+  // refresh 必须最先返回（spec §5.1 / 审核 FF6）：若走下面的单项选中，多选会被悄悄收成一项，
+  // 直接违反"刷新保留选中"。这里不读 item、也不改 names。
+  if (name === 'refresh') { closeMenu(); return refreshPane(pane) }
   const s = selectionFor(pane)
   const it = menu.value.item
   if (it && it.name !== '..' && !sel.isSelected(s, it.name)) sel.single(s, it.name)
   const names = [...s.keys]
+  if (SELECTION_DEPENDENT.includes(name) && !names.length) return
+  // 空白/面板级菜单的「⬆ 上传文件…」（spec §5.3）：upload-picked 天然无选中，不在
+  // SELECTION_DEPENDENT 内，所以防御之后必须**补上这条分派** —— 它的既有出口只有
+  // onPaneAction（FilePane 的动作表链路），右键菜单走的是 doAction，缺分派就成了死按钮
+  // （先 closeMenu() 再"什么都没发生"）。形态与上面的 refresh 分支同构（复核 Important）。
+  if (name === 'upload-picked') { closeMenu(); return uploadPicked() }
   const sourceDir = pane === 'remote' ? remotePath.value : (localPath.value || '/')
   const targetDir = pane === 'remote' ? (localPath.value || '/') : remotePath.value
   const sourceItems = itemsFor(pane)
@@ -762,21 +1024,34 @@ async function onMoveDrop(pane, { item, event }) {
   }
   // 目标子目录内容未加载 → 先按需加载一次再判重（spec 决策 25）；Windows 上
   // os.Rename 目标存在会直接失败，所以必须走同一套冲突策略而不是硬干。
-  const targetItems = pane === 'local'
-    ? await ListLocal(targetDir)
-    : await SftpList(host.value, '', targetDir)
-  const existing = (targetItems || []).map((it) => it.name)
-  const prefix = base.replace(/\/+$/, '')
-  const planned = payload.names.map((n) => ({ name: n, src: prefix + '/' + n, dst: targetDir + '/' + n }))
-  const { clean, conflicts } = classify(planned, existing)
-  let run = clean
-  let skipped = conflicts
-  if (conflicts.length) {
-    const policy = await askConflict({ conflicts, total: planned.length, target: targetDir, hiddenSelected: 0 }, 0)
-    if (policy === null) return
-    const applied = applyPolicy(conflicts, policy, existing)
-    run = clean.concat(applied.run)
-    skipped = applied.skipped
+  //
+  // §8.4 第 10 项（审核 FF2）：这段加载原本在 try **之外**（唯一的 try 在下面的移动循环里）
+  // ⇒ 死链时 onMoveDrop 直接 reject，没有任何调用点接住它：无日志、无自愈、unhandled rejection。
+  // 把"目标子目录列表加载 + 冲突询问"一起纳入 try。
+  let run = []
+  let skipped = []
+  try {
+    const targetItems = pane === 'local'
+      ? await ListLocal(targetDir)
+      : await SftpList(host.value, '', targetDir)
+    const existing = (targetItems || []).map((it) => it.name)
+    const prefix = base.replace(/\/+$/, '')
+    const planned = payload.names.map((n) => ({ name: n, src: prefix + '/' + n, dst: targetDir + '/' + n }))
+    const cls = classify(planned, existing)
+    run = cls.clean
+    skipped = cls.conflicts
+    if (cls.conflicts.length) {
+      const policy = await askConflict({ conflicts: cls.conflicts, total: planned.length, target: targetDir, hiddenSelected: 0 }, 0)
+      if (policy === null) return
+      const applied = applyPolicy(cls.conflicts, policy, existing)
+      run = cls.clean.concat(applied.run)
+      skipped = applied.skipped
+    }
+  } catch (e) {
+    // 混合面板：本地分支保留裸 err(e)，远程分支归口复核（本地 IO 失败不是链路信号）
+    if (pane === 'local') err(e)
+    else await remoteOpFailed(e)
+    return
   }
   for (const t of skipped) {
     transfers.value.push({ direction: 'move', name: t.name, src: t.src, dst: t.dst, size: 0, status: '跳过', elapsed: 0 })
@@ -793,7 +1068,9 @@ async function onMoveDrop(pane, { item, event }) {
     } catch (e) {
       rec.status = '失败'
       rec.reason = String((e && e.message) || e)
-      err(e)
+      // §8.4 第 11 项：移动循环的失败同样按面板分派（本地 = 本地面板 IO，远程 = 链路信号）
+      if (pane === 'local') err(e)
+      else await remoteOpFailed(e)
     }
     rec.elapsed = Math.floor((Date.now() - rec.startedAt) / 1000)
   }
@@ -883,8 +1160,24 @@ onMounted(async () => {
   await locations.load() // 书签与双侧最近位置（T6 store），供两个面板头的位置下拉使用
   // presets.toml 坏掉时只发一次 startup 事件可能早于前端订阅而丢失，所以由这里补一次用户可见提示
   if (locations.presetsError) err('预设文件解析失败：' + locations.presetsError)
-  // local starts at current working dir
-  try { localPath.value = await Cwd() } catch (e) { localPath.value = '/' }
+  // B3/B4 顺序是硬约束，且这里的 load() 失败必须被吞掉（审核 F8）：裸 await 会让下面
+  // 恢复本地面板的两次调用全不执行（本地面板直接空着，用户以为坏了）。
+  try { await sftpui.load() } catch (e) { err(e) }
+  // 本地恢复（§6.4 B3）：记忆值优先，为空或打不开才回落到当前工作目录。
+  // 探针必须用**会抛错**的 fetchLocal：loadLocal 内部吞错，判不出"这个目录打不开"（§6.5）。
+  const rememberedLocal = sftpui.lastPathFor('local')
+  let localTarget = ''
+  if (rememberedLocal) {
+    try { await fetchLocal(rememberedLocal); localTarget = rememberedLocal } catch (e) { localTarget = '' }
+  }
+  if (!localTarget) {
+    let cwd = '/'
+    try { cwd = await Cwd() } catch (e) { err(e); cwd = '/' }
+    // 文案逐字取自 spec §10，级别必须是 warn（审核 F7：err() 硬编码 error，会误导验收 grep）
+    if (rememberedLocal) warn('上次的本地目录 ' + rememberedLocal + ' 已不可用，已回到 ' + cwd)
+    localTarget = cwd
+  }
+  localPath.value = localTarget
   await loadLocal()
 })
 
@@ -899,13 +1192,61 @@ function stopClock() {
 // 不再销毁视图，但首次挂载/后端 ControlPersist 过期时 UI 可能与真实连接不符。
 async function syncConnection() {
   const h = host.value
-  if (!h || connected.value) return
+  if (!h) return
+  if (connected.value) {
+    // 已连接：真探活复核（spec §8.3）。**不重置路径、不重载列表** —— 每次切标签跳目录
+    // 是不可接受的。probing 复用同一个去重标志：探针在飞时不并发第二次探活。
+    if (probing) return
+    probing = true
+    try {
+      // === 'lost' 是硬要求（审核 F1）：三态字符串配 !(await ...) 恒 false ⇒ 自愈永不触发。
+      if ((await probeTimed(h)) === 'lost') await recoverConnection(h)
+    } catch { /* 探针本身失败不改变现状（未知不是失效） */ }
+    finally { probing = false }
+    return
+  }
   try {
     const ok = await SftpConnected(h)
     if (host.value !== h || connected.value) return // await 期间状态已变
     if (!ok) { connected.value = false; return }
+    // §6.4 B5：与 connect() 共用同一落点决策（不再无条件 SftpHome）。
+    // 否则「切主机再切回」（后端粘性 Connected 仍为 true，走这里恢复）会落到 home，
+    // 与「回到该主机最后路径」直接矛盾。
+    let home = '/'
+    try { home = await SftpHome(h) } catch { home = '/' }
+    if (host.value !== h) return
+    const target = resolveRemoteTarget({
+      pendingPath: pendingPath.value,
+      pendingHome: pendingHome.value,
+      remembered: sftpui.lastPathFor('remote', h),
+      home,
+    })
+    pendingPath.value = ''
+    pendingHome.value = false
     connected.value = true
-    try { remotePath.value = await SftpHome(h) } catch { remotePath.value = '/' }
+    remotePath.value = target.path
+    // §6.5：只有"来自记忆"才回落 home（判定与 connect 逐字同构）
+    if (target.fromMemory && target.path !== home) {
+      try {
+        await fetchRemote(target.path)
+      } catch (e) {
+        // 第二发（回落 home）单独兜错：这里是 syncConnection 的外层静默 catch（状态查询语义）
+        // 之外的用户可见失败，落进外层就**零日志**（§6.5 明写要记日志），还会跳过 loadRemote()
+        // 而把 remotePath 改成 home、items 仍是上一个主机的旧值。
+        try {
+          await fetchRemote(home)
+        } catch (e2) {
+          // 回落本身也失败（§6.5：不做二次回落）：1) 必须记原文（不许落进外层静默 catch）；
+          // 2) connected/loading 与 connect 的失败路径同语义（不谎报已连接，也不再跑 loadRemote）；
+          // 3) 不提交 home —— 列不出来的目录不该成为 remotePath（保持与 items 同源）。
+          err(e2)
+          if (host.value === h) connected.value = false
+          return
+        }
+        remotePath.value = home
+        warn('上次的远程目录 ' + target.path + ' 已不可用，已回到 ' + home)
+      }
+    }
     await loadRemote()
   } catch { /* 状态查询失败时保持现状 */ }
 }
@@ -986,7 +1327,8 @@ onUnmounted(() => {
       </select>
       <button v-if="!connected" @click="connect" :disabled="!host">🔌 连接</button>
       <button v-else @click="disconnect">⏏ 断开</button>
-      <button @click="loadRemote" :disabled="!connected">刷新</button>
+      <!-- 工具栏刷新刷两侧，本地半边未连接也能刷 ⇒ 这里**刻意不带 :disabled**（spec §5.1/§5.4） -->
+      <button @click="refreshAll">🔄 刷新</button>
       <label class="hidden-toggle">
         <input type="checkbox" v-model="showAll" /> 显示隐藏文件
       </label>
@@ -999,10 +1341,12 @@ onUnmounted(() => {
           :show-hidden="showAll" :loading="localLoading" :actions="actionsFor('local')" :hidden-selected="hiddenFor('local')"
           :presets="locations.presetsForPane('local', '')" :disks="locations.disksForPane('local')"
           :bookmarks="locations.bookmarksForPane('local', '')" :recents="locations.recentsForPane('local', '')" :bookmarked="bookmarkedFor('local')"
+          :sort-key="sftpui.sort.local.key" :sort-dir="sftpui.sort.local.dir"
           @select="onSelect('local', $event)" @open="openLocal" @action="onPaneAction('local', $event)"
           @pick-position="pickPosition('local', $event)" @toggle-bookmark="toggleBookmark('local')" @search="search.pane = 'local'; search.visible = true"
           @clear="sel.clear(localSelection)"
           @navigate="onNavigate('local', $event)"
+          @sort="onSort('local', $event)"
           @context="showMenu('local', $event)" @visible="localVisible = $event" @focus="focusedPane = 'local'"
           @dragstart="onDragStart('local', $event)" @dropon="onMoveDrop('local', $event)" />
       </div>
@@ -1011,10 +1355,12 @@ onUnmounted(() => {
           :show-hidden="showAll" :loading="remoteLoading" :actions="actionsFor('remote')" :hidden-selected="hiddenFor('remote')"
           :presets="locations.presetsForPane('remote', host)"
           :bookmarks="locations.bookmarksForPane('remote', host)" :recents="locations.recentsForPane('remote', host)" :bookmarked="bookmarkedFor('remote')"
+          :sort-key="sftpui.sort.remote.key" :sort-dir="sftpui.sort.remote.dir"
           @select="onSelect('remote', $event)" @open="openRemote" @action="onPaneAction('remote', $event)"
           @pick-position="pickPosition('remote', $event)" @toggle-bookmark="toggleBookmark('remote')" @search="search.pane = 'remote'; search.visible = true"
           @clear="sel.clear(remoteSelection)"
           @navigate="onNavigate('remote', $event)"
+          @sort="onSort('remote', $event)"
           @context="showMenu('remote', $event)" @visible="remoteVisible = $event" @focus="focusedPane = 'remote'"
           @dragstart="onDragStart('remote', $event)" @dropon="onMoveDrop('remote', $event)" />
       </div>
@@ -1025,19 +1371,42 @@ onUnmounted(() => {
       tabindex="0" title="拖动调整日志高度" @mousedown="onSplitterDown" @keydown="onSplitterKey"></div>
     <div class="logpane ui-panel" :style="{ height: logHeight + 'px' }"><LogPanel :source-types="['sftp', 'system']" /></div>
 
+    <!-- 菜单矩阵（spec §5.3）：只以 menuHasItem 一个判据切"空白/面板级"与"文件行"两支；
+         每项的置灰统一写 `remoteDep && !connected` —— remoteDep 是 remoteDepFor(name) 经
+         v-for 接进来的别名，保证模板里只有一种置灰表达式（模板内 ref 自动解包，不能写 .value）。 -->
     <ContextMenu :visible="menu.visible" :x="menu.x" :y="menu.y" @close="closeMenu">
-      <template v-if="menu.pane === 'remote'">
-        <button @click="doAction('download')"><span class="ic">⬇</span>下载…</button>
-        <button @click="doAction('upload')"><span class="ic">⬆</span>上传…</button>
-        <button @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
-        <button class="sep" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
-        <button @click="doAction('mkdir')"><span class="ic">📁</span>新建文件夹</button>
+      <template v-if="!menuHasItem">
+        <!-- 空白/面板级（列头与过滤栏背景同此）：🔄 刷新 · 📁 新建文件夹 · ⬆ 上传文件… -->
+        <template v-for="remoteDep in [remoteDepFor('refresh')]" :key="'blank-pane'">
+          <button :disabled="remoteDep && !connected" @click="doAction('refresh')"><span class="ic">🔄</span>刷新</button>
+          <button :disabled="remoteDep && !connected" @click="doAction('mkdir')"><span class="ic">📁</span>新建文件夹</button>
+        </template>
+        <template v-for="remoteDep in [remoteDepFor('upload-picked')]" :key="'blank-picked'">
+          <button :disabled="remoteDep && !connected" @click="doAction('upload-picked')"><span class="ic">⬆</span>上传文件…</button>
+        </template>
       </template>
       <template v-else>
-        <button @click="doAction('upload')"><span class="ic">⬆</span>上传到远程</button>
-        <button @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
-        <button class="sep" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
-        <button @click="doAction('mkdir')"><span class="ic">📁</span>新建文件夹</button>
+        <!-- 远程面板 · 文件行：⬇ 下载… · ⬆ 上传… · ✏ 重命名 · 🗑 删除 · ── · 🔄 刷新（不含 mkdir） -->
+        <template v-if="menu.pane === 'remote'">
+          <template v-for="remoteDep in [remoteDepFor('download')]" :key="'row-remote'">
+            <button :disabled="remoteDep && !connected" @click="doAction('download')"><span class="ic">⬇</span>下载…</button>
+            <button :disabled="remoteDep && !connected" @click="doAction('upload')"><span class="ic">⬆</span>上传…</button>
+            <button :disabled="remoteDep && !connected" @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
+            <button :disabled="remoteDep && !connected" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
+            <button class="sep" :disabled="remoteDep && !connected" @click="doAction('refresh')"><span class="ic">🔄</span>刷新</button>
+          </template>
+        </template>
+        <!-- 本地面板 · 文件行：⬆ 上传到远程 · ✏ 重命名 · 🗑 删除 · ── · 🔄 刷新（不含 mkdir） -->
+        <template v-else>
+          <template v-for="remoteDep in [remoteDepFor('upload')]" :key="'row-local-remote'">
+            <button :disabled="remoteDep && !connected" @click="doAction('upload')"><span class="ic">⬆</span>上传到远程</button>
+          </template>
+          <template v-for="remoteDep in [remoteDepFor('rename')]" :key="'row-local'">
+            <button :disabled="remoteDep && !connected" @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
+            <button :disabled="remoteDep && !connected" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
+            <button class="sep" :disabled="remoteDep && !connected" @click="doAction('refresh')"><span class="ic">🔄</span>刷新</button>
+          </template>
+        </template>
       </template>
     </ContextMenu>
 
@@ -1056,8 +1425,9 @@ onUnmounted(() => {
       :hidden-selected="conflict.hiddenSelected" @confirm="onConflictConfirm" @cancel="onConflictCancel" />
 
     <!-- 只挂一个实例，用 :scope 切换面板（组件内用全局 querySelector 聚焦，两个实例会打架） -->
+    <!-- @failed：深搜是远程操作，失败必须进连接失效复核的同一个归口（spec §8.4 第 13 项） -->
     <SearchOverlay :visible="search.visible" :scope="search.pane" :host="host" :root="search.pane === 'local' ? localPath : remotePath"
-      @close="search.visible = false" @open-hit="openHit" />
+      @close="search.visible = false" @open-hit="openHit" @failed="remoteOpFailed" />
   </div>
 </template>
 

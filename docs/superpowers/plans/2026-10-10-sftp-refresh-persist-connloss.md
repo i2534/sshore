@@ -1116,3 +1116,42 @@ git commit -m "docs(report): SFTP 刷新/持久化/连接自愈的 Linux+Windows
 - **比例**（实测数字）：本计划 1118 行 / 14 任务 / 73 个步骤；规格 780 行 ⇒ 约 1.43×，属同一量级，没有"比规格长几倍"的抄写式膨胀。代码块基本是**签名 + 测试名/断言**；函数体只出现在规格固定了逐字文案或分支顺序的地方（右键 handler 分支、store 的 payload 键、探针 race 形状）。若执行者发现某步只是把实现抄了一遍，按"步骤只决定实现者无法独自决定的东西"删减。
 - **未写进计划的东西**（刻意留给执行者的判断，不是遗漏）：函数体写法、CSS 细节、测试断言的实现手法（切片正则 vs SSR）、提交粒度内的行号微调。
 - **环境前提**（实测过的，不是猜测）：`~/.cache/go-build` 只读 ⇒ 一律带 `GOCACHE=$PWD/.gocache`；`wails v2.15.0` 的 `generate module` 支持 `-tags`；前端可用的测试手段只有纯函数/store/SSR/读源码四种。
+
+---
+
+## 执行记录（SDD · Subagent-Driven）
+
+- 分支 `feat/sftp-refresh-persist-connloss`；起点 `master` = 6169102，本计划完成时 HEAD = `538110b`。
+- 逐任务 ledger（预检冲突扫描、每条裁定、fix 轮、deferred minor 清单）：`.superpowers/sdd/2026-10-10-sftp-refresh-persist-connloss/progress.md`（gitignore 内，属工作区记录）。
+- 每任务 = 全新实现者（TDD，含 RED/GREEN 证据）→ review package → 全新复核者（判定 Spec/质量）→ 定点修复轮 → scoped re-review。**T2/T11/T12 各走了一轮 fix**；T1/T3/T11 的 trivial 修复由控制器直接落并留证。
+- 执行期发现的**计划缺陷**：T13 Step 1 的测试正则少一个右括号（照抄即 `Invalid regular expression`）—— 已由实现者修正。
+- **门禁**：`GOCACHE=$PWD/.gocache make ci` 退出码 0（build ✓ / `go vet` ✓ / 13 个包 `-race` ok / vitest 38 files·484 tests），完整日志见 `docs/superpowers/reports/2026-10-10-sftp-refresh-persist-connloss-evidence/make-ci.log`。
+- **真机验收 A1–F2 未执行**：本环境无图形会话、无 GUI 输入自动化、VBox 内核模块缺失且 `sudo` 不可用。逐项清单与阻塞证据见验收报告 `docs/superpowers/reports/2026-10-10-sftp-refresh-persist-connloss-acceptance.md`。
+- 与规格文本的偏离（6 处）记录在规格 §16.4。
+
+### 提交序列（本计划）
+
+```
+9e20198 feat(config): 新增 [sftp_ui] 配置段（最后路径 + 双侧排序）与归一挂点
+c885a09 test(config): 补 DefaultAppConfig 路径的 SftpUI 归一断言（T1 复核 Minor-1）
+3ac1c97 feat(sftp): 真探活能力（修 Pool.Probe 拨号吃满预算的误判 + Ctrl.Probe/SftpProbe 绑定）
+db04bb2 test(sftp): 补探活预算修复的坏会话用例与分派判别力（T2 复核 Important/Minor）
+7658a39 feat(app): GetSftpUI/SaveSftpUI 绑定（锁内只赋值、解锁后归一与落盘）
+e5b1888 test(app): 把未 Init 的 SaveSftpUI 用例落盘路径指到临时目录（T3 复核 Important：macOS 上会覆盖用户真实配置）
+a0ed9f1 fix(app): 配置写入点并发改造（新数组+写锁）与 last path 写入规则（recordRecentSFTP 不再改最后路径）
+ef3c824 chore(bindings): 重生成 Wails 绑定（GetSftpUI/SaveSftpUI/SftpProbe + SftpUIState 模型）
+4999cbb feat(utils): nextSort 与 resolveRemoteTarget 纯函数（排序取反 + 落点优先级/D15 回归守卫）
+2976aee feat(store): sftpui store（最后路径/双侧排序 + 读回合并的 saveSnapshot 与无变化短路）
+07baa2d feat(store): locations 成功写最后路径后镜像到 sftpui（零新 IPC）
+20d80bf refactor(filepane): 排序状态上收为 props + emit('sort')，补真实 SSR 渲染断言
+fedcc2c feat(filepane): 空白/行右键分流（item:null）与 ContextMenu 禁用样式
+c035806 feat(sftp): 启动恢复顺序与落点决策（记忆路径/主目录显式标志/失效回落），抽取可抛错的取列表函数
+a970d22 fix(sftp): 修 Task 11 复核的 2 Important + 2 Minor
+82fd960 feat(sftp): 工具栏/右键刷新入口与菜单分级矩阵、远程置灰判据
+feff286 fix(sftp): 补空白菜单 upload-picked 分派，收紧刷新入口/动作分派断言（Task 12 复核）
+fda2b89 feat(sftp): 连接失效自愈（三态探活 + 幂等重连 + 13 个远程落点归口）
+d955146 fix(sftp): 收尾 triage（失败耗时不含探活/重连、记账失败不再误判为连接/导航失败、setSort 忽略非法 pane、注释与断言修正）
+2231d43 docs(sftp): T14 验收报告（自动化门禁全绿 + 真机验收阻塞证据与可执行清单）
+0fd6836 docs: 同步执行记录（规格 §16.4 执行期偏离 / 计划的 SDD 执行记录与提交序列）
+538110b fix(sftp): last path 短路判据纳入内存镜像（§6.3.2 升级场景补写不再被拦）
+```

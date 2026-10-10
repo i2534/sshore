@@ -3,7 +3,10 @@ package sftp
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -255,16 +258,10 @@ func (c *BatchBackend) buildBatch(op, remote, local string) ([]byte, error) {
 		}
 		return []byte(fmt.Sprintf("put %s %s\n", l, r)), nil
 	case "putr":
-		// 递归上传：sftp put -r <local> <remoteDir>。
-		l, err := quoteArg(local)
-		if err != nil {
-			return nil, err
-		}
-		r, err := quoteArg(remote)
-		if err != nil {
-			return nil, err
-		}
-		return []byte(fmt.Sprintf("put -r %s %s\n", l, r)), nil
+		// 递归上传：**不能**用 OpenSSH 的 `put -r <local> <remoteDir>` —— 那条命令把
+		// remoteDir 当父目录、再追加源目录名（多套一层，与 GetTree/前端 dst 的「最终路径」
+		// 约定相反）。改为本地遍历源树、逐文件 put 到最终路径，见 buildPutTreeBatch。
+		return c.buildPutTreeBatch(remote, local)
 	case "rm":
 		r, err := quoteArg(remote)
 		if err != nil {
@@ -290,6 +287,162 @@ func (c *BatchBackend) buildBatch(op, remote, local string) ([]byte, error) {
 	default:
 		return nil, nil
 	}
+}
+
+// buildPutTreeBatch 构造「递归上传到最终目录」的 `sftp -b` 脚本（契约见 PutRecursive）。
+//
+// 脚本形状：
+//   - 先对目标目录的**全部祖先**自上而下逐级 `-mkdir`（OpenSSH 的 mkdir 是单级语义：
+//     目标中间层缺失时只建叶子会失败，见 mkdirAncestors），再补源树里每一级子目录
+//     （WalkDir 保证父先于子）；
+//   - 再逐文件 `put <local> <remoteDir>/<相对源根路径>`。
+//
+// 两个刻意的选择：
+//  1. `-mkdir` 带 `-` 前缀：`-b` 模式下未加前缀的命令失败会**中止整批**，而「目录已存在」
+//     在合并语义下是必须容忍的正常情况（与 RemoveRecursive 的 -rm/-rmdir 同一手法）。
+//     这也让逐级建祖先天然幂等：`-mkdir` 对已存在目录同样报 Failure，但被前缀抑制、EXIT=0。
+//  2. `put` **不加**前缀：文件级失败必须中止整批并把 stderr 透出，绝不静默漏传。
+//
+// 本地路径用 filepath 家族（本机语义），远端路径一律用 path 家族（POSIX）——Windows
+// 客户端的反斜杠绝不能进远端路径。
+func (c *BatchBackend) buildPutTreeBatch(remoteDir, local string) ([]byte, error) {
+	lines, err := putTreeBatchLines(remoteDir, local)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(strings.Join(lines, "\n") + "\n"), nil
+}
+
+// mkdirAncestors 返回远端目录 p **自上而下**的全部层级（含 p 自身），用于逐级幂等 `-mkdir`。
+//
+// 为什么需要它（2026-10-10 复核轮 2 / Minor-2）：GoBackend 用 MkdirAll 自己补缺失祖先，
+// 而 OpenSSH sftp 的 mkdir 是**单级**语义 —— 真机实测（一次性 sshd；本机
+// OpenSSH_8.9p1 的 sftp 客户端，脚本见报告「第二轮」小节）：
+// `-mkdir <深路径>` 在父目录缺失时报 "No such file or directory" 且**什么也不建**；带 `-`
+// 前缀时该失败被抑制（EXIT=0），于是后续 put 落到不存在的父目录 ⇒ 整批 EXIT=1。
+// 逐级 `-mkdir` 与 MkdirAll 等价；`-mkdir` 对已存在目录报 Failure 但同样被抑制，故幂等。
+//
+// 绝对路径到根为止（不返回 "/"：它一定存在，建它只会多一条无意义的 Failure 行）；
+// 相对路径到第一级为止（不返回 "."）。p 为 "." / "" / "/" 时返回 nil。
+func mkdirAncestors(p string) []string {
+	if p == "" || p == "." || p == "/" {
+		return nil
+	}
+	var rev []string
+	for cur := p; ; {
+		rev = append(rev, cur)
+		parent := path.Dir(cur)
+		if parent == cur || parent == "/" || parent == "." {
+			break
+		}
+		cur = parent
+	}
+	out := make([]string, 0, len(rev))
+	for i := len(rev) - 1; i >= 0; i-- {
+		out = append(out, rev[i])
+	}
+	return out
+}
+
+// putTreeBatchLines 遍历本地源树，产出批处理行（目录行在前、文件行在后）。
+//
+// 不套用 GoBackend 的 D16 枚举阈值（scanLocalTree）：batch 后端没有进度通道，静默截断
+// 一次上传是数据丢失而调用方无从察觉 —— 宁可慢，不可少传。内部临时文件（本地 .part）
+// 照旧不进清单（D18），源根软链照旧先解析成真实目录（否则 WalkDir 一件都枚举不到）。
+func putTreeBatchLines(remoteDir, local string) ([]string, error) {
+	root := local
+	if resolved, rerr := filepath.EvalSymlinks(root); rerr == nil {
+		root = resolved
+	}
+	st, err := os.Stat(root)
+	if err != nil {
+		return nil, err
+	}
+	if !st.IsDir() {
+		return nil, errors.New("递归上传的本地源必须是目录: " + local)
+	}
+	remoteRoot := path.Clean(remoteDir)
+	mkdirLine := func(remote string) (string, error) {
+		r, qerr := quoteArg(remote)
+		if qerr != nil {
+			return "", qerr
+		}
+		return "-mkdir " + r, nil
+	}
+	dirLines := make([]string, 0, 8)
+	fileLines := make([]string, 0, 8)
+	// 目标目录的祖先自上而下逐级建（幂等，见 mkdirAncestors）。
+	for _, ancestor := range mkdirAncestors(remoteRoot) {
+		line, aerr := mkdirLine(ancestor)
+		if aerr != nil {
+			return nil, aerr
+		}
+		dirLines = append(dirLines, line)
+	}
+	// 注：remoteRoot 为 "." 时 mkdirAncestors 返回 nil（当前目录一定存在），下面的
+	// 子目录行与文件行照旧 —— 不需要任何特殊分支。
+
+	werr := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if d.IsDir() {
+			if p == root {
+				return nil
+			}
+			rel, rerr := filepath.Rel(root, p)
+			if rerr != nil {
+				return rerr
+			}
+			if IsInternalTemp(filepath.Base(rel)) {
+				return nil
+			}
+			line, lerr := mkdirLine(path.Join(remoteRoot, filepath.ToSlash(rel)))
+			if lerr != nil {
+				return lerr
+			}
+			dirLines = append(dirLines, line)
+			return nil
+		}
+		info, ierr := d.Info()
+		if ierr != nil {
+			return ierr
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			// 软链：跟随（与 scanLocalTree 一致）；解析成目录 ⇒ 不递归。
+			sst, serr := os.Stat(p)
+			if serr != nil {
+				return serr
+			}
+			info = sst
+		}
+		if info.IsDir() || !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return rerr
+		}
+		if IsInternalTemp(filepath.Base(rel)) {
+			return nil
+		}
+		lq, lerr := quoteArg(p)
+		if lerr != nil {
+			return lerr
+		}
+		rq, rerr := quoteArg(path.Join(remoteRoot, filepath.ToSlash(rel)))
+		if rerr != nil {
+			return rerr
+		}
+		fileLines = append(fileLines, "put "+lq+" "+rq)
+		return nil
+	})
+	if werr != nil {
+		return nil, werr
+	}
+	// 目录行必须在文件行之前：sftp 的 put **不建父目录**，父目录不存在则整批在第一个
+	// 文件上失败。空目录因此也能被建出（与 GoBackend.PutTree / sftp get -r 一致）。
+	return append(dirLines, fileLines...), nil
 }
 
 func (c *BatchBackend) writeBatch(dir string, content []byte) (string, error) {
@@ -535,14 +688,20 @@ func (c *BatchBackend) Put(host, user, local, remote string) error {
 	return nil
 }
 
-// PutRecursive 递归上传本地目录到远端目录（sftp put -r）。
-// 目标语义由 e2e 探针实测确定（spec §13 R1，verdict "PUT-R: merge"）：
-//   - 远端 remoteDir 下没有同名目录时，sftp 建出 remoteDir/<base(local)>/... ；
-//   - 远端 remoteDir 下已存在同名目录时**并入**该目录，不嵌套出 remoteDir/<base>/<base> ；
-//   - 并入时同名文件被本地内容覆盖（实测另一行 "PUT-R-OVERWRITE: A"）。
+// PutRecursive 递归上传本地目录到远端**最终目录** remoteDir（2026-10-10 契约统一）。
 //
-// 本方法只负责把命令送出去并把结果转成 error；调用方若要"整树替换"，
-// 必须先自行删除远端同名目录（put -r 不会清理远端独有的旧文件）。
+// 参数基准（与 GoBackend.PutTree、与 GetTree 的 local 对称，也与前端 `dst` 计算一致）：
+// remoteDir **就是最终目标目录本身**，源树内容直接落在它下面
+// （`<remoteDir>/<相对源根路径>`）；同名目录已存在则**并入**（同名文件被覆盖），
+// 绝不清理远端独有的旧文件（不做整树替换），也不额外嵌套出 `<base>/<base>`。
+//
+// 实现：本地遍历源树（目录 + 文件）后，在同一个 `sftp -b` 批处理里先 `-mkdir` 出每一级
+// 目标目录（含空目录），再逐文件 `put <local> <最终远端路径>`（见 buildPutTreeBatch）。
+// **不再使用 OpenSSH 的 `put -r <local> <remoteDir>`**：那条命令把 remoteDir 当父目录、
+// 再追加源目录名 —— 与「remoteDir 即最终目录」相反，正是本轮消除的「多套一层」。
+//
+// batch 后端本就不支持原子语义（`guardAtomic` 硬拒 Atomic=true），这里只保证落点正确、
+// 命令失败如实透出（`-mkdir` 容忍「已存在」，`put` 失败仍中止整批）。
 func (c *BatchBackend) PutRecursive(host, user, local, remoteDir string) error {
 	c.logEvent(host, "info", "sftp put -r "+local+" → "+remoteDir)
 	batch, err := c.buildBatch("putr", remoteDir, local)

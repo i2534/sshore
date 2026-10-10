@@ -9,7 +9,9 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"sshore/internal/forward"
 	"sshore/internal/osutil"
@@ -629,25 +631,120 @@ func TestRemoveRecursiveRejectsGlobPaths(t *testing.T) {
 	}
 }
 
+// TestBuildBatchPutRecursive（2026-10-10 契约统一，RED→GREEN）：递归上传的批处理脚本必须
+// 逐文件 `put` 到**最终路径** `<remoteDir>/<相对源根>`，而不是旧的 `put -r <local> <remoteDir>`
+// —— OpenSSH 的 put -r 把 remoteDir 当父目录、再追加源目录名，正是「多套一层」的来源。
+// 目标目录（含空目录）先逐级 `-mkdir`：`-b` 模式下未加 `-` 前缀的命令失败会中止整批，
+// 而「目录已存在」是并入语义下必须容忍的（与 RemoveRecursive 的 -rm/-rmdir 同一手法）。
 func TestBuildBatchPutRecursive(t *testing.T) {
+	src := t.TempDir()
+	makeLocalTree(t, src, map[string]string{"x.txt": "X", "sub/y.txt": "Y"})
+	if err := os.MkdirAll(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	c := NewBatchBackend(nil, nil)
-	b, err := c.buildBatch("putr", "/remote/dir", "/local/dir")
+	b, err := c.buildBatch("putr", "/remote/dir", src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := string(b); got != "put -r \"/local/dir\" \"/remote/dir\"\n" {
-		t.Fatalf("putr batch = %q", got)
+	// 实现会先把源根 EvalSymlinks 再遍历（软链根必须能上传），脚本里的本地路径因此是解析后
+	// 的真实路径（Windows 上 EvalSymlinks 可能改变大小写）—— 期望值同样按解析后的路径构造。
+	root, rerr := filepath.EvalSymlinks(src)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	q := func(p string) string {
+		t.Helper()
+		s, qerr := quoteArg(p)
+		if qerr != nil {
+			t.Fatal(qerr)
+		}
+		return s
+	}
+	// 目录行按 `-mkdir` 的生成顺序：先是远端目标的**全部祖先**自上而下（OpenSSH 的 mkdir
+	// 是单级语义，只 -mkdir 叶子在父目录缺失时会静默失败、随后 put 让整批失败），
+	// 再按 WalkDir 的字典序补源树里的每个子目录（父先于子），最后是逐文件 put。
+	want := strings.Join([]string{
+		`-mkdir "/remote"`,
+		`-mkdir "/remote/dir"`,
+		`-mkdir "/remote/dir/empty"`,
+		`-mkdir "/remote/dir/sub"`,
+		"put " + q(filepath.Join(root, "sub", "y.txt")) + ` "/remote/dir/sub/y.txt"`,
+		"put " + q(filepath.Join(root, "x.txt")) + ` "/remote/dir/x.txt"`,
+	}, "\n") + "\n"
+	if got := string(b); got != want {
+		t.Fatalf("putr batch =\n%q\nwant\n%q", got, want)
+	}
+	if strings.Contains(string(b), "put -r ") {
+		t.Fatalf("递归上传不得再走 put -r（父目录约定会多套一层）: %q", string(b))
+	}
+}
+
+// TestBuildBatchPutRecursiveCreatesMissingAncestors（2026-10-10 复核轮 2 / Minor-2，RED→GREEN）：
+// 目标目录的**中间层**可能不存在（GoBackend 用 MkdirAll 自己补；batch 只 -mkdir 叶子会整批
+// 失败）。批处理必须对目标路径自上而下逐级 `-mkdir`，且每级都带 `-` 前缀 —— `-mkdir` 对
+// **已存在**的目录也报 "Failure"，带前缀时该失败被抑制、EXIT 仍为 0，所以逐级建天然幂等
+// （真机实测见 e2e/PROBE，用例侧证据见 TestTreeE2E 的「祖先缺失」阶段）。
+func TestBuildBatchPutRecursiveCreatesMissingAncestors(t *testing.T) {
+	for _, tc := range []struct {
+		remoteDir string
+		want      []string
+	}{
+		{"/remote/deep/nested/dir", []string{`-mkdir "/remote"`, `-mkdir "/remote/deep"`, `-mkdir "/remote/deep/nested"`, `-mkdir "/remote/deep/nested/dir"`}},
+		{"rel/dir", []string{`-mkdir "rel"`, `-mkdir "rel/dir"`}},
+		{".", nil}, // 当前目录一定存在：不产生任何 -mkdir 行
+	} {
+		src := t.TempDir()
+		makeLocalTree(t, src, map[string]string{"x.txt": "X"})
+		c := NewBatchBackend(nil, nil)
+		b, err := c.buildBatch("putr", tc.remoteDir, src)
+		if err != nil {
+			t.Fatalf("buildBatch(%q): %v", tc.remoteDir, err)
+		}
+		lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+		if len(lines) < len(tc.want)+1 {
+			t.Fatalf("remoteDir=%q 脚本过短: %q", tc.remoteDir, string(b))
+		}
+		for i, want := range tc.want {
+			if lines[i] != want {
+				t.Fatalf("remoteDir=%q 第 %d 行 = %q, want %q（必须自上而下逐级建祖先）\n脚本=%q", tc.remoteDir, i, lines[i], want, string(b))
+			}
+		}
+		// 目录行必须全部带 `-` 前缀，且都排在 put 之前。
+		seenPut := false
+		for _, ln := range lines {
+			if strings.HasPrefix(ln, "put ") {
+				seenPut = true
+				continue
+			}
+			if strings.Contains(ln, "mkdir") && !strings.HasPrefix(ln, "-mkdir ") {
+				t.Fatalf("remoteDir=%q 的 mkdir 行必须带 `-` 前缀（已存在要容忍）: %q", tc.remoteDir, ln)
+			}
+			if seenPut {
+				t.Fatalf("remoteDir=%q 的目录行必须排在所有 put 之前: %q", tc.remoteDir, ln)
+			}
+		}
 	}
 }
 
 func TestPutRecursiveRunsSftp(t *testing.T) {
+	src := t.TempDir()
+	makeLocalTree(t, src, map[string]string{"x.txt": "X"})
 	fr := &fakeRunner{}
 	c := NewBatchBackend(fr.run, nil)
-	if err := c.PutRecursive("h", "", "/local/dir", "/remote/dir"); err != nil {
+	if err := c.PutRecursive("h", "", src, "/remote/dir"); err != nil {
 		t.Fatalf("PutRecursive: %v", err)
 	}
 	if len(fr.calls) != 1 || fr.calls[0].name != "sftp" {
 		t.Fatalf("calls = %+v", fr.calls)
+	}
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if len(fr.batches) != 1 {
+		t.Fatalf("必须恰好一条批处理脚本, got %d", len(fr.batches))
+	}
+	if got := string(fr.batches[0]); !strings.Contains(got, `"/remote/dir/x.txt"`) || !strings.Contains(got, "-mkdir ") {
+		t.Fatalf("批处理脚本必须建目录 + 逐文件 put 到最终路径, got %q", got)
 	}
 }
 
@@ -879,5 +976,143 @@ func TestBatchRejectsAtomicTransfer(t *testing.T) {
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/r", lsLine("a.txt", false, 1))})
 	if err := c.TransferGet(TransferRequest{Host: "h", Remote: "/r", Local: "/l"}, nil); err != nil {
 		t.Fatalf("Atomic=false 不得被守卫拦住: %v", err)
+	}
+}
+
+// —— Task 2：探活（Ctrl.Probe）——
+
+// blockingFakeBackend 是专为「batch 探活必须共享在飞结果」造的替身（审核 I4）：
+// 本文件既有的 fakeBackend 的 List 立即返回、called 字段也无锁 —— 既造不出「阻塞在飞」，
+// 又会与仍在跑的 goroutine 构成 -race 报告，所以不能复用。
+// 嵌入 Backend 接口占位：只覆写被走到的方法（没覆写的方法真被调用会 nil panic，
+// 这是有意的，不静默通过）。
+type blockingFakeBackend struct {
+	Backend
+	listCalls atomic.Int32
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (b *blockingFakeBackend) List(string, string, string) ([]Item, error) {
+	b.listCalls.Add(1)
+	select {
+	case <-b.entered: // 只关一次：放行后的再次调用要立刻返回，不能重复 close
+	default:
+		close(b.entered)
+	}
+	<-b.release // 阻塞到测试放行：模拟 batch 的 cmd.Run() 挂住
+	return nil, errors.New("dead")
+}
+
+// TestCtrlProbeUsesPoolForGoBackend 钉住分派：*GoBackend 必须走 g.Probe → pool.Probe
+// （真实 ReadDirContext(".") 往返 + probeTimeout 预算 + 慢拨号复核），而不是走 List/batch
+// 回退分支 —— 分派写反会让默认 KindGo 后端丢掉 probeTimeout 与取消传播。
+//
+// 判别力（T2 复核 Minor）：只断言「慢拨号 + 健康 ⇒ true」没有判别力 —— GoBackend.List 也走
+// 同一个池、同一次 dial、同样能列成功。故这里再加一条两条路径**结果可分**的判据：让会话的
+// 服务端工作目录消失 —— pool.Probe 读 "."（相对路径，拼在工作目录上）⇒ 必失败，而 List 读
+// "/"（pkg/sftp 服务端只把相对路径拼到工作目录，"/" 仍是真实文件系统根）⇒ 仍会成功。
+// 于是「分派写反」必然答 true，本用例必然变红。
+func TestCtrlProbeUsesPoolForGoBackend(t *testing.T) {
+	root := t.TempDir()
+	var dials atomic.Int32
+	g := NewGoBackend(nil, nil)
+	g.pool = NewPool(func(host, user string) (*Session, error) {
+		dials.Add(1)
+		// 拨号比探针预算慢：模拟 ConnectTimeout 吃满 probeTimeout 的真实形态。
+		time.Sleep(probeTimeout + 300*time.Millisecond)
+		s, _ := newPipeSession(t, host, user, root)
+		return s, nil
+	})
+	defer g.CloseAll()
+
+	c := NewCtrlForcedBackend(g)
+	if _, ok := c.backend().(*GoBackend); !ok {
+		t.Fatal("测试前提错误：forced 后端必须是 *GoBackend")
+	}
+
+	// ① 慢拨号 + 健康会话 ⇒ true（BF5：不得因 cctx 过期把健康连接判死）。
+	if !c.Probe(context.Background(), "h", "u") {
+		t.Fatal("*GoBackend 的探活必须走 pool.Probe：慢拨号但会话健康 ⇒ true")
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("测试前提错误：①必须只拨号一次，dials=%d", n)
+	}
+
+	// ② 判别力：工作目录消失后 pool.Probe 读 "." ⇒ false，而 List 读 "/" ⇒ true（两条可分）。
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("造工作目录消失失败: %v", err)
+	}
+	// 先证明 List 路径在这种会话上确实会成功，否则本用例的判别力不成立、会静默退化。
+	if _, err := c.List("h", "u", "/"); err != nil {
+		t.Fatalf("测试前提错误：List 路径读 \"/\" 必须成功，否则两条路径不可分: %v", err)
+	}
+	if c.Probe(context.Background(), "h", "u") {
+		t.Fatal("工作目录消失后读 \".\" 必失败：Probe 必须答 false；答 true 说明没走 pool.Probe")
+	}
+
+	// ③ ctx 传播：pool.Probe 用调用方的 ctx，GoBackend.List 恒用 context.Background()。
+	//    已取消的 ctx ⇒ 必须 false 且不得再拨号（池已空）。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if c.Probe(ctx, "h", "u") {
+		t.Fatal("已取消的 ctx 必须传到池并让探活答 false（c.List 无视 ctx，会重新列目录并答 true）")
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("已取消的 ctx 下 pool.Probe 必须早退、不得新建会话，dials=%d", n)
+	}
+}
+
+// TestCtrlProbeFallbackIsBoundedAndWaitsForInflight 钉住规格 §8.2 / 审核 I5 + R8：
+// ① legacy batch 后端没有 ctx 感知的 runner（cmd.Run() 无超时）⇒ Ctrl.Probe 必须给调用方
+// 一个有上界的结果（ctx 超时即返回，不得挂死，否则前端 probing 恒 true、自愈永久静默失效）；
+// ② 同一 host 的并发第二次调用必须**等同一个在飞结果**，绝不能「在飞即 false」——
+// false 在前端被解释成 'lost'，会对可能健康的链路做无谓的 SftpDisconnect + 重连（违反 D14）；
+// ③ 在飞条目必须在飞行结束时清除，否则该 host 此后永久「在飞」、自愈静默失效。
+func TestCtrlProbeFallbackIsBoundedAndWaitsForInflight(t *testing.T) {
+	b := &blockingFakeBackend{entered: make(chan struct{}), release: make(chan struct{})}
+	c := NewCtrlForcedBackend(b)
+
+	// ① 有上界：100ms ctx 超时后必须返回 false，而不是跟着挂住。
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel1()
+	start := time.Now()
+	if c.Probe(ctx1, "h", "") {
+		t.Fatal("ctx 超时的 batch 探活必须返回 false")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("ctx 超时后必须立刻返回，实际耗时 %v", d)
+	}
+	select {
+	case <-b.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("探活必须真的打到后端 List（不得被空转短路）")
+	}
+
+	// ② 在飞期间：第二个调用者必须等结果，不得立即答 false。
+	second := make(chan bool, 1)
+	go func() { second <- c.Probe(context.Background(), "h", "") }()
+	select {
+	case got := <-second:
+		t.Fatalf("在飞期间第二个调用者不得立即返回（got %v）——「在飞即 false」会被前端当成 'lost' 做无谓 teardown", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// 放行：List 返回 error ⇒ 结果 false，且两个调用者共享同一次后端调用。
+	close(b.release)
+	if got := <-second; got {
+		t.Fatal("List 失败的探活必须返回 false")
+	}
+	if n := b.listCalls.Load(); n != 1 {
+		t.Fatalf("同 host 并发探活必须去重到一次后端调用，listCalls=%d", n)
+	}
+
+	// ③ 在飞条目必须已清除：第三次调用要真的重新打到后端（listCalls 2），
+	// 而不是等一条永远不会再交付的旧结果。
+	if c.Probe(context.Background(), "h", "") {
+		t.Fatal("List 恒失败的探活必须返回 false")
+	}
+	if n := b.listCalls.Load(); n != 2 {
+		t.Fatalf("在飞条目未清除 ⇒ 该 host 被永久标记「在飞」、自愈静默失效，listCalls=%d", n)
 	}
 }
