@@ -2,6 +2,7 @@ package sftp
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"sshore/internal/forward"
@@ -17,6 +18,11 @@ type Ctrl struct {
 	emit       forward.EmitFunc
 	journalDir string
 	forced     Backend // 仅供测试注入：backend() 优先返回它
+
+	// probeMu 保护 probing：batch 后端探活的每 host 单飞表（规格 §8.2 / 审核 I5）。
+	// 只保护 map 本身，绝不在持锁时等结果（等待必须在放锁之后）。
+	probeMu sync.Mutex
+	probing map[string]*probeFlight // host → 在飞的那次 batch 探活
 }
 
 // NewCtrl 保持 spec D3 的两参签名（env + 内置默认），既有调用点无需改动。
@@ -36,8 +42,8 @@ func NewCtrlWith(r osutil.Runner, emit forward.EmitFunc, sel TransportSelector) 
 // NewCtrlForcedBackend 返回一个**强制使用给定后端**的门面。forced 字段不可导出，包外
 // （package main）用例只能通过它注入测试后端。
 //
-// ⚠️ 测试专用（test-only）：唯一的调用点是 app_test.go 的
-// TestSftpBindingsPassAtomicTrueWhenBackendCapable。生产装配一律走 NewCtrl（batch）或
+// ⚠️ 测试专用（test-only）：调用点只有 app_test.go 的 TestSftpBindingsPassAtomicTrueWhenBackendCapable
+// 与 TestSftpProbeFalseWhenListFails。生产装配一律走 NewCtrl（batch）或
 // NewCtrlWith（按选择器懒解析），**任何生产代码都不得调用本函数** —— 它绕过了
 // resolveTransport 的选择器语义。review 可据此核查：grep 调用点时只应命中 _test.go。
 //
@@ -126,6 +132,94 @@ func (c *Ctrl) RecoverSwaps() (int, error) {
 func (c *Ctrl) CleanupParts() {
 	if g, ok := c.backend().(*GoBackend); ok {
 		g.CleanupParts()
+	}
+}
+
+// —— Task 2：真探活 ——
+
+// GoBackend.Probe 转发池探针（真实 ReadDirContext(".") 往返 + probeTimeout=5s +
+// 失败丢弃死会话）。定义在这里而不是 gosftp.go：它与下面 Ctrl.Probe 的分派是同一处
+// 逻辑，放一起便于对照维护（同包内方法可定义在任何文件）。
+//
+// 调用方必读的两条：
+//  1. Probe 经 markSessionConnected 会把**粘性** connected[host] 置 true（gosftp.go 的
+//     markConnected）——「探针答 false」与「SftpConnected 答 true」会同时成立，所以降级
+//     路径必须再调 SftpDisconnect 清连接意图，Probe 绝非纯只读。
+//  2. batch 回退分支（见 Ctrl.Probe）的残留 —— 挂死的 batch 子进程（cmd.Run() 无超时）
+//     本身靠 ssh 自身的超时回收，本轮不为 legacy 后端改 runner 装配（规格 R8）。
+func (g *GoBackend) Probe(ctx context.Context, host, user string) bool {
+	return g.pool.Probe(ctx, host, user)
+}
+
+// probeFlight 是 batch 探活的一次「在飞」记录：done 关闭即代表结果就绪，ok 是结果本身。
+//
+// 为什么不是裸的 chan bool：一个值只能被一个等待者收到，第 2 个之后的等待者会在该 chan 上
+// 干等（前端 probeTimed 每 15s 超时后会再发一次探活，同 host 多个等待者是可达的）；
+// 而「关闭 done + 读字段」是一次广播，任意多个等待者都能拿到同一个结果，且不存在
+// 「先交付结果、后清除条目」之间新来的调用者等一条不会再交付的结果的窗口。
+// 语义与规格 §8.2 / 审核 I5 完全一致：共享在飞结果，绝不「在飞即 false」。
+type probeFlight struct {
+	done chan struct{}
+	ok   bool
+}
+
+// Probe 是绑定层唯一入口的真探活（规格 §8.2）。
+//
+// GoBackend 有池化会话 ⇒ 直接走 pool.Probe（真实往返回合 + probeTimeout 预算 + 失败丢弃
+// 死会话）。其它后端（legacy batch）没有 ctx 感知的 runner（batch.go 的 osutil.Runner 是
+// 无 ctx 的 cmd.Run()，改成 CtxRunner 会牵动整条 legacy 装配、不成比例）⇒ 用 goroutine +
+// ctx select 给调用方一个上界：否则子进程一挂住，前端 await 永不返回、probing 恒 true，
+// 此后所有切标签探活被静默短路（规格 R8）。
+//
+// 分派用类型断言而不是给 Backend 接口加方法，理由照 RecoverSwaps/CleanupParts 先例
+// （只有 GoBackend 有的能力就在 Ctrl 层断言，避免波及测试替身）。
+func (c *Ctrl) Probe(ctx context.Context, host, user string) bool {
+	if g, ok := c.backend().(*GoBackend); ok {
+		return g.Probe(ctx, host, user)
+	}
+	return c.probeBatch(ctx, host, user)
+}
+
+// probeBatch 是 legacy batch 后端的探活：一次真实列目录（成功即 true），带 ctx 上界，
+// 并且同一 host 的并发调用**共享在飞的同一个结果**（审核 I5）——「在飞即 false」会被前端
+// 解释成 'lost'，对可能健康的链路做无谓的 SftpDisconnect + 重连（违反 D14：只有探针说
+// 失效才算失效）。等待本身不加自己的超时，由前端 probeTimed 的 15s 兜底（超时=未知）。
+func (c *Ctrl) probeBatch(ctx context.Context, host, user string) bool {
+	c.probeMu.Lock()
+	if f, ok := c.probing[host]; ok {
+		c.probeMu.Unlock()
+		select {
+		case <-f.done:
+			return f.ok
+		case <-ctx.Done():
+			return false
+		}
+	}
+	f := &probeFlight{done: make(chan struct{})}
+	if c.probing == nil {
+		c.probing = map[string]*probeFlight{}
+	}
+	c.probing[host] = f
+	c.probeMu.Unlock()
+
+	go func() {
+		_, err := c.List(host, user, "/")
+		// 先摘条目再交付结果：新来的调用者会自己另起一次真实探活（不共享一条已交付的
+		// 结果、也不会等一条永不再交付的结果）；已在等的等待者靠 close(done) 广播醒来。
+		c.probeMu.Lock()
+		delete(c.probing, host)
+		c.probeMu.Unlock()
+		f.ok = err == nil
+		close(f.done)
+	}()
+
+	select {
+	case <-f.done:
+		return f.ok
+	case <-ctx.Done():
+		// 调用方（前端 probeTimed / 绑定层）等不及了：答 false，但在飞的 goroutine 会
+		// 自己跑完并清掉条目 —— 绝不留下「永久在飞」的 host（否则自愈静默失效）。
+		return false
 	}
 }
 

@@ -195,21 +195,75 @@ func NewSyncID() string {
 	return hex.EncodeToString(b)
 }
 
+// SftpUIState 是 SFTP 视图的持久化状态：与 AppSettings 解耦（独立配置段），
+// 因为它只服务于 SFTP 面板，且设置页的"保存/恢复默认"整结构覆盖不应牵连它。
+//
+// 前提声明（spec §6.1，扩展到 sync/watch 之前必须先改键）：last_remote_dirs 的键是
+// **SSH 主机名（不含 user）**，即本设计假定"host 唯一标识一个远端位置"。SFTP 视图的
+// 所有绑定都把 user 传空串，所以该假定在视图范围内成立；但 internal/sync 用 rule.User
+// （见 internal/sync/ctrl.go 的调用点），若将来把"最后路径"能力扩展到 sync/watch，
+// 必须先把 user 纳入键。本轮不改键结构。
+type SftpUIState struct {
+	LastLocalDir   string            `toml:"last_local_dir" json:"last_local_dir"`
+	LastRemoteDirs map[string]string `toml:"last_remote_dirs" json:"last_remote_dirs"` // host（不含 user）→ 最后路径
+	SortLocalKey   string            `toml:"sort_local_key" json:"sort_local_key"`
+	SortLocalDir   int               `toml:"sort_local_dir" json:"sort_local_dir"`
+	SortRemoteKey  string            `toml:"sort_remote_key" json:"sort_remote_key"`
+	SortRemoteDir  int               `toml:"sort_remote_dir" json:"sort_remote_dir"`
+}
+
+// Normalize 兜底 SFTP 视图状态：排序键只认 name|size|modTime（非法/空 → name），
+// 方向归一为 ±1（<0 → -1，否则 → 1；零值 0 不合法）。LastRemoteDirs 为 nil 时补成
+// 非 nil 空 map —— 前端绑定不能拿到 null。不设条数上限：host 集合来自 ssh config，
+// 规模有限；主机被删/改名后的遗留条目无害，不清扫（避免误删用户数据）。
+func (s *SftpUIState) Normalize() {
+	switch s.SortLocalKey {
+	case "name", "size", "modTime":
+	default:
+		s.SortLocalKey = "name"
+	}
+	switch s.SortRemoteKey {
+	case "name", "size", "modTime":
+	default:
+		s.SortRemoteKey = "name"
+	}
+	s.SortLocalDir = normalizeSortDir(s.SortLocalDir)
+	s.SortRemoteDir = normalizeSortDir(s.SortRemoteDir)
+	if s.LastRemoteDirs == nil {
+		s.LastRemoteDirs = map[string]string{}
+	}
+}
+
+// normalizeSortDir 把排序方向归一为 ±1：<0 → -1（降序），否则 → 1（升序）。
+func normalizeSortDir(dir int) int {
+	if dir < 0 {
+		return -1
+	}
+	return 1
+}
+
 type AppConfig struct {
 	App        AppSettings  `toml:"app" json:"app"`
 	Tunnels    []Tunnel     `toml:"tunnels" json:"tunnels"`
 	RecentSFTP []RecentSFTP `toml:"recent_sftp" json:"recent_sftp"`
 	Syncs      []SyncRule   `toml:"syncs" json:"syncs"`
 
-	Bookmarks      []Bookmark     `toml:"bookmarks" json:"bookmarks"`
-	LocalRecent    []RecentLocal  `toml:"local_recent" json:"local_recent"`
-	RemoteRecent   []RecentRemote `toml:"remote_recent" json:"remote_recent"`
-	LegacyMigrated bool           `toml:"legacy_migrated" json:"legacy_migrated"`
+	Bookmarks    []Bookmark     `toml:"bookmarks" json:"bookmarks"`
+	LocalRecent  []RecentLocal  `toml:"local_recent" json:"local_recent"`
+	RemoteRecent []RecentRemote `toml:"remote_recent" json:"remote_recent"`
+
+	// SftpUI 不带 omitempty：老配置首次因任何原因写盘后该段自然出现。
+	SftpUI SftpUIState `toml:"sftp_ui" json:"sftp_ui"`
+
+	LegacyMigrated bool `toml:"legacy_migrated" json:"legacy_migrated"`
 }
 
-// normalize applies per-field defaults to the whole config (currently just App).
+// normalize applies per-field defaults to the whole config：App、每条 Syncs
+// （含 auto_reconnect 缺键时取全局默认），以及 SftpUI（非法排序值不得飘到 UI）。
+// LoadConfig 与 DefaultAppConfig 都经过这里，是唯一的归一挂点。
 func (c *AppConfig) normalize() {
 	c.App.Normalize()
+	c.SftpUI.Normalize()
 	for i := range c.Syncs {
 		c.Syncs[i].Normalize()
 		// spec §5.2：auto_reconnect 缺键时取全局默认（默认 true）。

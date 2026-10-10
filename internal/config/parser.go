@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/kevinburke/ssh_config"
+
+	"sshore/internal/osutil"
 )
 
 // Host represents a resolved SSH host entry from ~/.ssh/config.
@@ -78,10 +80,14 @@ const sshGTimeout = 5 * time.Second
 
 // defaultSSHGRun 以 5s 超时运行 `ssh -G <alias>` 并返回其 stdout。
 // 声明为变量而非函数，便于测试在不依赖真实 ssh 二进制的情况下验证接线。
+//
+// 这是本包**真实 exec 的那一层**：命令名交给 osutil 的 OpenSSH 解析器
+// （windows/386 上 WOW64 会把 System32 重定向到没有 OpenSSH 的 SysWOW64，
+// 见 internal/osutil/execpath.go），参数列表逐字不变。
 var defaultSSHGRun = func(alias string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), sshGTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "ssh", "-G", alias).Output()
+	out, err := exec.CommandContext(ctx, osutil.SSHExecutable(), "-G", alias).Output()
 	if err != nil {
 		return "", err
 	}

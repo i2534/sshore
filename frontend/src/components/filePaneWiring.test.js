@@ -198,6 +198,105 @@ describe('面板四段结构与列共轨', () => {
   })
 })
 
+describe('排序状态上收（props + emit sort）', () => {
+  it('排序读 props：无本地 ref、无 *.value 残留、emits 含 sort', () => {
+    expect(filePane).not.toContain('const sortKey = ref(')
+    expect(filePane).not.toContain('const sortDir = ref(')
+    // 审核 FF1（Blocking）：arrow() 与 visible() 同作用域，删 ref 只改其一 ⇒ 渲染期 ReferenceError、
+    // 整块面板白屏。这条断言专门抓漏改的 *.value 残留（渲染测试只能覆盖到 visible/arrow 都被调用到的路径）。
+    expect(filePane).not.toMatch(/sortKey\.value|sortDir\.value/)
+    expect(filePane).toMatch(/defineEmits\(\[[^\]]*'sort'/)
+    expect(filePane).toContain("from '../utils/sort'")
+  })
+
+  it('props 声明带安全默认值，模板 active 直接读 props 名', () => {
+    // 默认值是硬要求：T11 接线前 SftpView 不传这两个 prop，缺省必须能正常渲染而不是 undefined 排序
+    expect(filePane).toMatch(/sortKey:\s*\{\s*type:\s*String,\s*default:\s*'name'\s*\}/)
+    expect(filePane).toMatch(/sortDir:\s*\{\s*type:\s*Number,\s*default:\s*1\s*\}/)
+    expect(filePane).toContain(":class=\"{ active: sortKey === 'name' }\"")
+    expect(filePane).toContain(":class=\"{ active: sortKey === 'size' }\"")
+    expect(filePane).toContain(":class=\"{ active: sortKey === 'modTime' }\"")
+  })
+
+  it('点列头 = 用 T6 的 nextSort 算好「下一个方向」再 emit（不在组件里复制取反实现）', () => {
+    expect(filePane).toMatch(/function sortBy\(key\)\s*\{\s*emit\('sort',\s*nextSort\(\{\s*key:\s*props\.sortKey,\s*dir:\s*props\.sortDir\s*\},\s*key\)\)\s*\}/)
+    expect(filePane).not.toMatch(/sortDir\s*\*=\s*-1/) // 旧实现残留即红
+  })
+
+  it('arrow() 与 visible() 的读源都是 props（两处必须同改）', () => {
+    expect(filePane).toMatch(/function arrow\(key\)\s*\{\s*return\s+props\.sortKey === key \? \(props\.sortDir === 1 \? '▲' : '▼'\) : ''\s*\}/)
+    // 收紧（审核 Minor）：原来是一条横跨全文的正则 `/const visible = computed\(\(\)\s*=>\s*\{[\s\S]*?props\.sortKey[\s\S]*?props\.sortDir/`
+    // —— `[\s\S]*?` 会懒匹配**跨函数**一路吃到后面的 arrow()（它也在读 props.sortKey/sortDir），
+    // 于是把 visible 体内的读源删干净仍然绿。这里改成先切出 computed 体，再在切片内断言。
+    const iStart = filePane.indexOf('const visible = computed(')
+    const iEnd = filePane.indexOf('return sorted')
+    expect(iStart, '找不到 visible computed 的定义').toBeGreaterThan(-1)
+    expect(iEnd, '找不到 visible computed 的结尾（return sorted）').toBeGreaterThan(iStart)
+    const body = filePane.slice(iStart, iEnd)
+    expect(body).toContain('props.sortKey')
+    expect(body).toContain('props.sortDir')
+  })
+})
+
+// T10：右键触发面分级（spec §5.2 / §11.2）。空白/列头/过滤栏 = 面板级（item: null），
+// 文件行 = 行自身处理器。仓库无 jsdom ⇒ contextmenu 事件写不出来，只能读源码钉形状。
+describe('右键触发面分级（空白 vs 行）', () => {
+  const handler = () => {
+    const m = filePane.match(/function onPaneContext\(e\)\s*\{([\s\S]*?)\n\}/)
+    expect(m, '找不到 onPaneContext 空白右键处理器').not.toBeNull()
+    return m[1]
+  }
+
+  it('空白右键：对可编辑控件与任何 li 放行、对 .pos-wrap 先 closePos 且不弹菜单', () => {
+    const fn = handler()
+    expect(fn).toContain('input, textarea, [contenteditable]:not([contenteditable="false"])')
+    expect(fn).toMatch(/closest\('\.pos-wrap'\)[\s\S]*closePos\(\)/)
+    expect(fn).toMatch(/closest\('li'\)[\s\S]*return/)
+    expect(fn).toContain("emit('context', { item: null, event: e })")
+    expect(filePane).toMatch(/<div class="pane[^>]*@contextmenu="onPaneContext"/)
+    expect(filePane).not.toMatch(/@contextmenu\.prevent="onPaneContext"/)   // 必须不带 .prevent
+  })
+
+  it('.. 行新增 contextmenu 处理器并按无选中上抛', () => {
+    const up = filePane.slice(filePane.indexOf('class="up"'), filePane.indexOf('class="up"') + 260)
+    expect(up).toContain('@contextmenu.prevent="emit(\'context\', { item: null, event: $event })"')
+  })
+
+  it('分支顺序：可编辑放行 → .pos-wrap → 任何 li → preventDefault+emit', () => {
+    // 顺序错了就是行为错：把 li 分支提到可编辑之前，路径栏/过滤框会被劫持；
+    // 把 emit 提到 li 之前，行右键会双发射。
+    const fn = handler()
+    const iEditable = fn.indexOf('input, textarea')
+    const iPos = fn.indexOf(".pos-wrap")
+    const iLi = fn.indexOf("closest('li')")
+    const iEmit = fn.indexOf("emit('context'")
+    expect(iEditable).toBeGreaterThan(-1)
+    expect(iPos).toBeGreaterThan(-1)
+    expect(iLi).toBeGreaterThan(-1)
+    expect(iEmit).toBeGreaterThan(-1)
+    expect(iEditable).toBeLessThan(iPos)
+    expect(iPos).toBeLessThan(iLi)
+    expect(iLi).toBeLessThan(iEmit)
+    // 钉住不重复 emit（审核 Minor）：这条处理器只允许 emit 一次 'context'，
+    // 多一处（例如分支没 return 而继续往下走）就是"右键弹两次菜单"的静默缺陷。
+    expect(fn.match(/emit\('context'/g)).toHaveLength(1)
+  })
+
+  it('面板级右键先 preventDefault 再 emit item:null', () => {
+    // 顺序反了会在自定义菜单之上再弹一次原生菜单
+    expect(handler()).toMatch(/e\.preventDefault\(\)\s*\n\s*emit\('context', \{ item: null, event: e \}\)/)
+  })
+
+  it('注释写明三条刻意选择：不带 .prevent / li 必须 yield 的原因 / loading 落点降级', () => {
+    // 注释是回归护栏（spec §5.2 要求写进实现注释）：删掉注释即红，逼实现者重新论证而不是顺手加 .prevent。
+    const block = filePane.slice(filePane.indexOf('T10 右键触发面'), filePane.indexOf('function onPaneContext'))
+    expect(block, '找不到 T10 右键触发面说明注释').not.toBe('')
+    expect(block).toContain('stopPropagation')  // 「.prevent 不 stopPropagation ⇒ .. 行双发射」
+    expect(block).toContain('pointer-events')   // loading 期间 .list.busy 的落点降级
+    expect(block).toContain('原生')             // 不带 .prevent 是为了保住原生复制粘贴
+  })
+})
+
 describe('过滤栏的多选入口', () => {
   it('三个按钮都在过滤栏里，且都 emit(action, ...)', () => {
     const bar = filePane.split('data-role="filterbar"')[1]

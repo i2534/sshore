@@ -23,10 +23,17 @@ vi.mock('../../wailsjs/go/main/App', () => ({
   RemoveBookmark: vi.fn(async () => {}),
   AddLocalRecent: vi.fn(async () => {}),
   AddRemoteRecent: vi.fn(async () => {}),
+  // sftpui store 的两个绑定：locations 的镜像**只走内存**，这两个 mock 的存在正是
+  // 为了钉死"镜像前后调用次数都是 0"（规格 §7.2 零新增 IPC）。
+  GetSftpUI: vi.fn(async () => ({})),
+  SaveSftpUI: vi.fn(async () => {}),
 }))
 
-import { AddLocalRecent, AddRemoteRecent, ListPresets } from '../../wailsjs/go/main/App'
+import {
+  AddLocalRecent, AddRemoteRecent, ListPresets, GetSftpUI, SaveSftpUI,
+} from '../../wailsjs/go/main/App'
 import { useLocationsStore } from './locations'
+import { useSftpUIStore } from './sftpui'
 
 describe('locations store', () => {
   beforeEach(() => setActivePinia(createPinia()))
@@ -69,6 +76,11 @@ describe('locations store', () => {
   it('重复记录同一最近位置时短路：不发 IPC、列表不变', async () => {
     const s = useLocationsStore()
     await s.load()
+    const ui = useSftpUIStore()
+    // 真短路的前置：队首与内存镜像**同时**同值（新判据，§6.3.2）。真机同会话里
+    // 上一次成功写入会同时改队首与镜像，故这里先对齐镜像再断言"不写盘"。
+    ui.noteLocalPath('/home/u/a')
+    ui.noteRemotePath('prod', '/var/log')
     const beforeL = JSON.stringify(s.localRecents)
     const beforeR = JSON.stringify(s.remoteRecents)
     AddLocalRecent.mockClear()
@@ -89,6 +101,183 @@ describe('locations store', () => {
     expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
     expect(s.localRecents[0].path).toBe('/tmp/other')
     expect(s.remoteRecents[0].host).toBe('db')
+  })
+
+  // ---- 最后路径的内存镜像（§7.2）：唯一落盘出口在后端，前端只镜像成功结果 ----
+
+  it('addRemoteRecent 成功后镜像 sftpui 最后路径（零新 IPC）', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    expect(ui.lastPathFor('remote', 'prod')).toBe('') // 镜像初值：本会话还没 load sftpui
+
+    AddRemoteRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+    // 镜像发生前：两个 SFTP UI 绑定的调用次数都是 0
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+
+    await s.addRemoteRecent('prod', '/srv/app')
+
+    // 镜像后仍然是 0，且 AddRemoteRecent 只多了它自己那一次
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+    expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
+    expect(AddRemoteRecent).toHaveBeenCalledWith('prod', '/srv/app')
+
+    expect(ui.lastPathFor('remote', 'prod')).toBe('/srv/app')
+    // 镜像只负责最后路径：不得顺带碰 loaded/sort（§7.1 的其它状态各有唯一写入口）
+    expect(ui.loaded).toBe(false)
+    expect(ui.sort).toEqual({ local: { key: 'name', dir: 1 }, remote: { key: 'name', dir: 1 } })
+  })
+
+  it('addLocalRecent 成功后镜像 sftpui 本地最后路径（零新 IPC）', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+
+    AddLocalRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+
+    await s.addLocalRecent('/tmp/work')
+
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+    expect(AddLocalRecent).toHaveBeenCalledTimes(1)
+    expect(AddLocalRecent).toHaveBeenCalledWith('/tmp/work')
+
+    expect(ui.lastPathFor('local')).toBe('/tmp/work')
+    // 本地镜像不得污染远程键空间
+    expect(ui.lastPathFor('remote', 'prod')).toBe('')
+  })
+
+  it('写盘失败时不镜像（错误照旧抛出、列表也不变）', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    const beforeL = JSON.stringify(s.localRecents)
+    const beforeR = JSON.stringify(s.remoteRecents)
+
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+    AddRemoteRecent.mockRejectedValueOnce(new Error('写配置失败: boom'))
+    await expect(s.addRemoteRecent('prod', '/srv/boom')).rejects.toThrow('写配置失败: boom')
+    AddLocalRecent.mockRejectedValueOnce(new Error('写配置失败: boom'))
+    await expect(s.addLocalRecent('/tmp/boom')).rejects.toThrow('写配置失败: boom')
+
+    expect(ui.lastPathFor('remote', 'prod')).toBe('')
+    expect(ui.lastPathFor('local')).toBe('')
+    expect(JSON.stringify(s.localRecents)).toBe(beforeL)
+    expect(JSON.stringify(s.remoteRecents)).toBe(beforeR)
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+  })
+
+  it('真短路（队首与镜像同值）：不发 IPC，镜像保持对齐', async () => {
+    const s = useLocationsStore()
+    // 队首分别是 (prod, /var/log) 与 /home/u/a
+    await s.load()
+    const ui = useSftpUIStore()
+    // 真短路的必要条件：内存镜像也已经是这个值（新判据，§6.3.2）
+    ui.noteLocalPath('/home/u/a')
+    ui.noteRemotePath('prod', '/var/log')
+
+    AddLocalRecent.mockClear()
+    AddRemoteRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+
+    await s.addLocalRecent('/home/u/a')
+    await s.addRemoteRecent('prod', '/var/log')
+
+    // 短路语义不变：不写盘（队首与镜像都同值，后端那次补写已无必要）
+    expect(AddLocalRecent).not.toHaveBeenCalled()
+    expect(AddRemoteRecent).not.toHaveBeenCalled()
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+    // 短路分支仍做幂等镜像对齐（同值赋值，无害）
+    expect(ui.lastPathFor('local')).toBe('/home/u/a')
+    expect(ui.lastPathFor('remote', 'prod')).toBe('/var/log')
+  })
+
+  // ---- last path 补写不受队首短路约束（§6.3.2）：镜像陈旧 ⇒ 必须发一次 IPC ----
+  // 典型升级场景：老配置没有 last path（镜像空），而队首已是目标路径
+  //（SftpHome 每次 connect 把后端队首改写成 home，用户再从下拉/「主目录」选中它）。
+  // 此时若沿用"只比队首"的旧判据短路，那次 last path 补写被拦掉：同会话重连看似正确，
+  // **重启后落点丢失**。故短路判据必须追加"镜像也已经同值"。
+
+  it('队首同值但远程镜像为空（升级场景）⇒ 仍发一次 IPC 补写 last path', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    // 队首已是目标 (h, /p)，镜像尚未落值（未 load sftpui / 老配置无 last path）
+    s.remoteRecents = [{ host: 'h', path: '/p', ts: '1' }]
+    expect(ui.lastPathFor('remote', 'h')).toBe('')
+
+    AddRemoteRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+
+    await s.addRemoteRecent('h', '/p')
+
+    expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
+    expect(AddRemoteRecent).toHaveBeenCalledWith('h', '/p')
+    expect(ui.lastPathFor('remote', 'h')).toBe('/p')
+    // 补写只走这一个绑定：不夹带 sftpui 的读写（§7.2 零新增 IPC）
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+  })
+
+  it('队首同值但远程镜像陈旧（不同值）⇒ 仍发一次 IPC 补写 last path', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    s.remoteRecents = [{ host: 'h', path: '/p', ts: '1' }]
+    ui.noteRemotePath('h', '/old')
+
+    AddRemoteRecent.mockClear()
+    await s.addRemoteRecent('h', '/p')
+
+    expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
+    expect(ui.lastPathFor('remote', 'h')).toBe('/p')
+  })
+
+  it('队首同值但本地镜像为空（升级场景）⇒ 仍发一次 IPC 补写 last path', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    s.localRecents = [{ path: '/p', ts: '1' }]
+    expect(ui.lastPathFor('local')).toBe('')
+
+    AddLocalRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+
+    await s.addLocalRecent('/p')
+
+    expect(AddLocalRecent).toHaveBeenCalledTimes(1)
+    expect(AddLocalRecent).toHaveBeenCalledWith('/p')
+    expect(ui.lastPathFor('local')).toBe('/p')
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+  })
+
+  it('队首同值但本地镜像陈旧（不同值）⇒ 仍发一次 IPC 补写 last path', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    s.localRecents = [{ path: '/p', ts: '1' }]
+    ui.noteLocalPath('/old')
+
+    AddLocalRecent.mockClear()
+    await s.addLocalRecent('/p')
+
+    expect(AddLocalRecent).toHaveBeenCalledTimes(1)
+    expect(ui.lastPathFor('local')).toBe('/p')
   })
 
   it('load 同时拉取三组固定预设', async () => {

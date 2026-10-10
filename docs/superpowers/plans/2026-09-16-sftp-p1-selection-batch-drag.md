@@ -1337,6 +1337,15 @@ git commit -m "feat(sftp): 远端递归删除（- 前缀失败隔离 + glob 路�
 
 ### Task 9: `internal/sftp.PutRecursive`
 
+> **2026-10-10 勘误（本任务的历史实现已被后续修复取代）**：本节与下面 Step 1/3 里
+> `put -r "/local/dir" "/remote/dir"` 记录的是当时**父目录约定**下的实现（OpenSSH 会把
+> `local` 放进 `remoteDir` 之下）。但前端两个方向实际传的都是**最终路径**，该约定导致上传
+> 目录多套一层（`updir/` → `/t/updir/updir/a.txt`）。现已统一为 **`remoteDir` = 最终目标
+> 目录**：`PutRecursive` 遍历本地源树，在同一个 `sftp -b` 脚本里 `-mkdir` 各级目录 + 逐文件
+> `put` 到最终路径（见 `internal/sftp/batch.go` 的 `buildPutTreeBatch`；契约见
+> `docs/superpowers/specs/2026-09-18-sftp-gosftp-transport-design.md` 的 D6「参数基准」行）。
+> 下方代码块保留为历史记录，不再是当前实现。
+
 **Files:**
 - Modify: `internal/sftp/ctrl.go`（`buildBatch` 增 `putr` 分支；新增方法）
 - Test: `internal/sftp/ctrl_test.go`
