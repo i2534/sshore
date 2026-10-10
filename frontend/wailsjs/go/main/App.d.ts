@@ -44,6 +44,8 @@ export function GetAppInfo():Promise<main.AppInfo>;
 
 export function GetSettings():Promise<config.AppSettings>;
 
+export function GetSftpUI():Promise<config.SftpUIState>;
+
 export function GetUpdateInfo():Promise<update.UpdateInfo>;
 
 export function HomeDir():Promise<string>;
@@ -86,6 +88,8 @@ export function ResolveSyncConflict(arg1:string,arg2:string,arg3:string):Promise
 
 export function RetrySyncRuleFailures(arg1:string):Promise<void>;
 
+export function SaveSftpUI(arg1:config.SftpUIState):Promise<void>;
+
 export function SearchCancel(arg1:string):Promise<void>;
 
 export function SetSettings(arg1:config.AppSettings):Promise<void>;
@@ -107,6 +111,8 @@ export function SftpList(arg1:string,arg2:string,arg3:string):Promise<Array<sftp
 export function SftpMkdir(arg1:string,arg2:string,arg3:string):Promise<void>;
 
 export function SftpMove(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
+
+export function SftpProbe(arg1:string):Promise<boolean>;
 
 export function SftpPut(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:boolean,arg7:string):Promise<void>;
 

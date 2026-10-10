@@ -78,6 +78,10 @@ export function GetSettings() {
   return window['go']['main']['App']['GetSettings']();
 }
 
+export function GetSftpUI() {
+  return window['go']['main']['App']['GetSftpUI']();
+}
+
 export function GetUpdateInfo() {
   return window['go']['main']['App']['GetUpdateInfo']();
 }
@@ -162,6 +166,10 @@ export function RetrySyncRuleFailures(arg1) {
   return window['go']['main']['App']['RetrySyncRuleFailures'](arg1);
 }
 
+export function SaveSftpUI(arg1) {
+  return window['go']['main']['App']['SaveSftpUI'](arg1);
+}
+
 export function SearchCancel(arg1) {
   return window['go']['main']['App']['SearchCancel'](arg1);
 }
@@ -204,6 +212,10 @@ export function SftpMkdir(arg1, arg2, arg3) {
 
 export function SftpMove(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['SftpMove'](arg1, arg2, arg3, arg4);
+}
+
+export function SftpProbe(arg1) {
+  return window['go']['main']['App']['SftpProbe'](arg1);
 }
 
 export function SftpPut(arg1, arg2, arg3, arg4, arg5, arg6, arg7) {

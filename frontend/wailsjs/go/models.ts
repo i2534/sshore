@@ -102,6 +102,28 @@ export namespace config {
 	        this.ts = source["ts"];
 	    }
 	}
+	export class SftpUIState {
+	    last_local_dir: string;
+	    last_remote_dirs: Record<string, string>;
+	    sort_local_key: string;
+	    sort_local_dir: number;
+	    sort_remote_key: string;
+	    sort_remote_dir: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new SftpUIState(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.last_local_dir = source["last_local_dir"];
+	        this.last_remote_dirs = source["last_remote_dirs"];
+	        this.sort_local_key = source["sort_local_key"];
+	        this.sort_local_dir = source["sort_local_dir"];
+	        this.sort_remote_key = source["sort_remote_key"];
+	        this.sort_remote_dir = source["sort_remote_dir"];
+	    }
+	}
 	export class SyncRule {
 	    id: string;
 	    name: string;
