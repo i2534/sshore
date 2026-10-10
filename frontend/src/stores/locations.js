@@ -48,7 +48,8 @@ export const useLocationsStore = defineStore('locations', {
       // 否则每次目录导航/刷新/批量重载都会写一次配置（后端 AddLocalRecent 每次 saveConfig）。
       if (this.localRecents[0]?.path === path) {
         // 短路也要对齐镜像（幂等、无害）：sftpui.load() 失败时镜像是空串而这里队首非空，
-        // 此时短路正是唯一能修正镜像的机会（规格 §7.2 / 审核 FF17）。纯内存，零新增 IPC。
+        // 此时短路正是唯一能修正镜像的机会。注意这是**执行期裁定**，不是规格 §7.2 的要求
+        // —— FF17 讨论的是「不做兜底」，结论与之相反（T8 复核 Minor）。纯内存，零新增 IPC。
         useSftpUIStore().noteLocalPath(path)
         return
       }
