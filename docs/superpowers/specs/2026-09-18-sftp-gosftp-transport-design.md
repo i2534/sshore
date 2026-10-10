@@ -183,13 +183,13 @@ internal/sftp/
 | 能力 | 必须保持的语义 |
 |---|---|
 | `List` / `ListMany` | **缺失的 key = 该目录未知，绝不是空目录**（`ctrl.go:334-336`）；`Search`（`search.go:71-75`）与 `watch/scan.go:112-119` 都依赖它 |
-| 参数基准（评审 A 的 S2） | `Get/GetRecursive` 的 `local` = **目标文件 / 目标目录本身**；`Put/PutRecursive` 的 `remote` = 目标文件 / **目标父目录**（远端建 `<remoteDir>/<base(local)>`，同名已存在则**并入**，`ctrl.go:537-544` 是权威描述）。与前端 `planTasks` 传 `targetDir/name` 一致，e2e 固化 |
+| 参数基准（评审 A 的 S2；2026-10-10 修正） | `Get/GetRecursive` 的 `local` = **目标文件 / 目标目录本身**；`Put/PutRecursive` 的 `remote` = 目标文件 / **目标目录本身**（源树内容直接落在它下面：`<remote>/<相对源根>`；同名子目录已存在则**并入**，同名文件被覆盖，不清理远端独有文件）。**此前这里写的是「目标父目录」**（远端建 `<remoteDir>/<base(local)>`），与前端 `planTasks` 传 `targetDir/name` 的「最终路径」不一致，导致上传目录多套一层；现两个后端、两个方向都以「最终目录」为准（`internal/sftp/gosftp.go` PutTree、`internal/sftp/batch.go` PutRecursive），e2e 固化 |
 | `Home` | 远端家目录绝对路径（新实现用 `Getwd()`/`RealPath(".")`） |
 | **`Rename` / `Move`** | **必须覆盖已存在目标**：实测现状 `sftp rename` 覆盖；而 `Client.Rename`（plain `SSH_FXP_RENAME`）在 OpenSSH 上目标存在必失败 → 新实现用 `Client.PosixRename`（client.go:912）；**扩展缺失时明确失败并提示**，不做「先删后改」的有损序列（评审 B 的实测发现） |
 | `RemoveRecursive` | 拒绝根路径；目录不可读即整体失败；不静默漏删 |
 | 通配符拒绝 | batch 时代防远端 glob 误删（`ctrl.go:596`）。库直连无 glob 展开，保留作纵深防御 |
 | `Mkdir` / `Remove` | 语义不变 |
-| `GetRecursive` / `PutRecursive` | OpenSSH 的合并语义（D11）；D15 的逐文件 `.part` 不改变它 |
+| `GetRecursive` / `PutRecursive` | 合并语义（D11）：目标目录已存在则**并入**、同名文件被覆盖、不清理远端独有文件；D15 的逐文件 `.part` 不改变它。2026-10-10 起目标参数 = **最终目录本身**（不再追加源目录名），batch 后端也不再走 OpenSSH 的 `put -r`（它自带父目录约定） |
 
 ### D7 进度来自真实字节 + 末帧必达
 
@@ -224,6 +224,8 @@ internal/sftp/
 ### D11 递归语义与 OpenSSH 一致
 
 不借换代顺手改语义（不做整树替换、不清理远端独有文件、默认不保留 mode/mtime）；`.part` 是逐文件行为，不改变目录合并规则。
+
+2026-10-10 修正：这里的「一致」只指**合并规则**（目标目录已存在则并入、同名文件被覆盖、不动远端独有文件），**不含** `put -r` 的**父目录参数约定**。`TransferRequest` 的 `Remote`（上传）/`Local`（下载）一律表示**最终目标目录本身**（见 D6 参数基准行）；batch 后端因此不再生成 `put -r`，而是 `-mkdir` + 逐文件 `put` 到最终路径。
 
 ### D12 错误模型
 
