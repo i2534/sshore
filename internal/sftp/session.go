@@ -285,6 +285,19 @@ func (p *Pool) refill() {
 }
 
 // Probe 用库唯一 ctx 感知的 ReadDirContext 探活；超时/取消即关掉并丢弃该会话。
+//
+// 预算缺陷修复（规格 §8.2 / 审核 BF5）：AcquireList（上面）**完全不用 ctx**，池里没有
+// idle 会话时会真拨号，最长吃 ConnectTimeout=10s。拨号一旦慢于 probeTimeout，随后的
+// ReadDirContext 面对**已过期**的 cctx 会立刻返回 ctx.Err() ⇒ 修复前会把一条刚建好的
+// **健康**连接判失效、还会 Release(s,false) 关掉它，进而在前端触发「断开 + 重连」的
+// 无辜 teardown（规格 R1）。修法：cctx 过期但会话确实建出来了（Conn != nil，即
+// markSessionConnected 已跑）时，用**新预算**复核一次再判 —— 只有新预算也失败才判失效；
+// 失败仍按既有语义 Release(s,false) 丢弃会话（绝不把死会话留在池里）。
+//
+// ⚠️ 未声明的副作用（规格 §8.2，调用方必读）：Probe 经 AcquireList → markSessionConnected
+// 会把**粘性** connected[host] 置 true（gosftp.go 的 markConnected）。所以「探针答 false」
+// 与「SftpConnected 答 true」会同时成立 —— 降级路径必须再调 SftpDisconnect 清连接意图，
+// 否则未连接分支会读到粘性 true 又翻回「已连接」。Probe 不是纯只读操作。
 func (p *Pool) Probe(ctx context.Context, host, user string) bool {
 	cctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
@@ -302,6 +315,14 @@ func (p *Pool) Probe(ctx context.Context, host, user string) bool {
 		return false
 	}
 	_, err = s.Conn.ReadDirContext(cctx, ".")
+	if err != nil && cctx.Err() != nil {
+		// 这次失败只说明「预算被拨号吃满了」，不说明链路坏：会话是刚建出来的，用新预算
+		// 复核一次。新预算仍以调用方的 ctx 为父 —— 调用方自己取消/超时时照样立刻失败
+		// （那是调用方的意思，不是探针的误判）。
+		rctx, rcancel := context.WithTimeout(ctx, probeTimeout)
+		defer rcancel()
+		_, err = s.Conn.ReadDirContext(rctx, ".")
+	}
 	p.Release(s, err == nil)
 	return err == nil
 }

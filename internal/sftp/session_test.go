@@ -3,8 +3,12 @@ package sftp
 import (
 	"context"
 	"errors"
+	"net"
+	"os"
 	"testing"
 	"time"
+
+	"github.com/pkg/sftp"
 )
 
 // fakeSession 让测试完全不碰网络。
@@ -399,4 +403,103 @@ func TestPoolIdleCapEvictsOldestReleasedAndKeepsOtherHosts(t *testing.T) {
 	}
 	p.Release(got, true)
 	p.Release(gotOther, true)
+}
+
+// —— 探活预算缺陷回归（审核 BF5 / 规格 §8.2）——
+
+// newPipeSession 造一条走**真实 pkg/sftp 协议**的会话：net.Pipe + sftp.NewServer(root)
+// + sftp.NewClientPipe，照 internal/sftp/copy_download_test.go 的先例（不联网、不起 ssh，
+// 但走真正的 SFTP 往返）。
+//
+// 为什么必须这样造：Session.Conn 是具体类型 *sftp.Client（session.go），替身换不掉 ——
+// 想让 `ReadDirContext(".")` 真的成功/真的失败，只能用真实的协议两端。root 是服务端的
+// 工作目录（"." 即 root）。
+//
+// Proc 用跨平台替身子进程（helper_test.go）：Session.close 会 Close+Wait+Kill，nil Proc
+// 会 nil panic；且带 Proc 的会话才算「真的建立过连接」。
+// 返回 kill：关掉服务端与两端管道（用于把这条会话变成「断链」）。
+func newPipeSession(t *testing.T, host, user, root string) (*Session, func()) {
+	t.Helper()
+	c1, c2 := net.Pipe()
+	srv, err := sftp.NewServer(c1, sftp.WithServerWorkingDirectory(root))
+	if err != nil {
+		_ = c1.Close()
+		_ = c2.Close()
+		t.Fatalf("起内存 sftp 服务端失败: %v", err)
+	}
+	go func() { _ = srv.Serve() }()
+	cl, err := sftp.NewClientPipe(c2, c2)
+	if err != nil {
+		_ = srv.Close()
+		_ = c1.Close()
+		_ = c2.Close()
+		t.Fatalf("建内存 sftp 客户端失败: %v", err)
+	}
+	kill := func() {
+		_ = srv.Close()
+		_ = c1.Close()
+		_ = c2.Close()
+	}
+	t.Cleanup(func() {
+		_ = cl.Close() // 幂等：Session.close 也会关它
+		kill()
+	})
+	return &Session{Host: host, User: user, Conn: cl, Proc: testHelperPipes(t, "")}, kill
+}
+
+// TestPoolProbeDidNotFalseNegativeOnSlowDial 钉住审核 BF5（规格 R1）的误判：
+// AcquireList（session.go）**完全不用 ctx**，池里没有 idle 会话时会真拨号，最长吃
+// ConnectTimeout=10s。拨号一旦慢于 probeTimeout，随后的 ReadDirContext 面对**已过期**的
+// cctx 会立刻返回 ctx.Err() ⇒ 修复前会把一条**健康**连接判失效、还会 Release(s,false)
+// 关掉它，进而在前端触发「断开 + 重连」的无辜 teardown。
+// 修复后：cctx 过期但会话确实建出来了（s.Conn != nil）⇒ 用**新预算**复核一次再判。
+func TestPoolProbeDidNotFalseNegativeOnSlowDial(t *testing.T) {
+	root := t.TempDir()
+	var dialed *Session
+	p := NewPool(func(host, user string) (*Session, error) {
+		// 拨号比探针预算慢：模拟 ConnectTimeout 吃满 probeTimeout 的真实形态。
+		time.Sleep(probeTimeout + 300*time.Millisecond)
+		s, _ := newPipeSession(t, host, user, root)
+		dialed = s
+		return s, nil
+	})
+	defer p.CloseAll()
+
+	if !p.Probe(context.Background(), "h", "u") {
+		t.Fatal("拨号慢于 probeTimeout 但会话健康：Probe 必须返回 true（不得因 cctx 过期把健康连接判死）")
+	}
+	if dialed == nil {
+		t.Fatal("探活必须真的拨号建出会话")
+	}
+	if dialed.Closed() {
+		t.Fatal("健康会话必须被 Release(s,true) 放回池里，绝不能被 Release(s,false) 关掉")
+	}
+}
+
+// TestPoolProbeStillFailsForBrokenSession 是上一条的反向护栏：预算修复绝不能变成
+// 「永远不会失败」。远端不可用（ReadDirContext 拿到真实协议错误）时探活必须答 false，
+// 且失败会话必须按既有语义 Release(s,false) 丢弃，不得留在池里坑后续操作。
+// 用「服务端工作目录消失」造错误：确定性、不依赖网络时序、也不会挂住。
+func TestPoolProbeStillFailsForBrokenSession(t *testing.T) {
+	root := t.TempDir()
+	var dialed *Session
+	p := NewPool(func(host, user string) (*Session, error) {
+		s, _ := newPipeSession(t, host, user, root)
+		dialed = s
+		return s, nil
+	})
+	defer p.CloseAll()
+
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("造不可用远端失败: %v", err)
+	}
+	if p.Probe(context.Background(), "h", "u") {
+		t.Fatal("ReadDirContext 失败的会话：Probe 必须返回 false")
+	}
+	if dialed == nil {
+		t.Fatal("测试前提错误：探活必须真的拨号")
+	}
+	if !dialed.Closed() {
+		t.Fatal("探活失败的会话必须被 Release(s,false) 丢弃（否则死会话会留在池里）")
+	}
 }

@@ -1556,3 +1556,36 @@ func TestPresetConvertersAreSymmetric(t *testing.T) {
 		t.Fatalf("scope 缺省应为 local 且字段不得丢：%+v", got)
 	}
 }
+
+// —— Task 2：SftpProbe 绑定（真探活）——
+
+// probeFailingBackend 是「列目录必失败」的 sftp.Backend 替身：用来钉住规格 §11.1
+// 「未连接的 host ⇒ SftpProbe 必须答 false」（审核 I6）。嵌入接口占位，只覆写被走到的
+// 方法（未覆写的方法真被调用会 nil panic，这是有意的，不静默通过）。
+type probeFailingBackend struct{ sftp.Backend }
+
+func (b *probeFailingBackend) List(string, string, string) ([]sftp.Item, error) {
+	return nil, errors.New("connection lost")
+}
+
+// TestSftpProbeFalseWhenListFails 走完整绑定链 App.SftpProbe → Ctrl.Probe → 后端：
+// 未连接的 host（探活用的列目录失败）必须答 false。粘性的 SftpConnected 在这种情况下
+// 仍会是 true（刻意不看池），所以这条用例正是「真探活」与「假已连接」的分界。
+func TestSftpProbeFalseWhenListFails(t *testing.T) {
+	a := NewApp()
+	a.sftp = sftp.NewCtrlForcedBackend(&probeFailingBackend{})
+	if a.SftpProbe("h") {
+		t.Fatal("列目录失败的 host（未连接）：SftpProbe 必须返回 false")
+	}
+}
+
+// TestSftpProbeFalseBeforeInit：控制器未装配（app.Init 还没跑，a.sftp 仍为 nil）时，
+// SftpProbe 必须答 false 且不 panic（与 SftpConnected 同构守卫）；Wails dispatcher 会
+// 静默 recover panic，前端只会看到「点了没反应」，所以必须显式钉住。
+func TestSftpProbeFalseBeforeInit(t *testing.T) {
+	a := NewApp() // 故意不调用 startup/Init：a.sftp 保持 nil
+
+	if a.SftpProbe("h") {
+		t.Fatal("未就绪时 SftpProbe 必须返回 false（不得 panic）")
+	}
+}
