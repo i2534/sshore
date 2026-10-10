@@ -652,4 +652,9 @@ func TestLoadConfigWithoutSftpUISection(t *testing.T) {
 	if cfg.LegacyMigrated {
 		t.Fatal("LoadConfig 不得触碰 LegacyMigrated（迁移由 MigrateLegacyRecents 负责）")
 	}
+	// DefaultAppConfig() 是归一挂点的**另一条**路径：这条断言专门盯住"hook 只挂在 LoadConfig 上"
+	// 的漏改（Task 1 复核 Minor-1：删掉 DefaultAppConfig→normalize 也无用例变红）。
+	if DefaultAppConfig().SftpUI.LastRemoteDirs == nil {
+		t.Fatal("DefaultAppConfig 也必须归一 SftpUI（nil map → 非 nil 空 map）")
+	}
 }
