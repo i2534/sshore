@@ -1,6 +1,7 @@
 package osutil
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -232,5 +233,56 @@ func TestResolveExecNameRewritesOpenSSH(t *testing.T) {
 	}
 	if got := resolveExecName("sftp"); got != "/usr/bin/sftp" {
 		t.Errorf("resolveExecName(\"sftp\") = %q, want /usr/bin/sftp", got)
+	}
+}
+
+// —— 接线冒烟：真实 exec 层确实经过解析器 ——
+//
+// 不用 seam，改走生产 getenv：把 SSHORE_SSH_PATH / SSHORE_SFTP_PATH 指向本测试二进制
+// （helper 模式，认不出的 argv 直接以 0 退出，见 helper_test.go），若四个真实 exec 层
+// （NewRunner / NewCtxRunner / NewSpawner / StartPipes）都跑起来了，就证明
+// "ssh"/"sftp" 在 spawn 前确实被替换成了环境变量给的可执行文件。
+func TestRealExecLayerUsesResolvedSSHPath(t *testing.T) {
+	self := helperExe(t)
+	t.Setenv("SSHORE_SSH_PATH", self)
+
+	if out, err := NewRunner()("ssh"); err != nil || out.ExitCode != 0 {
+		t.Fatalf("NewRunner()(\"ssh\") = %+v, err=%v；真实 exec 层没走解析器?", out, err)
+	}
+	if out, err := NewCtxRunner()(context.Background(), "ssh"); err != nil || out.ExitCode != 0 {
+		t.Fatalf("NewCtxRunner()(\"ssh\") = %+v, err=%v；真实 exec 层没走解析器?", out, err)
+	}
+	sp, err := NewSpawner().Start("ssh", nil, nil)
+	if err != nil {
+		t.Fatalf("NewSpawner().Start(\"ssh\") 失败: %v", err)
+	}
+	if out := sp.Wait(); out.ExitCode != 0 {
+		t.Fatalf("NewSpawner().Start(\"ssh\") ExitCode = %d, want 0", out.ExitCode)
+	}
+	pp, err := StartPipes("ssh")
+	if err != nil {
+		t.Fatalf("StartPipes(\"ssh\") 失败: %v", err)
+	}
+	if out := pp.Wait(); out.ExitCode != 0 {
+		t.Fatalf("StartPipes(\"ssh\") ExitCode = %d, want 0", out.ExitCode)
+	}
+	_ = pp.Close()
+}
+
+func TestRealExecLayerUsesResolvedSFTPPath(t *testing.T) {
+	self := helperExe(t)
+	t.Setenv("SSHORE_SFTP_PATH", self)
+	if out, err := NewRunner()("sftp"); err != nil || out.ExitCode != 0 {
+		t.Fatalf("NewRunner()(\"sftp\") = %+v, err=%v；真实 exec 层没走解析器?", out, err)
+	}
+}
+
+// 非 ssh/sftp 的名字必须逐字透传（名字与 argv 都逐字到达子进程）。
+func TestRealExecLayerPassesThroughOtherNames(t *testing.T) {
+	self := helperExe(t)
+	// CtxRunner 的契约：非 0 退出不算 err、退出码如实回传，正好用来钉住透传。
+	out, err := NewCtxRunner()(context.Background(), self, "exit", "7")
+	if err != nil || out.ExitCode != 7 {
+		t.Fatalf("NewCtxRunner()(self, \"exit\", \"7\") = %+v, err=%v, want ExitCode 7", out, err)
 	}
 }
