@@ -987,6 +987,21 @@ func (a *App) SftpConnected(host string) bool {
 	return a.sftp.Connected(host)
 }
 
+// SftpProbe 是「真探活」：与粘性的 SftpConnected（刻意不看池里是否有活会话）不同，
+// 它做一次真实远端往返（GoBackend 走池化会话的 ReadDirContext；legacy batch 走一次列
+// 目录且带 ctx 上界），所以主机休眠/断链后它会答 false，前端据此自愈（规格 §8.2）。
+// user 恒传 ""：与 SFTP 视图其它调用（SftpList/SftpGet/…）的会话键 host\x00"" 一致。
+//
+// ⚠️ 调用方必读：探活会经 markSessionConnected 把粘性 connected[host] 置 true，所以
+// 「探针答 false」与「SftpConnected 答 true」会同时成立 —— 降级路径必须再调
+// SftpDisconnect 清连接意图，否则未连接分支会读到粘性 true 又翻回「已连接」。
+func (a *App) SftpProbe(host string) bool {
+	if a.sftp == nil {
+		return false
+	}
+	return a.sftp.Probe(context.Background(), host, "")
+}
+
 // DeleteLocal removes a local file or directory (recursively for dirs).
 func (a *App) DeleteLocal(path string) error {
 	p, err := filepath.Abs(path)

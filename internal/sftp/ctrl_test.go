@@ -9,7 +9,9 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"sshore/internal/forward"
 	"sshore/internal/osutil"
@@ -879,5 +881,107 @@ func TestBatchRejectsAtomicTransfer(t *testing.T) {
 	fr.push(osutil.Outcome{ExitCode: 0, Stdout: mockLs("/r", lsLine("a.txt", false, 1))})
 	if err := c.TransferGet(TransferRequest{Host: "h", Remote: "/r", Local: "/l"}, nil); err != nil {
 		t.Fatalf("Atomic=false 不得被守卫拦住: %v", err)
+	}
+}
+
+// —— Task 2：探活（Ctrl.Probe）——
+
+// blockingFakeBackend 是专为「batch 探活必须共享在飞结果」造的替身（审核 I4）：
+// 本文件既有的 fakeBackend 的 List 立即返回、called 字段也无锁 —— 既造不出「阻塞在飞」，
+// 又会与仍在跑的 goroutine 构成 -race 报告，所以不能复用。
+// 嵌入 Backend 接口占位：只覆写被走到的方法（没覆写的方法真被调用会 nil panic，
+// 这是有意的，不静默通过）。
+type blockingFakeBackend struct {
+	Backend
+	listCalls atomic.Int32
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (b *blockingFakeBackend) List(string, string, string) ([]Item, error) {
+	b.listCalls.Add(1)
+	select {
+	case <-b.entered: // 只关一次：放行后的再次调用要立刻返回，不能重复 close
+	default:
+		close(b.entered)
+	}
+	<-b.release // 阻塞到测试放行：模拟 batch 的 cmd.Run() 挂住
+	return nil, errors.New("dead")
+}
+
+// TestCtrlProbeUsesPoolForGoBackend 钉住分派：*GoBackend 必须走 g.Probe → pool.Probe
+// （真实 ReadDirContext 往返 + 已修的预算），而不是走 batch 的 goroutine 回退分支。
+// 用「拨号慢于 probeTimeout 但会话健康 ⇒ true」区分：回退分支会去调 List（本替身没实现，
+// 真走到会 nil panic），而池探针只看这条慢拨号是否被新预算救回来。
+func TestCtrlProbeUsesPoolForGoBackend(t *testing.T) {
+	root := t.TempDir()
+	g := NewGoBackend(nil, nil)
+	g.pool = NewPool(func(host, user string) (*Session, error) {
+		time.Sleep(probeTimeout + 300*time.Millisecond)
+		s, _ := newPipeSession(t, host, user, root)
+		return s, nil
+	})
+	defer g.CloseAll()
+
+	c := NewCtrlForcedBackend(g)
+	if !c.Probe(context.Background(), "h", "u") {
+		t.Fatal("*GoBackend 的探活必须走 pool.Probe：慢拨号但会话健康 ⇒ true")
+	}
+	if _, ok := c.backend().(*GoBackend); !ok {
+		t.Fatal("测试前提错误：forced 后端必须是 *GoBackend")
+	}
+}
+
+// TestCtrlProbeFallbackIsBoundedAndWaitsForInflight 钉住规格 §8.2 / 审核 I5 + R8：
+// ① legacy batch 后端没有 ctx 感知的 runner（cmd.Run() 无超时）⇒ Ctrl.Probe 必须给调用方
+// 一个有上界的结果（ctx 超时即返回，不得挂死，否则前端 probing 恒 true、自愈永久静默失效）；
+// ② 同一 host 的并发第二次调用必须**等同一个在飞结果**，绝不能「在飞即 false」——
+// false 在前端被解释成 'lost'，会对可能健康的链路做无谓的 SftpDisconnect + 重连（违反 D14）；
+// ③ 在飞条目必须在飞行结束时清除，否则该 host 此后永久「在飞」、自愈静默失效。
+func TestCtrlProbeFallbackIsBoundedAndWaitsForInflight(t *testing.T) {
+	b := &blockingFakeBackend{entered: make(chan struct{}), release: make(chan struct{})}
+	c := NewCtrlForcedBackend(b)
+
+	// ① 有上界：100ms ctx 超时后必须返回 false，而不是跟着挂住。
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel1()
+	start := time.Now()
+	if c.Probe(ctx1, "h", "") {
+		t.Fatal("ctx 超时的 batch 探活必须返回 false")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("ctx 超时后必须立刻返回，实际耗时 %v", d)
+	}
+	select {
+	case <-b.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("探活必须真的打到后端 List（不得被空转短路）")
+	}
+
+	// ② 在飞期间：第二个调用者必须等结果，不得立即答 false。
+	second := make(chan bool, 1)
+	go func() { second <- c.Probe(context.Background(), "h", "") }()
+	select {
+	case got := <-second:
+		t.Fatalf("在飞期间第二个调用者不得立即返回（got %v）——「在飞即 false」会被前端当成 'lost' 做无谓 teardown", got)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// 放行：List 返回 error ⇒ 结果 false，且两个调用者共享同一次后端调用。
+	close(b.release)
+	if got := <-second; got {
+		t.Fatal("List 失败的探活必须返回 false")
+	}
+	if n := b.listCalls.Load(); n != 1 {
+		t.Fatalf("同 host 并发探活必须去重到一次后端调用，listCalls=%d", n)
+	}
+
+	// ③ 在飞条目必须已清除：第三次调用要真的重新打到后端（listCalls 2），
+	// 而不是等一条永远不会再交付的旧结果。
+	if c.Probe(context.Background(), "h", "") {
+		t.Fatal("List 恒失败的探活必须返回 false")
+	}
+	if n := b.listCalls.Load(); n != 2 {
+		t.Fatalf("在飞条目未清除 ⇒ 该 host 被永久标记「在飞」、自愈静默失效，listCalls=%d", n)
 	}
 }
