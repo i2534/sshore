@@ -910,13 +910,21 @@ func (b *blockingFakeBackend) List(string, string, string) ([]Item, error) {
 }
 
 // TestCtrlProbeUsesPoolForGoBackend 钉住分派：*GoBackend 必须走 g.Probe → pool.Probe
-// （真实 ReadDirContext 往返 + 已修的预算），而不是走 batch 的 goroutine 回退分支。
-// 用「拨号慢于 probeTimeout 但会话健康 ⇒ true」区分：回退分支会去调 List（本替身没实现，
-// 真走到会 nil panic），而池探针只看这条慢拨号是否被新预算救回来。
+// （真实 ReadDirContext(".") 往返 + probeTimeout 预算 + 慢拨号复核），而不是走 List/batch
+// 回退分支 —— 分派写反会让默认 KindGo 后端丢掉 probeTimeout 与取消传播。
+//
+// 判别力（T2 复核 Minor）：只断言「慢拨号 + 健康 ⇒ true」没有判别力 —— GoBackend.List 也走
+// 同一个池、同一次 dial、同样能列成功。故这里再加一条两条路径**结果可分**的判据：让会话的
+// 服务端工作目录消失 —— pool.Probe 读 "."（相对路径，拼在工作目录上）⇒ 必失败，而 List 读
+// "/"（pkg/sftp 服务端只把相对路径拼到工作目录，"/" 仍是真实文件系统根）⇒ 仍会成功。
+// 于是「分派写反」必然答 true，本用例必然变红。
 func TestCtrlProbeUsesPoolForGoBackend(t *testing.T) {
 	root := t.TempDir()
+	var dials atomic.Int32
 	g := NewGoBackend(nil, nil)
 	g.pool = NewPool(func(host, user string) (*Session, error) {
+		dials.Add(1)
+		// 拨号比探针预算慢：模拟 ConnectTimeout 吃满 probeTimeout 的真实形态。
 		time.Sleep(probeTimeout + 300*time.Millisecond)
 		s, _ := newPipeSession(t, host, user, root)
 		return s, nil
@@ -924,11 +932,39 @@ func TestCtrlProbeUsesPoolForGoBackend(t *testing.T) {
 	defer g.CloseAll()
 
 	c := NewCtrlForcedBackend(g)
+	if _, ok := c.backend().(*GoBackend); !ok {
+		t.Fatal("测试前提错误：forced 后端必须是 *GoBackend")
+	}
+
+	// ① 慢拨号 + 健康会话 ⇒ true（BF5：不得因 cctx 过期把健康连接判死）。
 	if !c.Probe(context.Background(), "h", "u") {
 		t.Fatal("*GoBackend 的探活必须走 pool.Probe：慢拨号但会话健康 ⇒ true")
 	}
-	if _, ok := c.backend().(*GoBackend); !ok {
-		t.Fatal("测试前提错误：forced 后端必须是 *GoBackend")
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("测试前提错误：①必须只拨号一次，dials=%d", n)
+	}
+
+	// ② 判别力：工作目录消失后 pool.Probe 读 "." ⇒ false，而 List 读 "/" ⇒ true（两条可分）。
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("造工作目录消失失败: %v", err)
+	}
+	// 先证明 List 路径在这种会话上确实会成功，否则本用例的判别力不成立、会静默退化。
+	if _, err := c.List("h", "u", "/"); err != nil {
+		t.Fatalf("测试前提错误：List 路径读 \"/\" 必须成功，否则两条路径不可分: %v", err)
+	}
+	if c.Probe(context.Background(), "h", "u") {
+		t.Fatal("工作目录消失后读 \".\" 必失败：Probe 必须答 false；答 true 说明没走 pool.Probe")
+	}
+
+	// ③ ctx 传播：pool.Probe 用调用方的 ctx，GoBackend.List 恒用 context.Background()。
+	//    已取消的 ctx ⇒ 必须 false 且不得再拨号（池已空）。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if c.Probe(ctx, "h", "u") {
+		t.Fatal("已取消的 ctx 必须传到池并让探活答 false（c.List 无视 ctx，会重新列目录并答 true）")
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("已取消的 ctx 下 pool.Probe 必须早退、不得新建会话，dials=%d", n)
 	}
 }
 
