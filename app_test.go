@@ -1112,6 +1112,265 @@ func TestAddRemoteRecentDedupesAndCaps(t *testing.T) {
 	}
 }
 
+// 规格 §6.3.2（审核 BF7 重写的判据）：last path 的写入**不受 recents 队首短路约束**。
+// 升级场景 = 老配置没有 last path（或值已过期）+ 队首恰好已是同一项：此时短路只能省掉
+// recents 的重排/刷新 TS，**不能**连 last path 一起省掉，否则用户的最后路径永远补不上。
+func TestAddRemoteRecentRecordsLastPathEvenWhenRecentHeadMatches(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.RemoteRecent = []config.RecentRemote{{Host: "prod", Path: "/r", TS: "2000-01-01T00:00:00Z"}}
+	a.cfg.SftpUI.LastRemoteDirs = nil // 老配置：没有 last path
+
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod"]; got != "/r" {
+		t.Fatalf("队首同值也必须写 last path（§6.3.2），得到 %q", got)
+	}
+	if got := a.cfg.RemoteRecent[0].TS; got != "2000-01-01T00:00:00Z" {
+		t.Fatalf("队首同值必须短路（TS 不得刷新），得到 %q", got)
+	}
+	if len(a.cfg.RemoteRecent) != 1 {
+		t.Fatalf("短路不得产生重复项: %+v", a.cfg.RemoteRecent)
+	}
+	// last path 变了 ⇒ 必须落盘一次（§6.3.2「其余情况 ⇒ 一次 saveConfig」）。
+	onDisk, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if got := onDisk.SftpUI.LastRemoteDirs["prod"]; got != "/r" {
+		t.Fatalf("last path 变化后必须落盘，磁盘上得到 %q", got)
+	}
+
+	// last path 存在但是旧值 ⇒ 同样必须更新，队首仍然短路。
+	a.cfg.SftpUI.LastRemoteDirs = map[string]string{"prod": "/old"}
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod"]; got != "/r" {
+		t.Fatalf("last path 旧值必须被更新为 %q，得到 %q", "/r", got)
+	}
+	if got := a.cfg.RemoteRecent[0].TS; got != "2000-01-01T00:00:00Z" {
+		t.Fatalf("队首同值必须短路（TS 不得刷新），得到 %q", got)
+	}
+}
+
+// 同构：本地侧的 LastLocalDir 不受 AddLocalRecent 的队首短路约束。
+func TestAddLocalRecentRecordsLastPathEvenWhenHeadMatches(t *testing.T) {
+	a := newTestApp(t)
+	a.cfg.LocalRecent = []config.RecentLocal{{Path: "/l", TS: "2000-01-01T00:00:00Z"}}
+	a.cfg.SftpUI.LastLocalDir = "" // 老配置：没有 last path
+
+	if err := a.AddLocalRecent("/l"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("队首同值也必须写 LastLocalDir（§6.3.2），得到 %q", got)
+	}
+	if got := a.cfg.LocalRecent[0].TS; got != "2000-01-01T00:00:00Z" {
+		t.Fatalf("队首同值必须短路（TS 不得刷新），得到 %q", got)
+	}
+	if len(a.cfg.LocalRecent) != 1 {
+		t.Fatalf("短路不得产生重复项: %+v", a.cfg.LocalRecent)
+	}
+	onDisk, err := config.LoadConfig(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if got := onDisk.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("LastLocalDir 变化后必须落盘，磁盘上得到 %q", got)
+	}
+
+	a.cfg.SftpUI.LastLocalDir = "/old"
+	if err := a.AddLocalRecent("/l"); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("LastLocalDir 旧值必须被更新为 %q，得到 %q", "/l", got)
+	}
+}
+
+// 规格 §6.3.1（审核 BF1 回归，Blocking）：后端内部的 recordRecentSFTP 一律不写 last path。
+// SftpHome 每次 connect 都被调用，若它顺带写 last path，单主机用户的最后路径会被静默
+// 改写成 home —— 而前端 store 的队首短路会让紧接着的 addRemoteRecent(记忆路径) 不发 IPC，
+// 于是本次会话落点仍正确、盘上已是 home，验收看不出来（最坏一类静默损坏）。
+func TestRecordRecentSFTPDoesNotTouchLastPath(t *testing.T) {
+	a := newTestApp(t)
+	// 先经公开绑定建立 last path（绑定层是唯一可写 last path 的入口）。
+	if err := a.AddRemoteRecent("prod", "/a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AddLocalRecent("/l"); err != nil {
+		t.Fatal(err)
+	}
+	if a.cfg.SftpUI.LastRemoteDirs["prod"] != "/a" || a.cfg.SftpUI.LastLocalDir != "/l" {
+		t.Fatalf("前置条件被破坏：last path 未建立 %#v / %q",
+			a.cfg.SftpUI.LastRemoteDirs, a.cfg.SftpUI.LastLocalDir)
+	}
+
+	a.recordRecentSFTP("prod", "/b", "/m", false)
+
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod"]; got != "/a" {
+		t.Fatalf("内部路径不得改写 LastRemoteDirs（SftpHome 会把它改成 home），得到 %q", got)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("内部路径不得改写 LastLocalDir，得到 %q", got)
+	}
+	if len(a.cfg.RemoteRecent) == 0 || a.cfg.RemoteRecent[0].Host != "prod" || a.cfg.RemoteRecent[0].Path != "/b" {
+		t.Fatalf("内部路径仍必须更新 RemoteRecent 队首为 {prod /b}: %+v", a.cfg.RemoteRecent)
+	}
+	if len(a.cfg.LocalRecent) == 0 || a.cfg.LocalRecent[0].Path != "/m" {
+		t.Fatalf("内部路径仍必须更新 LocalRecent 队首为 /m: %+v", a.cfg.LocalRecent)
+	}
+}
+
+// 并发红线（规格 §6.3.4 红线 3 / 用户 2026-10-10 扩大范围）：四个写入点与锁外 TOML
+// 编码（saveConfig 的浅拷贝快照）并发时，-race 不得报 DATA RACE。专抓
+// `kept := a.cfg.X[:0]`（复用底层数组）与 `append(a.cfg.Bookmarks, b)`（cap 有余量时
+// 写进共享底层数组）这两种原地写形状。
+func TestConfigWritesAreRaceFreeAgainstSaveConfig(t *testing.T) {
+	a := newTestApp(t) // cfgPath 在 t.TempDir()，绝不写用户真实配置
+	const n = 50
+	var wg stdsync.WaitGroup
+	wg.Add(5)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if err := a.AddRemoteRecent("prod", fmt.Sprintf("/r%d", i%5)); err != nil {
+				t.Errorf("并发 AddRemoteRecent 失败: %v", err) // t.Errorf 可跨 goroutine，Fatal 不可以
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if err := a.AddLocalRecent(fmt.Sprintf("/l%d", i%5)); err != nil {
+				t.Errorf("并发 AddLocalRecent 失败: %v", err)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		b := config.Bookmark{Name: "日志", Scope: "remote", Host: "prod", Path: "/var/log"}
+		for i := 0; i < n; i++ {
+			if err := a.AddBookmark(b); err != nil {
+				t.Errorf("并发 AddBookmark 失败: %v", err)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if err := a.RemoveBookmark("remote", "prod", "/var/log"); err != nil {
+				t.Errorf("并发 RemoveBookmark 失败: %v", err)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < n; i++ {
+			if err := a.saveConfig(); err != nil {
+				t.Errorf("并发 saveConfig 失败: %v", err)
+			}
+		}
+	}()
+	wg.Wait()
+
+	got := a.ListLocations()
+	seenR := map[string]bool{}
+	for _, e := range got.RemoteRecents {
+		k := e.Host + "\x00" + e.Path
+		if seenR[k] {
+			t.Fatalf("RemoteRecent 出现重复项: %q (%+v)", k, got.RemoteRecents)
+		}
+		seenR[k] = true
+	}
+	seenL := map[string]bool{}
+	for _, e := range got.LocalRecents {
+		if seenL[e.Path] {
+			t.Fatalf("LocalRecent 出现重复项: %q (%+v)", e.Path, got.LocalRecents)
+		}
+		seenL[e.Path] = true
+	}
+}
+
+// nil-map 写入（审核 I1 / 规格 §11.1）：App 由 `&config.AppConfig{}` 构造时
+// `SftpUI.LastRemoteDirs` 为 nil，直接 `LastRemoteDirs[host] = path` 会 panic。
+// 实现必须在 helper 内 make 新 map，本用例钉死这条路径（含内部 rememberLast=false）。
+func TestLastPathWriteOnBareConfigDoesNotPanic(t *testing.T) {
+	a := NewApp()
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
+	a.cfg = &config.AppConfig{} // 裸零值
+	if a.cfg.SftpUI.LastRemoteDirs != nil {
+		t.Fatal("前置条件被破坏：裸零值的 LastRemoteDirs 必须为 nil")
+	}
+
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatalf("AddRemoteRecent: %v", err)
+	}
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod"]; got != "/r" {
+		t.Fatalf("nil map 上写 last path 必须由 helper 内 make 构造，得到 %q", got)
+	}
+	if err := a.AddLocalRecent("/l"); err != nil {
+		t.Fatalf("AddLocalRecent: %v", err)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/l" {
+		t.Fatalf("LastLocalDir = %q", got)
+	}
+	// 内部路径（rememberLast=false）也不得 panic。
+	a.recordRecentSFTP("prod2", "/r2", "/l2", false)
+	if got := a.cfg.SftpUI.LastRemoteDirs["prod2"]; got != "" {
+		t.Fatalf("rememberLast=false 不得写 last path，得到 %q", got)
+	}
+}
+
+// 审核 I2 回归：`rememberLast == false` 的内部调用（模拟传输完成，每个文件一次）绝不
+// 额外落盘 —— 若把 last path 的比较放在 rememberLast 门控之外，map 永不更新 ⇒ 每次都判
+// changed ⇒ 每个文件一次全量 TOML 编码 + rename（正是 app.go 短路注释要避免的写放大）。
+//
+// 判据刻意不用 mtime（秒级粒度会假绿），而用**内容指纹 + 灵敏性对照**：先把磁盘写成哨兵
+// 配置，内存里放一个磁盘上没有的标记，则「任何一次 saveConfig」都会改变文件内容。
+func TestRecordRecentSFTPWithoutRememberLastDoesNotWriteConfig(t *testing.T) {
+	a := newTestApp(t)
+	if err := config.SaveConfig(a.cfgPath, config.DefaultAppConfig()); err != nil {
+		t.Fatalf("写哨兵配置失败: %v", err)
+	}
+	before, err := os.ReadFile(a.cfgPath)
+	if err != nil {
+		t.Fatalf("读哨兵配置失败: %v", err)
+	}
+	// 内存态：队首恰好同值（recents 走短路）、last path 留空（老配置升级形态）、
+	// 且带一个磁盘上没有的标记 —— 于是「有没有落盘」可由内容比对确定性地判定。
+	a.cfg.RemoteRecent = []config.RecentRemote{{Host: "prod", Path: "/r", TS: "2000-01-01T00:00:00Z"}}
+	a.cfg.SftpUI.LastRemoteDirs = nil
+	a.cfg.App.UpdateSkippedVersion = "memory-marker"
+
+	a.recordRecentSFTP("prod", "/r", "", false)
+
+	after, err := os.ReadFile(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("rememberLast=false 且队首同值的内部调用不得落盘（写放大回归）")
+	}
+	if a.cfg.SftpUI.LastRemoteDirs["prod"] != "" {
+		t.Fatalf("内部路径不得写 last path，得到 %q", a.cfg.SftpUI.LastRemoteDirs["prod"])
+	}
+
+	// 灵敏性对照：同一形态走公开绑定（rememberLast=true）时 last path 必须变 ⇒ 必落盘。
+	// 若这一段也认为「没落盘」，说明上面的内容指纹判据本身是假绿。
+	if err := a.AddRemoteRecent("prod", "/r"); err != nil {
+		t.Fatalf("AddRemoteRecent: %v", err)
+	}
+	after2, err := os.ReadFile(a.cfgPath)
+	if err != nil {
+		t.Fatalf("回读配置失败: %v", err)
+	}
+	if bytes.Equal(before, after2) {
+		t.Fatal("对照失败：last path 变化必须落盘，否则本用例的内容指纹判据是假绿")
+	}
+}
+
 func TestListPresetsReadsPresetsFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "presets.toml")
