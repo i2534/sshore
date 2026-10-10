@@ -1338,6 +1338,13 @@ func TestSftpBindingsFailFastBeforeInit(t *testing.T) {
 	// SaveSftpUI：要么成功、要么返回明确错误，但绝不能 panic（panic 会被 Wails
 	// dispatcher 静默 recover，前端只看到「点了没反应」）。锁内 nil 守卫必须
 	// 把 a.cfg 造出来，所以调用后 a.cfg 不允许仍为 nil。
+	//
+	// 落盘路径必须先指到临时目录：本 App 由 NewApp() 构造、cfgPath 为空，否则
+	// saveConfig() 会落到 config.DefaultConfigPath()。TestMain 只锚 APPDATA/
+	// XDG_CONFIG_HOME（其注释自认 darwin 未覆盖）⇒ 在 macOS 上会原子覆盖用户的
+	// 真实 ~/Library/Application Support/sshore/sshore.toml（T3 复核 Important）。
+	// 这不影响上面的 nil-cfg 覆盖：cfgPath 与 a.cfg 是两回事。
+	a.cfgPath = filepath.Join(t.TempDir(), "sshore.toml")
 	terr := a.SaveSftpUI(config.SftpUIState{
 		LastLocalDir:   "/tmp/last",
 		LastRemoteDirs: map[string]string{"prod": "/srv"},
