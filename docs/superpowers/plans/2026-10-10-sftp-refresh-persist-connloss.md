@@ -12,6 +12,7 @@
 
 ## Global Constraints
 
+- **Task 0（干净克隆前置，审核 B1 Blocking）**：`main.go:16` 是 `//go:embed all:frontend/dist`，而 `frontend/dist` 被 `.gitignore:3` 忽略 ⇒ **任何** Go 命令（含 T2 的 `go test ./internal/sftp/ ./`、T3/T4 的 `go test ./`）在干净克隆上都会硬失败（隔离实验实测 `go vet ./` → `pattern all:frontend/dist: no matching files found`，EXIT=1）。开工第一步：`cd frontend && npm ci && npm run build`（`package-lock.json` 已入库、`node_modules` 未入库）。这不是 T5 的事，是所有 Go 命令的前提。
 - **沙箱构建缓存只读**：所有 Go 命令必须带 `GOCACHE=$PWD/.gocache`（实测 `~/.cache/go-build` 报 `read-only file system`；仓库根已有 gitignore 的 `.gocache/`）。
 - **最终门禁**：`GOCACHE=$PWD/.gocache make ci`（= `cd frontend && npm run build` → `go vet ./...` → `go test ./... -race -count=1` → `cd frontend && npx vitest run`）。任何任务收尾前该命令必须全绿，或如实报告哪一步失败。
 - **新增 Go 绑定后必须重生成**：仓库根执行 `GOCACHE=$PWD/.gocache wails generate module -tags webkit2_41`，`frontend/wailsjs/go/main/App.{js,d.ts}` 与 `frontend/wailsjs/go/models.ts` **一并提交**。生成失败必须停下报告，**不得手改生成文件**。
@@ -72,7 +73,7 @@ func TestLoadConfigNormalizesSftpUISection(t *testing.T)
 func TestLoadConfigWithoutSftpUISection(t *testing.T)
 ```
 
-`TestSftpUITOMLRoundTrip` 的键集合必须含：`"10.99.152.18"`、`"prod db"`、`"中文主机"`、`quote"host`、`host.with.dots`、`prod-db`；`LastLocalDir` 用 Windows 风格 `D:\工作\虚拟 共享`。判据：`Encode` 后 `Decode` 回来**逐字段相等**（只比解码后的值，不断言落盘字节形态），且 `[app]` 段等其它字段不受影响。
+`TestSftpUITOMLRoundTrip` 的键集合必须含：`"10.99.152.18"`、`"prod db"`、`"中文主机"`、`quote"host`、`host.with.dots`、`prod-db`；`LastLocalDir` 用 Windows 风格路径，**Go 源码里必须写成反引号 raw string**（`` `D:\工作\虚拟 共享` ``）或双反斜杠转义 —— 双引号串里的 `\工` 是非法转义、编译不过（审核 M7）。判据：`Encode` 后 `Decode` 回来**逐字段相等**（只比解码后的值，不断言落盘字节形态），且 `[app]` 段等其它字段不受影响。
 
 `TestLoadConfigNormalizesSftpUISection`：写一份临时 TOML，其中 `sort_local_key = "bogus"`、`sort_local_dir = 7`、`last_remote_dirs` 只给一个键 → `LoadConfig` 读回后 `SortLocalKey=="name"`、`SortLocalDir==1`。
 
@@ -87,7 +88,8 @@ Expected: FAIL，编译错误 `undefined: SftpUIState`。
 
 - 结构体与标签逐字照 Interfaces 块；`Normalize()` 规则：两个 key 走白名单 `name|size|modTime`（非法/空→`name`），两个 dir `<0`→`-1` 否则 `1`，`LastRemoteDirs==nil`→`map[string]string{}`。
 - `AppConfig` 里把 `SftpUI` 放在 `RemoteRecent` 之后、`LegacyMigrated` 之前。
-- **归一挂点**：`func (c *AppConfig) normalize()` 内新增 `c.SftpUI.Normalize()`（现在只调 `c.App.Normalize()`）—— 这是唯一挂点，`LoadConfig` 与 `DefaultAppConfig` 都经过它。
+- **归一挂点**：`func (c *AppConfig) normalize()` 内新增 `c.SftpUI.Normalize()` —— 注意该函数现在**还会**归一 `App` 与每条 `Syncs`（审核 M1：别写成「只调 `c.App.Normalize()`」）。`LoadConfig` 与 `DefaultAppConfig` 都经过它，这是唯一挂点。
+- **实现注释（审核 M1，规格 §6.1 强制）**：在 `SftpUIState` 字段上写明前提 —— `last_remote_dirs` 的键是 **SSH 主机名（不含 user）**，视图内 user 恒 `''`；`internal/sync` 用 `rule.User`，扩展到 sync/watch 前必须先改键（否则 R14 无人承接）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -107,7 +109,7 @@ git commit -m "feat(config): 新增 [sftp_ui] 配置段（最后路径 + 双侧�
 ## Task 2: 探活能力（`Pool.Probe` 预算修复 + `Ctrl.Probe` + `SftpProbe` 绑定）
 
 **Files:**
-- Modify: `internal/sftp/session.go`（`Pool.Probe` `:288-305`）、`internal/sftp/ctrl.go`（新增方法，参考 `:118-130` 的类型断言先例）、`app.go`（绑定区，参考 `SftpConnected` `:983-988`）
+- Modify: `internal/sftp/session.go`（`Pool.Probe` `:288-307`）、`internal/sftp/ctrl.go`（新增方法，参考 `:118-130` 的类型断言先例）、`app.go`（绑定区，参考 `SftpConnected` `:983-988`）
 - Test: `internal/sftp/session_test.go`、`internal/sftp/ctrl_test.go`、`app_test.go`
 
 **Interfaces:**
@@ -134,15 +136,32 @@ func TestPoolProbeStillFailsForBrokenSession(t *testing.T)
 // dial 立即返回会话，但 ReadDirContext 返回 error ⇒ Probe == false
 ```
 
-`internal/sftp/ctrl_test.go`（沿用 `:658-712` 的 `fakeBackend` 与 `cancel_test.go:491` 的 pool 注入先例）：
+`internal/sftp/ctrl_test.go`（沿用 `cancel_test.go:491` 的 pool 注入先例与 `NewCtrlForcedBackend`；**不要复用 `ctrl_test.go:658-712` 的 `fakeBackend`** —— 它的 `List` 既不阻塞、`called` 字段也无锁，造不出「阻塞」且会与仍在跑的 goroutine 构成 `-race` 报告，见审核 I4）：
 
 ```go
-func TestCtrlProbeUsesPoolForGoBackend(t *testing.T)      // 强制后端为 *GoBackend ⇒ 走 pool.Probe（用注入的慢 dial 断言 true）
-func TestCtrlProbeFallbackIsBoundedAndSingleFlight(t *testing.T)
-// 用 NewCtrlForcedBackend(fakeBackend)（其 List 阻塞不返回）：
-//   - Probe 在 100ms ctx 超时后必须返回 false（不得挂住）
-//   - 同 host 并发第二次 Probe 立即返回 false（单飞），且只调用了一次 List
+// 新写一个专用替身（审核 I4）：
+type blockingFakeBackend struct {
+    sftp.Backend                       // 嵌入接口占位，只实现被调用到的方法
+    listCalls atomic.Int32             // 计数必须原子
+    entered   chan struct{}            // 进入 List 的信号
+    release   chan struct{}            // 测试用它放行
+}
+func (b *blockingFakeBackend) List(string, string, string) ([]Item, error) {
+    b.listCalls.Add(1)
+    close(b.entered)
+    <-b.release                        // 阻塞到测试放行
+    return nil, errors.New("dead")
+}
+
+func TestCtrlProbeUsesPoolForGoBackend(t *testing.T)   // *GoBackend + 慢 dial ⇒ true（见 session_test 那条）
+func TestCtrlProbeFallbackIsBoundedAndWaitsForInflight(t *testing.T)
+// NewCtrlForcedBackend(&blockingFakeBackend{...})：
+//   - 100ms ctx 超时后 Probe 返回 false（不得挂住）
+//   - 同 host 并发第二次 Probe **等到同一个结果**（不是立即 false），且 listCalls == 1
+func TestSftpProbeFalseWhenListFails(t *testing.T)     // 审核 I6：补规格 §11.1「未连接 host → false」那条
 ```
+
+**注**：若要让 `*GoBackend` 的 `pool.Probe` 真的走通 `ReadDirContext`，`Session.Conn` 是具体类型 `*sftp.Client`（`session.go:34`），只能照 `internal/sftp/copy_download_test.go:35-75` 的 `net.Pipe + sftp.NewServer(root) + sftp.NewClientPipe` 先例造会话；慢拨号那条用例只需 `Conn != nil` 的桩 + 成功返回即可。
 
 `app_test.go`：
 
@@ -159,7 +178,7 @@ Expected: FAIL（`undefined: (*Ctrl).Probe` / 慢拨号用例在旧实现下返�
 
 - `Pool.Probe`：`AcquireList` 返回后，若 `cctx.Err() != nil` 且会话确实建出（`s.Conn != nil`）⇒ 用**新预算** `context.WithTimeout(ctx, probeTimeout)` 再跑一次 `ReadDirContext(".")`；只有新预算也失败才判 false。**保留**失败时 `Release(s, false)`（丢死会话）。
 - `GoBackend.Probe(ctx, host, user)` = `g.pool.Probe(ctx, host, user)`。
-- `Ctrl.Probe`：`if g, ok := c.backend().(*GoBackend); ok { return g.Probe(...) }`，否则走 spec §8.2 的 goroutine + `ctx` select + **每 host 单飞**（`map[string]bool` + `sync.Mutex`，前一次未结束时直接 false，不重复起 goroutine）。**单飞标记必须在 goroutine 完成时清除**（`defer func() { mu.Lock(); delete(inflight, host); mu.Unlock() }()`），否则该 host 第一次探针之后被永久标记为"在飞"，自愈能力静默失效。
+- `Ctrl.Probe`：`if g, ok := c.backend().(*GoBackend); ok { return g.Probe(...) }`，否则走 spec §8.2 的 goroutine + `ctx` select + **每 host 共享在飞结果（审核 I5，v1.7 修正）**：per-host 存一个 `chan bool`，第二个调用者**等同一个结果**，而不是立刻返回 `false`。理由：`false` 在前端被解释成 `'lost'` ⇒ 触发断开+重连；batch 子进程一挂住，「在飞」就会被误判成「链路已死」，对可能健康的链路做无谓 teardown（违反 D14）。共享项必须在 goroutine 结束时清除（`defer` 内 `mu.Lock(); delete(inflight, host); mu.Unlock()`），否则该 host 此后被永久标记「在飞」、自愈静默失效。**不要写 `map[string]bool` + 立即 `return false`**（那正是 I5 的缺陷形态）。
 - 实现注释两处必须写：① `Probe` 会经 `markSessionConnected` 置**粘性** `connected[host]=true`（因此调用方降级时必须再调 `SftpDisconnect`）；② batch 分支的残留（挂死子进程靠 ssh 自身超时回收）。
 - `app.go` 的 `SftpProbe(host string) bool`：`if a.sftp == nil { return false }`，否则 `a.sftp.Probe(context.Background(), host, "")`（user 恒 `""`，与视图其它调用一致）。
 
@@ -198,11 +217,17 @@ func TestSaveSftpUIPersistsAndKeepsOtherSections(t *testing.T)
 // newTestApp（app_test.go:884-889 的骨架，cfgPath 在 t.TempDir()）：
 // 先造 Tunnels/Syncs/Bookmarks/RemoteRecent 各一条 → SaveSftpUI(全字段) → config.LoadConfig(cfgPath)
 // 断言六个字段逐字相等，且 Tunnels/Syncs/Bookmarks/RemoteRecent 逐项未受影响
+//   ⚠️ SyncRule 夹具必须写全字段（Kind/PollIntervalS/Excludes/AutoReconnect 等）：
+//      LoadConfig 会归一 Syncs（Kind 空→dir、PollIntervalS 0→5、Excludes nil→默认集、
+//      AutoReconnect nil→全局默认），只设部分字段会让这条用例因「与被测行为无关」的归一而必红（审核 M2）；
+//      或改为只比对显式设置的字段。
 func TestSaveSftpUINormalizesInvalidSort(t *testing.T)
 // 传 {SortLocalKey:"bogus", SortLocalDir:7, LastRemoteDirs:nil}
 // 断言落盘后 SortLocalKey=="name"、SortLocalDir==1（LastRemoteDirs 允许 nil 或空 map，二选一写明）
-func TestSaveSftpUIShrugsOffNilCfg(t *testing.T)
-// NewApp()（a.cfg == nil）→ SaveSftpUI(...) 不得 panic；随后 GetSftpUI() 返回归一化零值
+// nil-cfg 覆盖**并入既有** app_test.go:1282-1315 的 TestSftpBindingsFailFastBeforeInit（规格 §11.1 指定的归属，审核 M5）：
+//   a := NewApp() 后**先** GetSftpUI()：断言不 panic 且返回归一化零值（SortLocalKey=="name"、SortLocalDir==1、
+//   LastRemoteDirs 非 nil）—— **顺序不能反**（审核 I6）：先调 SaveSftpUI 会把 a.cfg 造出来，nil-cfg 分支就永不执行；
+//   **再**断言 SaveSftpUI(全字段) 不 panic、或返回明确错误。
 func TestGetSftpUIDoesNotMutateSharedState(t *testing.T)
 // newTestApp 后把 a.cfg.SftpUI.LastRemoteDirs 置 nil → GetSftpUI() 返回非 nil map，
 // 但 a.cfg.SftpUI.LastRemoteDirs 仍为 nil（证明 Normalize 发生在解锁之后、没有原地写共享结构）
@@ -242,7 +267,7 @@ git commit -m "feat(app): GetSftpUI/SaveSftpUI 绑定（锁内只赋值、解锁
 ## Task 4: 四个配置写入点的并发改造 + last path 写入规则
 
 **Files:**
-- Modify: `app.go`（`AddLocalRecent` `:1343-1366`、`AddRemoteRecent` `:1367-1392`、`AddBookmark` `:1312-1326`、`RemoveBookmark` `:1328-1341`、`recordRecentSFTP` `:1394-1409`、`cfgMu` 注释 `:37-42`）
+- Modify: `app.go`（`AddLocalRecent` `:1343-1365`、`AddRemoteRecent` `:1367-1392`、`AddBookmark` `:1312-1326`、`RemoveBookmark` `:1328-1341`、`recordRecentSFTP` `:1394-1410`、`ListLocations` `:1291-1310`、`cfgMu` 注释 `:37-42`）—— 行号仅供定位，**以符号名为准**（审核 M6）
 - Test: `app_test.go`
 
 **Interfaces:**
@@ -250,9 +275,17 @@ git commit -m "feat(app): GetSftpUI/SaveSftpUI 绑定（锁内只赋值、解锁
 - Produces:
   ```go
   func (a *App) recordRecentSFTP(host, remoteDir, localDir string, rememberLast bool)  // 签名扩展
-  // 内部辅助（私有，供上面四个函数复用；锁内只构造新值 + 赋值，不落盘）：
-  func (a *App) rememberRemotePathLocked(host, path string) (changed bool)  // 调用方已持写锁
+  // 内部辅助（私有；锁内只构造新值 + 赋值，不落盘；**调用方必须已持写锁**）：
+  func (a *App) rememberRemotePathLocked(host, path string) (changed bool)
   func (a *App) rememberLocalPathLocked(path string) (changed bool)
+  // recents 的"只更列表"入口（审核 I3）：recordRecentSFTP 现状是**委托** AddRemoteRecent/AddLocalRecent，
+  // 若照字面"加个 bool 参数、保持委托"，它会连 last path 一起写（新用例必红）；
+  // 若把 recordRecentSFTP 包进写锁再调公开绑定，则**同锁重入死锁**（RWMutex 不可重入，测试 hang 到 timeout）。
+  // 正确切法（二选一，推荐前者）：
+  //   (a) func (a *App) addRemoteRecentLocked(host, path string, rememberLast bool) (changed bool)
+  //       func (a *App) addLocalRecentLocked(path string, rememberLast bool) (changed bool)
+  //       —— 公开绑定包 true；recordRecentSFTP 在写锁内调 false；两者都不得在持锁时调用公开绑定。
+  //   (b) 把 AddRemoteRecent/AddLocalRecent 降为上面的内部形态，公开绑定只做 Normalize/落盘包装。
   ```
 
 - [ ] **Step 1: 写失败测试**
@@ -277,17 +310,19 @@ func TestConfigWritesAreRaceFreeAgainstSaveConfig(t *testing.T)
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `GOCACHE=$PWD/.gocache go test ./ -run 'LastPath|RecordRecentSFTP|ConfigWritesAreRaceFree' -race -v`
-Expected: FAIL（`LastRemoteDirs["prod"]` 为空；`recordRecentSFTP` 参数个数不符；race 用例在旧实现下报 `DATA RACE`）。
+Expected: FAIL —— 注意此时**整个 `package main` 编译失败**（`recordRecentSFTP` 参数个数不符），所以「race 用例报 DATA RACE」这类观察要等实现之后才有意义，别在这里等（审核 M3）。
 
 - [ ] **Step 3: 实现**
 
 - **写入分工（规格 §6.3.1）**：只有 `AddLocalRecent`/`AddRemoteRecent` 写 last path；`recordRecentSFTP(..., false)`（`SftpHome` `:1127` 与传输完成 `:810/823/836/882`）一律不写。`recordRecentSFTP` 的内部调用点全部补 `false` 实参。
-- **last path 不受队首短路约束（§6.3.2）**：先算 `lastChanged`，再走 recents 去重/短路；仅当"recents 无需变更（队首同值）**且** last path 无需变更"时 `return nil`（不写盘）；否则一次 `saveConfig()`。
+- **last path 不受队首短路约束（§6.3.2）**：`if rememberLast { lastChanged = a.rememberRemotePathLocked(host, path) }` —— **门控必须在 helper 之外（审核 I2）**：若写成「先无条件比较 `LastRemoteDirs[host] != path`」，则 `rememberLast == false` 的内部路径（传输完成 `:810/823/836/882`）会因为 map 永不更新而**每次都判 changed** ⇒ 每个文件一次全量 TOML 编码 + rename，正是 `app.go:1374-1375` 注释要避免的写放大回归。然后只更新需要更新的部分：`lastChanged == false && recents 队首同值` ⇒ `return nil`（不写盘）；否则一次 `saveConfig()`。
 - **四个函数统一并发改造（§6.3.4 第 3 条）**：
   - `AddLocalRecent`/`AddRemoteRecent`：`kept := a.cfg.X[:0]` → `kept := make([]T, 0, len(a.cfg.X))`；
   - `AddBookmark`：**不能只写 `append(a.cfg.Bookmarks, b)`**（cap 有余量时仍会写进共享底层数组）⇒ 构造新数组 `nb := make([]config.Bookmark, 0, len(a.cfg.Bookmarks)+1)`，先拷旧再追加，最后整结构赋值 `a.cfg.Bookmarks = nb`；
   - `RemoveBookmark`：同构造新数组后逐项过滤；
-  - 去重/增删/（recents 两处的）last path 更新整段放进 `a.cfgMu.Lock()` … `Unlock()`，锁内只赋值，解锁后再 `saveConfig()`。
+  - 去重/增删/（recents 两处的）last path 更新整段放进 `a.cfgMu.Lock()` … `Unlock()`，锁内只赋值，解锁后再 `saveConfig()`；**锁内只允许调 `*Locked` 系列，禁止调公开绑定**（审核 I3：同锁重入会死锁）。
+  - `recordRecentSFTP` 保持「fire-and-forget」（`_ =`）与既有入参守卫，只在写锁内走 recents-only 入口。
+- **读方也纳入本轮（审核 M8）**：`ListLocations()`（`:1291-1310`）现在无锁读 `a.cfg.Bookmarks/LocalRecent/RemoteRecent`，而 Wails 每次调用一个 goroutine ⇒ 给它加 `cfgMu.RLock()`（一处、零成本），否则「这四个写入点并发安全」的宣称是过头的。`localRecentPaths()` 等 startup 期读点保持现状，记入 §13。
   - **保持既有入参守卫与语义**：`AddRemoteRecent` 的 `host == "" || path == ""` 直接 return、`RemoveBookmark` 的 scope/host/path 匹配规则、各函数的去重置顶与 20 条上限，一律不动。
 - `cfgMu` 注释（`:37-42`）扩写为"保护 `cfg.App` 与 `cfg.SftpUI`"，并注明四个写入函数的锁规约。
 
@@ -298,8 +333,9 @@ Expected: PASS（含既有 `TestAddRecentHeadShortCircuit`、`TestAddRemoteRecen
 
 - [ ] **Step 5: 源码结构性判据**
 
-Run: `grep -n 'cfg\.[A-Za-z]*Recent\[:0\]\|SftpUI.LastRemoteDirs\[' app.go`
-Expected: 无输出（证明没有原地复用 slice、没有原地写 map）。
+Run: `grep -nE 'Recent\[:0\]' app.go; grep -nE 'SftpUI\.LastRemoteDirs\[[^]]*\]\s*=' app.go; grep -n 'make(map\[string\]string' app.go`
+Expected: **前两条无输出**（没有原地复用 slice、没有原地**赋值**写 map），**第三条命中**（last path 的 map 由 helper 内 `make` 构造）。
+**注意判据口径（审核 I1）**：只匹配**赋值**（`...] =`），因为 §6.3.2 的读比较 `LastRemoteDirs[host] != path` 也会命中裸 `LastRemoteDirs[` —— v1.6 的 grep 与实现互相打架，且对 BF14 要求的「写锁内构造了新 map」毫无判别力。
 
 - [ ] **Step 6: 提交**
 
@@ -324,10 +360,10 @@ git commit -m "fix(app): 配置写入点并发改造（新数组+写锁）与 la
   // models.ts 新增 class SftpUIState；last_remote_dirs 形如 Record<string, string>
   ```
 
-- [ ] **Step 1: 先产 `frontend/dist`（否则生成必失败）**
+- [ ] **Step 1: 确认 `frontend/dist` 已存在**
 
-Run: `cd frontend && npm run build`
-Expected: 构建成功。**理由（自审修正）**：`main.go:16` 是 `//go:embed all:frontend/dist`，任何 Go 侧构建都要求该目录已存在；`frontend/dist` 被 gitignore，干净克隆上不存在。此步用的是**旧绑定**（此刻还没有任何前端代码 import 新符号），所以不会形成循环依赖。
+Run: `test -d frontend/dist && echo dist-ok`
+Expected: `dist-ok`。若不存在：按 Global Constraints 的 Task 0 执行 `cd frontend && npm ci && npm run build` 补齐（**审核 B1**：这个前置属于所有 Go 命令，不属于 T5；T2–T4 的 `go test ./` 就会用到它）。
 
 - [ ] **Step 2: 重生成**
 
@@ -339,10 +375,10 @@ Expected: 退出码 0；`git status --short` 显示三个生成文件被改动�
 Run: `grep -n 'GetSftpUI\|SaveSftpUI\|SftpProbe' frontend/wailsjs/go/main/App.d.ts frontend/wailsjs/go/main/App.js && grep -n 'class SftpUIState' frontend/wailsjs/go/models.ts`
 Expected: 三个函数各命中 `.d.ts` 与 `.js`；`class SftpUIState` 命中一次。
 
-- [ ] **Step 4: 验证前端构建（用新绑定再编一次）**
+- [ ] **Step 4: 再编一次前端（**非判别性**，审核 M4）**
 
 Run: `cd frontend && npm run build`
-Expected: 构建成功（Rollup 不报 "is not exported by wailsjs/go/main/App.js"）。
+Expected: 构建成功。**说明**：`package.json` 的 build 只是 `vite build`（无类型检查），而此刻 T6–T13 尚未实施、没有任何前端代码 import 新符号 ⇒ 这一步用旧绑定也能过，**不能**证明新绑定的可见性。真正的判据是 Step 3 的 grep；「新符号真被 import 且能编过」由 T7 Step 4 与 T14 的 `make ci` 提供。
 
 - [ ] **Step 5: 提交**
 
@@ -386,6 +422,9 @@ it('记忆路径优先于 home 并被标记', () => expect(resolveRemoteTarget({
   .toEqual({ path: '/r', fromMemory: true }))
 it('无记忆则回落 home', () => expect(resolveRemoteTarget({ remembered: '', home: '/h' }))
   .toEqual({ path: '/h', fromMemory: false }))
+it('pendingPath 空串视为未指定（工具栏「连接」主流程恒为 ""）', () =>   // 审核 F16
+  expect(resolveRemoteTarget({ pendingPath: '', remembered: '/r', home: '/h' }))
+    .toEqual({ path: '/r', fromMemory: true }))
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -545,7 +584,8 @@ it('排序读 props：无本地 ref、无 *.value 残留、emits 含 sort', () =
 
 `filePane.render.test.js`（SSR 真渲染，仿 `TransferQueue.render.test.js:1-11`）：
 ```js
-const render = (props) => renderToString(createSSRApp({ render: () => h(FilePane, { items, ...props }) }))
+const render = async (props) => await renderToString(createSSRApp({ render: () => h(FilePane, { items, ...props }) }))
+// 必须 await（先例 TransferQueue.render.test.js 每个用例都 await render(...)）：漏了拿到的是 Promise
 it('按 props 排序并渲染箭头与 active 类', () => {
   const html = render({ sortKey: 'size', sortDir: -1 })
   // 断言：行序为 size 降序（用 indexOf 比较两个文件名的位置）、'▼' 出现在 "大小" 列头、该列头带 active
@@ -615,7 +655,7 @@ it('.. 行新增 contextmenu 处理器并按无选中上抛', () => {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd frontend && npx vitest run src/components/filePaneWiring.test.js src/components/contextMenu.test.js`
+Run: `cd frontend && npx vitest run src/components/filePaneWiring.test.js src/components/contextMenuWiring.test.js`
 Expected: FAIL。
 
 - [ ] **Step 3: 实现**
@@ -626,7 +666,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd frontend && npx vitest run src/components/filePaneWiring.test.js src/components/contextMenu.test.js`
+Run: `cd frontend && npx vitest run src/components/filePaneWiring.test.js src/components/contextMenuWiring.test.js`
 Expected: PASS。
 
 - [ ] **Step 5: 提交**
@@ -672,7 +712,8 @@ it('本地路径用记忆值优先、失败回落 Cwd', () => {
   const body = src.match(/onMounted\(async \(\) => \{([\s\S]*?)\n\}\)/)[1]
   expect(body.indexOf("lastPathFor('local')")).toBeGreaterThan(-1)
   expect(body.indexOf("lastPathFor('local')")).toBeLessThan(body.indexOf('Cwd()'))
-  expect(body).toContain('上次的本地目录')          // 回落时的 warn 文案（spec §10 逐字）
+  expect(body).toContain('上次的本地目录')          // 回落文案（spec §10 逐字）
+  expect(body).toMatch(/warn\(/)                   // 审核 F7：级别是 warn，不能用 err()（它硬编码 error）
 })
 it('connect/syncConnection 共用 resolveRemoteTarget，且 pendingHome 是显式标志', () => {
   expect(src.match(/resolveRemoteTarget\(/g).length).toBeGreaterThanOrEqual(2)
@@ -681,11 +722,25 @@ it('connect/syncConnection 共用 resolveRemoteTarget，且 pendingHome 是显�
   expect(home).not.toContain("pendingPath.value = ''")
   expect(home).toContain('pendingHome')
 })
-it('connect 被 sftpui.loaded 兜住', () => expect(src).toMatch(/if \(!sftpui\.loaded\) await sftpui\.load\(\)/))
+it('connect 被 sftpui.loaded 兜住，且 load 失败不会冒泡成 unhandled rejection（审核 F8）', () => {
+  expect(src).toMatch(/!sftpui\.loaded/)
+  expect(src).toMatch(/sftpui\.load\(\)\.catch\(err\)|try\s*\{[^}]*sftpui\.load\(\)/)
+})
+it('排序接线（审核 F9，最后一米）', () => {
+  expect((src.match(/@sort="onSort\('/g) || []).length).toBe(2)
+  expect(src).toContain(':sort-key="sftpui.sort.local.key"')
+  expect(src).toContain(':sort-key="sftpui.sort.remote.key"')
+  expect(src).toContain(':sort-dir="sftpui.sort.local.dir"')
+  expect(src).toContain(':sort-dir="sftpui.sort.remote.dir"')
+})
+it('loadRemote 成功路径记录远程最后路径（审核 F10）', () => {
+  const fn = src.match(/async function loadRemote\(\)[\s\S]*?\n\}/)[0]
+  expect(fn).toMatch(/addRemoteRecent\(/)
+})
 it('记忆路径失效回落 home 只在 fromMemory 时发生', () => {
   const fn = src.match(/async function connect\(\)\s*\{([\s\S]*?)\n\}/)[1]
   expect(fn).toContain('fromMemory')
-  expect(fn).toContain("err('上次的远程目录")
+  expect(fn).toMatch(/warn\('上次的远程目录/)     // 审核 F7：级别是 warn，不是 err()
 })
 it('取列表函数抽取：loadRemote/loadLocal 包装会抛错的 fetch*', () => {
   expect(src).toContain('async function fetchRemote(')
@@ -701,9 +756,14 @@ Expected: FAIL。
 
 - [ ] **Step 3: 实现**
 
-- 抽 `fetchRemote(target)`/`fetchLocal(target)`（**抛错**）；`loadRemote`/`loadLocal` 包一层 `try/catch → err(e)`，**外部语义不变**（seq 守卫、loading、`addRecent` 全部保留）。
+- 抽 `fetchRemote(target)`/`fetchLocal(target)`（**抛错**）；`loadRemote`/`loadLocal` 包一层 catch，**外部语义不变**（seq 守卫、loading、`addRecent` 全部保留）。**审核 F23**：`fetch*` **只做** `List*(target) || []` 并抛错 —— 绝不自增 `localSeq`/`remoteSeq`、不改 loading、不记 recent；这三件事留在 `loadRemote/loadLocal/goRemote/goLocal`，否则 `goRemote` 的「旧响应丢弃 + 失败回滚」（`:289/294/299`）会被破坏。
+- **`loadRemote` 成功路径补 `await locations.addRemoteRecent(host.value, remotePath.value)`（审核 F10）**：双击进目录与刷新都只经它；store 有队首短路 ⇒ 不增加写盘。
+- `loadRemote` 的 catch 改走 `remoteOpFailed(e)`（**审核 F5**：v1.7 写的「err(e)，语义不变」与 T13 落点 #2 冲突；正确表述是「记原文 + 一次探活复核，可能自愈」）。
 - `onMounted` 顺序照 spec §6.4 B3；`localPath` 先取 `sftpui.lastPathFor('local')`，为空或打开失败才回落 `await Cwd()`（回落时写 warn 文案，逐字取 spec §10）。
-- `connect()` 首部 `if (!sftpui.loaded) await sftpui.load()`；落点用 `resolveRemoteTarget({ pendingPath, pendingHome, remembered: sftpui.lastPathFor('remote', h), home })`；若 `fromMemory === true` 且首列失败 ⇒ 回落 `home` 再列一次 + warn 文案；`pendingPath`/`pendingHome` 消费后清空（含失败分支）。
+- `connect()` 首部 `if (!sftpui.loaded) await sftpui.load().catch(err)`（**审核 F8**：`load()` 会 reject，裸 await 会让连接按钮 unhandled rejection）。
+- 落点用 `resolveRemoteTarget({ pendingPath: pendingPath.value, pendingHome: pendingHome.value, remembered: sftpui.lastPathFor('remote', h), home })` —— **必须取 `.value`（审核 F17）**：传 ref 对象会恒为真值、把 ref 当路径交给 `SftpList`。
+- 若 `fromMemory === true` 且首列失败 ⇒ 回落 `home` 再列一次 + `warn(…)`（审核 F7）；`pendingPath`/`pendingHome` 消费后清空（含失败分支）。
+- `onMounted` 里也要容忍 load 失败：`try { await sftpui.load() } catch (e) { err(e) }`，否则后续 `Cwd()`/`loadLocal()` 全不执行（审核 F8）。
 - `goRemoteHome()` 未连接分支改为 `pendingHome.value = true; await connect()`。
 - `syncConnection()` 未连接分支改为共用同一落点决策（不再无条件 `remotePath = await SftpHome(h)`）。
 - `onSort(pane, { key, dir })`：`try { await sftpui.setSort(pane, key, dir) } catch (e) { err(e) }`；两侧 `FilePane` 传 `:sort-key`/`:sort-dir` 并接 `@sort`。
@@ -751,16 +811,29 @@ it('doAction 的 refresh 分支在 sel.single 之前', () => {
   const body = src.match(/async function doAction\(name\)\s*\{([\s\S]*?)\n\}/)[1]
   expect(body.indexOf("name === 'refresh'")).toBeLessThan(body.indexOf('sel.single('))
 })
-it('空选择防御存在', () => expect(src).toMatch(/\/\/ 空选择|name !== 'refresh' && name !== 'mkdir' && !names\.length/))
-it('置灰接线：远依赖动作在未连接时 disabled', () => {
-  expect(src).toMatch(/:disabled="[^"]*!connected[^"]*"/)
-  const af = src.match(/function actionsFor\(pane\)\s*\{([\s\S]*?)\n\}/)[1]
-  expect(af).toMatch(/upload-picked'[^}]*disabled: !connected/)
+it('空选择防御只约束依赖选中的动作，且在 sel.single 之后（审核 F2）', () => {
+  const body = src.match(/async function doAction\(name\)\s*\{([\s\S]*?)\n\}/)[1]
+  expect(body).toMatch(/SELECTION_DEPENDENT|\['download', 'upload', 'remove', 'rename'\]/)
+  expect(body).not.toMatch(/name !== 'refresh' && name !== 'mkdir' && !names\.length/)
+  expect(body.indexOf('sel.single(')).toBeLessThan(body.indexOf('SELECTION_DEPENDENT'))
 })
-it('菜单模板：单一选中判据 + 两个分支都含刷新项', () => {
-  expect(src).toMatch(/const menuHasItem = computed\(/)          // 一个具名判据，不在模板里散算
-  expect(src.match(/doAction\('refresh'\)/g).length).toBeGreaterThanOrEqual(2)  // 空白菜单 + 行菜单各一次
-  expect(src).toContain("doAction('download')")                   // 行菜单的选中项动作仍在
+it('置灰接线：唯一判据 remoteDep + 批量下拉也置灰（审核 F3/F19）', () => {
+  expect(src).toContain('remoteDep')
+  expect(src).toMatch(/remoteDep\s*&&\s*!connected/)
+  const af = src.match(/function actionsFor\(pane\)\s*\{([\s\S]*?)\n\}/)[1]
+  expect(af).toMatch(/upload-picked'[^}]*disabled: !connected\.value/)
+  expect(af).toMatch(/upload'[^}]*disabled: !connected\.value/)
+})
+it('菜单矩阵：单一判据 + 各分支内容差异（审核 F22）', () => {
+  expect(src).toMatch(/const menuHasItem = computed\(/)
+  expect(src.match(/doAction\('refresh'\)/g).length).toBeGreaterThanOrEqual(2)
+  const tpl = src.slice(src.indexOf('<ContextMenu'), src.indexOf('</ContextMenu>'))
+  const blank = tpl.slice(0, tpl.indexOf("doAction('download')"))
+  const row = tpl.slice(tpl.indexOf("doAction('download')"))
+  expect(blank).toContain("doAction('mkdir')")
+  expect(blank).toContain("doAction('upload-picked')")
+  expect(row).toContain("doAction('download')")
+  expect(row).not.toContain("doAction('mkdir')")
 })
 ```
 
@@ -772,10 +845,11 @@ Expected: FAIL。
 - [ ] **Step 3: 实现**
 
 - `refreshAll()`/`refreshPane(pane)` 照 spec §5.1；工具栏按钮改 `@click="refreshAll"` 并去掉 `:disabled`。
-- `doAction`：顶部先 `if (name === 'refresh') { closeMenu(); return refreshPane(pane) }`（必须在 `sel.single` 之前），并加空选择防御（`refresh`/`mkdir` 除外）。
+- `doAction`：顶部先 `if (name === 'refresh') { closeMenu(); return refreshPane(pane) }`（必须在 `sel.single` 之前，否则多选被收成一项）。
+- **空选择防御（审核 F2）**：写在 `sel.single(...)` 与 `const names = [...s.keys]` **之后**，只约束 `['download','upload','remove','rename']` —— 不能写成「除 refresh/mkdir 外一律 return」（会误伤空白菜单的 `upload-picked`，并让未选中行的整条行菜单变 no-op）。
 - 新增唯一选中判据 `const menuHasItem = computed(() => !!(menu.value.item && menu.value.item.name !== '..'))`（`..` 行按无选中处理），模板以它切两个菜单分支。
 - `showMenu` 支持 `item: null`；`ContextMenu` 模板按 §5.3 矩阵渲染：**两个分支都含** 🔄 刷新（空白菜单为「刷新 · 新建文件夹 · 上传文件…」，行菜单为「下载/上传/重命名/删除 + ── + 刷新」）；用 `remoteDep && !connected` 判据置灰（`remoteDep` 含本地面板的上传类动作）。
-- `actionsFor('local')` 的 `upload`/`upload-picked` 两项加 `disabled: !connected`（第三个入口）。
+- `actionsFor('local')` 的 `upload`/`upload-picked` 两项加 `disabled: !connected.value`（第三个入口；**审核 F3**：script 里 `connected` 是 ref，漏 `.value` 会让置灰恒 false 而前缀式断言照样绿）。
 - 表格里的置灰点都要在模板/函数里落实，否则 Step 1 的断言不绿。
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -817,16 +891,20 @@ git commit -m "feat(sftp): 工具栏双侧刷新 + 右键菜单分级/置灰（�
 ```js
 it('syncConnection 已连接分支探活，且不重置路径/不重载列表', () => {
   const fn = src.match(/async function syncConnection\(\)\s*\{([\s\S]*?)\n\}/)[1]
-  const connectedBranch = fn.slice(fn.indexOf('if (connected.value)'), fn.indexOf('// 未连接'))
+  // 切片不许依赖未规定的注释（审核 F14）：用花括号配对切
+  const connectedBranch = fn.match(/if \(connected\.value\) \{([\s\S]*?)\n  \}/)[1]
   expect(connectedBranch).toContain('probeTimed(')
-  expect(connectedBranch).not.toMatch(/SftpHome|loadRemote\(|remotePath\.value =/)   // 只裁已连接分支
+  expect(connectedBranch).toMatch(/===\s*'lost'/)                                     // 审核 F1：三态字符串配 !(...) 永不触发
+  expect(connectedBranch).not.toMatch(/SftpHome|loadRemote\(|remotePath\.value =/)
 })
-it('recoverConnection：recovering 幂等 → SftpDisconnect → pendingPath → connect 的顺序', () => {
+it('recoverConnection：幂等 → SftpDisconnect → connect，且不写 pendingPath（审核 F6）', () => {
   const fn = src.match(/async function recoverConnection\([\s\S]*?\n\}/)[0]
   expect(fn.indexOf('if (recovering) return')).toBeLessThan(fn.indexOf('recovering = true'))
   expect(fn.indexOf('recovering = true')).toBeLessThan(fn.indexOf('SftpDisconnect('))
   expect(fn.indexOf('SftpDisconnect(')).toBeLessThan(fn.indexOf('connect()'))
-  expect(fn).toContain("sftpui.lastPathFor('remote'")
+  // F6：把记忆值塞进优先级 1 的 pendingPath ⇒ fromMemory=false ⇒ §6.5 回落永不触发、R3 承诺失效；
+  // 正确做法是不写 pendingPath，让 connect() 在优先级 3 自己取（fromMemory=true）。
+  expect(fn).not.toMatch(/pendingPath\.value\s*=\s*sftpui\.lastPathFor/)
 })
 it('只重连一次：recoverConnection 体内无 while/定时器', () => {
   const fn = src.match(/async function recoverConnection\([\s\S]*?\n\}/)[0]
@@ -843,23 +921,35 @@ it('三态契约：只有 lost 触发重连；unknown 与抛错都不改状态',
   expect(pf).toMatch(/'unknown'/)
   expect(pf).not.toMatch(/catch[\s\S]{0,80}'lost'/)      // 探针抛错不得被当成 lost
 })
-it('12 个远程落点覆盖（可达性口径）', () => {
-  const pure = ['dispatchTransfer', 'loadRemote', 'goRemote', 'goRemoteHome', 'uploadPicked']
-  const mixed = ['removeSelected', 'renameItem', 'mkdirIn', 'onMoveDrop']
-  // 对每个落点所在函数：切片到函数结束，断言 catch 里**可达** remoteOpFailed( 或 verifyRemote(
-  //   —— 注意 dispatchTransfer 的取消分支仍需裸 err(e) 记原文，所以**不能**断言"没有裸 err(e)"，
-  //      正确口径是：`if (rec.cancelRequested) err(e) else await remoteOpFailed(e)`
-  // 混合面板函数：额外断言存在 `pane === 'local'` 的 err(e) 分支（本地失败不探活）
-  // cleanItem：断言按 rec.direction 分派（download=本地 / else=远程）
-  // onMoveDrop：断言 `try {` 出现在 `SftpList(` 之前（目标子目录加载必须在 try 内）
+it('13 个远程落点覆盖（可达性口径，可执行断言；审核 F13）', () => {
+  const bodyOf = (n) => (src.match(new RegExp('(async )?function ' + n + '\\([^)]*\\)\\s*\\{([\\s\\S]*?)\\n\\}')) || [])[2] || ''
+  const remote = ['dispatchTransfer', 'loadRemote', 'goRemote', 'goRemoteHome', 'uploadPicked',
+                  'removeSelected', 'renameItem', 'mkdirIn', 'onMoveDrop', 'cleanItem']
+  for (const fn of remote) expect(bodyOf(fn), fn).toMatch(/remoteOpFailed\(|verifyRemote\(/)
+  for (const fn of ['removeSelected', 'renameItem', 'mkdirIn', 'onMoveDrop'])
+    expect(bodyOf(fn), fn).toMatch(/pane === 'local'[\s\S]{0,60}err\(e\)|err\(e\)[\s\S]{0,60}pane === 'local'/)
+  expect(bodyOf('cleanItem')).toMatch(/rec\.direction/)
+  const mv = bodyOf('onMoveDrop')
+  expect(mv.indexOf('try {')).toBeLessThan(mv.indexOf('SftpList('))
+  expect(src).toContain('@failed="remoteOpFailed"')                                  // SearchOverlay 归口
+  expect(src).not.toMatch(/async function connect\(\)[\s\S]{0,400}remoteOpFailed/)  // connect 保持 err(e)
 })
-it('远程操作成功后回同步 connected=true', () => {
+it('远程操作成功后回同步 connected=true，且带 host 守卫（审核 F21）', () => {
   const fn = src.match(/async function dispatchTransfer\([\s\S]*?\n\}/)[0]
-  expect(fn).toMatch(/if \(!connected\.value\) connected\.value = true/)
+  expect(fn).toMatch(/const h = host\.value/)
+  expect(fn).toMatch(/host\.value === h && !connected\.value\) connected\.value = true/)
 })
-it('取消中的失败跳过探活', () => {
+it('取消中的失败跳过探活 + 三条自愈文案逐字 + 探活耗时日志（审核 F15/F7/F12）', () => {
   const fn = src.match(/async function dispatchTransfer\([\s\S]*?\n\}/)[0]
   expect(fn).toMatch(/cancelRequested[\s\S]{0,120}remoteOpFailed|remoteOpFailed[\s\S]{0,120}cancelRequested/)
+  expect(src).toContain('远端连接已失效（主机休眠或网络中断），正在重连…')
+  expect(src).toContain('已重新连接')
+  expect(src).toContain('重连失败：')
+  expect(src).toContain('探活耗时')
+})
+it('probing/recovering 是非 ref 的普通 let（审核 F15）', () => {
+  expect(src).toMatch(/let probing = false/)
+  expect(src).toMatch(/let recovering = false/)
 })
 ```
 
@@ -872,7 +962,11 @@ Expected: FAIL。
 
 - `probeTimed(host)` → 三态：`Promise.race([SftpProbe(host), 15s 计时器])`；探针返回 `true` → `'ok'`、`false` → `'lost'`、超时或**探针自身抛错** → `'unknown'`；`setTimeout` 句柄必须 `clearTimeout`。
 - `verifyRemote()`：`if (!h || !connected.value || probing) return`；`probing = true` … `finally { probing = false }`；**只有 `'lost'` 才** `recoverConnection(h)`（`'unknown'` 不改状态、不重连、不记 error）。
-- `recoverConnection(h)`：入口 `if (recovering) return`；按 spec §8.3 步骤 1–7；成功/失败判据 = `connected.value`；`host.value !== h` 时静默 return（不记"重连失败"）。
+- `recoverConnection(h)`：入口 `if (recovering) return`；按 spec §8.3 步骤 1–7；成功/失败判据 = `connected.value`；`host.value !== h` 时静默 return（不记「重连失败」）。
+  - **不要写 `pendingPath.value = sftpui.lastPathFor('remote', h)`（审核 F6）**：`pendingPath` 是优先级 1 且会让 `resolveRemoteTarget` 返回 `fromMemory === false` ⇒ §6.5「仅来自记忆才回落 home」在自愈路径永不触发（R3 承诺失效）；`connect()` 本来就会在优先级 3 取同一记忆值。
+- **`connect` 保持 `err(e)`、不接入 `remoteOpFailed`**（审核 F13：它只在未连接时被调用，守卫必然命中 ⇒ 死接线）。
+- **`SearchOverlay.vue` 纳入本轮（审核 F13）**：`emits` 增加 `'failed'`、catch 里 `emit('failed', e)`；`SftpView` 的 `<SearchOverlay>` 加 `@failed="remoteOpFailed"`。
+- 回同步 `connected` 时**带 host 守卫**（审核 F21）：await 之前 `const h = host.value`，之后 `if (host.value === h && !connected.value) connected.value = true`。
 - `remoteOpFailed(e)` = `err(e)` + `await verifyRemote()`；**按 spec §8.4 的 12 项清单**逐个替换。三处形状要写对：① `dispatchTransfer` 保留取消分支的原文日志 —— `if (rec.cancelRequested) err(e) else await remoteOpFailed(e)`；② `onMoveDrop` 把 `targetItems` 加载与 `askConflict` 挪进 `try`；③ `cleanItem` 按 `rec.direction` 分派（download=本地分支保持 `err`，否则 `remoteOpFailed`）。
 - `dispatchTransfer` 成功路径若 `connected.value === false` ⇒ 置 `true`（§8.5 的一致性回同步）。
 - 注释写清三处"为什么"：`verifyRemote` 的 `connected===false` 早退（防"连接本身失败"再触发一轮）、`probing` 与 `recovering` 各管一段、探针超时按"未知"处理。
@@ -908,6 +1002,7 @@ git commit -m "feat(sftp): 连接失效自愈（切标签探活/操作失败复�
 
 - [ ] **Step 1: 全量门禁**
 
+前置：`frontend/dist` 必须存在（Global Constraints 的 Task 0；`make ci` 第一步也会产它）。
 Run: `GOCACHE=$PWD/.gocache make ci`
 Expected: 四步全绿；把完整输出保存到报告的证据目录（例如 `.superpowers/sftp-refresh-2026-10-10/make-ci.log`）。
 
@@ -917,7 +1012,7 @@ Expected: 四步全绿；把完整输出保存到报告的证据目录（例如 
 
 - [ ] **Step 3: Linux 真机验收 D/F 组（断链自愈）**
 
-按 spec §11.3 的 D1/D2/D3/F1/F2 执行：`ss -K dst <host> dport = :22`（无 root 用 `iptables -A OUTPUT -p tcp --dport 22 -j DROP` 再删规则）；D1 必须给出日志原文（含时间戳）与自愈前后截图，F1 必须给出探活耗时分布，F2 跑 `SSHORE_SFTP_TRANSPORT=batch`。
+按 spec §11.3 的 D1/D2/D3/F1/F2 执行：断链用 `ss -K dst <host> dport = :22` 或 `iptables -A OUTPUT -p tcp --dport 22 -j DROP`（**审核 F20**：两者都需 root/CAP_NET_ADMIN，差内核 `CONFIG_INET_DIAG_DESTROY`/容器 capabilities，不是「有 root/无 root」之别；哪个可用跑哪个并在报告写明）；Windows 侧用 VirtualBox 停用网卡或 `netsh interface set interface <名称> disable`。D1 给出日志原文（含时间戳）+ 自愈前后截图；F1 给出 `探活耗时 <N>ms` 日志汇总 + 无「远端连接已失效」误判；F2 跑 `SSHORE_SFTP_TRANSPORT=batch`。
 
 - [ ] **Step 4: Windows 客户机验收**
 
@@ -925,7 +1020,8 @@ Expected: 四步全绿；把完整输出保存到报告的证据目录（例如 
 
 - [ ] **Step 5: 写报告并提交**
 
-报告结构：范围/结论摘要 → 门禁输出 → 逐条判据表（A1…F2）× 平台 → 未验证项与残留风险（照抄 spec §12 的 R 表口径，**不得**用"应该没问题"代替证据）→ 证据文件清单。
+报告结构：范围/结论摘要 → 门禁输出 → 逐条判据表（A1…F2）× 平台 → 未验证项与残留风险（照抄 spec §12 的 R 表口径，**不得**用「应该没问题」代替证据）→ 证据文件清单。
+**证据必须入库（审核 F11）**：`.superpowers/` 在 `.gitignore` 里 ⇒ 截图/日志放 `docs/superpowers/reports/2026-10-10-sftp-refresh-persist-connloss-evidence/`，或把关键原始输出内联进报告正文；`git add` 时把证据目录一并加上。
 
 ```bash
 git add docs/superpowers/reports/2026-10-10-sftp-refresh-persist-connloss-acceptance.md
@@ -938,7 +1034,7 @@ git commit -m "docs(report): SFTP 刷新/持久化/连接自愈的 Linux+Windows
 
 | # | 严重度 | 问题 | 修正 |
 |---|---|---|---|
-| S1 | **Blocking** | T5 直接跑 `wails generate module`，但 `main.go:16` 是 `//go:embed all:frontend/dist`，而 `frontend/dist` 被 gitignore ⇒ **干净克隆/CI 上生成必失败** | T5 新增 Step 1：先用**旧绑定** `cd frontend && npm run build` 产 dist（不构成循环依赖），步骤重编号 |
+| S1 | **Blocking** | T5 直接跑 `wails generate module`，但 `main.go:16` 是 `//go:embed all:frontend/dist`，而 `frontend/dist` 被 gitignore ⇒ **干净克隆/CI 上生成必失败** | T5 新增 Step 1 产 dist。**二阶段审核 B1 进一步指出该前置放错了任务**（T2/T3/T4 就要跑 `go test ./`）⇒ 已上移到 Global Constraints 的 Task 0；T5 Step 1 改为「确认 dist 已存在」 |
 | S2 | Important | T2 的"每 host 单飞"没写清除时机 ⇒ 首次探针后该 host 被永久标记"在飞"，batch 后端自愈静默失效 | 点名 `defer` 内清除 inflight 标记 |
 | S3 | Important | T4 对 `AddBookmark` 只说"改新数组"不够：朴素 `append(a.cfg.Bookmarks, b)` 在 cap 有余量时**仍写共享底层数组** | 点名"构造新数组 + 拷旧 + 追加 + 整结构赋值"；并补"保持既有入参守卫与去重/上限语义" |
 | S4 | Important | T13 的 `probeTimed` 契约自相矛盾（Interfaces 写"超时返回 false"，正文写返回 `'timeout'` 视为未知）⇒ 实现者会把超时当"链路失效"而误重连 | 改为三态 `'ok' \| 'lost' \| 'unknown'`，**只有 `'lost'` 触发重连**；测试补 `clearTimeout`、`'unknown'`、抛错不得归为 `'lost'` |
@@ -948,9 +1044,67 @@ git commit -m "docs(report): SFTP 刷新/持久化/连接自愈的 Linux+Windows
 | S8 | Minor | T11 的 `function goRemoteHome[\s\S]{0,200}` 是跨函数边界的脆正则；另有一条只带注释的桩断言 | 改切片断言；桩断言写实（顺序 + 回落文案） |
 | S9 | Minor | T12 的 `toMatch(/menu\.item|menuHasItem/)` 是空洞断言（`menu.item` 今天就已存在于 `doAction` 里） | 换成"具名判据 `menuHasItem` + 两个菜单分支各含一次刷新 + 行菜单仍含下载" |
 
-### 两阶段审核 · 第二阶段（干净 subagent 双面审核，待填）
+### 两阶段审核 · 第二阶段（干净 subagent 双面审核：后端/构建 15 条 + 前端/验收 23 条，共 38 条，全部处置）
 
-审核面按模块拆包（后端/构建门禁面 + 前端/验收面），每个 subagent 只拿"规格路径 + 计划路径 + 仓库路径 + 复核要求"，**不携带本轮对话背景**；结论回来后在下一修订版填此节，并逐条处置。
+审核方式：两个**新上下文、不携带本轮对话背景**的只读 subagent，按模块拆包（后端/构建门禁面审 T1–T5 + Global Constraints；前端/验收面审 T6–T14 + Review Focus）；两者都被要求「不要相信计划里的行号，回当前工作区重新定位符号，行号漂移本身算 finding」。报告的关键事实由 Lead 逐条复核（读源码 + 一次 TOML 探针 + 隔离 `go vet` 实验）后才处置。**裁定：38 条全部接受**（其中 M5 按规格指定归属并入既有用例，属等价改写而非驳回）。
+
+**两个 Blocking（照计划实施就必红/必失效）**
+
+| ID | 问题 | 处置 |
+|---|---|---|
+| B1 | dist 前置放在 T5，而 T2/T3/T4 已经在跑 package main 的 `go test ./`；`main.go:16` 是 `//go:embed all:frontend/dist`、该目录被 gitignore ⇒ **干净克隆在 T2 就硬失败**（隔离实验 `go vet ./` → `pattern all:frontend/dist: no matching files found`，EXIT=1） | 提到 `## Global Constraints` 的 **Task 0**：`cd frontend && npm ci && npm run build`；T5 Step 1 改为「确认 dist 已存在」 |
+| F1 | 规格 §8.3/§8.4 的代码块是 `if (!(await probeTimed(h)))`，而 `probeTimed` 返回三态字符串 ⇒ `!'lost'` 恒 false ⇒ **切标签自愈永不触发**（D1 挂、D2 可能照过） | 规格两处改 `=== 'lost'`；T13 断言补 `expect(connectedBranch).toMatch(/===\s*'lost'/)`；并同步 §11.2 的断言口径 |
+| F2 | 空选择防御写成「除 refresh/mkdir 外一律 return」⇒ 空白菜单的「上传文件…」（`upload-picked`，天然无选中）点了永远 no-op；若放在 `sel.single` 之前，未选中行的整条行菜单也变 no-op | 规格与 T12 改为「放在 `sel.single` 与 `names` 之后、只约束 `['download','upload','remove','rename']`」，并补可判别断言 |
+
+**Important（后端 6 条 / 前端 10 条）**
+
+| ID | 问题 | 处置 |
+|---|---|---|
+| I1 | T4 的结构性 grep 命中「读」而非只命中「写」（§6.3.2 的 `LastRemoteDirs[host] != path`），且对 BF14 的「写锁内构造新 map」无判别力；helper 里 `map[host]=path` 在裸 `&AppConfig{}` 上会 panic | 判据改 `grep -nE 'SftpUI\.LastRemoteDirs\[[^]]*\]\s*='`（只匹配赋值）+ 断言 `make(map[string]string`；补 nil-map 写入用例 |
+| I2 | 未写明 `rememberLast == false` 时 `lastChanged` 恒 false ⇒ 每个文件一次全量编码+rename（写放大回归） | 写成 `if rememberLast { lastChanged = a.rememberRemotePathLocked(...) }`；补「内部路径不额外写盘」用例 |
+| I3 | 只有 `rememberLast` 参数、没有「只更 recents」的私有 helper：照字面实现会让回归用例必红，或在持写锁时调公开绑定 ⇒ **同锁重入死锁** | Interfaces 补 `addRemoteRecentLocked/addLocalRecentLocked(..., rememberLast)`；明写「锁内禁止调公开绑定」 |
+| I4 | `fakeBackend.List` 既不阻塞、计数也无锁 ⇒ 造不出阻塞且 `-race` 会红；且「Conn 非 nil 的会话」需要 `net.Pipe + sftp.NewServer` 先例 | 新增专用 `blockingFakeBackend`（atomic + channel）；补会话构造先例说明 |
+| I5 | 每 host 单飞「在飞即 false」把「未知」编码成「已死」⇒ batch 挂住时对健康链路做无谓 teardown（违反 D14） | 改为**共享在飞结果**（per-host `chan bool`，第二个调用者等同一次结果）；规格 §8.2 同步 |
+| I6 | 规格 §11.1 两条用例无人承接：`SftpProbe` 未连接 host → false；`GetSftpUI` 的 nil-cfg 分支（被 `SaveSftpUI` 先造出 cfg 而永不执行） | T2 补 `TestSftpProbeFalseWhenListFails`；T3 用例顺序改为「先 `GetSftpUI()` 再 `SaveSftpUI`」 |
+| F3 | `actionsFor` 在 script 里写 `disabled: !connected`（`connected` 是 ref，`!connected` 恒 false）⇒ 第三入口置灰静默失效，且前缀式断言照样绿 | 实现改 `!connected.value`；断言改 `!connected\.value` |
+| F4 | T10 的 vitest 命令指向**不存在**的 `contextMenu.test.js`，而 vitest 过滤不到文件时退出码 0 ⇒ Step 2「Expected: FAIL」实际 PASS（假绿） | 两处命令改为 `contextMenuWiring.test.js` |
+| F5 | T11 说 `loadRemote` 的 catch「err(e)，语义不变」，与 T13 落点 #2「纯远程 ⇒ remoteOpFailed」冲突 | T11 改述为「记原文 + 一次探活复核（本轮要的语义变更）」 |
+| F6 | `recoverConnection` 把记忆值塞进优先级 1 的 `pendingPath` ⇒ `fromMemory=false` ⇒ §6.5 回落永不触发（R3 承诺失效），且 `connect()` 先置 `connected=true` ⇒ 会记「已重新连接」而面板停空 | 不写 `pendingPath`，让 `connect()` 在优先级 3 自取（`fromMemory=true`）；断言加 `not.toMatch(/pendingPath\.value\s*=\s*sftpui\.lastPathFor/)` |
+| F7 | 规格定为 **warn** 的两条回落文案被计划用 `err()`（硬编码 error）打成 error；三条自愈文案（验收 D1 靠 grep）**没有任何逐字断言** | 新增 `warn()`/`info()` helper；断言改用 `warn(`；补三条文案逐字断言 |
+| F8 | `sftpui.load()` 会 reject 却写成裸 `await` ⇒ 连接按钮 unhandled rejection；`onMounted` 里还会中断后续 `Cwd()`/`loadLocal()`（本地面板不加载） | `connect()` 用 `.catch(err)`；`onMounted` 用 try/catch；断言补兜底形态 |
+| F9 | SftpView 把 `sftpui.sort.*` 灌进 `FilePane`、接 `@sort` 这「最后一米」**无断言**（漏接 ⇒ 点列头无反应、重启不恢复而测试仍绿） | T11 补 `@sort="onSort(` 命中 2 次 + 四条 `:sort-key`/`:sort-dir` 断言 |
+| F10 | `loadRemote`（`:218`）不记 `addRemoteRecent`，只有 `connect`/`goRemote` 记 ⇒ **双击进目录/刷新永不写入远程最后路径**（本地侧 `loadLocal` 反倒记） | `loadRemote` 成功路径补记（store 有队首短路，零额外写盘）；规格 §6.3.1 调用点清单与 C2 手势同步 |
+| F11 | 证据目录放 `.superpowers/`（被 gitignore），与规格「`make ci` 日志入库」冲突 ⇒ 验收不可复现 | 证据改放 `docs/superpowers/reports/2026-10-10-…-evidence/` 或内联；`git add` 一并加 |
+| F12 | F1 验收要「探活耗时分布」，但没有任何地方产出该数据 ⇒ 判据不可观测 | 规格 §10 新增 info 级 `探活耗时 <N>ms`（前端 `probeTimed` 计时）；F1 判据改为汇总该日志 + 无「远端连接已失效」误判 |
+| F13 | 「12 点覆盖」测试块**只有注释**（无可执行断言）；且 4 处清单外 catch 未声明（`connect` 内 `SftpHome` 静默、`syncConnection` 的 `SftpConnected`/`SftpHome`、`SearchOverlay` 的 `SftpSearch`、`StatPaths` 本地） | 换成真实断言（函数体切片 + `remoteOpFailed\(|verifyRemote\(`）；`connect` 注明不替换；`SearchOverlay` **纳入**（新增 `@failed="remoteOpFailed"`）；另 3 处写进规格 §8.4 排除清单并给理由 |
+| F14 | `syncConnection` 的切片右界依赖一句**未被规定**的 `// 未连接` 注释（不存在）⇒ `slice(a,-1)` 把未连接分支一起纳入、以看不懂的方式变红 | 改花括号配对切片 |
+| F15 | 断言把 `probing`/`recovering` 钉在「非 ref」上，但计划从未声明它们是普通 `let` | 断言补 `let probing = false` / `let recovering = false`，即显式规定形态 |
+| F16 | 「空串 = 未指定」这条决定主流程（工具栏「连接」`pendingPath` 恒 `''`）的契约**无用例** | T6 补 `pendingPath: ''` 用例 |
+| F17 | `resolveRemoteTarget({ pendingPath, pendingHome, ... })` 传的是 **ref 对象**（恒真值）⇒ 会把 ref 当路径交给 `SftpList`；纯函数单测用字面量测不出 | 明确写 `.value` |
+| F18 | 规格 §11.2 的两条要求无任务承接：两面板 `@context` 接到 `showMenu`；`SaveSftpUI` 唯一出口 | 两条断言分别补进 `sftpMenuWiring` |
+| F19 | `:disabled="[^"]*!connected[^"]*"` 只能证明「某处有 `!connected`」，钉不住 `remoteDep` 判据、也不覆盖每个远依赖项 | 断言改「`remoteDep` 代号 + `remoteDep && !connected` + 模板逐项」 |
+| F20 | 「无 root 用 iptables」的替代理由不成立（两者都要特权）；Windows 侧 D1 断链手段未写 | 改为权限/内核支持口径；Windows 用 VirtualBox 停网卡或 `netsh interface … disable` |
+| F21 | 传输在飞时切主机 ⇒ 旧主机的成功回调把 `connected` 置 true，UI 显示「已连接」但新主机未连 | 回同步带 host 守卫（`const h = host.value` + `host.value === h`）；补断言 |
+| F22 | 「刷新出现 ≥2 次」钉不住菜单矩阵差异（空白含 mkdir/上传文件、行菜单不含 mkdir） | 改为按 `<ContextMenu>` 模板切片，逐分支断言内容差异 |
+| F23 | `fetchRemote/fetchLocal` 的边界未写：若把 seq/loading/recent 也塞进去，`goRemote/goLocal` 的「旧响应丢弃 + 失败回滚」会被破坏 | 明确 `fetch*` 只做 `List*(target) || []` 并抛错 |
+
+**Minor（后端 8 条 / 前端 5 条）**
+
+| ID | 问题 | 处置 |
+|---|---|---|
+| M1 | T1 说 `normalize()`「现在只调 `c.App.Normalize()`」（事实不符：还归一 Syncs）；§6.1 强制的「键=host、不含 user」前提注释无人承接 | 修正描述；T1 Step 3 补前提注释要求 |
+| M2 | T3 的 SyncRule 夹具若只设部分字段，`LoadConfig` 的归一会让用例因无关原因必红 | 夹具写全字段（或只比显式设置的字段） |
+| M3 | T4 Step 2 的「race 用例报 DATA RACE」不可达（同包编译失败先发生） | 改述为「整个 package main 编译失败」 |
+| M4 | T5 Step 4 的 `npm run build` 无判别力（此刻没有代码 import 新符号，旧绑定也能过） | 标注非判别性，真正判据是 Step 3 的 grep + T7/T14 |
+| M5 | T3 新开独立用例，偏离规格指定的「并入 `TestSftpBindingsFailFastBeforeInit`」 | 按规格并入（等价改写） |
+| M6 | `Pool.Probe :288-305`、`recordRecentSFTP :1394-1409`、`AddLocalRecent :1343-1366` 等 ±1~2 行漂移 | 校正并注明「以符号名为准」 |
+| M7 | 测试里 `D:\工作\虚拟 共享` 写成字面量会因非法转义编译不过 | 明确用反引号 raw string 或双反斜杠 |
+| M8 | 加锁只覆盖写方，`ListLocations()` 仍无锁读同字段 ⇒ 「4 个写入点并发安全」的宣称过头 | `ListLocations` 加 `cfgMu.RLock()`；宣称收窄为「写入点之间 + 与 ListLocations 读点之间」 |
+| F18 已列 | — | — |
+| F13/16/17 已列 | — | — |
+| （前端 Minor 其余 2 条：F14/F15 已在 Important 段列明） | — | — |
+
+**两个审核者共同的未验证边界**（保留，不得当成已验证）：未执行 `make ci`/`wails generate module`/真机 A1–F2（只读约束 + 会改仓库）；`models.ts` 对 `map[string]string` 字段的精确产物未生成核对；Windows/WebView2 的 contextmenu/`e.target` 语义未实测；`~/.cache/go-build` 只读的根因未验证（现象已实测）。
 
 ## 自查记录（写在计划末尾，供执行者核对）
 
@@ -959,6 +1113,6 @@ git commit -m "docs(report): SFTP 刷新/持久化/连接自愈的 Linux+Windows
 - **类型/命名一致性**（逐条对过）：`config.SftpUIState` 六字段 → T3/T4 复用；`Ctrl.Probe`/`SftpProbe` → T13 调 `SftpProbe`；`nextSort` → T9；`resolveRemoteTarget` → T11；store 的 `lastPathFor/setSort/loaded/load/noteLocalPath/noteRemotePath` → T8/T11/T13；`recordRecentSFTP(...,rememberLast)` → T4 测试同签名；`fetchRemote/fetchLocal` → T11 产出、T12/T13 复用；`probeTimed/verifyRemote/remoteOpFailed/recoverConnection` → 只在 T13 内闭环。
 - **Step 自查发现并已修的一处缺口**：Spec §11.1 的两条用例（"只含 sort 的 `SaveSftpUI` 会清零路径"这一危险语义、`GetSftpUI ‖ SaveSftpUI` 并发）原先没有落到任何任务，已补进 T3 Step 1。
 - **Review Focus 与测试的对应**：第 1 条→T1 Step 1 + T7 Step 1；第 2 条→T11 Step 1；第 3 条→T13 Step 1 + T12 Step 1；第 4 条→T13 Step 1；第 5 条→T1 Step 1（四个用例）+ T7 Step 1。
-- **比例**（实测数字）：本计划 964 行 / 14 任务 / 72 个步骤；规格 729 行 ⇒ 约 1.32×，属同一量级，没有"比规格长几倍"的抄写式膨胀。代码块基本是**签名 + 测试名/断言**；函数体只出现在规格固定了逐字文案或分支顺序的地方（右键 handler 分支、store 的 payload 键、探针 race 形状）。若执行者发现某步只是把实现抄了一遍，按"步骤只决定实现者无法独自决定的东西"删减。
+- **比例**（实测数字）：本计划 1118 行 / 14 任务 / 73 个步骤；规格 780 行 ⇒ 约 1.43×，属同一量级，没有"比规格长几倍"的抄写式膨胀。代码块基本是**签名 + 测试名/断言**；函数体只出现在规格固定了逐字文案或分支顺序的地方（右键 handler 分支、store 的 payload 键、探针 race 形状）。若执行者发现某步只是把实现抄了一遍，按"步骤只决定实现者无法独自决定的东西"删减。
 - **未写进计划的东西**（刻意留给执行者的判断，不是遗漏）：函数体写法、CSS 细节、测试断言的实现手法（切片正则 vs SSR）、提交粒度内的行号微调。
 - **环境前提**（实测过的，不是猜测）：`~/.cache/go-build` 只读 ⇒ 一律带 `GOCACHE=$PWD/.gocache`；`wails v2.15.0` 的 `generate module` 支持 `-tags`；前端可用的测试手段只有纯函数/store/SSR/读源码四种。
