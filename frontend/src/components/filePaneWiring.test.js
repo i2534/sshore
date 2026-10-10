@@ -225,7 +225,16 @@ describe('排序状态上收（props + emit sort）', () => {
 
   it('arrow() 与 visible() 的读源都是 props（两处必须同改）', () => {
     expect(filePane).toMatch(/function arrow\(key\)\s*\{\s*return\s+props\.sortKey === key \? \(props\.sortDir === 1 \? '▲' : '▼'\) : ''\s*\}/)
-    expect(filePane).toMatch(/const visible = computed\(\(\)\s*=>\s*\{[\s\S]*?props\.sortKey[\s\S]*?props\.sortDir/)
+    // 收紧（审核 Minor）：原来是一条横跨全文的正则 `/const visible = computed\(\(\)\s*=>\s*\{[\s\S]*?props\.sortKey[\s\S]*?props\.sortDir/`
+    // —— `[\s\S]*?` 会懒匹配**跨函数**一路吃到后面的 arrow()（它也在读 props.sortKey/sortDir），
+    // 于是把 visible 体内的读源删干净仍然绿。这里改成先切出 computed 体，再在切片内断言。
+    const iStart = filePane.indexOf('const visible = computed(')
+    const iEnd = filePane.indexOf('return sorted')
+    expect(iStart, '找不到 visible computed 的定义').toBeGreaterThan(-1)
+    expect(iEnd, '找不到 visible computed 的结尾（return sorted）').toBeGreaterThan(iStart)
+    const body = filePane.slice(iStart, iEnd)
+    expect(body).toContain('props.sortKey')
+    expect(body).toContain('props.sortDir')
   })
 })
 
@@ -268,6 +277,9 @@ describe('右键触发面分级（空白 vs 行）', () => {
     expect(iEditable).toBeLessThan(iPos)
     expect(iPos).toBeLessThan(iLi)
     expect(iLi).toBeLessThan(iEmit)
+    // 钉住不重复 emit（审核 Minor）：这条处理器只允许 emit 一次 'context'，
+    // 多一处（例如分支没 return 而继续往下走）就是"右键弹两次菜单"的静默缺陷。
+    expect(fn.match(/emit\('context'/g)).toHaveLength(1)
   })
 
   it('面板级右键先 preventDefault 再 emit item:null', () => {

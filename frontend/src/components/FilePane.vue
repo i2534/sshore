@@ -129,6 +129,9 @@ function onPaneContext(e) {
   // 1) 可编辑控件放行原生菜单（保住路径栏/过滤框的复制粘贴）。
   //    contenteditable="false" 必须排除（审核 FF19：否则它也会被当成可编辑）。
   //    以后新增可编辑控件（如行内重命名输入框）要补进这个选择器，否则会被面板根劫持。
+  //    ⚠️ 但**仅**豁免这个选择器不足以让行内可编辑控件（如重命名输入框）拿回原生右键菜单：
+  //    这类控件位于文件行 <li> 内，li 自己的 @contextmenu.prevent 处理器会先 preventDefault()
+  //    并把行级菜单 emit 出去 ⇒ 还必须同时豁免它所在那个 li 的处理器（本轮只记注释，未实现）。
   if (t.closest && t.closest('input, textarea, [contenteditable]:not([contenteditable="false"])')) return
   // 2) 位置弹层（.pos-wrap）内右键：先收起弹层，且不弹我们的菜单
   //    （审核 FF7：否则 .posmenu 与 ContextMenu 两个 z-index:1000 浮层同屏压在一起）

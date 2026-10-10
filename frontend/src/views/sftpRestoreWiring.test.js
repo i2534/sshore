@@ -69,6 +69,20 @@ describe('SFTP 启动恢复 / 落点决策 / 失效回落接线', () => {
     expect(fn).toMatch(/addRemoteRecent\(/)
   })
 
+  it('connect 内的记账自带 try/catch，写盘失败不再落进外层 catch 被判成「连接失败」', () => {
+    // T11 复核 out-of-scope 观察（收尾 triage 已修，本用例只负责钉住它不被改回去）：
+    // 配置写盘（IPC）失败是本地 IO 故障、不是链路信号。记账若裸放在 connect 的主 try 里，
+    // 失败会落进外层 catch ⇒ err(e) + connected=false，把"写盘失败"误判成"SFTP 连接失败"。
+    const fn = src.match(/async function connect\(\)\s*\{([\s\S]*?)\n\}/)[1]
+    const line = fn.split('\n').find((l) => l.includes('addRemoteRecent(h, remotePath.value)'))
+    expect(line, '找不到 connect 内的记账调用').toBeTruthy()
+    // 该行必须自带 try/catch，且 catch 里只记日志、绝不 rethrow（rethrow 等于没修）
+    expect(line).toMatch(/try\s*\{.*await locations\.addRemoteRecent\(h, remotePath\.value\).*\}\s*catch \(e\)\s*\{\s*err\(e\)\s*\}/)
+    expect(line).not.toMatch(/throw/)
+    // 且必须位于外层 catch 之前 —— 放进外层 catch 里等于永远不会被触发
+    expect(fn.indexOf(line)).toBeLessThan(fn.lastIndexOf('catch (e) {'))
+  })
+
   it('记忆路径失效回落 home 只在 fromMemory 时发生', () => {
     const fn = src.match(/async function connect\(\)\s*\{([\s\S]*?)\n\}/)[1]
     expect(fn).toContain('fromMemory')
