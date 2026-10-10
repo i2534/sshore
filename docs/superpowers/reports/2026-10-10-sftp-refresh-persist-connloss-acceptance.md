@@ -81,3 +81,18 @@ ok  	sshore/internal/watch	6.840s
 3. Windows/WebView2 的 `contextmenu` / `e.target` 语义未实测（右键分流只有源码形状断言）。
 4. 单飞/重连的**并发时序**只在单测层覆盖（Go：`-race` + 挂住放行替身；前端：无 jsdom ⇒ 形状断言）。
 5. 已 triage 后**保留**的 deferred minor：`SearchOverlay` 的 `emit('failed')` 不分 scope（本地深搜失败也会白跑一次探活，规格 §8.4 第 13 项本就要求无条件 emit）；`recoverConnection` 的失败原因恒为「连接未建立」（真因由 `connect()` 内既有 `err(e)` 先落一条）；`runtime/**` 三个生成文件被 `wails generate` 改成 755（内容零改动）；T9/T12 的若干测试粒度偏粗项。
+
+---
+
+## 6 真机验收执行结果（2026-10-10 补跑，15/15 项已执行）
+
+§1 的"真机验收未执行"已被本节取代：本轮在一台**有真实 X 会话**的机器上，以 `Xvfb :99` 为显示、自写 XTEST 驱动（`xdo`，等效 xdotool）合成输入、对**真实 sshd 的真实 SFTP 会话**执行了 §4 的全部 15 项（A1–F2），逐项结果、日志原文与决定性截图见：
+
+- 结果表 + 边界说明：[`2026-10-10-sftp-refresh-persist-connloss-evidence/real/RESULTS.md`](2026-10-10-sftp-refresh-persist-connloss-evidence/real/RESULTS.md)
+- 工作台与过程记录（隔离 HOME、可控 TCP 代理、临时 ssh 别名与其还原校验）：[`.../real/harness.md`](2026-10-10-sftp-refresh-persist-connloss-evidence/real/harness.md)
+- 决定性截图 25 张：`.../real/*.jpg`
+
+**结论**：15 项全部 PASS。其中 3 项是"修好之后的端到端复核"，值得单独点出：① 空白菜单「上传文件…」实测会打开文件选择器（此前是死按钮）；② `[WARN] 远端连接已失效…` 的级别与文案逐字正确；③ `sftp mkdir …: permission denied` 这类权限错误**不会**触发断开/重连。
+
+**仍不在本轮覆盖内**（照实保留）：Windows/WebView2 的 `contextmenu`/`e.target` 语义；跨物理网络的断链形态；上传/下载/拖拽移动类手势；真实合成器（非 Xvfb）下的右键行为。
+
