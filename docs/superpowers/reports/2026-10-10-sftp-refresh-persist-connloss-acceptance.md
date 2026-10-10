@@ -38,6 +38,7 @@ ok  	sshore/internal/watch	6.840s
       Tests  483 passed (483)
 ```
 
+- 最终一次门禁（提交 `5bc3004` 之后、最后一个写入者之后）：`docs/superpowers/reports/2026-10-10-sftp-refresh-persist-connloss-evidence/make-ci-final.log`，退出码 **0**，vitest **38 files / 488 tests**、13 个 Go 包 `-race` 全 `ok`。上表为任务收尾时的那次运行（484 tests）。
 - 新增用例总量：Go（`internal/config` 4 + `internal/sftp` 2 + 根包 6 组）+ 前端（T6 14、T7 13、T8 4、T9 10、T10 9、T11 13、T12 12、T13 20）。
 - 关键判别力实验（由实现者/复核者在各自任务内实跑）：`Pool.Probe` 的「过期即 true」变异被新用例判红；四条并发写路径在改前报真 `DATA RACE`；`commit 82fd960` 上 `upload-picked` 无分派被新断言判红；13 个落点逐个抹掉 `remoteOpFailed(` 全部转红。
 
