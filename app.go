@@ -497,6 +497,52 @@ func (a *App) SetSettings(s config.AppSettings) error {
 	return nil
 }
 
+// GetSftpUI 返回 SFTP 视图状态（最后路径 + 双侧排序），非法值已归一：排序键只认
+// name|size|modTime，方向恒为 ±1，LastRemoteDirs 保证非 nil（前端不能拿到 null）。
+//
+// 并发红线（规格 §6.3.4 红线 2）：读锁内**只做值拷贝**，Normalize() 在解锁
+// **之后**调用。Normalize 会给 nil map 赋新 map 头 —— 一旦经共享结构原地归一
+// （`a.cfg.SftpUI.Normalize()`），那是对共享结构的原地写：与同时持 RLock 的
+// snapshotConfig（`cp := *a.cfg` 会读该字段）以及锁外正在跑的 TOML 编码构成数据
+// 竞争（实测：该形状下 -race 报 8 处 DATA RACE）。值拷贝 + 解锁后归一是零成本且
+// 更耐改的形状（将来把 `s := a.cfg.SftpUI` 换成指针读也不会引入原地写）。
+// a.cfg == nil（App 尚未 Init / startup）时返回归一化零值，绝不 panic。
+func (a *App) GetSftpUI() config.SftpUIState {
+	a.cfgMu.RLock()
+	if a.cfg == nil {
+		a.cfgMu.RUnlock()
+		s := config.SftpUIState{}
+		s.Normalize()
+		return s
+	}
+	s := a.cfg.SftpUI
+	a.cfgMu.RUnlock()
+	s.Normalize()
+	return s
+}
+
+// SaveSftpUI 归一并落盘 SFTP 视图状态（规格 §9 / §6.3.5）。
+//
+// 锁与 IO 规约：Normalize() 在加写锁**之前**完成（同 GetSftpUI 的理由，锁内绝不碰
+// map 头）；写锁内只做「nil 守卫 + 整结构赋值」，绝不做 IO；落盘在解锁之后。
+// 锁内的 nil 守卫照 setAppSettings —— App 未 Init 时 a.cfg 为 nil，少了它这里就是
+// 空指针，而 Wails dispatcher 会把 panic 静默 recover，前端只看到「点了没反应、
+// 也不报错」（规格 §6.3.4 BF13）。
+//
+// 语义是**整结构覆盖**：只给 sort 四字段的 state 会把路径字段清零。前端
+// saveSnapshot() 必须先 GetSftpUI 读回、只覆盖 sort 四字段再整结构写回（§6.3.3）；
+// 由 TestSaveSftpUIWholeStructOverwriteIsPinned 固化，改动此处须同步改前端契约。
+func (a *App) SaveSftpUI(s config.SftpUIState) error {
+	s.Normalize()
+	a.cfgMu.Lock()
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
+	a.cfg.SftpUI = s
+	a.cfgMu.Unlock()
+	return a.saveConfig()
+}
+
 // forwardCtrl / syncCtrl 返回已装配的控制器。与 sftpCtrl 同一成因与同一条铁律：
 // 应用启动尚未完成（main.go 的 app.Init 还没跑）时必须返回明确错误 / 空值，绝不能
 // nil 解引用 panic —— 它会被 Wails dispatcher 的 recover 静默吞掉，前端只看到
