@@ -1189,6 +1189,50 @@ func TestAddLocalRecentRecordsLastPathEvenWhenHeadMatches(t *testing.T) {
 	}
 }
 
+// 空路径 = 无操作（收尾复核 Minor：AddLocalRecent 缺了 AddRemoteRecent 那条 host/path
+// 空值守卫，是真实的不对称）。
+//
+// 修前行为：AddLocalRecent("") 会把 LastLocalDir 清成 ""，并把一条 {Path: ""} 置顶进
+// LocalRecent，然后整份配置落盘 —— 即"一次误传的空路径可以静默清掉用户的最后本地目录"。
+// 修后行为：与 AddRemoteRecent(host == "" || path == "") 一致，两条入口（公开绑定
+// AddLocalRecent 与内部 addLocalRecentLocked）都直接返回 false ⇒ 内存态不动、绝不落盘。
+//
+// 同时钉住不回归：recordRecentSFTP 的 SftpHome 调用点传 localDir == ""（其守卫在调用点，
+// 与本守卫是两层），该路径修后照样不报错、不写空条目。
+func TestAddLocalRecentEmptyPathIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	a := NewApp()
+	a.cfgPath = filepath.Join(dir, "sshore.toml") // 绝不碰用户真实配置
+	a.cfg = config.DefaultAppConfig()
+	a.cfg.SftpUI.LastLocalDir = "/keep"
+	a.cfg.LocalRecent = []config.RecentLocal{{Path: "/l", TS: "2000-01-01T00:00:00Z"}}
+
+	if err := a.AddLocalRecent(""); err != nil {
+		t.Fatalf("空路径必须是无操作、不得报错: %v", err)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/keep" {
+		t.Fatalf("空路径不得改写 LastLocalDir，得到 %q（修前会被清成 \"\"）", got)
+	}
+	if len(a.cfg.LocalRecent) != 1 || a.cfg.LocalRecent[0].Path != "/l" {
+		t.Fatalf("空路径不得往 LocalRecent 追加空条目: %+v", a.cfg.LocalRecent)
+	}
+	// 不落盘：修前这里已经写出 LastLocalDir="" + 空条目
+	if _, err := os.Stat(a.cfgPath); !os.IsNotExist(err) {
+		onDisk, lerr := config.LoadConfig(a.cfgPath)
+		t.Fatalf("空路径不得落盘，磁盘上却是 LastLocalDir=%q LocalRecent=%+v (stat err=%v, load err=%v)",
+			onDisk.SftpUI.LastLocalDir, onDisk.LocalRecent, err, lerr)
+	}
+
+	// 内部路径（SftpHome 调用点传 localDir == ""）：不得报错、不得写空条目、不得清 last path。
+	a.recordRecentSFTP("home-host", "/home/u", "", false)
+	if len(a.cfg.LocalRecent) != 1 || a.cfg.LocalRecent[0].Path != "/l" {
+		t.Fatalf("recordRecentSFTP 的空 localDir 不得写空条目: %+v", a.cfg.LocalRecent)
+	}
+	if got := a.cfg.SftpUI.LastLocalDir; got != "/keep" {
+		t.Fatalf("recordRecentSFTP 的空 localDir 不得改写 LastLocalDir，得到 %q", got)
+	}
+}
+
 // 规格 §6.3.1（审核 BF1 回归，Blocking）：后端内部的 recordRecentSFTP 一律不写 last path。
 // SftpHome 每次 connect 都被调用，若它顺带写 last path，单主机用户的最后路径会被静默
 // 改写成 home —— 而前端 store 的队首短路会让紧接着的 addRemoteRecent(记忆路径) 不发 IPC，
