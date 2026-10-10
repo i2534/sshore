@@ -23,10 +23,17 @@ vi.mock('../../wailsjs/go/main/App', () => ({
   RemoveBookmark: vi.fn(async () => {}),
   AddLocalRecent: vi.fn(async () => {}),
   AddRemoteRecent: vi.fn(async () => {}),
+  // sftpui store 的两个绑定：locations 的镜像**只走内存**，这两个 mock 的存在正是
+  // 为了钉死"镜像前后调用次数都是 0"（规格 §7.2 零新增 IPC）。
+  GetSftpUI: vi.fn(async () => ({})),
+  SaveSftpUI: vi.fn(async () => {}),
 }))
 
-import { AddLocalRecent, AddRemoteRecent, ListPresets } from '../../wailsjs/go/main/App'
+import {
+  AddLocalRecent, AddRemoteRecent, ListPresets, GetSftpUI, SaveSftpUI,
+} from '../../wailsjs/go/main/App'
 import { useLocationsStore } from './locations'
+import { useSftpUIStore } from './sftpui'
 
 describe('locations store', () => {
   beforeEach(() => setActivePinia(createPinia()))
@@ -89,6 +96,104 @@ describe('locations store', () => {
     expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
     expect(s.localRecents[0].path).toBe('/tmp/other')
     expect(s.remoteRecents[0].host).toBe('db')
+  })
+
+  // ---- 最后路径的内存镜像（§7.2）：唯一落盘出口在后端，前端只镜像成功结果 ----
+
+  it('addRemoteRecent 成功后镜像 sftpui 最后路径（零新 IPC）', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    expect(ui.lastPathFor('remote', 'prod')).toBe('') // 镜像初值：本会话还没 load sftpui
+
+    AddRemoteRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+    // 镜像发生前：两个 SFTP UI 绑定的调用次数都是 0
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+
+    await s.addRemoteRecent('prod', '/srv/app')
+
+    // 镜像后仍然是 0，且 AddRemoteRecent 只多了它自己那一次
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+    expect(AddRemoteRecent).toHaveBeenCalledTimes(1)
+    expect(AddRemoteRecent).toHaveBeenCalledWith('prod', '/srv/app')
+
+    expect(ui.lastPathFor('remote', 'prod')).toBe('/srv/app')
+    // 镜像只负责最后路径：不得顺带碰 loaded/sort（§7.1 的其它状态各有唯一写入口）
+    expect(ui.loaded).toBe(false)
+    expect(ui.sort).toEqual({ local: { key: 'name', dir: 1 }, remote: { key: 'name', dir: 1 } })
+  })
+
+  it('addLocalRecent 成功后镜像 sftpui 本地最后路径（零新 IPC）', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+
+    AddLocalRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+
+    await s.addLocalRecent('/tmp/work')
+
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+    expect(AddLocalRecent).toHaveBeenCalledTimes(1)
+    expect(AddLocalRecent).toHaveBeenCalledWith('/tmp/work')
+
+    expect(ui.lastPathFor('local')).toBe('/tmp/work')
+    // 本地镜像不得污染远程键空间
+    expect(ui.lastPathFor('remote', 'prod')).toBe('')
+  })
+
+  it('写盘失败时不镜像（错误照旧抛出、列表也不变）', async () => {
+    const s = useLocationsStore()
+    await s.load()
+    const ui = useSftpUIStore()
+    const beforeL = JSON.stringify(s.localRecents)
+    const beforeR = JSON.stringify(s.remoteRecents)
+
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+    AddRemoteRecent.mockRejectedValueOnce(new Error('写配置失败: boom'))
+    await expect(s.addRemoteRecent('prod', '/srv/boom')).rejects.toThrow('写配置失败: boom')
+    AddLocalRecent.mockRejectedValueOnce(new Error('写配置失败: boom'))
+    await expect(s.addLocalRecent('/tmp/boom')).rejects.toThrow('写配置失败: boom')
+
+    expect(ui.lastPathFor('remote', 'prod')).toBe('')
+    expect(ui.lastPathFor('local')).toBe('')
+    expect(JSON.stringify(s.localRecents)).toBe(beforeL)
+    expect(JSON.stringify(s.remoteRecents)).toBe(beforeR)
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+  })
+
+  it('队首同值短路：不发 IPC，但镜像仍对齐（幂等无害，FF17）', async () => {
+    const s = useLocationsStore()
+    // 队首分别是 (prod, /var/log) 与 /home/u/a
+    await s.load()
+    const ui = useSftpUIStore()
+
+    AddLocalRecent.mockClear()
+    AddRemoteRecent.mockClear()
+    GetSftpUI.mockClear()
+    SaveSftpUI.mockClear()
+
+    await s.addLocalRecent('/home/u/a')
+    await s.addRemoteRecent('prod', '/var/log')
+
+    // 短路语义不变：不写盘
+    expect(AddLocalRecent).not.toHaveBeenCalled()
+    expect(AddRemoteRecent).not.toHaveBeenCalled()
+    expect(GetSftpUI).toHaveBeenCalledTimes(0)
+    expect(SaveSftpUI).toHaveBeenCalledTimes(0)
+    // 但镜像要对齐：load() 失败时镜像是空串而 locations 队首非空，短路正是修正机会（FF17）
+    expect(ui.lastPathFor('local')).toBe('/home/u/a')
+    expect(ui.lastPathFor('remote', 'prod')).toBe('/var/log')
   })
 
   it('load 同时拉取三组固定预设', async () => {
