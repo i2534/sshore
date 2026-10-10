@@ -1223,7 +1223,9 @@ func TestAddLocalRecentEmptyPathIsNoop(t *testing.T) {
 			onDisk.SftpUI.LastLocalDir, onDisk.LocalRecent, err, lerr)
 	}
 
-	// 内部路径（SftpHome 调用点传 localDir == ""）：不得报错、不得写空条目、不得清 last path。
+	// recordRecentSFTP 自身对空 localDir 的守卫（SftpHome 那条路径）：不得报错、不得写空条目、
+	// 不得清 last path。注意：这条在"给 AddLocalRecent 补空路径守卫"**之前也是绿的**（守卫本来就在
+	// recordRecentSFTP 内），属不变量校验，不是本轮修复的回归判别。
 	a.recordRecentSFTP("home-host", "/home/u", "", false)
 	if len(a.cfg.LocalRecent) != 1 || a.cfg.LocalRecent[0].Path != "/l" {
 		t.Fatalf("recordRecentSFTP 的空 localDir 不得写空条目: %+v", a.cfg.LocalRecent)
