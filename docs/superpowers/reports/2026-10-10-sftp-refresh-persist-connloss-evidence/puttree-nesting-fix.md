@@ -1,12 +1,16 @@
 # 上传目录多套一层（PutTree / PutRecursive 目录语义）修复报告
 
+> **本文件有两轮**：第 1 轮 = 目录语义修复（正文 §1–§7，基线 `ada9030`，结束于 `3cc859a`）；
+> 第 2 轮 = 复核轮定点修复（文末「## 复核轮修复（第二轮）」，基线 `3cc859a`，4 条复核意见）。
+
 - 仓库 / 分支：`sshkit` @ `feat/sftp-refresh-persist-connloss`（未切分支、未 push）
 - 代码修复提交：`a5a6702`（GoBackend.PutTree）、`2420121`（BatchBackend.PutRecursive）
 - 测试可移植性提交：`eb06494`（`putr` 脚本断言的本地路径按 `EvalSymlinks` 后构造，避免 Windows 大小写差异；**无行为变化**）
 - 文档提交：`0ceb67f`（本报告首版 + REGRESSION-B/spec/plan 勘误）、`c97445c`、`5e8cec1`（报告元信息短 SHA 补记）
-- 基线（修复前）：`ada9030`。**精确清单以 `git log --oneline ada9030..HEAD` 为准**（其中含本行的补记提交）
+- 基线（第 1 轮修复前）：`ada9030`。**第 1 轮精确清单以 `git log --oneline ada9030..3cc859a` 为准**
+  （第 2 轮起于 `3cc859a`，清单见文末小节；写成闭区间是为了不随后续提交漂移）
 - 触发证据：`real/REGRESSION-B.md` B-9（真机复现：`updir/` → `/home/lan/acc-b` 落成 `/home/lan/acc-b/updir/updir/a.txt`）
-- 本轮未改前端、未改刷新/持久化/自愈代码
+- 第 1 轮未改前端、未改刷新/持久化/自愈代码
 
 ---
 
@@ -283,3 +287,424 @@ GOCACHE=$PWD/.gocache go test ./internal/sftp/ -run 'TestGoBackendPutTreeLandsIn
 GOCACHE=$PWD/.gocache make e2e            # 一次性真 sshd：TestTreeE2E 双后端（batch/gosftp）
 GOCACHE=$PWD/.gocache make ci             # build + vet + go test -race + vitest
 ```
+
+---
+
+# 复核轮修复（第二轮）
+
+- 修复基线：`3cc859a`（复核第一轮结束时的工作树/HEAD）
+- 本轮**代码/测试**提交（**只本地提交、未 push**；精确清单 `git log --oneline 3cc859a..23d8336`）：
+  写成闭区间是为了不随后续提交自指漂移；本节补记（本次 docs 提交）位于 `23d8336` 之后、不计入下表。
+  | 短 SHA | 标题 | 覆盖条目 |
+  |---|---|---|
+  | `cd59f53` | fix(sftp): 上传侧重试清理只扫本树会写到的目录（不再递归既有子树） | Important-1 |
+  | `dc26ab9` | fix(sftp): batch 递归上传逐级建出目标祖先目录（祖先缺失不再整批失败） | Minor-2 |
+  | `ded63e6` | docs(sftp): 注释与实现对齐 —— 重试清理只清 .part，不清 backup-swap 的 .bak | Minor-3 |
+  | `94003cb` | fix(sftp): 远端清理按「本目录自己的目标」判定（收窄 shortID 截断下的误删面） | Minor-4（收窄判据） |
+  | `23d8336` | docs(sftp): 更正注释里的 sftp 版本（实测为 OpenSSH_8.9p1 的 sftp 客户端） | 注释准确性（纯文档） |
+- 未动：`frontend/**`、刷新/持久化/自愈代码、下载方向语义（`GetTree`/`Put`/`Get`）。
+- 验证：`make ci` **EXIT=0**、`make e2e`（一次性真 sshd，batch/gosftp 双迭代 8 用例）**EXIT=0**（见 §7）。
+
+## 0. 处置总览
+
+| # | 级别 | 位置 | 结论 | 提交 |
+|---|---|---|---|---|
+| 1 | Important | `internal/sftp/gosftp.go`（`PutTree` 调用点 + `cleanupRemoteTreeParts`） | 已修：扫描面收窄为「本树实际会写到的 目录 × 该目录里本树的目标」；不再递归既有子树，ReadDir 次数不随既有子树规模增长 | `cd59f53` |
+| 2 | Minor | `internal/sftp/batch.go`（`putTreeBatchLines`） | 已修：对目标路径自上而下逐级 `-mkdir`（全部带 `-` 前缀，幂等）；祖先缺失时 batch 也能落盘 | `dc26ab9` |
+| 3 | Minor | `gosftp.go` 注释（call site、`isPartForTarget`、清理块注释） | 已修：**改注释与实现一致**（明确只清 `.part`、**不清** `.bak`），未新增 bak 判据（拒绝扩大删除面）；新增断言把「bak 存活」钉死 | `ded63e6` |
+| 4 | Minor | `shortID` 8 rune 截断 | 复核确认：第 1 条修完后原设想的「嵌套最终目录 ⇒ 跨任务删 `.part`」**已消失**；本轮再收窄判据，使残留条件收敛为「同一最终目标路径 + 8 rune 碰撞（真实同文件冲突）」，并加断言 | `94003cb` |
+
+---
+
+## 1. Important-1：清理扫描面过宽
+
+### 1.1 改了什么
+
+- 新增 `putTreeCleanupScope(files)`（`gosftp.go`）：由本次要传的 `files` 的 `rel` 推导出清理扫描面
+  —— 每个文件贡献 `{ path.Dir(rel) → path.Base(rel) }`，即「本树**实际会写的目录** × 该目录里本树的 basename」，顺序稳定（根在前、其余字典序）；某目录里没有本树会写的文件时**连 `ReadDir` 都不发**。
+- `cleanupRemoteTreeParts` 签名由 `(ctx, s, remoteRoot, targets, id)` 改为
+  `(ctx, s, remoteRoot, scope []cleanupScope, id)`：对每个扫描单元恰好做**一次** `ReadDir`，
+  **不再递归**；判定用该单元自己的目标集合。
+- `PutTree` 调用点改为 `g.cleanupRemoteTreeParts(ctx, s, rootRemote, putTreeCleanupScope(files), req.ID)`。
+- 新增注入点 `readRemoteDir`（与既有 `removeRemote`/`copyStream`/`scanCheckpoint` 同一手法）：
+  让单测能**计数 ReadDir 调用**，把验收判据 ④ 变成可观测断言。
+- 常量 `cleanupTreeMaxEntries/cleanupTreeMaxDepth` 保留但注释说明：它们现在只约束**本地侧**（`cleanupTreeParts`，整棵本地子树）；远端侧不再需要（扫描量与本树写入目录数同阶）。
+
+### 1.2 修前行为
+
+`cleanupRemoteTreeParts` 从 `rootRemote` 开始**递归遍历整棵既有目标子树**（每目录一次 `ReadDirContext`，
+上限 `cleanupTreeMaxEntries=100000` / `cleanupTreeMaxDepth=64`），并用「全树 basename 并集」判定每个目录里的条目。
+新语义下 `rootRemote` 是用户可能已有内容的最终目录，于是：
+(a) 清理开销随用户既有子树规模线性增长；(b) `shortID` 只截 8 rune，碰撞时会扫到与本树无关的分支并删除其 `.part`。
+
+### 1.3 修后行为
+
+只扫「本树实际会写到的目录」各一次，且只认该目录里本树的目标：
+目录数/往返次数与本树写入目录集合**同阶**，不随既有子树规模增长；本树不会写到的目录/名字不再进入删除面。
+
+### 1.4 验收判据逐条
+
+| 判据 | 落地断言 |
+|---|---|
+| ① 行为等价：本 id 的过期 `.part`（在本树会写到的目录里）仍被清掉 | `TestGoBackendPutTreeCleanupScopeIsWriteDirSet` 断言 `out/big.bin.<marker><id8>-stale1` 与 `out/sub/y.bin.<marker><id8>-stale2` 均被删；`TestGoBackendPutTreeRetryCleansStaleRemoteParts` 原断言保持全绿 |
+| ② 行为收紧：本树**不会**写到的子目录里的过期 `.part` 不再被扫到 | 同用例断言 `out/unrelated/big.bin.<marker><collidingID8>-dead1` 原样留下（碰撞 id 场景）；`TestGoBackendPutTreeCleanupTargetsArePerDir` 再收窄一层 |
+| ③ 既有「同名业务文件不得被删」断言仍绿 | `TestGoBackendPutTreeRetryCleansStaleRemoteParts`（`business` 文件内容必须仍是 `BIZ`） |
+| ④ 扫描目录数/往返次数不随既有子树规模增长 | `TestGoBackendPutTreeCleanupReadDirCountFollowsWriteDirSet`：远端先造 40 个无关既有子目录，用 `readRemoteDir` 计数并断言目录集**恰为** `[out, out/sub]` |
+
+### 1.5 RED（先写断言、跑红）
+
+RED 环境：`git worktree add --detach /tmp/sshkit-red2 HEAD`（= `3cc859a`，主工作树未动），把本轮测试文件复制进去，并在 scratch 的 `gosftp.go` 里只做「让新 API 名可编译」的最小改动（补 `readRemoteDir` 注入点、把
+`cleanupRemoteTreeParts` 签名换成新签名、补 `putTreeCleanupDirs`），**函数体保留旧的递归遍历**
+（`_ = dirs`）。
+
+```bash
+cd /tmp/sshkit-red2
+GOCACHE=/home/lan/workspace/scripts/sshkit/.gocache \
+  go test ./internal/sftp/ -run 'TestGoBackendPutTreeCleanupScopeIsWriteDirSet|TestGoBackendPutTreeCleanupReadDirCountFollowsWriteDirSet|TestPutTreeCleanupDirsIsParentSetOfRel|TestBakFilesAreNotCleaned|TestBuildBatchPutRecursive|TestBuildBatchPutRecursiveCreatesMissingAncestors' -count=1 -v
+```
+
+原始输出（节选，完整见 `/tmp/sshkit-red2` 运行记录）：
+
+```
+=== RUN   TestGoBackendPutTreeCleanupScopeIsWriteDirSet
+    cleanup_scope_test.go:99: 本树不会写到的目录里的 .part 不得被扫到/删除: /tmp/TestGoBackendPutTreeCleanupScopeIsWriteDirSet1850991904/001/out/unrelated/big.bin.sshore-sftppart-t10000-1-dead1 err=stat /tmp/.../out/unrelated/big.bin.sshore-sftppart-t10000-1-dead1: no such file or directory
+--- FAIL: TestGoBackendPutTreeCleanupScopeIsWriteDirSet (0.01s)
+=== RUN   TestGoBackendPutTreeCleanupReadDirCountFollowsWriteDirSet
+    cleanup_scope_test.go:127: 清理扫描的远端目录 = [out out/sub out/unrelated out/unrelated/noise00 out/unrelated/noise01 ... out/unrelated/noise39], want [out out/sub]（必须只扫本树写入目录集合，不得递归既有子树）
+--- FAIL: TestGoBackendPutTreeCleanupReadDirCountFollowsWriteDirSet (0.01s)
+=== RUN   TestBuildBatchPutRecursive
+    ctrl_test.go:676: putr batch =
+        "-mkdir \"/remote/dir\"\n-mkdir \"/remote/dir/empty\"\n-mkdir \"/remote/dir/sub\"\nput \".../sub/y.txt\" \"/remote/dir/sub/y.txt\"\nput \".../x.txt\" \"/remote/dir/x.txt\"\n"
+        want
+        "-mkdir \"/remote\"\n-mkdir \"/remote/dir\"\n-mkdir \"/remote/dir/empty\"\n-mkdir \"/remote/dir/sub\"\nput ..."
+--- FAIL: TestBuildBatchPutRecursive (0.00s)
+=== RUN   TestBuildBatchPutRecursiveCreatesMissingAncestors
+    ctrl_test.go:706: remoteDir="/remote/deep/nested/dir" 脚本过短: "-mkdir \"/remote/deep/nested/dir\"\nput \".../x.txt\" \"/remote/deep/nested/dir/x.txt\"\n"
+--- FAIL: TestBuildBatchPutRecursiveCreatesMissingAncestors (0.00s)
+FAIL	sshore/internal/sftp	0.048s
+```
+
+要点：删掉的是 `out/unrelated/...`——**本树不会写到的分支**，且 `id` 前 8 rune 与本次相同（`t10000-1`），
+正是 Important-1 描述的「shortID 碰撞 + 扩大删除面」；ReadDir 扫了 43 个目录（含 40 个既有噪声目录），
+而本树只会写 `out` 与 `out/sub`。
+
+### 1.6 GREEN（同一批用例，修复后）
+
+```bash
+GOCACHE=$PWD/.gocache go test ./internal/sftp/ \
+  -run 'TestGoBackendPutTreeCleanupScopeIsWriteDirSet|TestGoBackendPutTreeCleanupReadDirCountFollowsWriteDirSet|TestGoBackendPutTreeCleanupTargetsArePerDir|TestPutTreeCleanupScopeIsPerDirTargetSet|TestBakFilesAreNotCleaned|TestCleanupRemoteTreePartsRemovesOnlyKnownRemoteParts|TestGoBackendPutTreeRetryCleansStaleRemoteParts|TestIsPartForTargetRecognizesOnlyOwnParts' -count=1 -v
+```
+
+```
+=== RUN   TestBakFilesAreNotCleaned
+--- PASS: TestBakFilesAreNotCleaned (0.00s)
+=== RUN   TestGoBackendPutTreeCleanupScopeIsWriteDirSet
+--- PASS: TestGoBackendPutTreeCleanupScopeIsWriteDirSet (0.01s)
+=== RUN   TestGoBackendPutTreeCleanupReadDirCountFollowsWriteDirSet
+--- PASS: TestGoBackendPutTreeCleanupReadDirCountFollowsWriteDirSet (0.01s)
+=== RUN   TestGoBackendPutTreeCleanupTargetsArePerDir
+--- PASS: TestGoBackendPutTreeCleanupTargetsArePerDir (0.00s)
+=== RUN   TestPutTreeCleanupScopeIsPerDirTargetSet
+--- PASS: TestPutTreeCleanupScopeIsPerDirTargetSet (0.00s)
+=== RUN   TestIsPartForTargetRecognizesOnlyOwnParts
+--- PASS: TestIsPartForTargetRecognizesOnlyOwnParts (0.00s)
+=== RUN   TestCleanupRemoteTreePartsRemovesOnlyKnownRemoteParts
+--- PASS: TestCleanupRemoteTreePartsRemovesOnlyKnownRemoteParts (0.00s)
+=== RUN   TestGoBackendPutTreeRetryCleansStaleRemoteParts
+--- PASS: TestGoBackendPutTreeRetryCleansStaleRemoteParts (0.01s)
+PASS
+ok  	sshore/internal/sftp	0.052s
+```
+
+> `internal/sftp/cleanup_test.go` 的两处直接调用点按新签名改为
+> `[]cleanupScope{{dir: ".", targets: []string{"a.bin"}}}`，**断言与语义不变**（该用例只写 `sub` 一个目录）。
+
+---
+
+## 2. Minor-2：缺祖先目录时 batch 整批失败
+
+### 2.1 先做真机探针（决定写法）
+
+`sftp` 的 `mkdir` 是**单级**语义，写法的取舍必须实测（本机 `openssh-client 1:8.9p1-3ubuntu0.17`，
+一次性 sshd + 内存临时目录；`-` 前缀 = `sftp -b` 的「失败不中止整批」）：
+
+| 探针 | 命令 | 结果 |
+|---|---|---|
+| 1 | `-mkdir <深路径>`，祖先全缺失 | stderr `remote mkdir ".../x/y/z": No such file or directory`，**什么也没建**，`EXIT=0`（被 `-` 抑制） |
+| 2 | `mkdir <深路径>`（不带 `-`），祖先全缺失 | 同上报错，`EXIT=1`（中止整批） |
+| 3 | `-mkdir <已存在目录>` | stderr `remote mkdir ".../dup": Failure`，`EXIT=0`；不带 `-` 时 `EXIT=1` |
+| 4 | 自上而下逐级 `-mkdir <a1>` `<a1/b2>` `<a1/b2/c3>` + `put` | `EXIT=0`，三级目录与文件全部落盘 |
+| 5 | `-mkdir <同名普通文件>` | stderr `Failure`，`EXIT=0`（随后 `put` 会报错并中止） |
+
+⇒ **逐级 `-mkdir` + `-` 前缀**即可与 `MkdirAll` 等价，且天然幂等（第 3 行：已存在只报 `Failure`，
+被前缀抑制），不需要先 `ls` 探测。
+
+原始输出（节选）：
+
+```
+=== PROBE 1: -mkdir 深路径，祖先全部缺失 ===
+remote mkdir "/tmp/tmp.kfYLgm5mzb/remote/x/y/z": No such file or directory
+EXIT1=0
+--- 落盘 ---                       ← 空
+=== PROBE 3: -mkdir 幂等性 —— 已存在目录 ===
+remote mkdir "/tmp/tmp.kfYLgm5mzb/remote/dup": Failure
+EXIT3(with dash, existing)=0
+remote mkdir "/tmp/tmp.kfYLgm5mzb/remote/dup": Failure
+EXIT3b(no dash, existing)=1
+=== PROBE 4: 逐级 -mkdir 自上而下（祖先缺失场景的修法候选） ===
+EXIT4=0
+--- 落盘 ---
+/tmp/tmp.kfYLgm5mzb/remote/a1/b2/c3/leaf.txt
+```
+
+### 2.2 改了什么
+
+- 新增 `mkdirAncestors(p)`（`batch.go`）：返回远端目录 `p` **自上而下**的全部层级（含 `p` 自身）；
+  绝对路径到根为止（**不返回 `/`**：它一定存在，建它只会多一条无意义的 `Failure` 行），相对路径到第一级为止
+  （**不返回 `.`**）；`p` 为 `""`/`"."`/`"/"` 时返回 `nil`。
+- `putTreeBatchLines` 由「只建 `remoteRoot` 一条」改为「对 `mkdirAncestors(remoteRoot)` 逐级建」，
+  全部走既有的 `-mkdir` 生成器（`-` 前缀不变），目录行仍全部排在 `put` 之前；源树子目录行与文件行逻辑未动。
+
+### 2.3 修前 / 修后行为
+
+- 修前：目标中间层缺失时 `-mkdir` 静默失败（被抑制），随后 `put` `dest open ...: No such file or directory`
+  ⇒ batch **整批 EXIT=1**，一个文件也落不下（报错清楚、不静默，但不满足「自己补齐祖先」）。
+- 修后：祖先逐级建出（幂等），目标中间层缺失也能完整落盘；`GoBackend` 侧行为不变（本来就 `MkdirAll`）。
+
+### 2.4 RED（真 sshd：`TestTreeE2E` 新增的「祖先缺失」阶段）
+
+```bash
+cd /tmp/sshkit-red2   # 同上：pre-fix 生产代码 + 本轮测试
+GOCACHE=$PWD/.gocache E2E_RUN=TestTreeE2E bash e2e/test_local.sh
+```
+
+```
+--- 迭代 backend=batch ---
+>>> -run ^TestTreeE2E$ (迭代 backend=batch)
+=== RUN   TestTreeE2E
+    e2e_test.go:607: SSHORE_E2E_BACKEND=batch
+    e2e_test.go:690: 祖先目录缺失时 PutTree 必须自己补齐（batch 逐级 -mkdir / gosftp MkdirAll）: sftp put -r sshore-e2e: exit status 1 (Warning: Permanently added '[127.0.0.1]:22901' (ED25519) to the list of known hosts.
+        remote mkdir "/tmp/tmp.62Lu9x1z6F/remote-conf/tree/missing-mid/leaf": No such file or directory
+        remote mkdir "/tmp/tmp.62Lu9x1z6F/remote-conf/tree/missing-mid/leaf/b": No such file or directory
+        remote mkdir "/tmp/tmp.62Lu9x1z6F/remote-conf/tree/missing-mid/leaf/b/c": No such file or directory
+        remote mkdir "/tmp/tmp.62Lu9x1z6F/remote-conf/tree/missing-mid/leaf/emptydir": No such file or directory
+        dest open "/tmp/tmp.62Lu9x1z6F/remote-conf/tree/missing-mid/leaf/b/c/z.txt": No such file or directory)
+--- FAIL: TestTreeE2E (0.61s)
+FAIL: backend=batch 没有名字**精确等于** E2E_RUN 名单项 'TestTreeE2E' 的用例真正 PASS
+...
+--- 迭代 backend=gosftp ---
+=== RUN   TestTreeE2E
+    e2e_test.go:608: 目录传输实现 = GoBackend.GetTree/PutTree（backend=1, Atomic=true）
+--- PASS: TestTreeE2E (0.59s)
+EXIT_RED_E2E=1
+```
+
+（同一阶段 `gosftp` 迭代 PASS，正好把差异归因到 batch 的 `-mkdir` 语义。）
+
+### 2.5 GREEN
+
+单元（脚本形状）：
+
+```bash
+GOCACHE=$PWD/.gocache go test ./internal/sftp/ \
+  -run 'TestBuildBatchPutRecursive|TestBuildBatchPutRecursiveCreatesMissingAncestors|TestPutRecursiveRunsSftp' -count=1 -v
+```
+
+```
+=== RUN   TestBuildBatchPutRecursive
+--- PASS: TestBuildBatchPutRecursive (0.00s)
+=== RUN   TestBuildBatchPutRecursiveCreatesMissingAncestors
+--- PASS: TestBuildBatchPutRecursiveCreatesMissingAncestors (0.00s)
+=== RUN   TestPutRecursiveRunsSftp
+--- PASS: TestPutRecursiveRunsSftp (0.00s)
+PASS
+ok  	sshore/internal/sftp	0.013s
+```
+
+真机（`make e2e` 的 `TestTreeE2E`，两个迭代都含「祖先缺失」阶段）：
+
+```
+>>> -run ^TestTreeE2E$ (迭代 backend=batch)
+    e2e_test.go:607: SSHORE_E2E_BACKEND=batch
+    e2e_test.go:697: 目录往返完成：3 个文件 + 空目录 + 合并语义 + 祖先缺失补齐（backend=0, Atomic=false）
+--- PASS: TestTreeE2E (0.60s)
+>>> -run ^TestTreeE2E$ (迭代 backend=gosftp)
+    e2e_test.go:607: SSHORE_E2E_BACKEND=gosftp
+    e2e_test.go:697: 目录往返完成：3 个文件 + 空目录 + 合并语义 + 祖先缺失补齐（backend=1, Atomic=true）
+--- PASS: TestTreeE2E (0.59s)
+```
+
+新增用例的把握点：`/remote/deep/nested/dir` → 行序必须是 `/remote` → `/remote/deep` → `/remote/deep/nested`
+→ `/remote/deep/nested/dir`；每行都带 `-` 前缀；所有目录行必须排在所有 `put` 之前；另覆盖 `rel/dir`
+（相对路径）与 `"."`（不产生任何 `-mkdir` 行）两个边界。
+
+---
+
+## 3. Minor-3：注释与实现不符（`.part`/`.bak`）
+
+### 3.1 结论与理由（二选一：**改注释**）
+
+选「改注释与实现一致」，**不**新增 bak 判据。理由：
+1. `BakName`/`BakNameRemote` 的形状是 `<target><marker>bak-<rand>`（退化时 `<marker>bak-<rand>`），
+   后缀是 `bak-`，永远过不了 `isPartForTarget` 的 `shortID(id)+"-"` 判据 —— 实测
+   `a/big.bin.sshore-sftppart-bak-ab12cd` 在重试清理后**存活**（本用例已把它固化成断言）。
+2. bak 名里**没有 id**：任何「本目标 + `bak-`」判据都无法区分「我们这次留下的」与「别人/别的时刻留下的」，
+   加它等于**扩大删除面**——任务明确要求「不要为了对齐注释而扩大删除面」。
+3. 旧 bak 是 swap 前的上一版数据，留下更安全；本地侧另有 7 天陈旧清理 `CleanupStaleLocalParts` 兜底。
+
+### 3.2 改了什么
+
+- `gosftp.go` `PutTree` 调用点注释：`只删…命中的远端 .part/.bak` → 明确「只删 `.part`；**不**清 backup-swap 的 `.bak`」。
+- `gosftp.go` 清理块注释：补「清理的**不是** backup-swap 的 `.bak`：后缀是 `bak-` 而非 `<shortID>-`，
+  过不了 `isPartForTarget`（由 `TestBakFilesAreNotCleaned` 钉住）」，并区分
+  「本地侧仍是整棵子树 + 硬上限 / 远端侧不再递归」。
+- `isPartForTarget` 注释：删掉误导性的「（bak 同理但前缀是 bak-）」，写明两个分支**都不**命中 bak，
+  以及「要清 bak 必须新加判据、那会扩大删除面」的取舍。
+- 新增 `internal/sftp/cleanup_bak_test.go`（`TestBakFilesAreNotCleaned`）：判据层（按**生成器真实形状**
+  `BakNameRemote` 构造常规名与退化短名，都不得被认出）+ 清理层（远端真实存在的 bak 在
+  `cleanupRemoteTreeParts` 之后必须原样留下）。
+
+### 3.3 RED（反向：断言必须能抓住「按旧注释实现」这种错法）
+
+临时把旧注释声称的行为真的实现出来（在 `isPartForTarget` 里加 bak 判据），跑断言：
+
+```bash
+# 临时补丁：isPartForTarget 的 suffix 分支加
+#   if strings.HasPrefix(suffix, "bak-") { return true }
+GOCACHE=$PWD/.gocache go test ./internal/sftp/ -run 'TestBakFilesAreNotCleaned' -count=1 -v
+```
+
+```
+=== RUN   TestBakFilesAreNotCleaned
+    cleanup_bak_test.go:27: bak 不得被认成本次传输的 .part（后缀是 bak- 而非 <shortID>-）: "big.bin.sshore-sftppart-bak-56fe8a" target="big.bin"
+--- FAIL: TestBakFilesAreNotCleaned (0.01s)
+FAIL
+FAIL	sshore/internal/sftp	0.006s
+```
+
+（临时补丁已还原，未进任何提交。）
+
+### 3.4 GREEN
+
+见 §1.6 的 `--- PASS: TestBakFilesAreNotCleaned (0.00s)`。
+
+---
+
+## 4. Minor-4：`shortID` 截断 8 rune —— 复核结论
+
+### 4.1 结论
+
+**原设想的场景（「配合嵌套最终目录跨任务删 `.part`」）在第 1 条修完后已经消失**，本轮的处置是「再收窄判据 + 加断言」，**没有**改 `shortID` 本身。
+
+推理链：
+1. 修后扫描面只含「本树会写到的 目录 × 该目录里本树的目标」。**嵌套的、与本树无关的最终目录根本不进扫描面**
+   —— 即便 id 前 8 rune 完全相同也不会被扫到。§1.5 的 RED 恰恰反证了这一点：旧实现会删
+   `out/unrelated/...` 里的碰撞 id `.part`，新实现不删（断言已固化）。
+2. 进一步检查「本树会写到的目录」内部仍有残留面：把**全树 basename 并集**交给每个待扫目录判定时，
+   只要某 basename 在本树任意位置出现，本树写到的**任何**目录里同名 `.part` 都会被删。例如
+   本树写 `out/big.bin` + `out/sub/y.bin` 时，`out/sub/big.bin.<marker><别的任务碰撞 id>-x`
+   （别的任务的最终路径是 `out/sub/big.bin`，本树不写它）会被误删。
+3. ⇒ 本轮把扫描单元改成「目录 + **该目录里**本树会写的 basename」（`cleanupScope`/`putTreeCleanupScope`）。
+   于是跨任务误删的**必要条件**收敛为：
+   `同一目录` ∧ `同一 basename` ∧ `shortID 前 8 rune 相同`
+   ⇔ **同一最终目标路径 + 8 rune 碰撞** —— 也就是「两个任务在写同一个最终路径」的真实同文件冲突
+   （此时被清掉 `.part` 的一方只是该次传输报错重试；已提交内容与目标文件不受影响，绝不发生原文所述的
+   「跨目录/无关分支误删」）。
+4. 未改 `shortID`（仍截 8 rune）：它参与 `partname.go` 的命名契约，前端 `queue.js` 硬编码同一
+   `PART_MARKER` 且单测钉住字面量，动它会外溢到前后端共享契约；而收窄后的残留条件已是「同一路径冲突」，
+   继续收窄也换不到安全收益（文件名里只有 8 rune id，判据无法再区分）。
+
+### 4.2 RED（新断言 + 上一版实现 `cd59f53`）
+
+```bash
+GOCACHE=$PWD/.gocache go test ./internal/sftp/ -run 'TestGoBackendPutTreeCleanupTargetsArePerDir' -count=1 -v
+```
+
+```
+=== RUN   TestGoBackendPutTreeCleanupTargetsArePerDir
+    cleanup_scope_test.go:169: 本树在该目录里不写 big.bin，别的任务的 big.bin .part 不得被删: /tmp/TestGoBackendPutTreeCleanupTargetsArePerDir950053593/001/out/sub/big.bin.sshore-sftppart-t10000-1-dead1 err=stat /tmp/.../out/sub/big.bin.sshore-sftppart-t10000-1-dead1: no such file or directory
+--- FAIL: TestGoBackendPutTreeCleanupTargetsArePerDir (0.01s)
+FAIL
+```
+
+### 4.3 GREEN
+
+见 §1.6 的 `--- PASS: TestGoBackendPutTreeCleanupTargetsArePerDir` 与
+`--- PASS: TestPutTreeCleanupScopeIsPerDirTargetSet`。
+
+---
+
+## 5. 本轮新增/修改的测试清单
+
+| 文件 | 内容 |
+|---|---|
+| `internal/sftp/cleanup_scope_test.go`（新增） | `countingReadRemoteDir` 计数助手；`TestGoBackendPutTreeCleanupScopeIsWriteDirSet`（①+②+碰撞 id 收紧）、`TestGoBackendPutTreeCleanupReadDirCountFollowsWriteDirSet`（④）、`TestGoBackendPutTreeCleanupTargetsArePerDir`（Minor-4 收窄 + 完备性）、`TestPutTreeCleanupScopeIsPerDirTargetSet`（纯函数形状） |
+| `internal/sftp/cleanup_bak_test.go`（新增） | `TestBakFilesAreNotCleaned`（Minor-3：判据层 + 清理层） |
+| `internal/sftp/cleanup_test.go` | 两处直接调用点适配新签名（断言与语义不变） |
+| `internal/sftp/ctrl_test.go` | `TestBuildBatchPutRecursive` 期望值加祖先 `-mkdir` 行；新增 `TestBuildBatchPutRecursiveCreatesMissingAncestors`（行序/前缀/顺序/边界） |
+| `internal/sftp/e2e_test.go` | `TestTreeE2E` 新增「祖先缺失」阶段（真 sshd，双后端）+ 函数头说明同步 |
+
+---
+
+## 6. 残留风险与本轮未做
+
+1. **回收面已收敛但仍非零（Minor-4 残留）**：跨任务误删现在需要「同一最终目标路径 + `shortID` 8 rune 碰撞
+   + 并发」。此时两个任务本来就在写同一个最终文件，被清 `.part` 的一方会失败重试，**不会**破坏已提交内容。
+   若将来要把这最后一点也消掉，正确做法是让临时名带上可判别的完整 id（或随机 nonce 参与判据），
+   而不是继续在 8 rune 前缀上加码 —— 那会动到前后端共享的命名契约，本轮不做。
+2. **下载侧本地清理未动**：`cleanupTreeParts`（`GetTree`，本地 `filepath.WalkDir`）仍是整棵本地子树 +
+   `cleanupTreeMaxEntries/MaxDepth` 硬上限。本轮范围明确在**上传侧远端**（Important-1 的位置），
+   本地遍历没有 SFTP 往返开销，未扩大范围去改；如需要，可作为后续轮次对称处理。
+3. **batch 脚本长度**：祖先行只增加 `O(路径深度)` 条，与既有「目录行 ×N + put ×N」量级一致；
+   仍不做 D16 截断（沿用上一轮的有意选择）。
+4. **`-mkdir` 遇同名普通文件**：仍是被抑制的 `Failure`，随后 `put` 报错并中止整批（报错不被吞掉，
+   只是消息来自 `put`）—— 与上一轮记录一致，本轮未改变。
+5. **未做**：未重跑真机 GUI 验收（本轮约束只要求 `make ci` + `make e2e`，且改动面全在 `internal/sftp`）；
+   未动前端、刷新/持久化/自愈代码、下载方向语义。
+
+---
+
+## 7. 收尾验证（最终冻结版本）
+
+```bash
+GOCACHE=$PWD/.gocache make ci
+```
+
+```
+ok  	sshore	1.866s
+ok  	sshore/internal/config	1.344s
+ok  	sshore/internal/forward	1.887s
+ok  	sshore/internal/importer	1.018s
+ok  	sshore/internal/localfs	1.031s
+ok  	sshore/internal/namepattern	1.017s
+ok  	sshore/internal/osutil	6.444s
+ok  	sshore/internal/preset	1.017s
+ok  	sshore/internal/sftp	19.656s
+ok  	sshore/internal/sshconn	1.018s
+ok  	sshore/internal/sync	16.284s
+ok  	sshore/internal/update	14.848s
+ok  	sshore/internal/watch	6.821s
+ Test Files  38 passed (38)
+      Tests  489 passed (489)
+CI_EXIT=0        # 由外层 `echo "CI_EXIT=$?"` 捕获（`make ci` 的 stdout 在 /tmp/ci-final.log）
+```
+
+```bash
+GOCACHE=$PWD/.gocache make e2e     # 一次性真 sshd；batch/gosftp 双迭代 × 8 用例
+```
+
+```
+  TestTreeE2E                                 batch→batch  gosftp→gosftp
+== ALL E2E TESTS PASSED (观测后端: batch 迭代=batch, gosftp 迭代=gosftp; E2E_RUN=TestGoBackendE2E,TestCancelWholeBatchE2E,TestResumeE2E,TestTreeE2E,TestSyncE2E,TestCapabilitiesE2E,TestNoLeftoverOnCloseE2E,TestCloseAllCleansRegisteredPartsE2E) ==
+E2E_EXIT=0
+```
+
+**退出码：`make ci` EXIT=0、`make e2e` EXIT=0。** 命令与退出码原文：
+
+```
+$ { GOCACHE=$PWD/.gocache make ci > /tmp/ci-final.log 2>&1; echo "CI_EXIT=$?"; GOCACHE=$PWD/.gocache make e2e > /tmp/e2e-final.log 2>&1; echo "E2E_EXIT=$?"; }
+CI_EXIT=0
+E2E_EXIT=0
+```
+
+（验证对象 = 本轮最终 HEAD `23d8336`，工作树干净 `git status --short` 无输出。完整日志：`/tmp/ci-final.log`、`/tmp/e2e-final.log`。）
