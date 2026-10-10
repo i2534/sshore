@@ -95,6 +95,22 @@ describe('SftpView 刷新入口 / 菜单矩阵 / 置灰判据', () => {
     expect(blank).toContain("doAction('upload-picked')")
     expect(row).toContain("doAction('download')")
     expect(row).not.toContain("doAction('mkdir')")
+    // 再收紧一级（复核 Minor）：上一版只用 `row` 一个切片同时覆盖「远程行 + 本地行」，
+    // 两个刷新按钮在同一个切片里 ⇒ 删掉其中任意一个仍然绿。这里按两个行分支的锚点切成
+    // 互不重叠的两段，各自钉住自己的那个刷新按钮。
+    const iRemoteRow = tpl.indexOf("menu.pane === 'remote'")
+    const iLocalRow = tpl.indexOf(":key=\"'row-local-remote'\"")
+    expect(iRemoteRow, '找不到远程行分支（menu.pane === remote）').toBeGreaterThan(-1)
+    expect(iLocalRow, '找不到本地行分支（row-local-remote）').toBeGreaterThan(iRemoteRow)
+    // 锚点必须真的把模板切开：每段恰好一个刷新按钮，不是空切片或原文溢出碰运气
+    const remoteRow = tpl.slice(iRemoteRow, iLocalRow)
+    const localRow = tpl.slice(iLocalRow)
+    expect(remoteRow).toContain("doAction('refresh')")
+    expect(localRow).toContain("doAction('refresh')")
+    expect((remoteRow.match(/doAction\('refresh'\)/g) || []).length).toBe(1)
+    expect((localRow.match(/doAction\('refresh'\)/g) || []).length).toBe(1)
+    expect(remoteRow).toContain("doAction('download')") // 远程行独有
+    expect(localRow).toContain("doAction('upload')") // 本地行独有（上传到远程）
   })
 
   // 菜单动作分派覆盖（复核 Minor / Important 的测试盲区）：模板里每个 `doAction('<name>')`
@@ -104,9 +120,17 @@ describe('SftpView 刷新入口 / 菜单矩阵 / 置灰判据', () => {
     const names = [...new Set([...tpl.matchAll(/doAction\('([^']+)'\)/g)].map((m) => m[1]))]
     expect(names.length).toBeGreaterThanOrEqual(6) // 防 matchAll/切片写错 ⇒ 空集恒绿
     expect(names).toContain('upload-picked') // 正是本次复核抓到的死按钮，钉住它被抽出来
+    // 可达性前提（复核 Minor）：下面拿"函数体文本包含 name === 'x'"当分派证据，若切片写错
+    // 拿到空体/空串，覆盖断言会变成恒真（"没有名字找不到分派"）。先钉住两个体非空、且真的
+    // 有分派分支，覆盖结论才可信。
+    const body = doActionBody()
+    expect(body.trim().length, 'doAction 体为空（切片正则写错？）').toBeGreaterThan(100)
+    expect((body.match(/name === '/g) || []).length, 'doAction 里没有分派分支').toBeGreaterThanOrEqual(4)
+    expect(body).toContain("name === 'refresh'") // 至少一个已知分支真的可达
     const legacy = src.match(/function legacyAction\(name, pane, it\)\s*\{([\s\S]*?)\n\}/)
     expect(legacy).not.toBe(null)
-    const dispatch = doActionBody() + legacy[1]
+    expect(legacy[1].trim().length, 'legacyAction 体为空（切片正则写错？）').toBeGreaterThan(50)
+    const dispatch = body + legacy[1]
     expect(names.filter((n) => !dispatch.includes(`name === '${n}'`))).toEqual([])
   })
 
