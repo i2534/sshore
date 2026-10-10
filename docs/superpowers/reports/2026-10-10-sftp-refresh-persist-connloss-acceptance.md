@@ -2,7 +2,7 @@
 
 - 计划：`docs/superpowers/plans/2026-10-10-sftp-refresh-persist-connloss.md`
 - 规格：`docs/superpowers/specs/2026-10-10-sftp-refresh-persist-connloss-design.md`（v1.7）
-- 分支：`feat/sftp-refresh-persist-connloss`（起点 `master` = 6169102，当前 HEAD = `d955146`）
+- 分支：`feat/sftp-refresh-persist-connloss`（起点 `master` = 6169102，当前 HEAD = `538110b`）
 - **只本地提交，未 push。**
 
 ## 1 结论摘要

@@ -1121,7 +1121,7 @@ git commit -m "docs(report): SFTP 刷新/持久化/连接自愈的 Linux+Windows
 
 ## 执行记录（SDD · Subagent-Driven）
 
-- 分支 `feat/sftp-refresh-persist-connloss`；起点 `master` = 6169102，本计划完成时 HEAD = `2231d43`。
+- 分支 `feat/sftp-refresh-persist-connloss`；起点 `master` = 6169102，本计划完成时 HEAD = `538110b`。
 - 逐任务 ledger（预检冲突扫描、每条裁定、fix 轮、deferred minor 清单）：`.superpowers/sdd/2026-10-10-sftp-refresh-persist-connloss/progress.md`（gitignore 内，属工作区记录）。
 - 每任务 = 全新实现者（TDD，含 RED/GREEN 证据）→ review package → 全新复核者（判定 Spec/质量）→ 定点修复轮 → scoped re-review。**T2/T11/T12 各走了一轮 fix**；T1/T3/T11 的 trivial 修复由控制器直接落并留证。
 - 执行期发现的**计划缺陷**：T13 Step 1 的测试正则少一个右括号（照抄即 `Invalid regular expression`）—— 已由实现者修正。
@@ -1152,4 +1152,6 @@ feff286 fix(sftp): 补空白菜单 upload-picked 分派，收紧刷新入口/动
 fda2b89 feat(sftp): 连接失效自愈（三态探活 + 幂等重连 + 13 个远程落点归口）
 d955146 fix(sftp): 收尾 triage（失败耗时不含探活/重连、记账失败不再误判为连接/导航失败、setSort 忽略非法 pane、注释与断言修正）
 2231d43 docs(sftp): T14 验收报告（自动化门禁全绿 + 真机验收阻塞证据与可执行清单）
+0fd6836 docs: 同步执行记录（规格 §16.4 执行期偏离 / 计划的 SDD 执行记录与提交序列）
+538110b fix(sftp): last path 短路判据纳入内存镜像（§6.3.2 升级场景补写不再被拦）
 ```
