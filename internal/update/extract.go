@@ -3,7 +3,9 @@ package update
 import (
 	"archive/tar"
 	"archive/zip"
+	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -28,11 +30,64 @@ func binaryNames(goos string) []string {
 // 任何错误路径都会删掉临时文件与 dest，绝不把半成品留在磁盘上（也不写穿预置在 dest 的符号链接）。
 // 安全约束：只接受常规文件条目、拒绝含 .. 或绝对路径的条目、拒绝「目标二进制名」的链接条目、
 // 跳过无关链接条目、拒绝多份匹配、拒绝超限条目。
+//
+// 格式按**内容魔数**判定，绝不看文件名：下载落点固定是
+// <tmp>/sshore-update-<pid>.part（见 download 的实现），从不带 .tar.gz/.zip 后缀。
+// 曾经按后缀分派，Windows 平台挑中的 .zip 资产因此被整份喂给 gzip.NewReader，
+// 必现 "gzip: invalid header"（2026-10-11 Windows 真机定位）。
 func ExtractBinary(archive, goos, dest string) error {
-	if strings.HasSuffix(archive, ".zip") {
+	kind, err := sniffArchive(archive)
+	if err != nil {
+		return err
+	}
+	if kind == archiveZip {
 		return extractZip(archive, goos, dest)
 	}
+	// sniffArchive 只在 gzip/zip 两态下返回 nil（其余一律带错返回），故此处即 gzip。
 	return extractTarGz(archive, goos, dest)
+}
+
+// archiveKind 是嗅探出的归档真实格式。
+type archiveKind int
+
+const (
+	archiveUnknown archiveKind = iota
+	archiveGzip
+	archiveZip
+)
+
+// 归档魔数。zip 的三类签名（local file header / 空档 EOCD / 分卷标记）都收下：
+// 归为 zip 后由 extractZip 给出「归档里没有找到 <二进制>」这种更贴近语义的错误，
+// 而不是把它误判成「不是 zip 文件」。
+var (
+	gzipMagic = []byte{0x1f, 0x8b}
+	zipMagics = [][]byte{[]byte("PK\x03\x04"), []byte("PK\x05\x06"), []byte("PK\x07\x08")}
+)
+
+// sniffArchive 只读文件头若干字节判定格式，不依赖任何文件名约定。
+// 文件缺失/不可读时原样返回错误；空文件与不足 4 字节的短文件一律判为无法识别
+// （截断的下载不该被当成合法归档）。错误信息自带文件头字节，便于对现场取证。
+func sniffArchive(archive string) (archiveKind, error) {
+	f, err := os.Open(archive)
+	if err != nil {
+		return archiveUnknown, err
+	}
+	defer f.Close()
+	var head [4]byte
+	n, err := io.ReadFull(f, head[:])
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return archiveUnknown, err
+	}
+	b := head[:n]
+	for _, m := range zipMagics {
+		if bytes.HasPrefix(b, m) {
+			return archiveZip, nil
+		}
+	}
+	if bytes.HasPrefix(b, gzipMagic) {
+		return archiveGzip, nil
+	}
+	return archiveUnknown, fmt.Errorf("无法识别的归档格式（文件头 % x）：既不是 gzip 也不是 zip", b)
 }
 
 func wantName(goos string) string {
