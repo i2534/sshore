@@ -3,7 +3,6 @@ package update
 import (
 	_ "embed"
 	"fmt"
-	"os/exec"
 	"strconv"
 )
 
@@ -61,19 +60,5 @@ func ScriptEnv(p Plan, pid int) []string {
 	}
 }
 
-// StartDetached 分离启动脚本：两侧都不依赖父进程存活。
-func StartDetached(goos, scriptPath string, args, env []string) error {
-	var cmd *exec.Cmd
-	if goos == "windows" {
-		cmd = exec.Command("cmd", "/d", "/c", scriptPath)
-		cmd.Env = append(cmd.Environ(), env...)
-	} else {
-		cmd = exec.Command(scriptPath, args...)
-	}
-	setDetached(cmd) // 平台差异（新会话 / 隐藏窗口）见 start_unix.go 与 start_windows.go
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	// 不 Wait：脚本要在本进程退出后继续跑。
-	return cmd.Process.Release()
-}
+// StartDetached 的启动方式按平台分派：unix 走 execve + setsid（start_unix.go），
+// Windows 走 WMI（start_windows.go，原因见那里的说明）。此处只保留脚本内容与参数契约。

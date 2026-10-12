@@ -48,6 +48,15 @@ func TestScriptBytesAreSafeAndLFOnly(t *testing.T) {
 			t.Errorf("update.cmd 缺少 %q", want)
 		}
 	}
+	// update.cmd 必须纯 ASCII（2026-10-12 Windows 真机定位）：cmd.exe 用控制台代码页解码
+	// 批处理文件，非 ASCII 字节（例如中文注释）会把行结束符吞掉、令其后每一行错位，
+	// 脚本会在毫秒级内以 EXIT=255 退出且日志为空 —— 表现为「点重启并升级后应用消失、
+	// 版本不变、pending 残留」。日志文案因此一律用英文；中文只走 Go 侧的 UI 提示。
+	for i, b := range cmd {
+		if b > 0x7f {
+			t.Fatalf("update.cmd 必须纯 ASCII，第 %d 字节为 0x%02x（非 ASCII 会在某些代码页下破坏行结构）", i, b)
+		}
+	}
 }
 
 func TestScriptArgsAndEnv(t *testing.T) {
