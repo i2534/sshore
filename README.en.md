@@ -41,6 +41,8 @@ sshore polls the **update source** for the latest Release at the configured inte
 badge on the sidebar "⚙ Settings" button when a newer version exists; checking, downloading and
 verification progress are all visible under Settings → Updates.
 
+![Settings → Updates: current version, available release, download/skip/open-release-page and update source](docs/images/update.png)
+
 ### Update source and verification
 
 - The default source is the GitHub API: `https://api.github.com/repos/i2534/sshore/releases/latest`
@@ -75,7 +77,7 @@ verification progress are all visible under Settings → Updates.
 
 1. When a newer version exists, click "Download update": download the archive → compare the SHA256 from
    `checksums.txt` → unpack the pending file (same directory as the current binary, named after the
-   **target version**, e.g. `sshore.v0.7.0` / `sshore.v0.7.0.exe`) → write the matching `.sha256`.
+   **target version**, e.g. `sshore.v0.7.4` / `sshore.v0.7.4.exe`) → write the matching `.sha256`.
    Unpacking only accepts the whitelisted `sshore` / `sshore.exe` and rejects symlinks and path traversal.
 2. Click "Restart and upgrade": re-hash, write a one-shot upgrade script, start it detached, then quit.
 3. The script waits for the old process to exit → backs up the current binary as `sshore.<current-version>`
@@ -112,7 +114,7 @@ confirmation once more.
 # Linux: unpack and overwrite in the directory holding sshore (directories are created first
 # so the block is paste-ready)
 mkdir -p /tmp/upd ~/bin
-tar -xzf sshore-v0.7.0-linux-amd64.tar.gz -C /tmp/upd
+tar -xzf sshore-v0.7.4-linux-amd64.tar.gz -C /tmp/upd
 install -m 0755 /tmp/upd/sshore ~/bin/sshore
 ```
 
