@@ -2,7 +2,7 @@
 
 > 本文是 Task 16 交付的**人工验收清单**，由人在 Windows 客户机上执行；编写者未在真机上跑过本清单。
 > 配套设计：`docs/superpowers/specs/2026-09-18-sftp-gosftp-transport-design.md`（D1/D3/D15）；
-> 前序真机探测结论：`.superpowers/sdd/2026-09-18-sftp-gosftp-transport/task-0-report.md` 与 `probe.md`。
+> 前序真机探测结论来自 Task 0 的会话记录（`.superpowers/` 是本地工作目录，不入库）。
 > README 的「已知限制」是本文各项的来源，两边必须保持一致。
 
 ## 0. 环境与前置
@@ -208,7 +208,28 @@ const defaultTransport = KindBatch   // 回退：把 KindGo 改回 KindBatch，�
 `sftp_transport = "gosftp"`）仍然可用，便于继续定位；失败现象与原始输出请回写进本清单或 spec 的
 issue 段（不要只留在聊天记录里）。
 
-## 8. 记录模板
+## 8. 应用内升级链路（下载更新 / 重启并升级）
+
+> 2026-10-12 在 VBox win10 上定位过两个 **Windows 专有**的必现缺陷，共同特征是
+> **只有真机端到端才暴露**（单测与 CI 当时全绿）。本节把那次排查固化为必验项。
+
+- [ ] **下载更新**：点「下载更新」后进度推进并在若干秒内进入「已就绪」。
+  若在 Windows 上必现 `gzip: invalid header`，说明解包又在按**文件名后缀**猜格式 ——
+  生产落点是固定后缀的 `sshore-update-<pid>.part`，必须按**内容魔数**判定
+  （`PK\x03\x04` → zip，`1f 8b` → gzip，无法识别时给出明确错误）。
+- [ ] **重启并升级**：点「重启并升级」后应用退出，约 10–20 秒内以新版重新出现，且 `<ExeDir>` 满足：
+  - `sshore.exe` 已是**目标版本**（sha256 与 Release 的 `checksums.txt` 一致）
+  - 出现备份 `sshore.v<当前版本>.exe`
+  - 待安装文件 `sshore.v<目标版本>.exe` 与其 `.sha256` **都不再存在**（已换成正式名）
+  - 升级日志 `sshore-update.log` 与脚本 `sshore-update.cmd` **都不存在**（成功路径自删）
+- [ ] **失败必须留下线索**：升级没生效时先看 `<ExeDir>\sshore-update.log`。
+  若日志是 **0 字节或根本没有日志**，优先怀疑 **`update.cmd` 的编码**：cmd.exe 用控制台代码页
+  解码批处理文件，非 ASCII 字节（例如中文注释）会吞掉行结束符、令其后每一行错位，
+  脚本在毫秒级以 `EXIT=255` 退出且不写任何 `STEP=`/`RESULT=`。
+  `update.cmd` 必须保持**纯 ASCII**（门禁见 `internal/update/script_test.go`）。
+- [ ] **回归口径**：记录升级前后两个二进制的 sha256；新版启动后窗口标题应显示新版本号。
+
+## 9. 记录模板
 
 ```
 验收提交：<git rev-parse --short HEAD>
@@ -218,6 +239,7 @@ issue 段（不要只留在聊天记录里）。
 §3 进度/取消/重试/续传：  3.1 [ ]  3.2 [ ]  3.3 [ ]
 §4 无残留进程：  完成 [ ]  取消 [ ]  退出 [ ]
 §5 长名/.part 不可见：  [ ]
+§8 应用内升级：  下载 [ ]  重启并升级 [ ]  失败线索 [ ]
 失败项与原始输出：
 结论：PASS ⇒ 保留默认 gosftp / FAIL ⇒ 已回退 KindBatch（附 commit）
 ```

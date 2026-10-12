@@ -38,6 +38,8 @@
 sshore 会按设置里的间隔向**更新源**查询最新 Release，有新版时在侧栏「⚙ 设置」上亮角标；
 检查、下载与校验的进度都在「设置 → 更新」里可见。
 
+![设置 → 更新：当前版本、可下载的新版本、下载/跳过/打开发布页与更新源](docs/images/update.png)
+
 ### 更新源与校验
 
 - 默认更新源是 GitHub API：`https://api.github.com/repos/i2534/sshore/releases/latest`
@@ -67,7 +69,7 @@ sshore 会按设置里的间隔向**更新源**查询最新 Release，有新版�
 ### 升级流程（必须由你点一下）
 
 1. 有新版时点「下载更新」：下载压缩包 → 比对 `checksums.txt` 的 SHA256 → 解包出待安装文件
-   （与当前二进制同目录，文件名带**目标版本**，如 `sshore.v0.7.0` / `sshore.v0.7.0.exe`）
+   （与当前二进制同目录，文件名带**目标版本**，如 `sshore.v0.7.4` / `sshore.v0.7.4.exe`）
    → 写入同名 `.sha256`。解包只认白名单里的 `sshore` / `sshore.exe`，拒绝符号链接与路径遍历条目。
 2. 点「重启并升级」：重算哈希、写出一次性升级脚本、分离启动它，然后程序自己退出。
 3. 脚本等旧进程退出 → 把当前二进制备份为 `sshore.<当前版本>`（**只保留最近一份备份**）
@@ -100,7 +102,7 @@ sshore 会按设置里的间隔向**更新源**查询最新 Release，有新版�
 ```bash
 # Linux：解压后覆盖到 sshore 所在目录（先建好解压与安装目录，首次粘贴即可跑通）
 mkdir -p /tmp/upd ~/bin
-tar -xzf sshore-v0.7.0-linux-amd64.tar.gz -C /tmp/upd
+tar -xzf sshore-v0.7.4-linux-amd64.tar.gz -C /tmp/upd
 install -m 0755 /tmp/upd/sshore ~/bin/sshore
 ```
 
