@@ -15,6 +15,7 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"sshore/internal/clipboard"
 	"sshore/internal/config"
 	"sshore/internal/forward"
 	"sshore/internal/importer"
@@ -160,6 +161,14 @@ func (a *App) startup(ctx context.Context) {
 	// 状态不变」（2026-09-20 真机定位）。清理只是兜底动作，绝不该挡在控制器装配之前。
 	// 目录快照在此同步取出：后台 goroutine 不再触碰 a.cfg，避免与后续设置写入竞争。
 	go cleanupStaleLocalPartsAt(a.localRecentPaths())
+	// 剪贴板临时目录的陈旧清理（>1 小时）。同样必须后台执行，并且必须走包级注入点
+	// cleanupClipboardTempDirsAt —— 否则任何调用 a.startup(...) 的测试（含既有
+	// TestStartupDoesNotBlockOnStalePartCleanup）都会真去扫删开发机的 /tmp。
+	go func() {
+		if _, err := cleanupClipboardTempDirsAt(os.TempDir(), time.Hour, time.Now()); err != nil {
+			_ = err // 静默：清理只是兜底；startup 期 a.emit 尚未注入，无处记日志
+		}
+	}()
 	// 更新服务：注入全部外部依赖（HTTP/进程/配置读写/事件通道），Init 做残留自检
 	// 与轮询调度。必须放在 startup —— 这里才有 ctx，且 Init 会被测试直接调用。
 	a.updater = update.New(update.Options{
@@ -210,6 +219,16 @@ var cleanupStaleLocalPartsAt = func(roots []string) {
 		_, _ = sftp.CleanupStaleLocalParts(root, now)
 	}
 }
+
+// cleanupClipboardTempDirsAt 清理剪贴板临时目录（sshore-clip-*）中超过 minAge 的残留。
+//
+// 这些目录在写入剪贴板后**不能**立即删除：CF_HDROP 里存的是路径引用，粘贴那一刻
+// 资源管理器才去读文件。因此只能靠下一次启动兜底回收（1 小时门槛见设计 §4.3）。
+//
+// 声明为包级变量：单测注入假实现，钉住「startup 走注入点」这条约束
+// （见 TestStartupCleanupIsInjectable）——直接调真函数会让既有的 startup 测试
+// 真去扫删开发机的 /tmp。
+var cleanupClipboardTempDirsAt = clipboard.CleanStaleTempDirs
 
 // Init wires controllers. emit forwards subsystem events to the frontend.
 // forward needs a Spawner (long-lived ssh -N); sftp needs a blocking Runner (one-shot ops).
@@ -1004,6 +1023,25 @@ func (a *App) StatPaths(paths []string) []PathInfo {
 		out = append(out, info)
 	}
 	return out
+}
+
+// ClipboardFileSupport 报告本平台能否把文件/目录作为文件对象写入系统剪贴板。
+// Windows 为 true；其它平台为 false —— 前端据此不渲染右键菜单的「文件」项
+// （不是置灰，是根本不出现在子菜单里，设计 §3.4）。
+func (a *App) ClipboardFileSupport() bool {
+	return clipboard.Support()
+}
+
+// ClipboardTempDir 新建一个剪贴板专用临时目录，作为远程「文件」的下载落点。
+// 目录在本次复制后不删除（剪贴板存的是路径引用），由下次启动的陈旧清理回收。
+func (a *App) ClipboardTempDir() (string, error) {
+	return clipboard.NewTempDir()
+}
+
+// CopyFilesToClipboard 把 paths 指向的文件/目录作为文件对象写入系统剪贴板，
+// 之后可直接粘贴到资源管理器。非 Windows 平台返回 clipboard.ErrUnsupported。
+func (a *App) CopyFilesToClipboard(paths []string) error {
+	return clipboard.SetFiles(paths)
 }
 
 // CopyLocal 复制本地文件/目录到 dst。拒绝把 src 复制进它自己的子树。
