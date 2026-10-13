@@ -754,14 +754,17 @@ function onConflictCancel() { conflict.visible = false; if (conflict.resolve) co
 // gesture: 'single' | 'batch'（默认 batch）。判别依据是**手势来源**而不是项数（spec 决策 7）：
 //   右键单项下载/上传、跨面板单项拖拽 = single → 不弹冲突框，对已存在目标有意直接覆盖；
 //   面板头下拉、多选批量、系统拖入 = batch → 保留 needsConfirm/askConflict 流程。
-async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, systemPaths, gesture = 'batch' }) {
+async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, systemPaths, gesture = 'batch', hiddenSelected, keepSelection = false, existingNames }) {
   const sourceSelection = direction === 'upload' ? localSelection : remoteSelection
   const targetItems = direction === 'download' ? visibleLocalItems.value : visibleRemoteItems.value
   const tasks = systemPaths
     ? systemPaths.map((i) => ({ name: i.name, src: i.path, dst: (direction === 'download' ? localJoin : posixJoin)(targetDir, i.name), isDir: i.isDir }))
     : planTasks({ direction, names, sourceDir, targetDir, isDirMap: (sourceItems || []).reduce((m, it) => (m[it.name] = it.isDir, m), {}) })
-  const hidden = hiddenSelectedCount(sourceSelection, visibleFor(direction === 'upload' ? 'local' : 'remote'))
-  const existing = (targetItems || []).map((it) => it.name)
+  // hiddenSelected / existingNames 是可注入的覆盖项（复制到剪贴板时用）：
+  // 目标目录是本次新建的空目录，既不该拿「用户当前本地目录」判冲突，
+  // 也不该为隐藏选中项弹确认框。既有调用点不传 ⇒ 行为完全不变。
+  const hidden = hiddenSelected ?? hiddenSelectedCount(sourceSelection, visibleFor(direction === 'upload' ? 'local' : 'remote'))
+  const existing = existingNames ?? (targetItems || []).map((it) => it.name)
   const { clean, conflicts } = classify(tasks, existing)
   let run = clean
   let skipped = []
@@ -799,8 +802,9 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   logStore.add({ source_id: 'sftp', source_type: 'sftp', level: s.failed ? 'error' : 'info', ts: new Date().toISOString(),
     message: '批量' + direction + ' ' + results.length + ' 项：成功 ' + s.ok + ' 跳过 ' + s.skipped + ' 失败 ' + s.failed })
   const doneNames = results.filter((r) => r.status === '完成').map((r) => r.name)
-  sel.remove(sourceSelection, doneNames) // 只移除成功项：失败/留在原地的项仍应保持选中（spec §6.4）
-  return s
+  // 复制到剪贴板是只读动作（keepSelection=true）：不得清空用户的选中集（设计 §3.3）。
+  if (!keepSelection) sel.remove(sourceSelection, doneNames) // 只移除成功项：失败/留在原地的项仍应保持选中（spec §6.4）
+  return { ...s, results } // results 供「复制 → 文件」筛选完成项；s 的 ok/skipped/failed/failures 字段不变
 }
 
 // 「复制失败清单」：队列只负责 emit，落盘/剪贴板由编排层做（避免出现死按钮）。
@@ -835,6 +839,50 @@ async function copyText(pane, names, kind) {
     await navigator.clipboard.writeText(text)
     info('已复制 ' + names.length + ' 个' + (kind === 'copy-name' ? '文件名' : '全路径') + '到剪贴板')
   } catch (e) { err(e) }
+}
+
+// 「文件」：把选中的文件/目录作为文件对象写进系统剪贴板（Windows 可直接粘到资源管理器）。
+// 本地面板直接写；远程必须先下载到剪贴板临时目录 —— 剪贴板里存的是**路径引用**，
+// 所以临时目录本次不删除，由下次启动的陈旧清理回收（设计 §4.3）。
+async function copyFilesAsObjects(pane, names) {
+  if (!names.length) return
+  try {
+    if (pane === 'local') {
+      const paths = names.map((n) => localJoin(localPath.value || '/', n))
+      await CopyFilesToClipboard(paths)
+      info('已复制 ' + paths.length + ' 个文件到剪贴板（可直接粘贴到文件管理器）')
+      return
+    }
+
+    const tmp = await ClipboardTempDir()
+    // existingNames: [] 是必须的：runBatch 默认拿**用户当前本地目录**判冲突，
+    // 只要本地有同名文件就会弹冲突框并按默认策略「跳过」，结果是静默什么都不复制。
+    // hiddenSelected: 0 免掉隐藏选中项的询问（隐藏项也要一并复制）；
+    // keepSelection: true 让这次只读动作不摘掉用户的远程选中集。
+    const s = await runBatch({
+      direction: 'download',
+      names,
+      sourceDir: remotePath.value,
+      targetDir: tmp,
+      sourceItems: visibleRemoteItems.value,
+      gesture: 'batch',
+      hiddenSelected: 0,
+      keepSelection: true,
+      existingNames: [],
+    })
+    if (!s) { await err('复制已取消，未写入剪贴板'); return }
+    // 中途取消时已完成的项也不许写：半批数据进剪贴板会让用户以为复制了全部。
+    if (s.results.some((r) => r.status === '取消')) { await err('复制已取消，未写入剪贴板'); return }
+
+    // 临时目录是**本地**路径 ⇒ 必须用 localJoin（posixJoin 会产出反斜杠系统认不出的路径）。
+    const paths = s.results.filter((r) => r.status === '完成').map((r) => localJoin(tmp, r.name))
+    if (!paths.length) { await err('复制失败：没有成功的项（见传输队列）'); return }
+    await CopyFilesToClipboard(paths)
+    info('已复制 ' + paths.length + ' 个文件到剪贴板（可直接粘贴到文件管理器）')
+    if (s.failed > 0) await err('有 ' + s.failed + ' 项复制失败（见传输队列）')
+  } catch (e) {
+    err(e)
+  }
 }
 
 // 删除（唯一不可撤销的批量动作，单独走确认）
@@ -965,10 +1013,10 @@ async function doAction(name) {
   if (name === 'refresh') { closeMenu(); return refreshPane(pane) }
   // 复制三项同样必须在这里返回（在 sel.single 之前）：它们自己算作用集合，
   // 且**不得**改变选中集——复制是只读动作（设计 §3.3）。
-  if (name === 'copy-name' || name === 'copy-path') {
+  if (name === 'copy-name' || name === 'copy-path' || name === 'copy-file') {
     const names = copyTargetNames(selectionFor(pane), menu.value.item, visibleFor(pane))
     closeMenu()
-    return copyText(pane, names, name)
+    return name === 'copy-file' ? copyFilesAsObjects(pane, names) : copyText(pane, names, name)
   }
   const s = selectionFor(pane)
   const it = menu.value.item
