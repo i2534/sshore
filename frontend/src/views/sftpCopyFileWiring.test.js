@@ -62,14 +62,14 @@ describe('SftpView 复制「文件」接线', () => {
     expect(body).toContain("await err('复制已取消，未写入剪贴板')")
   })
 
-  it('中途取消 ⇒ 整批不写剪贴板（半批数据不许进剪贴板）', () => {
+  it('中途取消 ⇒ 整批不写剪贴板（判据是整批的 s.cancelled，不是只含已派发项的 results）', () => {
     const body = fnBody()
-    const iCancelled = body.indexOf("'取消'")
-    expect(iCancelled, '必须判定「取消」状态').toBeGreaterThan(-1)
-    const iWrite = body.indexOf('CopyFilesToClipboard(')
-    // 远程分支里的取消判定必须出现在写剪贴板之前
-    expect(iCancelled).toBeLessThan(body.lastIndexOf('CopyFilesToClipboard('))
+    expect(body, '必须用整批的 s.cancelled 判定').toContain('s.cancelled')
+    expect(body, '不得用 results.some(…「取消」)：被取消的排队项不在 results 里').not.toContain('results.some')
+    const iGuard = body.indexOf('s.cancelled')
+    const iWrite = body.lastIndexOf('CopyFilesToClipboard(')
     expect(iWrite).toBeGreaterThan(-1)
+    expect(iGuard, '取消守卫必须出现在写剪贴板之前').toBeLessThan(iWrite)
   })
 
   it('只把「完成」的项写进剪贴板，并且用本地路径拼接临时目录下的落点', () => {
@@ -108,6 +108,7 @@ describe('SftpView 复制「文件」接线', () => {
     expect(src).toContain('hiddenSelected ?? hiddenSelectedCount(')
     expect(src).toContain('existingNames ?? (targetItems || []).map(')
     expect(src).toContain('if (!keepSelection) sel.remove(sourceSelection, doneNames)')
-    expect(src).toContain('return { ...s, results }')
+    expect(src).toContain('return { ...s, results, cancelled: hasCancelled(batch) }')
+    expect(src).toContain("hasCancelled } from '../utils/queue'")
   })
 })

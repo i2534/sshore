@@ -91,4 +91,16 @@ describe('SftpView 复制子菜单接线', () => {
     expect(doActionBody()).toContain('copyTargetNames(')
     expect(src).toContain('copyPayload(')
   })
+
+  // 最终评审的 Critical：三个绑定被使用但从未 import ⇒ 运行期 ReferenceError
+  // （构建与颜色都不报错：Vite 把未声明标识符当全局原样留在产物里）。
+  it('用到的三个剪贴板绑定必须真的从 wailsjs import', () => {
+    const m = src.match(/import \{([^}]+)\} from '\.\.\/\.\.\/wailsjs\/go\/main\/App'/)
+    expect(m, '找不到 wailsjs 的 import 行').not.toBe(null)
+    const imported = m[1].split(',').map((s) => s.trim())
+    for (const name of ['ClipboardFileSupport', 'ClipboardTempDir', 'CopyFilesToClipboard']) {
+      expect(src, `${name} 没有被使用`).toContain(name)
+      expect(imported, `${name} 被使用却没有 import`).toContain(name)
+    }
+  })
 })

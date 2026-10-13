@@ -33,7 +33,7 @@ $ which virsh
 | Windows 二进制构建 | `GOCACHE=$PWD/.gocache make windows` | **EXIT=0**，产出 `build/bin/sshore.exe` |
 | 产物形态 | `file build/bin/sshore.exe` | `PE32+ executable (GUI) x86-64`，4,941,312 字节 |
 | Linux 能力查询 | `go test . -run TestAppClipboardFileSupportFalseOnLinux` | PASS（Linux 上 `ClipboardFileSupport()` 返回 false ⇒ 前端不渲染「文件」项） |
-| 剪贴板包单测 | `go test ./internal/clipboard/ -v` | **8/8 PASS**（DROPFILES 布局、双 `\0` 终止、非 ASCII/emoji/单引号、临时目录唯一性与陈旧清理） |
+| 剪贴板包单测 | `go test ./internal/clipboard/ -v` | **10/10 PASS**（`hdrops` 5 + `tempdir` 3 + 非 Windows 降级 2） |
 | 全量门禁 | `GOCACHE=$PWD/.gocache make ci` | **EXIT=0**：`vite build` ✓ / `go vet ./...` 无输出 ✓ / `go test ./... -race -count=1` 全 ok ✓ / `npx vitest run` **45 文件 543 测试全 PASS** |
 | Windows 交叉编译 | `GOOS=windows GOARCH=amd64` 与 `386`，`CGO_ENABLED=0 go build ./...` | 两条均 **EXIT=0** |
 | Windows vet（CI `go-windows` job 的等价门禁） | `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...` | **EXIT=0，无输出**（证明 `RtlMoveMemory` 填内存写法没有触发 `unsafeptr` 告警） |

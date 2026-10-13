@@ -266,6 +266,17 @@ export function shouldDispatch(rec) {
   return !!rec && !rec.batchAborted
 }
 
+// hasCancelled：本批是否出现过「取消」终态。
+//
+// ⚠️ 必须传**整批队列记录**（`runBatch` 里的 `batch`），不能传 `results`：
+// `results` 只收集**已派发**的项（`results.push(rec)` 在 `await dispatchTransfer(rec)`
+// 之后），而被取消的排队项由 applyBatchCancel 直接写「取消」、随后 shouldDispatch
+// 为假使循环 break —— 它们永远进不了 results。用 results 判定会让
+// 「取消后整批不写剪贴板」的守卫恒为假（2026-10-13 最终评审抓到的 Critical）。
+export function hasCancelled(records) {
+  return (records || []).some((r) => !!r && r.status === '取消')
+}
+
 // —— 行内渲染决策（评审 I1）——
 
 // rowNote：行内备注。终态文案只由操作结果 + 取消事实决定。
