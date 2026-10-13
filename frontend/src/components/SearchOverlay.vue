@@ -81,7 +81,7 @@ function cancel() {
 
 watch(() => props.visible, (v) => {
   if (v) {
-    // 聚焦输入框：@keyup.esc 挂在遮罩上，只有焦点在子树里才会触发（spec §8.2 要求 Esc 可关）。
+    // 聚焦输入框：模态框现在**只能**靠显式按钮关闭（设计 §5），聚焦只为让用户直接输入。
     nextTick(() => { const el = document.querySelector('.search-overlay input'); if (el) el.focus() })
     pattern.value = ''
     hits.value = []
@@ -109,7 +109,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div v-if="visible" class="ui-overlay search-overlay" @click.self="emit('close')" @keyup.esc="emit('close')">
+  <div v-if="visible" class="ui-overlay search-overlay">
     <div class="panel">
       <div class="head">
         <span class="ftitle">{{ title() }}</span>
