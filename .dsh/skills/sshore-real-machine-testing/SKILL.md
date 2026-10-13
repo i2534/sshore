@@ -109,6 +109,9 @@ DISPLAY=:99 import -window root /tmp/win1.png        # 之后用 xdo 在 RDP 窗
 | RDP 裸连被"REMOTE HOST IDENTIFICATION HAS CHANGED"拒 | 宿主 `known_hosts` 里 `[127.0.0.1]:2222` 是旧客户机密钥 | 用独立 `UserKnownHostsFile`/`StrictHostKeyChecking no` 的临时块，用完删除 |
 | 会话内 agent `click{x,y}` 不生效（`cursor` 恒为屏幕中心） | 该 op 不吃 x/y | 先 `{"op":"setpos","x":..,"y":..}` 再 `click`；但仍可能整条 SendInput 不落地（本次实测鼠标键盘都不生效）⇒ 换 RDP 通道 |
 | 客户机 `.ps1` 某行"莫名失效" | 中文版 Windows 的 PS 5.1 按 GBK 读无 BOM 脚本 | 走 `vboxctl ps`（自动处理）；**`vboxctl gui` 反而不要自己加 BOM** |
+| `xdo type` 输入含 `\` 的路径时报 `bad keysym \` | `xdo.c` 的 `type` 把每个字符当 **keysym 名**解析，而 `\` / `:` / `-` 的 keysym 名分别是 `backslash` / `colon` / `minus`，不是字符本身 | 改用 `xdo key <keysym 名>` 逐键发；`:` 需要上档键 ⇒ `xdo hotkey shift semicolon`；**每键之间留 ~0.15s**（连发会丢键，表现为路径只输入了一部分） |
+| 读客户机剪贴板验证 `CF_HDROP` 时拿到空 / `count=0` | **剪贴板是 per-session 的**：`vboxctl ps`（SSH）落在 Session 0，读不到 Session 1（桌面）的剪贴板；另外 `GetFileDropList()` 需要 STA 线程 | 用 `vboxctl gui readclip.ps1` 送进 Session 1 再读：`Add-Type -AssemblyName System.Windows.Forms` → `[Windows.Forms.Clipboard]::GetFileDropList()` / `GetText()`，结果写 `Z:\` 让宿主能读（本次验 CF_HDROP 即此法） |
+| `VBoxManage` 报 `character device /dev/vboxdrv does not exist`，但 `lsmod \| grep vboxdrv` 明明有模块 | 当前会话的**文件沙箱遮蔽了 `/dev`**（既不是容器隔离，也不是驱动没装）：`workspace-write` 下 `/dev/vbox*` 不可见，放宽权限后立刻可见 | 不要在受限沙箱里下"本机跑不了 VBox"的结论——这是最容易误判的一条；换有完整 `/dev` 可见性的权限后复验 `ls -la /dev/vbox*` + `VBoxManage --version` |
 | 只跑 `make ci` 就宣称"真机通过" | 门禁不含 GUI 与真协议 | 本 skill 的存在理由：`make ci` 之后必须真机跑 §5 矩阵 |
 
 ## 7 证据规范
