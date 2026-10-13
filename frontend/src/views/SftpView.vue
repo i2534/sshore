@@ -9,9 +9,11 @@ import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
 import LogPanel from '../components/LogPanel.vue'
 import ContextMenu from '../components/ContextMenu.vue'
+import MenuSubmenu from '../components/MenuSubmenu.vue'
 import AppDialog from '../components/AppDialog.vue'
 import ConflictDialog from '../components/ConflictDialog.vue'
 import * as sel from '../utils/selection'
+import { copyTargetNames, copyPayload } from '../utils/copy'
 import { join as localJoin, parentOf as localParent, joinRel, splitPath } from '../utils/localpath'
 import { actionFor } from '../utils/keys'
 import { clampLogHeight, LOG_DEFAULT_H } from '../utils/logpane'
@@ -809,6 +811,32 @@ async function copyFailures() {
   try { await navigator.clipboard.writeText(text) } catch (e) { err(e) }
 }
 
+// ===== 右键「复制 ▸」（设计 §3）=====
+// 运行时能力：Windows true / Linux false。Linux 上「文件」项**不渲染**（不是置灰）。
+const clipboardFileSupport = ref(false)
+
+// 子菜单三项。置灰判据必须写在 script：既有 sftpMenuWiring.test.js 明令 ContextMenu
+// 模板切片内不得出现 `connected.value`（模板里 ref 自动解包，写 .value 恒错）。
+// 「文件」在远程面板未连接时置灰——它需要先下载，其它两项是纯字符串拼接。
+const COPY_ITEMS = computed(() => {
+  const items = [
+    { key: 'copy-name', label: '文件名' },
+    { key: 'copy-path', label: '全路径' },
+  ]
+  if (clipboardFileSupport.value) items.push({ key: 'copy-file', label: '文件', disabled: menu.value.pane === 'remote' && !connected.value })
+  return items
+})
+
+// 文本两项：整串文本一次写入剪贴板，多行以 \n 拼接（顺序由 utils/copy 保证）。
+async function copyText(pane, names, kind) {
+  if (!names.length) return // 空集合不得把用户的剪贴板清成空串
+  const text = copyPayload(kind, names, { pane, localPath: localPath.value, remotePath: remotePath.value })
+  try {
+    await navigator.clipboard.writeText(text)
+    info('已复制 ' + names.length + ' 个' + (kind === 'copy-name' ? '文件名' : '全路径') + '到剪贴板')
+  } catch (e) { err(e) }
+}
+
 // 删除（唯一不可撤销的批量动作，单独走确认）
 async function removeSelected(pane) {
   const s = selectionFor(pane)
@@ -935,6 +963,13 @@ async function doAction(name) {
   // refresh 必须最先返回（spec §5.1 / 审核 FF6）：若走下面的单项选中，多选会被悄悄收成一项，
   // 直接违反"刷新保留选中"。这里不读 item、也不改 names。
   if (name === 'refresh') { closeMenu(); return refreshPane(pane) }
+  // 复制三项同样必须在这里返回（在 sel.single 之前）：它们自己算作用集合，
+  // 且**不得**改变选中集——复制是只读动作（设计 §3.3）。
+  if (name === 'copy-name' || name === 'copy-path') {
+    const names = copyTargetNames(selectionFor(pane), menu.value.item, visibleFor(pane))
+    closeMenu()
+    return copyText(pane, names, name)
+  }
   const s = selectionFor(pane)
   const it = menu.value.item
   if (it && it.name !== '..' && !sel.isSelected(s, it.name)) sel.single(s, it.name)
@@ -1179,6 +1214,9 @@ onMounted(async () => {
   }
   localPath.value = localTarget
   await loadLocal()
+  // 剪贴板能力查询必须放进**这个** onMounted：sftpRestoreWiring.test.js 用正则取第一个
+  // onMounted 的两条顺序断言，新增第二个 onMounted 会让它们全红。不 await：不拖慢启动路径。
+  ClipboardFileSupport().then((v) => { clipboardFileSupport.value = !!v }).catch(() => { clipboardFileSupport.value = false })
 })
 
 function startClock() {
@@ -1391,6 +1429,7 @@ onUnmounted(() => {
           <template v-for="remoteDep in [remoteDepFor('download')]" :key="'row-remote'">
             <button :disabled="remoteDep && !connected" @click="doAction('download')"><span class="ic">⬇</span>下载…</button>
             <button :disabled="remoteDep && !connected" @click="doAction('upload')"><span class="ic">⬆</span>上传…</button>
+            <MenuSubmenu label="复制" :items="COPY_ITEMS" @pick="doAction($event)" />
             <button :disabled="remoteDep && !connected" @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
             <button :disabled="remoteDep && !connected" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
             <button class="sep" :disabled="remoteDep && !connected" @click="doAction('refresh')"><span class="ic">🔄</span>刷新</button>
@@ -1401,6 +1440,7 @@ onUnmounted(() => {
           <template v-for="remoteDep in [remoteDepFor('upload')]" :key="'row-local-remote'">
             <button :disabled="remoteDep && !connected" @click="doAction('upload')"><span class="ic">⬆</span>上传到远程</button>
           </template>
+          <MenuSubmenu label="复制" :items="COPY_ITEMS" @pick="doAction($event)" />
           <template v-for="remoteDep in [remoteDepFor('rename')]" :key="'row-local'">
             <button :disabled="remoteDep && !connected" @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
             <button :disabled="remoteDep && !connected" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
