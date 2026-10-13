@@ -22,7 +22,13 @@ export function CheckUpdate(arg1:boolean):Promise<update.UpdateInfo>;
 
 export function ClearSkippedUpdate():Promise<void>;
 
+export function ClipboardFileSupport():Promise<boolean>;
+
+export function ClipboardTempDir():Promise<string>;
+
 export function ConfirmSyncRuleDeletes(arg1:string,arg2:string):Promise<void>;
+
+export function CopyFilesToClipboard(arg1:Array<string>):Promise<void>;
 
 export function CopyLocal(arg1:string,arg2:string):Promise<void>;
 
