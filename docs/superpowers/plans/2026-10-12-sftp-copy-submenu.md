@@ -524,7 +524,7 @@ Expected: PASS（11 个用例）
 
 - [ ] **Step 5: 在 `SftpView.vue` 接入菜单与文本两项**
 
-1. import 区加：`import MenuSubmenu from '../components/MenuSubmenu.vue'`、`import { copyTargetNames, copyPayload } from '../utils/copy'`。
+1. import 区加：`import MenuSubmenu from '../components/MenuSubmenu.vue'`、`import { copyTargetNames, copyPayload } from '../utils/copy'`；**并把三个剪贴板绑定加进已有的 wailsjs import 行**（`ClipboardFileSupport, ClipboardTempDir, CopyFilesToClipboard`）——⚠️ 漏了这一步运行期就是 `ReferenceError`，而 Vite 构建**不会**报错（未声明标识符被当作全局原样留在产物里）。最终评审的 Critical 正是这条；T6 的测试已补"绑定必须出现在 import 列表里"的断言防重犯。
 2. 菜单矩阵两支各插入 `<MenuSubmenu label="复制" :items="COPY_ITEMS" @pick="doAction($event)" />`：远程行放在 `上传…` 之后、`重命名` 之前；本地行放在 `上传到远程` 之后、`重命名` 之前。
 3. `COPY_ITEMS` 用**固定形状**（测试按这个形状断言）：
    ```js

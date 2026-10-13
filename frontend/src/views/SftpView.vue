@@ -1,6 +1,6 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpProbe, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpProbe, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome, ClipboardFileSupport, ClipboardTempDir, CopyFilesToClipboard } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import { useLocationsStore } from '../stores/locations'
 import { useSftpUIStore } from '../stores/sftpui'
@@ -19,7 +19,7 @@ import { actionFor } from '../utils/keys'
 import { clampLogHeight, LOG_DEFAULT_H } from '../utils/logpane'
 import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName, nextTransferSeq, transferID } from '../utils/batch'
 import { failureText, isInternalTempName, applyProgress, TRANSFER_PROGRESS_EVENT,
-  applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch } from '../utils/queue'
+  applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch, hasCancelled } from '../utils/queue'
 import { payloadFor, payloadFromDragEvent, DRAG_MIME, pickDropPane, canDropInto } from '../utils/dnd'
 import { setSystemDropHandler } from '../utils/systemDrop'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
@@ -804,7 +804,7 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   const doneNames = results.filter((r) => r.status === '完成').map((r) => r.name)
   // 复制到剪贴板是只读动作（keepSelection=true）：不得清空用户的选中集（设计 §3.3）。
   if (!keepSelection) sel.remove(sourceSelection, doneNames) // 只移除成功项：失败/留在原地的项仍应保持选中（spec §6.4）
-  return { ...s, results } // results 供「复制 → 文件」筛选完成项；s 的 ok/skipped/failed/failures 字段不变
+  return { ...s, results, cancelled: hasCancelled(batch) } // cancelled 看整批（含未派发的排队项），results 只看已派发项
 }
 
 // 「复制失败清单」：队列只负责 emit，落盘/剪贴板由编排层做（避免出现死按钮）。
@@ -872,7 +872,8 @@ async function copyFilesAsObjects(pane, names) {
     })
     if (!s) { await err('复制已取消，未写入剪贴板'); return }
     // 中途取消时已完成的项也不许写：半批数据进剪贴板会让用户以为复制了全部。
-    if (s.results.some((r) => r.status === '取消')) { await err('复制已取消，未写入剪贴板'); return }
+    // 判据必须用整批的 s.cancelled —— 被取消的**排队项**不在 s.results 里（见 queue.js）。
+    if (s.cancelled) { await err('复制已取消，未写入剪贴板'); return }
 
     // 临时目录是**本地**路径 ⇒ 必须用 localJoin（posixJoin 会产出反斜杠系统认不出的路径）。
     const paths = s.results.filter((r) => r.status === '完成').map((r) => localJoin(tmp, r.name))
