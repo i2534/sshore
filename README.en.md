@@ -182,7 +182,7 @@ wails dev
   (`Ns 后第 N 次重连`) and the card shows `reconnecting` / `error` instead of
   silently pretending to be connected
 - **SFTP file management**: dual-pane browse / multi-select (Ctrl-click, Shift-range,
-  Ctrl+A) / batch download, upload and delete / right-click menu / drag-and-drop
+  Ctrl+A) / batch download, upload and delete / right-click menu (with Copy ▸: file name / full path / file — the file entry pastes straight into Explorer on Windows; Linux offers the first two) / drag-and-drop
   delivery (pane to pane, dropped in from the OS, dragged onto a subdirectory to
   move) / instant filter in both panes; per-pane 📍 location dropdown (bookmarks +
   recents, up to 20 each, remote recents isolated per host) and ☆ bookmark toggle /
