@@ -1,6 +1,6 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
-import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpProbe, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome } from '../../wailsjs/go/main/App'
+import { ListHosts, SftpList, SftpGet, SftpGetDir, SftpPut, SftpPutRecursive, SftpRemoveRecursive, SftpMove, SftpRemove, SftpMkdir, SftpRename, SftpConnect, SftpDisconnect, SftpConnected, SftpProbe, SftpTransferCancel, ListLocal, DeleteLocal, MkdirLocal, RenameLocal, StatLocal, PickLocalFile, CopyLocal, StatPaths, Cwd, SftpHome, ClipboardFileSupport, ClipboardTempDir, CopyFilesToClipboard } from '../../wailsjs/go/main/App'
 import { useLogStore } from '../stores/logs'
 import { useLocationsStore } from '../stores/locations'
 import { useSftpUIStore } from '../stores/sftpui'
@@ -9,15 +9,17 @@ import FilePane from '../components/FilePane.vue'
 import TransferQueue from '../components/TransferQueue.vue'
 import LogPanel from '../components/LogPanel.vue'
 import ContextMenu from '../components/ContextMenu.vue'
+import MenuSubmenu from '../components/MenuSubmenu.vue'
 import AppDialog from '../components/AppDialog.vue'
 import ConflictDialog from '../components/ConflictDialog.vue'
 import * as sel from '../utils/selection'
+import { copyTargetNames, copyPayload } from '../utils/copy'
 import { join as localJoin, parentOf as localParent, joinRel, splitPath } from '../utils/localpath'
 import { actionFor } from '../utils/keys'
 import { clampLogHeight, LOG_DEFAULT_H } from '../utils/logpane'
 import { planTasks, classify, applyPolicy, needsConfirm, summarize, copyName, nextTransferSeq, transferID } from '../utils/batch'
 import { failureText, isInternalTempName, applyProgress, TRANSFER_PROGRESS_EVENT,
-  applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch } from '../utils/queue'
+  applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch, hasCancelled } from '../utils/queue'
 import { payloadFor, payloadFromDragEvent, DRAG_MIME, pickDropPane, canDropInto } from '../utils/dnd'
 import { setSystemDropHandler } from '../utils/systemDrop'
 import { EventsOn } from '../../wailsjs/runtime/runtime'
@@ -752,14 +754,17 @@ function onConflictCancel() { conflict.visible = false; if (conflict.resolve) co
 // gesture: 'single' | 'batch'（默认 batch）。判别依据是**手势来源**而不是项数（spec 决策 7）：
 //   右键单项下载/上传、跨面板单项拖拽 = single → 不弹冲突框，对已存在目标有意直接覆盖；
 //   面板头下拉、多选批量、系统拖入 = batch → 保留 needsConfirm/askConflict 流程。
-async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, systemPaths, gesture = 'batch' }) {
+async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, systemPaths, gesture = 'batch', hiddenSelected, keepSelection = false, existingNames }) {
   const sourceSelection = direction === 'upload' ? localSelection : remoteSelection
   const targetItems = direction === 'download' ? visibleLocalItems.value : visibleRemoteItems.value
   const tasks = systemPaths
     ? systemPaths.map((i) => ({ name: i.name, src: i.path, dst: (direction === 'download' ? localJoin : posixJoin)(targetDir, i.name), isDir: i.isDir }))
     : planTasks({ direction, names, sourceDir, targetDir, isDirMap: (sourceItems || []).reduce((m, it) => (m[it.name] = it.isDir, m), {}) })
-  const hidden = hiddenSelectedCount(sourceSelection, visibleFor(direction === 'upload' ? 'local' : 'remote'))
-  const existing = (targetItems || []).map((it) => it.name)
+  // hiddenSelected / existingNames 是可注入的覆盖项（复制到剪贴板时用）：
+  // 目标目录是本次新建的空目录，既不该拿「用户当前本地目录」判冲突，
+  // 也不该为隐藏选中项弹确认框。既有调用点不传 ⇒ 行为完全不变。
+  const hidden = hiddenSelected ?? hiddenSelectedCount(sourceSelection, visibleFor(direction === 'upload' ? 'local' : 'remote'))
+  const existing = existingNames ?? (targetItems || []).map((it) => it.name)
   const { clean, conflicts } = classify(tasks, existing)
   let run = clean
   let skipped = []
@@ -797,8 +802,9 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   logStore.add({ source_id: 'sftp', source_type: 'sftp', level: s.failed ? 'error' : 'info', ts: new Date().toISOString(),
     message: '批量' + direction + ' ' + results.length + ' 项：成功 ' + s.ok + ' 跳过 ' + s.skipped + ' 失败 ' + s.failed })
   const doneNames = results.filter((r) => r.status === '完成').map((r) => r.name)
-  sel.remove(sourceSelection, doneNames) // 只移除成功项：失败/留在原地的项仍应保持选中（spec §6.4）
-  return s
+  // 复制到剪贴板是只读动作（keepSelection=true）：不得清空用户的选中集（设计 §3.3）。
+  if (!keepSelection) sel.remove(sourceSelection, doneNames) // 只移除成功项：失败/留在原地的项仍应保持选中（spec §6.4）
+  return { ...s, results, cancelled: hasCancelled(batch) } // cancelled 看整批（含未派发的排队项），results 只看已派发项
 }
 
 // 「复制失败清单」：队列只负责 emit，落盘/剪贴板由编排层做（避免出现死按钮）。
@@ -807,6 +813,77 @@ async function copyFailures() {
   if (!failed.length) return
   const text = failed.map((t) => failureText(t)).join('\n')
   try { await navigator.clipboard.writeText(text) } catch (e) { err(e) }
+}
+
+// ===== 右键「复制 ▸」（设计 §3）=====
+// 运行时能力：Windows true / Linux false。Linux 上「文件」项**不渲染**（不是置灰）。
+const clipboardFileSupport = ref(false)
+
+// 子菜单三项。置灰判据必须写在 script：既有 sftpMenuWiring.test.js 明令 ContextMenu
+// 模板切片内不得出现 `connected.value`（模板里 ref 自动解包，写 .value 恒错）。
+// 「文件」在远程面板未连接时置灰——它需要先下载，其它两项是纯字符串拼接。
+const COPY_ITEMS = computed(() => {
+  const items = [
+    { key: 'copy-name', label: '文件名' },
+    { key: 'copy-path', label: '全路径' },
+  ]
+  if (clipboardFileSupport.value) items.push({ key: 'copy-file', label: '文件', disabled: menu.value.pane === 'remote' && !connected.value })
+  return items
+})
+
+// 文本两项：整串文本一次写入剪贴板，多行以 \n 拼接（顺序由 utils/copy 保证）。
+async function copyText(pane, names, kind) {
+  if (!names.length) return // 空集合不得把用户的剪贴板清成空串
+  const text = copyPayload(kind, names, { pane, localPath: localPath.value, remotePath: remotePath.value })
+  try {
+    await navigator.clipboard.writeText(text)
+    info('已复制 ' + names.length + ' 个' + (kind === 'copy-name' ? '文件名' : '全路径') + '到剪贴板')
+  } catch (e) { err(e) }
+}
+
+// 「文件」：把选中的文件/目录作为文件对象写进系统剪贴板（Windows 可直接粘到资源管理器）。
+// 本地面板直接写；远程必须先下载到剪贴板临时目录 —— 剪贴板里存的是**路径引用**，
+// 所以临时目录本次不删除，由下次启动的陈旧清理回收（设计 §4.3）。
+async function copyFilesAsObjects(pane, names) {
+  if (!names.length) return
+  try {
+    if (pane === 'local') {
+      const paths = names.map((n) => localJoin(localPath.value || '/', n))
+      await CopyFilesToClipboard(paths)
+      info('已复制 ' + paths.length + ' 个文件到剪贴板（可直接粘贴到文件管理器）')
+      return
+    }
+
+    const tmp = await ClipboardTempDir()
+    // existingNames: [] 是必须的：runBatch 默认拿**用户当前本地目录**判冲突，
+    // 只要本地有同名文件就会弹冲突框并按默认策略「跳过」，结果是静默什么都不复制。
+    // hiddenSelected: 0 免掉隐藏选中项的询问（隐藏项也要一并复制）；
+    // keepSelection: true 让这次只读动作不摘掉用户的远程选中集。
+    const s = await runBatch({
+      direction: 'download',
+      names,
+      sourceDir: remotePath.value,
+      targetDir: tmp,
+      sourceItems: visibleRemoteItems.value,
+      gesture: 'batch',
+      hiddenSelected: 0,
+      keepSelection: true,
+      existingNames: [],
+    })
+    if (!s) { await err('复制已取消，未写入剪贴板'); return }
+    // 中途取消时已完成的项也不许写：半批数据进剪贴板会让用户以为复制了全部。
+    // 判据必须用整批的 s.cancelled —— 被取消的**排队项**不在 s.results 里（见 queue.js）。
+    if (s.cancelled) { await err('复制已取消，未写入剪贴板'); return }
+
+    // 临时目录是**本地**路径 ⇒ 必须用 localJoin（posixJoin 会产出反斜杠系统认不出的路径）。
+    const paths = s.results.filter((r) => r.status === '完成').map((r) => localJoin(tmp, r.name))
+    if (!paths.length) { await err('复制失败：没有成功的项（见传输队列）'); return }
+    await CopyFilesToClipboard(paths)
+    info('已复制 ' + paths.length + ' 个文件到剪贴板（可直接粘贴到文件管理器）')
+    if (s.failed > 0) await err('有 ' + s.failed + ' 项复制失败（见传输队列）')
+  } catch (e) {
+    err(e)
+  }
 }
 
 // 删除（唯一不可撤销的批量动作，单独走确认）
@@ -935,6 +1012,13 @@ async function doAction(name) {
   // refresh 必须最先返回（spec §5.1 / 审核 FF6）：若走下面的单项选中，多选会被悄悄收成一项，
   // 直接违反"刷新保留选中"。这里不读 item、也不改 names。
   if (name === 'refresh') { closeMenu(); return refreshPane(pane) }
+  // 复制三项同样必须在这里返回（在 sel.single 之前）：它们自己算作用集合，
+  // 且**不得**改变选中集——复制是只读动作（设计 §3.3）。
+  if (name === 'copy-name' || name === 'copy-path' || name === 'copy-file') {
+    const names = copyTargetNames(selectionFor(pane), menu.value.item, visibleFor(pane))
+    closeMenu()
+    return name === 'copy-file' ? copyFilesAsObjects(pane, names) : copyText(pane, names, name)
+  }
   const s = selectionFor(pane)
   const it = menu.value.item
   if (it && it.name !== '..' && !sel.isSelected(s, it.name)) sel.single(s, it.name)
@@ -1179,6 +1263,9 @@ onMounted(async () => {
   }
   localPath.value = localTarget
   await loadLocal()
+  // 剪贴板能力查询必须放进**这个** onMounted：sftpRestoreWiring.test.js 用正则取第一个
+  // onMounted 的两条顺序断言，新增第二个 onMounted 会让它们全红。不 await：不拖慢启动路径。
+  ClipboardFileSupport().then((v) => { clipboardFileSupport.value = !!v }).catch(() => { clipboardFileSupport.value = false })
 })
 
 function startClock() {
@@ -1391,6 +1478,7 @@ onUnmounted(() => {
           <template v-for="remoteDep in [remoteDepFor('download')]" :key="'row-remote'">
             <button :disabled="remoteDep && !connected" @click="doAction('download')"><span class="ic">⬇</span>下载…</button>
             <button :disabled="remoteDep && !connected" @click="doAction('upload')"><span class="ic">⬆</span>上传…</button>
+            <MenuSubmenu label="复制" :items="COPY_ITEMS" @pick="doAction($event)" />
             <button :disabled="remoteDep && !connected" @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
             <button :disabled="remoteDep && !connected" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>
             <button class="sep" :disabled="remoteDep && !connected" @click="doAction('refresh')"><span class="ic">🔄</span>刷新</button>
@@ -1401,6 +1489,7 @@ onUnmounted(() => {
           <template v-for="remoteDep in [remoteDepFor('upload')]" :key="'row-local-remote'">
             <button :disabled="remoteDep && !connected" @click="doAction('upload')"><span class="ic">⬆</span>上传到远程</button>
           </template>
+          <MenuSubmenu label="复制" :items="COPY_ITEMS" @pick="doAction($event)" />
           <template v-for="remoteDep in [remoteDepFor('rename')]" :key="'row-local'">
             <button :disabled="remoteDep && !connected" @click="doAction('rename')"><span class="ic">✏</span>重命名</button>
             <button :disabled="remoteDep && !connected" @click="doAction('remove')"><span class="ic">🗑</span>删除</button>

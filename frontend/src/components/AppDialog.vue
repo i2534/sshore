@@ -21,7 +21,7 @@ function confirm() {
 </script>
 
 <template>
-  <div v-if="visible" class="ui-overlay" @click.self="emit('cancel')">
+  <div v-if="visible" class="ui-overlay">
     <div class="dialog" role="dialog">
       <div class="dtitle">{{ title }}</div>
       <p class="dmsg">{{ message }}</p>
@@ -31,7 +31,6 @@ function confirm() {
         class="dinput"
         :placeholder="placeholder"
         @keyup.enter="confirm"
-        @keyup.esc="emit('cancel')"
       />
       <div class="dbtns">
         <button class="primary" @click="confirm">{{ mode === 'prompt' ? '确定' : '确认' }}</button>

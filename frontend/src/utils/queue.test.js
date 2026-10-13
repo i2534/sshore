@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { statusClass, summarizeQueue, directionArrow, failureText,
   percentOf, speedOf, etaOf, fmtSpeed, isInternalTempName, activeActions, failedActions,
   applyProgress, TRANSFER_PROGRESS_EVENT, PART_MARKER,
-  outcomeStatus, applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch,
+  outcomeStatus, applyOutcome, applyCancelResult, applyBatchCancel, shouldDispatch, hasCancelled,
   rowNote, rowProgressText, barModel,
   CANCELLED_LATE_TEXT, CANCELLING_TEXT, CANCEL_FAILED_TEXT, WAITING_FRAME_TEXT, SCANNING_TEXT } from './queue'
 
@@ -518,5 +518,23 @@ describe('failureText 既有形状不变（Task 9 队列项仍在用）', () => 
   it('拼出 源 → 目标：原因', () => {
     expect(failureText({ src: 'a', dst: 'b', reason: 'boom' })).toBe('a → b：boom')
     expect(failureText({ name: 'a' })).toBe('a → ：未知原因')
+  })
+})
+
+// 最终评审的 Critical：runBatch 只把**已派发**的项放进 results，被取消的排队项
+// （applyBatchCancel 直接写「取消」、shouldDispatch 为假后 break）永远不在其中。
+// 判据必须看整批队列记录，因此抽成纯函数并在这里真断言。
+describe('hasCancelled：整批取消判定', () => {
+  it('任一「取消」项即判为真（含从未派发、只存在于队列里的那一项）', () => {
+    expect(hasCancelled([{ status: '完成' }, { status: '取消' }])).toBe(true)
+  })
+
+  it('没有取消项判为假', () => {
+    expect(hasCancelled([{ status: '完成' }, { status: '跳过' }, { status: '失败' }])).toBe(false)
+  })
+
+  it('空批与 null 判为假（不把"什么都没做"当成取消）', () => {
+    expect(hasCancelled([])).toBe(false)
+    expect(hasCancelled(null)).toBe(false)
   })
 })

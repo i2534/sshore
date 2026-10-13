@@ -34,8 +34,20 @@ export function ClearSkippedUpdate() {
   return window['go']['main']['App']['ClearSkippedUpdate']();
 }
 
+export function ClipboardFileSupport() {
+  return window['go']['main']['App']['ClipboardFileSupport']();
+}
+
+export function ClipboardTempDir() {
+  return window['go']['main']['App']['ClipboardTempDir']();
+}
+
 export function ConfirmSyncRuleDeletes(arg1, arg2) {
   return window['go']['main']['App']['ConfirmSyncRuleDeletes'](arg1, arg2);
+}
+
+export function CopyFilesToClipboard(arg1) {
+  return window['go']['main']['App']['CopyFilesToClipboard'](arg1);
 }
 
 export function CopyLocal(arg1, arg2) {
