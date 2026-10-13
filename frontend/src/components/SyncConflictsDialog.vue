@@ -30,7 +30,7 @@ function fmtSize(n) {
 </script>
 
 <template>
-  <div v-if="visible" class="ui-overlay" @click.self="emit('close')">
+  <div v-if="visible" class="ui-overlay">
     <div class="dialog" role="dialog">
       <div class="dtitle">冲突裁决 · {{ ruleName }}</div>
       <p class="dmsg">

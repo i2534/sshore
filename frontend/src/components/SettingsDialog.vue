@@ -34,7 +34,7 @@ watch(
 </script>
 
 <template>
-  <div v-if="visible" class="ui-overlay" @click.self="emit('close')">
+  <div v-if="visible" class="ui-overlay">
     <div class="dialog" role="dialog" aria-label="设置">
       <div class="dhead">
         <div class="dtitle">设置</div>
