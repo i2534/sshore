@@ -45,6 +45,40 @@ func TestSearchTruncatesAndCancels(t *testing.T) {
 	}
 }
 
+// A7: 恰好 Limit 个命中且没有更多命中时，不得误报 truncated。
+func TestSearchExactlyLimitNotTruncated(t *testing.T) {
+	root := t.TempDir()
+	for _, n := range []string{"a.log", "b.log", "c.log"} {
+		if err := os.WriteFile(filepath.Join(root, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hits, _, truncated, err := Search(context.Background(), root, "*.log", SearchOpts{MaxDepth: 0, Limit: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 3 {
+		t.Fatalf("want 3 hits, got %d: %+v", len(hits), hits)
+	}
+	if truncated {
+		t.Fatal("恰好 Limit 个命中、没有更多命中时不得误报 truncated")
+	}
+}
+
+// A7 对照：Limit+1 个命中 → truncated=true 且 hits 长度=Limit（截断语义不变）。
+func TestSearchOverLimitTruncated(t *testing.T) {
+	root := t.TempDir()
+	for _, n := range []string{"a.log", "b.log", "c.log", "d.log"} {
+		if err := os.WriteFile(filepath.Join(root, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hits, _, truncated, err := Search(context.Background(), root, "*.log", SearchOpts{MaxDepth: 0, Limit: 3})
+	if err != nil || !truncated || len(hits) != 3 {
+		t.Fatalf("truncate: hits=%d truncated=%v err=%v", len(hits), truncated, err)
+	}
+}
+
 func TestSearchSkipsSymlinkTargets(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

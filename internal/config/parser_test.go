@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	osuser "os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -63,6 +64,241 @@ Host staging
 	// reflects the global default — that is acceptable; authoritative params come from ssh -G.
 	if prod.HostName != "10.0.0.5" || prod.User != "prod" || prod.Port != 2222 || prod.ProxyJump != "bastion" {
 		t.Fatalf("prod-db fields wrong: %+v", prod)
+	}
+}
+
+// A4: 多别名 Host 行必须为每个非通配符别名各生成一条（原来只取 Patterns[0]，
+// 其余别名静默丢失），值用 cfg.Get(该 alias) 解析。
+func TestEnumerateHostsMultiAliasPatterns(t *testing.T) {
+	path := writeTestSSHConfig(t,
+		"Host web web.example.com 10.0.0.5",
+		"  HostName 10.0.0.5",
+		"  User deploy",
+		"  Port 2222",
+	)
+	got, err := EnumerateHosts(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 aliases, got %d: %+v", len(got), got)
+	}
+	byAlias := map[string]Host{}
+	for _, h := range got {
+		byAlias[h.Alias] = h
+	}
+	for _, alias := range []string{"web", "web.example.com", "10.0.0.5"} {
+		h, ok := byAlias[alias]
+		if !ok {
+			t.Fatalf("alias %q missing: %+v", alias, got)
+		}
+		if h.HostName != "10.0.0.5" || h.User != "deploy" || h.Port != 2222 {
+			t.Fatalf("alias %q fields wrong: %+v", alias, h)
+		}
+	}
+}
+
+// A4 去重：同一 alias 出现在多个 Host 块时只列一次（值取 cfg.Get 的首个匹配）。
+func TestEnumerateHostsDedupAlias(t *testing.T) {
+	path := writeTestSSHConfig(t,
+		"Host dup",
+		"  HostName 10.0.0.1",
+		"Host dup",
+		"  HostName 10.0.0.2",
+	)
+	got, err := EnumerateHosts(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("同 alias 必须去重: want 1, got %d: %+v", len(got), got)
+	}
+	if got[0].Alias != "dup" || got[0].HostName != "10.0.0.1" {
+		t.Fatalf("去重后值应取首个匹配块: %+v", got[0])
+	}
+}
+
+// A4 护栏：遍历全部 pattern 时，通配符与否定 pattern（!x）不得成为别名。
+func TestEnumerateHostsSkipsWildcardAndNegatedPatterns(t *testing.T) {
+	path := writeTestSSHConfig(t,
+		"Host * !bad",
+		"  HostName 10.0.0.9",
+		"Host good !bad",
+		"  HostName 10.0.0.8",
+	)
+	got, err := EnumerateHosts(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].Alias != "good" {
+		t.Fatalf("只应列出 good（* 通配、!bad 否定都跳过）: %+v", got)
+	}
+}
+
+// A3: Include 内嵌主机必须被枚举（库把 Include 解析成私有嵌套 Config，
+// 顶层 cfg.Hosts 看不到）。相对路径按 ssh 规则（~/.ssh）或配置所在目录解析；
+// 字段值优先顶层 cfg.Get，库看不到该文件时用递归 Decode 的 Config 兜底。
+func TestEnumerateHostsFollowsInclude(t *testing.T) {
+	dir := t.TempDir()
+	confDir := filepath.Join(dir, "conf.d")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(dir, "config")
+	if err := os.WriteFile(main, []byte("Host top\n  HostName 10.0.0.1\nInclude conf.d/*\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "a.conf"), []byte("Host inc-web\n  HostName 10.9.0.1\n  User webuser\n  Port 2201\n  ProxyJump bastion\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "b.conf"), []byte("Host inc-db\n  HostName 10.9.0.2\n  User dbuser\n  Port 2202\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := EnumerateHosts(main)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 hosts (top+inc-web+inc-db), got %d: %+v", len(got), got)
+	}
+	byAlias := map[string]Host{}
+	for _, h := range got {
+		byAlias[h.Alias] = h
+	}
+	web, ok := byAlias["inc-web"]
+	if !ok {
+		t.Fatalf("inc-web missing: %+v", got)
+	}
+	if web.HostName != "10.9.0.1" || web.User != "webuser" || web.Port != 2201 || web.ProxyJump != "bastion" {
+		t.Fatalf("inc-web fields wrong: %+v", web)
+	}
+	db, ok := byAlias["inc-db"]
+	if !ok {
+		t.Fatalf("inc-db missing: %+v", got)
+	}
+	if db.HostName != "10.9.0.2" || db.User != "dbuser" || db.Port != 2202 {
+		t.Fatalf("inc-db fields wrong: %+v", db)
+	}
+}
+
+// A3: 一行 Include 多个 glob 都要展开；值优先级仍以顶层 cfg.Get 的首个匹配为准
+// （主配置与 Include 同 alias 时，主配置先出现 ⇒ 取主配置值）。
+func TestEnumerateHostsIncludeMultiGlobAndPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "config")
+	if err := os.WriteFile(main, []byte("Host shared\n  HostName 10.0.0.1\nInclude one.conf two.conf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "one.conf"), []byte("Host shared\n  HostName 10.9.9.9\nHost only-one\n  HostName 10.9.0.1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "two.conf"), []byte("Host only-two\n  HostName 10.9.0.2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := EnumerateHosts(main)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 hosts (shared+only-one+only-two), got %d: %+v", len(got), got)
+	}
+	byAlias := map[string]Host{}
+	for _, h := range got {
+		byAlias[h.Alias] = h
+	}
+	if byAlias["shared"].HostName != "10.0.0.1" {
+		t.Fatalf("顶层 cfg.Get 优先级被破坏: %+v", byAlias["shared"])
+	}
+	if byAlias["only-one"].HostName != "10.9.0.1" || byAlias["only-two"].HostName != "10.9.0.2" {
+		t.Fatalf("多 glob 展开不全: %+v", got)
+	}
+}
+
+// A3: 递归 Include（主→l1→l2…）逐层枚举；深度上限参照库的 5 层，
+// 第 6 层不再展开（防环）。
+func TestEnumerateHostsIncludeRecursionDepthCap(t *testing.T) {
+	dir := t.TempDir()
+	// chain[i] 包含 Host deep<i> 并 Include chain[i+1]；主配置 Include chain1。
+	const levels = 7
+	for i := 1; i <= levels; i++ {
+		body := fmt.Sprintf("Host deep%d\n  HostName 10.7.0.%d\n", i, i)
+		if i < levels {
+			body += fmt.Sprintf("Include chain%d.conf\n", i+1)
+		}
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("chain%d.conf", i)), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	main := filepath.Join(dir, "config")
+	if err := os.WriteFile(main, []byte("Include chain1.conf\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := EnumerateHosts(main)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	byAlias := map[string]Host{}
+	for _, h := range got {
+		byAlias[h.Alias] = h
+	}
+	for i := 1; i <= 5; i++ {
+		if _, ok := byAlias[fmt.Sprintf("deep%d", i)]; !ok {
+			t.Fatalf("deep%d 应在深度上限内被枚举: %+v", i, got)
+		}
+	}
+	for i := 6; i <= levels; i++ {
+		if _, ok := byAlias[fmt.Sprintf("deep%d", i)]; ok {
+			t.Fatalf("deep%d 超出 5 层深度上限，不应被枚举: %+v", i, got)
+		}
+	}
+}
+
+// A3: 循环 Include 不死循环 —— 相对 glob 自包含时靠 visited 去重收敛，
+// 该文件的主机恰好列出一次。
+func TestEnumerateHostsIncludeSelfCycleTerminates(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "loop.conf")
+	if err := os.WriteFile(main, []byte("Host loophost\n  HostName 10.8.0.1\nInclude loop*\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := EnumerateHosts(main)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].Alias != "loophost" || got[0].HostName != "10.8.0.1" {
+		t.Fatalf("自包含循环必须收敛且去重: %+v", got)
+	}
+}
+
+// A3: 绝对路径循环 Include 由库自身的深度守卫报错 —— 必须快速返回错误，
+// 绝不能死循环（本用例在超时内完成即证明收敛）。
+func TestEnumerateHostsIncludeAbsoluteCycleFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	main := filepath.Join(dir, "config")
+	if err := os.WriteFile(main, []byte(fmt.Sprintf("Host cyc\n  HostName 10.8.0.2\nInclude %s\n", main)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := EnumerateHosts(main)
+	if err == nil {
+		t.Fatal("绝对路径自包含循环应触发库的深度守卫错误（而不是死循环或静默）")
+	}
+}
+
+// A3: Include glob 解析规则单元级 —— 绝对路径原样、~/ 展开到用户 home、
+// 相对路径落在给定 base（与库 NewInclude 的 ssh 规则一致）。
+func TestResolveIncludeGlob(t *testing.T) {
+	u, err := osuser.Current()
+	if err != nil {
+		t.Skipf("无法解析当前用户 home: %v", err)
+	}
+	if got := resolveIncludeGlob("~/conf.d/*", "/base"); got != filepath.Join(u.HomeDir, "conf.d", "*") {
+		t.Fatalf("~/ 展开错误: %q", got)
+	}
+	if got := resolveIncludeGlob("/abs/conf.d/*", "/base"); got != "/abs/conf.d/*" {
+		t.Fatalf("绝对路径应原样: %q", got)
+	}
+	if got := resolveIncludeGlob("conf.d/*", "/base"); got != filepath.Join("/base", "conf.d", "*") {
+		t.Fatalf("相对路径应落在 base: %q", got)
 	}
 }
 

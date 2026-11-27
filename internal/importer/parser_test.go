@@ -1,6 +1,9 @@
 package importer
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseLocalMultiple(t *testing.T) {
 	cmd := "ssh -N -L 5432:127.0.0.1:5432 -L 8080:127.0.0.1:80 prod-db"
@@ -128,6 +131,42 @@ func TestParseSetsAutoReconnectDefault(t *testing.T) {
 	}
 	if len(tunnels) != 1 || !tunnels[0].AutoReconnect {
 		t.Fatalf("imported tunnel must default AutoReconnect=true, got %+v", tunnels)
+	}
+}
+
+// A2: shell 粘贴常见的**单引号** spec 也必须剥掉一层引号（原来只剥双引号，
+// 单引号会留在 token 里导致 Atoi 失败 → 端口静默变 0）。
+func TestParseSingleQuotedSpecToken(t *testing.T) {
+	tunnels, err := Parse(`ssh -L '8080:localhost:80' host`)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(tunnels) != 1 {
+		t.Fatalf("want 1 tunnel got %d: %+v", len(tunnels), tunnels)
+	}
+	t0 := tunnels[0]
+	if t0.Mode != "local" || t0.ListenPort != 8080 || t0.TargetHost != "localhost" || t0.TargetPort != 80 || t0.Host != "host" {
+		t.Fatalf("tunnel wrong: %+v", t0)
+	}
+}
+
+// A2: 端口 Atoi 失败必须返回含非法 token 的明确错误，绝不 `_` 吞错静默产出端口 0。
+func TestParseInvalidPortReturnsError(t *testing.T) {
+	cases := []struct{ cmd, token string }{
+		{`ssh -L abc:localhost:80 host`, "abc"},
+		{`ssh -L 8080:localhost:def host`, "def"},
+		{`ssh -L 127.0.0.1:abc:localhost:80 host`, "abc"},
+		{`ssh -L 8080:localhost:80 -p xyz host`, "xyz"},
+		{`ssh -D notaport host`, "notaport"},
+	}
+	for _, c := range cases {
+		_, err := Parse(c.cmd)
+		if err == nil {
+			t.Fatalf("Parse(%q) 对非法端口 %q 必须返回错误", c.cmd, c.token)
+		}
+		if !strings.Contains(err.Error(), c.token) {
+			t.Fatalf("Parse(%q) 错误必须含非法 token %q，得到: %v", c.cmd, c.token, err)
+		}
 	}
 }
 

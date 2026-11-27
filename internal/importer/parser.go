@@ -73,13 +73,29 @@ func Parse(command string) ([]config.Tunnel, error) {
 	return buildTunnels(argv, host, hostUser)
 }
 
-// unquote strips ONE pair of surrounding double quotes from a shell-pasted
-// token, e.g. `"8080:localhost:80"` from `ssh -L "8080:localhost:80" host`.
+// unquote strips ONE pair of surrounding double OR single quotes from a
+// shell-pasted token, e.g. `"8080:localhost:80"` / `'8080:localhost:80'`
+// from `ssh -L "8080:localhost:80" host`（A2：单引号同样常见，原来只剥双引号）。
 func unquote(tok string) string {
-	if len(tok) >= 2 && tok[0] == '"' && tok[len(tok)-1] == '"' {
-		return tok[1 : len(tok)-1]
+	if len(tok) >= 2 {
+		if tok[0] == '"' && tok[len(tok)-1] == '"' {
+			return tok[1 : len(tok)-1]
+		}
+		if tok[0] == '\'' && tok[len(tok)-1] == '\'' {
+			return tok[1 : len(tok)-1]
+		}
 	}
 	return tok
+}
+
+// parsePort 解析端口 token；失败返回含非法 token 的明确错误
+// （A2：绝不 `_` 吞错静默产出端口 0 —— 那会让坏规则落盘后连接即失败）。
+func parsePort(tok string) (int, error) {
+	p, err := strconv.Atoi(tok)
+	if err != nil {
+		return 0, fmt.Errorf("invalid port %q", tok)
+	}
+	return p, nil
 }
 
 // splitSpec splits a forward spec on colons that are outside square brackets,
@@ -119,7 +135,11 @@ func buildTunnels(argv []string, host, hostUser string) ([]config.Tunnel, error)
 			}
 		case "-p":
 			if i+1 < len(argv) {
-				port, _ = strconv.Atoi(argv[i+1])
+				p, err := parsePort(argv[i+1])
+				if err != nil {
+					return nil, err
+				}
+				port = p
 			}
 		case "-l":
 			if i+1 < len(argv) {
@@ -166,23 +186,47 @@ func makeTunnel(flag, spec, host, jump, user string, port int) (config.Tunnel, e
 	parts := splitSpec(spec)
 	if mode == "dynamic" {
 		if len(parts) == 1 {
-			t.ListenPort, _ = strconv.Atoi(parts[0])
+			p, err := parsePort(parts[0])
+			if err != nil {
+				return t, err
+			}
+			t.ListenPort = p
 		} else {
 			t.ListenBind = parts[0]
-			t.ListenPort, _ = strconv.Atoi(parts[1])
+			p, err := parsePort(parts[1])
+			if err != nil {
+				return t, err
+			}
+			t.ListenPort = p
 		}
 		return t, nil
 	}
 	switch len(parts) {
 	case 3: // port:host:port
-		t.ListenPort, _ = strconv.Atoi(parts[0])
+		lp, err := parsePort(parts[0])
+		if err != nil {
+			return t, err
+		}
+		t.ListenPort = lp
 		t.TargetHost = parts[1]
-		t.TargetPort, _ = strconv.Atoi(parts[2])
+		tp, err := parsePort(parts[2])
+		if err != nil {
+			return t, err
+		}
+		t.TargetPort = tp
 	case 4: // bind:port:host:port
 		t.ListenBind = parts[0]
-		t.ListenPort, _ = strconv.Atoi(parts[1])
+		lp, err := parsePort(parts[1])
+		if err != nil {
+			return t, err
+		}
+		t.ListenPort = lp
 		t.TargetHost = parts[2]
-		t.TargetPort, _ = strconv.Atoi(parts[3])
+		tp, err := parsePort(parts[3])
+		if err != nil {
+			return t, err
+		}
+		t.TargetPort = tp
 	default:
 		return t, fmt.Errorf("malformed %s spec %q", mode, spec)
 	}

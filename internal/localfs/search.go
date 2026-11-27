@@ -54,16 +54,14 @@ func Search(ctx context.Context, root, pattern string, o SearchOpts) ([]Hit, int
 		depth := strings.Count(rel, "/")
 		// add 统一"先判上限再放行"，避免目录分支与文件分支的截断口径不一致
 		// （目录分支原来会把命中推到 limit+1）。返回 false ⇒ 已达上限，调用方 SkipAll。
+		// A7: truncated 只在**试图添加第 Limit+1 条**时置位 —— 恰好 Limit 个命中
+		// 且没有更多命中时不得误报（原来 append 后的后置置位会误报）。
 		add := func(h Hit) bool {
 			if len(hits) >= o.Limit {
 				truncated = true
 				return false
 			}
 			hits = append(hits, h)
-			if len(hits) >= o.Limit {
-				truncated = true
-				return false
-			}
 			return true
 		}
 		if d.IsDir() {
