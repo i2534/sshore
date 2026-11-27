@@ -47,6 +47,9 @@ export function cjkStack(value) { return stackFor(CJK_FONTS, value) }
 
 // —— system 主题检测（模块级缓存，避免把 MediaQueryList 塞进响应式 store） ----
 let mediaQuery = null
+// 监听是否已注册必须用独立标志：load() 先 apply()，resolveTheme('system') 经 getMedia()
+// 已把 mediaQuery 赋值，拿缓存当"已注册"会让 change 监听永不挂上（V1）。
+let systemListenerRegistered = false
 
 function getMedia() {
   if (!window.matchMedia) return null
@@ -136,10 +139,11 @@ export const useSettingsStore = defineStore('settings', {
     },
     // 仅在 theme 为 system 时关注系统深浅色变化（监听器幂等注册一次）
     ensureSystemListener() {
-      if (mediaQuery) return
+      // 幂等判据用独立标志，绝不能用 mediaQuery 缓存：apply() 已先把它赋值（V1）。
+      if (systemListenerRegistered) return
       const m = getMedia()
       if (!m) return
-      mediaQuery = m
+      systemListenerRegistered = true
       m.addEventListener('change', () => {
         if (this.theme === 'system') this.apply()
       })

@@ -180,7 +180,9 @@ async function cleanItem(rec) {
   if (!rec || !rec.partPath) return
   try {
     if (rec.direction === 'download') await DeleteLocal(rec.partPath)
-    else await SftpRemove(host.value, '', rec.partPath)
+    // V7：partPath 属于发起上传那台主机（rec.host），绝不能用当前 host.value —— 切主机后会删错机器。
+    // 旧记录无 host 字段时兜底当前主机，保持现状语义。
+    else await SftpRemove(rec.host || host.value, '', rec.partPath)
     rec.partPath = ''
     logStore.add({ source_id: 'sftp', source_type: 'sftp', level: 'info', ts: new Date().toISOString(), message: '已清理临时文件 ' + rec.src })
   } catch (e) {
@@ -390,6 +392,11 @@ function onHostChange() {
   connected.value = false
   remoteItems.value = []
   sel.clear(remoteSelection)
+  // V6：pendingPath/pendingHome 是属于**旧主机**的落点意图，切主机即作废。
+  // 不清的话残留会被下一次 connect 消费，带着旧主机的目标路径连新主机
+  // （connect 的主机守卫在消费 pending 之后，挡不住这种泄漏）。
+  pendingPath.value = ''
+  pendingHome.value = false
 }
 
 async function connect() {
@@ -652,10 +659,14 @@ function posixParentOf(p) {
 // 空白右键不清空已有选中（spec §5.3 / 验收 B1），刷新也不改选中（§5.1）。
 function showMenu(pane, { item, event }) {
   const rect = window.innerWidth
+  // V8：Y 也要夹取，否则底部右键溢出视口。菜单高度不定，按最多 6 行（远程文件行：
+  // 下载/上传/复制/重命名/删除/刷新）× 约 32px 行高（button padding 6px×2 + 文本约 20px）
+  // 加菜单内边距/边框，保守取 240px 当高度上限 —— 与 X 的 180px（min-width 160 + 余量）同风格。
+  const menuH = 240
   menu.value = {
     visible: true,
     x: Math.min(event.clientX, rect - 180),
-    y: event.clientY,
+    y: Math.min(event.clientY, window.innerHeight - menuH),
     pane,
     item,
   }
@@ -786,6 +797,9 @@ async function runBatch({ direction, names, sourceDir, targetDir, sourceItems, s
   const batch = run.map((t, n) => ({
     id: transferID(seq, n), direction, name: t.name, src: t.src, dst: t.dst,
     size: 0, status: '处理中', startedAt: Date.now(), partPath: '', resume: false, isDir: !!t.isDir, pending: true,
+    // V7：记下本批发起时的主机。上传项的 partPath 属于这台主机，切主机后清理仍须删它；
+    // 下载项清理走本地 DeleteLocal，host 字段对其无副作用。
+    host: host.value,
   }))
   for (const rec of batch) transfers.value.push(rec)
   for (const rec of batch) {
@@ -902,6 +916,9 @@ async function removeSelected(pane) {
   const ok = await openConfirm('确认删除', msg)
   if (!ok) return
   const base = pane === 'local' ? (localPath.value || '/') : remotePath.value
+  // V4：本批实际删成功的名字在循环里当场收集，绝不事后扫整条历史队列按名字猜 ——
+  // 早前它处同名失败记录会把本次成功删除也牵连进"失败"，让选中集残留幽灵项。
+  const removed = []
   for (const n of names) {
     const full = pane === 'local' ? localJoin(base, n) : posixJoin(base, n)
     const rec = { direction: pane === 'local' ? 'move' : 'download', name: n, src: full, dst: '', size: 0, status: '处理中', startedAt: Date.now() }
@@ -910,6 +927,7 @@ async function removeSelected(pane) {
       if (pane === 'local') await DeleteLocal(full)
       else await SftpRemoveRecursive(host.value, '', full)
       rec.status = '完成'
+      removed.push(n) // 本项本批确实删成功 ⇒ 移出选中集
     } catch (e) {
       rec.status = '失败'
       rec.reason = String((e && e.message) || e)
@@ -922,7 +940,7 @@ async function removeSelected(pane) {
   }
   await (pane === 'local' ? loadLocal() : loadRemote())
   // 只把成功删掉的项移出选中集合：失败项还留在原地，保持选中便于重试（spec §6.4）。
-  const removed = names.filter((n) => !transfers.value.some((t) => t.name === n && t.status === '失败'))
+  // removed 已在删除循环里按本批真实结果收集（V4），不再按名字扫全队列。
   sel.remove(s, removed)
 }
 
@@ -981,7 +999,8 @@ async function uploadPicked() {
     const name = local.split(/[\\/]/).pop()
     // 单文件手势同样要有 id（绑定首参是 id）：复用 dispatchTransfer，才能同时拿到
     // 进度订阅、取消返回值的终态判定与失败后的重试/续传/清理锚点。
-    t = { id: transferID(nextTransferSeq(), 0), direction: 'upload', name, src: local, dst: posixJoin(remotePath.value, name), size: 0, status: '处理中', startedAt: Date.now(), partPath: '', resume: false, isDir: false }
+    // V7：入队即记下发起上传的主机 —— partPath 属于这台主机，切主机后清理仍须删它（cleanItem 用 rec.host）。
+    t = { id: transferID(nextTransferSeq(), 0), direction: 'upload', name, src: local, dst: posixJoin(remotePath.value, name), size: 0, status: '处理中', startedAt: Date.now(), partPath: '', resume: false, isDir: false, host: host.value }
     try { t.size = await StatLocal(local) } catch (e) { t.size = 0 }
     transfers.value.push(t)
     await dispatchTransfer(t)
@@ -1241,7 +1260,10 @@ async function handleSystemDrop(pane, paths) {
 
 onMounted(async () => {
   await loadHosts()
-  await locations.load() // 书签与双侧最近位置（T6 store），供两个面板头的位置下拉使用
+  // V2：locations.load() 失败不得中断后续恢复（与下面 sftpui.load 同款兜底）：ListLocations reject
+  // 时裸 await 会让 sftpui.load / 本地恢复 / loadLocal 全不执行，本地面板直接空着、用户以为坏了。
+  // 失败只记日志，继续往下走。书签与双侧最近位置（T6 store）供两个面板头的位置下拉使用。
+  try { await locations.load() } catch (e) { err(e) }
   // presets.toml 坏掉时只发一次 startup 事件可能早于前端订阅而丢失，所以由这里补一次用户可见提示
   if (locations.presetsError) err('预设文件解析失败：' + locations.presetsError)
   // B3/B4 顺序是硬约束，且这里的 load() 失败必须被吞掉（审核 F8）：裸 await 会让下面

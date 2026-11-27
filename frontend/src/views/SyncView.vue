@@ -49,6 +49,9 @@ const form = ref(newSyncRuleForm())
 const conflictsVisible = ref(false)
 const conflictsFor = ref({ id: '', name: '' })
 const conflicts = ref([])
+// V5：冲突列表请求序号（同 SftpView remoteSeq/localSeq 写法）。每次 openConflicts 自增，
+// 过期响应直接丢弃 —— 否则 A 的响应晚于 B 返回时会覆盖 B 的列表，而标题仍是 B，裁决发到错误规则。
+let conflictsSeq = 0
 // FIX 1：裁决失败的原因必须显示在对话框内部（左侧 opError 被遮罩挡住），
 // 且批量在途时要防重复触发。
 const conflictsError = ref('')
@@ -123,11 +126,14 @@ function toggleLog(rule) {
 async function openConflicts(rule) {
   opError.value = ''
   conflictsError.value = '' // FIX 1b：打开对话框时清空上一次的错误
+  const seq = ++conflictsSeq // V5：本次请求序号，await 期间若又打开别的规则则作废
   try {
     conflictsFor.value = { id: rule.id, name: ruleLabel(rule) } // S6：与卡片同一回退顺序
-    conflicts.value = (await SyncRuleConflicts(rule.id)) || []
+    const list = (await SyncRuleConflicts(rule.id)) || []
+    if (seq !== conflictsSeq) return // 过期响应丢弃：期间已打开更新的规则，不得覆盖其列表/标题
+    conflicts.value = list
     conflictsVisible.value = true
-  } catch (e) { opError.value = String(e) }
+  } catch (e) { if (seq === conflictsSeq) opError.value = String(e) }
 }
 
 // FIX 1c：无论裁决成功还是抛错（例如并发对账已把该路径解掉），末尾都要重取冲突列表，

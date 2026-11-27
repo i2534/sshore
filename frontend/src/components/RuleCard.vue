@@ -29,8 +29,10 @@ async function toggle() {
   } catch (e) {
     // 启停失败不再冒泡到全局 fatal 横幅：写入日志面板（转发视图可见），
     // 并照常刷新列表以同步后端真实状态。
+    // V3（同 SyncCard S7）：source_id 必须是规则 id —— 「日志」按钮按 tunnel.id 过滤，
+    // 写成恒定的 'rule' 会让恰好这些错误被 LogPanel 精确匹配过滤掉、永远看不见。
     logStore.add({
-      source_id: 'rule',
+      source_id: props.tunnel.id,
       source_type: 'tunnel',
       level: 'error',
       message: `${props.tunnel.name || props.tunnel.host}: ${String(e)}`,

@@ -227,3 +227,40 @@ describe('settings store 更新字段（Task 15）', () => {
     expect(s.updateSource).toBe('')
   })
 })
+
+// V1：system 主题监听器永不注册。load() 先 apply()，resolveTheme('system') 经 getMedia()
+// 已把模块级 mediaQuery 赋值；ensureSystemListener() 第一行 `if (mediaQuery) return` 把"已缓存"
+// 误当"已注册"，change 监听从未挂上。既有测试用 matchMedia:()=>null 桩绕过了这条路径，
+// 所以这里必须给一个**真实形状**的 MediaQueryList（含 addEventListener）才能复现。
+// 本用例放在文件末尾：此前所有用例的 matchMedia 桩都返回 null，getMedia() 不会缓存
+// mediaQuery（恒 null），所以这里开始时模块级缓存必为 null，能真实走到注册路径。
+describe('settings store system 主题监听（V1）', () => {
+  it('load() 后 change 监听已注册；系统切浅色时 system 主题重新 apply；重复 load 不重复注册', async () => {
+    const calls = []
+    const attrs = []
+    // 真实形状的 MediaQueryList：matches 可改，addEventListener 记录调用以便手动触发 change
+    const mql = { matches: false, addEventListener: (type, fn) => calls.push({ type, fn }) }
+    globalThis.window = { matchMedia: () => mql }
+    globalThis.document = { documentElement: { setAttribute: (k, v) => attrs.push([k, v]), style: { setProperty() {} } } }
+    setActivePinia(createPinia())
+    const s = useSettingsStore()
+    backend.settings = {} // 出厂默认 theme=system
+
+    await s.load()
+    // 监听必须真的挂上（修复前恒 0：mediaQuery 已被 apply 缓存，ensure 直接 return）
+    expect(calls.length).toBe(1)
+    expect(calls[0].type).toBe('change')
+    // 初始 system + matches=false ⇒ dark
+    expect(attrs.at(-1)).toEqual(['data-theme', 'dark'])
+
+    // 系统切到浅色：触发 change，theme 仍是 system ⇒ 必须重新 apply 成 light
+    mql.matches = true
+    calls[0].fn()
+    expect(attrs.at(-1)).toEqual(['data-theme', 'light'])
+
+    // 重复 load 不得重复注册（幂等）
+    await s.load()
+    await s.load()
+    expect(calls.length).toBe(1)
+  })
+})
