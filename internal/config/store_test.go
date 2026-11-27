@@ -548,7 +548,7 @@ func TestSftpUITOMLRoundTrip(t *testing.T) {
 	want := SftpUIState{
 		LastLocalDir: `D:\工作\虚拟 共享`,
 		LastRemoteDirs: map[string]string{
-			"192.0.2.10":   "/var/log/nginx",
+			"192.0.2.10":     "/var/log/nginx",
 			"prod db":        "/srv/app",
 			"中文主机":           "/data/中文 目录",
 			`quote"host`:     "/tmp/q",
