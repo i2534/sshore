@@ -197,33 +197,30 @@ func (s *Service) resolveSource() (string, string) {
 
 // Check 执行一次检查；manual=false 时受门卫与轮询约束。
 func (s *Service) Check(ctx context.Context, manual bool) (UpdateInfo, error) {
+	// Config/resolveSource 只读注入依赖（生产 Config 走独立的配置锁，不重入
+	// s.mu），放在临界区外读取；守卫判断与置位则必须在同一临界区完成（I-1 同形）。
+	cfg := s.opts.Config()
+	src, warn := s.resolveSource()
+
 	s.mu.Lock()
 	switch s.info.State {
 	case StateDownloading, StateReady, StateApplying:
+		state := s.info.State
 		s.mu.Unlock()
-		return s.Info(), fmt.Errorf("%w: 当前状态 %s", ErrBusy, s.Info().State)
+		return s.Info(), fmt.Errorf("%w: 当前状态 %s", ErrBusy, state)
 	case StateChecking:
 		s.mu.Unlock()
 		return s.Info(), nil
 	}
-	s.mu.Unlock()
-
-	cfg := s.opts.Config()
 	if !manual && (!cfg.Auto || !IsRelease(s.opts.Version)) {
-		s.log("未自动检查更新（非 release 构建或已关闭自动检查）")
-		s.mu.Lock()
 		s.info.Manual = false
 		s.setLocked(StateDisabled, "")
 		s.mu.Unlock()
+		s.log("未自动检查更新（非 release 构建或已关闭自动检查）")
 		return s.Info(), nil
 	}
-	src, warn := s.resolveSource()
-	if warn != "" {
-		// spec §6/§10.2：回退默认源也要写一行日志
-		s.log(warn)
-	}
-
-	s.mu.Lock()
+	// 守卫与置位同一临界区：否则两个并发 Check 都会通过上面的状态检查、
+	// 各发一次请求，旧响应还会覆盖新状态（F4）。
 	s.info.Manual = manual
 	s.info.Source = src
 	if warn != "" {
@@ -231,6 +228,10 @@ func (s *Service) Check(ctx context.Context, manual bool) (UpdateInfo, error) {
 	}
 	s.setLocked(StateChecking, warn)
 	s.mu.Unlock()
+	if warn != "" {
+		// spec §6/§10.2：回退默认源也要写一行日志
+		s.log(warn)
+	}
 
 	// 检查请求总超时 10s（spec §7.2.2）
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -284,7 +285,12 @@ func (s *Service) Check(ctx context.Context, manual bool) (UpdateInfo, error) {
 		return s.Info(), nil
 	}
 
-	if IsRelease(s.opts.Version) && Compare(rel.Tag, s.opts.Version) <= 0 {
+	// up-to-date 口径与 ApplyAndRestart 对齐（F5）：describe 构建按其剥后缀的
+	// semver 基线参与 Compare（Compare 内部已剥 -N-g<hash> 后缀）。否则
+	// v0.7.0-5-gabc 遇到最新 tag v0.7.0 会判 available，下载成功后 Apply
+	// 永远 verify-failed——推送一个永远装不上的“新版本”。
+	// dev/未知版本不参与版本序比较（与 Apply 的 KindDev 分支一致），保持 available。
+	if cur := Class(s.opts.Version); (cur == KindClean || cur == KindDescribe) && Compare(rel.Tag, s.opts.Version) <= 0 {
 		s.mu.Lock()
 		s.info.Latest = rel.Tag
 		s.setLocked(StateUpToDate, "")
@@ -722,7 +728,11 @@ func (s *Service) DiscardPending() error {
 	s.pending = Plan{}
 	s.info.ReadyPath = ""
 	s.info.Progress = 0
-	if s.info.Latest != "" {
+	// available 必须以「手里有可下载的 Release」为前提（F6）：重启自检恢复的
+	// ready 只填 Latest/ReadyPath，rel 是零值——丢弃后置 available 会让下一次
+	// 下载拿零值 rel 报 ErrNoAsset「本平台暂无可用包」（误导文案的死胡同）。
+	// rel 缺失时回 idle，前端 idle 态提供「立即检查更新」重新取回 Release。
+	if s.info.Latest != "" && s.rel.Tag != "" {
 		s.setLocked(StateAvailable, "")
 	} else {
 		s.setLocked(StateIdle, "")

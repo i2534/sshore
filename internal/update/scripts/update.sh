@@ -66,7 +66,10 @@ actual=$(wc -c < "$PENDING")
 [ "$actual" = "$SIZE" ] || fail 3 "pending 大小不符：$actual != $SIZE"
 
 # 4) 清理更早备份（只留最近一份；绝不删 pending、sidecar、脚本、日志）
-for f in "$DIR"/sshore.v* "$DIR"/sshore.dev-*; do
+# 版本串以数字或 v 开头（cleanRe 允许无 v 前缀的 tag，如 0.6.0）：
+# sshore.[0-9]* 覆盖无 v 备份；不匹配正式二进制 sshore 本身（需 .数字），
+# pending/sidecar/脚本/日志由下面的 PB/BB 与 case 排除保住。
+for f in "$DIR"/sshore.v* "$DIR"/sshore.dev-* "$DIR"/sshore.[0-9]*; do
   [ -e "$f" ] || continue
   b=$(basename "$f")
   [ "$b" = "$PB" ] && continue

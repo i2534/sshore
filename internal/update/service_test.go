@@ -327,6 +327,10 @@ func TestDiscardPendingKeepsExclusiveLockFile(t *testing.T) {
 
 	svc, _ := newSvc(t, "v0.6.0", func(o *Options) { o.ExePath = exe })
 	svc.mu.Lock()
+	// F6 夹具补全：本用例模拟「正常下载后丢弃」，该路径 rel 必然已填充；
+	// 旧夹具漏填 rel（零值），在 F6 修复后属于「重启恢复后丢弃」语义（回 idle）。
+	// 补上 rel 以保持本用例原有的 available 断言不变。
+	svc.rel = Release{Tag: "v0.7.0"}
 	svc.info.State = StateReady
 	svc.info.Latest = "v0.7.0"
 	svc.pending = plan

@@ -119,7 +119,13 @@ func unsafeEntry(name string) bool {
 // isTargetLink 判断 tar 的链接类条目是否指向目标二进制。
 // 策略：只有「目标二进制名」的 symlink/hardlink 才整档拒绝，无关链接条目一律跳过。
 // hardlink 是 tar.TypeLink：它的条目名可能无关，但 Linkname 指向目标名时同样算目标条目。
+// 只对链接类型生效（F7）：名为 sshore 的目录（TypeDir）归一后 basename 也等于
+// 目标名，但它不是链接——必须跳过（与 extractZip 对目录 continue 对齐），
+// 否则「二进制放在 sshore/ 目录里」的合法归档会被整档拒绝。
 func isTargetLink(hdr *tar.Header, goos string) bool {
+	if hdr.Typeflag != tar.TypeSymlink && hdr.Typeflag != tar.TypeLink {
+		return false
+	}
 	if cleanEntry(hdr.Name) == wantName(goos) {
 		return true
 	}

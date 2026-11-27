@@ -20,7 +20,8 @@ import (
 //  1. 环境变量 SSHORE_SSH_PATH / SSHORE_SFTP_PATH —— 覆盖一切，给人/测试用；
 //  2. exec.LookPath(<name>) —— amd64 与 Linux 都命中这条，行为与今天逐字节相同；
 //  3. 仅 Windows 的回退：%SystemRoot%\Sysnative\OpenSSH → %SystemRoot%\System32\OpenSSH
-//     → %ProgramFiles%\OpenSSH（**Sysnative 必须排在 System32 之前**，见上）；
+//     → %ProgramW6432%\OpenSSH（缺失回退 %ProgramFiles%；32 位进程里后者被 WOW64 改写为 x86 目录）
+//     （**Sysnative 必须排在 System32 之前**，见上）；
 //  4. 兜底返回裸名 <name> —— 等价于今天的行为，不会更差。
 //
 // 非 Windows 只走 1→2→4。
@@ -89,7 +90,14 @@ func windowsOpenSSHDirs() []string {
 		filepath.Join(root, "Sysnative", "OpenSSH"),
 		filepath.Join(root, "System32", "OpenSSH"),
 	}
-	if pf := strings.TrimSpace(getenv("ProgramFiles")); pf != "" {
+	// 32 位（windows/386）进程里 WOW64 把 ProgramFiles 改写为
+	// C:\Program Files (x86)；64 位 Program Files 目录要读 ProgramW6432。
+	// 优先 ProgramW6432，缺失再回退 ProgramFiles（amd64 进程两者同值，行为不变）。
+	pf := strings.TrimSpace(getenv("ProgramW6432"))
+	if pf == "" {
+		pf = strings.TrimSpace(getenv("ProgramFiles"))
+	}
+	if pf != "" {
 		dirs = append(dirs, filepath.Join(pf, "OpenSSH"))
 	}
 	return dirs

@@ -64,7 +64,13 @@ func BuildArgs(t config.Tunnel) []string {
 	if t.User != "" {
 		args = append(args, "-l", t.User)
 	}
-	fwd := fmt.Sprintf("%s:%d", t.ListenBind, t.ListenPort)
+	// IPv6 字面量 bind 按 ssh 语法加方括号（含 ':' 即视为 IPv6 字面量；
+	// 已带括号的输入不重复包裹）。IPv4/空 bind 行为逐字不变。
+	bind := t.ListenBind
+	if strings.Contains(bind, ":") && !strings.HasPrefix(bind, "[") {
+		bind = "[" + bind + "]"
+	}
+	fwd := fmt.Sprintf("%s:%d", bind, t.ListenPort)
 	switch t.Mode {
 	case "dynamic":
 		args = append(args, "-D", fwd)
@@ -215,13 +221,30 @@ func (c *Ctrl) Start(t config.Tunnel) error {
 		return fmt.Errorf("%s: %s", t.Name, msg)
 	}
 
-	// 原地升级到 connected：身份不变，watchExit 持有同一指针。
-	entry.mu.Lock()
-	entry.args = BuildArgs(t)
-	entry.proc = proc
-	entry.state = StateConnected
-	entry.lastStableAt = time.Now()
-	entry.mu.Unlock()
+	// ── post-spawn 终检闸门（与 respawnLoop 同形，spec §3.5）──
+	// trySpawn 期间 c.mu 已释放：用户可能 Stop（proc==nil 无可杀，只关 cancel
+	// 置 stopped）或 OnShutdown 接管，外部 Start 也可能替换条目。必须核对
+	// 条目身份 + cancel 未关且仍 connecting 才升级 connected；否则 Kill 刚
+	// spawn 的进程，绝不让已停止的隧道复活/留下不可停止的孤儿。
+	adopted := false
+	c.mu.Lock()
+	if cur, _ := c.procs[t.ID]; cur == entry {
+		entry.mu.Lock()
+		if entry.cancel != nil && entry.state == StateConnecting {
+			entry.args = BuildArgs(t)
+			entry.proc = proc
+			entry.state = StateConnected
+			entry.lastStableAt = time.Now()
+			adopted = true
+		}
+		entry.mu.Unlock()
+	}
+	c.mu.Unlock()
+	if !adopted {
+		_ = proc.Kill()
+		// 用户已停止（Stop/OnShutdown 均返回 nil）：保持「已停止」语义，不报错。
+		return nil
+	}
 	c.emitEvent(t.ID, "info", "connected")
 	go c.watchExit(t.ID, entry, proc)
 	return nil
