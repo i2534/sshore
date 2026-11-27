@@ -675,6 +675,7 @@ func (c *Ctrl) align(r *ruleRuntime) {
 	}
 	r.mu.Lock()
 	r.stats.AlignTotal = len(snap.Entries)
+	r.stats.AlignScanned = 0 // 每轮重置：否则第二轮起 scanned>total，前端对齐进度永不显示
 	r.mu.Unlock()
 	var dels []string
 	var changed []string
@@ -746,8 +747,21 @@ func (c *Ctrl) alignFile(r *ruleRuntime) {
 	r.mu.Lock()
 	r.stats.SourceMissing = false
 	r.mu.Unlock()
-	c.applyOne(r, path.Base(r.rule.RemotePath), watch.KindWrite,
-		&Entry{RemoteSize: items[0].Size, RemoteMTime: items[0].ModTime})
+	rel := path.Base(r.rule.RemotePath)
+	meta := &Entry{RemoteSize: items[0].Size, RemoteMTime: items[0].ModTime}
+	// 与 dir align 对齐：只在条目缺失或远端真的变了时才处理。Decide 的
+	// "有基线且本地未改"分支恒返回 GET，无条件 applyOne 会让远端没变的文件
+	// 每轮对账都被重下载（本地改过则刷假冲突）。单文件没有 snap.Entries 预登记，
+	// diff 依据就是 d.Entries[rel] 与本轮取回的远端元信息。
+	changed := true
+	r.state.With(func(d *StateFile) {
+		if ent := d.Entries[rel]; ent != nil && ent.RemoteSize == meta.RemoteSize && ent.RemoteMTime == meta.RemoteMTime {
+			changed = false
+		}
+	})
+	if changed {
+		c.applyOne(r, rel, watch.KindWrite, meta)
+	}
 }
 
 // applyOne 走决策表并执行动作。全程在规则 goroutine 内 ⇒ 传输天然串行。
@@ -874,6 +888,11 @@ func (c *Ctrl) applyAction(r *ruleRuntime, rel string, kind watch.Kind, remote *
 				d.Entries[rel] = e
 			}
 			e.LocalSize, e.LocalMTime, e.HasLocal, e.Adopted = st.Size, st.ModTime, st.Exists, true
+			if ent != nil {
+				// 与 Get 分支对齐：本轮取回的远端元信息必须一并登记，否则下一次
+				// 对账看到 Remote*=0 会判成"远端变化"，再下载一次（本地改过则假冲突）。
+				e.RemoteSize, e.RemoteMTime = ent.RemoteSize, ent.RemoteMTime
+			}
 		})
 		c.emit(r.rule.ID, "info", rel+" 本地已存在且大小一致，未下载（未校验内容）")
 	case ActionConflict:
