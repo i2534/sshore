@@ -7,6 +7,7 @@ import (
 	"os"
 	osuser "os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -294,7 +295,13 @@ func TestResolveIncludeGlob(t *testing.T) {
 	if got := resolveIncludeGlob("~/conf.d/*", "/base"); got != filepath.Join(u.HomeDir, "conf.d", "*") {
 		t.Fatalf("~/ 展开错误: %q", got)
 	}
-	if got := resolveIncludeGlob("/abs/conf.d/*", "/base"); got != "/abs/conf.d/*" {
+	// 绝对路径必须用**本平台原生**形式：Windows 的 filepath.IsAbs 不认 POSIX 的 /abs
+	// （无盘符/UNC 前缀），拿 POSIX 绝对路径在 Windows 上断言"原样"是测试不可移植。
+	absIn, absWant := "/abs/conf.d/*", "/abs/conf.d/*"
+	if runtime.GOOS == "windows" {
+		absIn, absWant = `C:\abs\conf.d\*`, `C:\abs\conf.d\*`
+	}
+	if got := resolveIncludeGlob(absIn, "/base"); got != absWant {
 		t.Fatalf("绝对路径应原样: %q", got)
 	}
 	if got := resolveIncludeGlob("conf.d/*", "/base"); got != filepath.Join("/base", "conf.d", "*") {

@@ -3,9 +3,20 @@ package sftp
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// skipOnWindowsHost：以下 GetTree 用例的夹具需要在**本地**文件系统创建含反斜杠/..
+// 的 POSIX 文件名（模拟远端），Windows 本地文件系统造不出这种名字。Windows 语义已由
+// TestValidateRemoteRel* 纯函数用例（goos 注入）与 2026-11-27 真机验收覆盖。
+func skipOnWindowsHost(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("夹具需 POSIX 文件名（含 \\），Windows 本地无法创建；Windows 语义见 validateRemoteRel 单测与真机验收")
+	}
+}
 
 // —— S2：GetTree 下载到 Windows 时的路径穿越守卫 ——
 //
@@ -56,6 +67,7 @@ func TestValidateRemoteRelNormalTree(t *testing.T) {
 // TestGetTreeRejectsWindowsPathTraversal：goos=windows 时，远端单个文件名叫 `..\..\evil`
 // 必须让整项 GetTree 失败（fail-fast），错误指明问题文件名，且绝不写到目标目录之外。
 func TestGetTreeRejectsWindowsPathTraversal(t *testing.T) {
+	skipOnWindowsHost(t)
 	remoteRoot, dst := t.TempDir(), t.TempDir()
 	srcDir := filepath.Join(remoteRoot, "src")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
@@ -86,6 +98,7 @@ func TestGetTreeRejectsWindowsPathTraversal(t *testing.T) {
 
 // TestGetTreeRejectsWindowsBackslashSubdir：危险名出现在**子目录**上同样必须被拒（subdirs 也要校验）。
 func TestGetTreeRejectsWindowsBackslashSubdir(t *testing.T) {
+	skipOnWindowsHost(t)
 	remoteRoot, dst := t.TempDir(), t.TempDir()
 	// 远端子目录名含反斜杠（POSIX 合法）：src/a\b/inner.txt
 	badDir := filepath.Join(remoteRoot, "src", `a\b`)
@@ -112,6 +125,7 @@ func TestGetTreeRejectsWindowsBackslashSubdir(t *testing.T) {
 
 // TestGetTreeLinuxAllowsBackslashNames：goos=linux 时含反斜杠的合法名正常下载（回归守卫）。
 func TestGetTreeLinuxAllowsBackslashNames(t *testing.T) {
+	skipOnWindowsHost(t)
 	remoteRoot, dst := t.TempDir(), t.TempDir()
 	srcDir := filepath.Join(remoteRoot, "src")
 	if err := os.MkdirAll(srcDir, 0o755); err != nil {
