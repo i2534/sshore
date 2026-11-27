@@ -35,7 +35,7 @@ type App struct {
 	cfgPath string
 	sync    *sync.Ctrl
 
-	// cfgMu 保护 cfg.App 与 cfg.SftpUI。
+	// cfgMu 保护 cfg.App、cfg.SftpUI、locations 与 Tunnels/Syncs。
 	//
 	// cfg.App：更新服务 goroutine（Config/Save 回调）读、Wails 调用线程
 	// （GetSettings/SetSettings）写。setAppSettings 是**整结构赋值**，因此任何对
@@ -52,6 +52,15 @@ type App struct {
 	// 底层数组与 map 的内容会被锁外的 TOML 编码共享 —— 原地复用 `x[:0]` /
 	// `append(a.cfg.X, ...)` / 原地写 `LastRemoteDirs[host]` 都与该编码并发，
 	// 是真的数据竞争（-race 可复现），裸 `&config.AppConfig{}` 上还是 nil map panic。
+	//
+	// Tunnels/Syncs 同一规约（A1）：CreateTunnel / UpdateTunnel / DeleteTunnel /
+	// CreateSyncRule / UpdateSyncRule / DeleteSyncRule 与内部 updateTunnel /
+	// updateSyncRule 在写锁内**只构造新 slice**（copy 后 append/替换/删除，整字段
+	// 赋值），锁内绝不做 IO、绝不调 forward/sync 控制器的 Start/Stop（进程操作可能
+	// 阻塞）；Stop 与 saveConfig 一律在解锁之后。读点（ListTunnels / ListSyncRules /
+	// findTunnel / findSyncRule / AutoStartEnabled / OnShutdown / ResolveSyncConflict）
+	// 一律 RLock 下取快照（新 slice）再在锁外使用。CheckRemoteConflict 是纯函数，
+	// 在写锁内基于受保护的当前 slice 做查重，与赋值原子完成（避免查-改间隙）。
 	//
 	// 铁律：锁内只允许调 *Locked 系列私有 helper，**禁止调公开绑定**
 	// （AddRemoteRecent 等）。cfgMu 是不可重入的 RWMutex，同锁重入即死锁 ——
@@ -76,6 +85,12 @@ type App struct {
 	// Init 没有 ctx，且 app_test 直接调用 Init 的路径很多，在那里起后台 goroutine
 	// 会污染测试且无人 Shutdown（Task 11 裁定 1）。
 	updater *update.Service
+
+	// sftpReady 由 Init 在 a.sftp 装配完成后关闭；startup 的崩溃恢复 goroutine
+	// 等它再调 RecoverSwaps（startup 时 a.sftp 尚未初始化，main.go 的顺序是
+	// startup → Init）。sftpReadyOnce 保证多次 Init 也只关闭一次。
+	sftpReady     chan struct{}
+	sftpReadyOnce stdsync.Once
 }
 
 var (
@@ -169,6 +184,28 @@ func (a *App) startup(ctx context.Context) {
 			_ = err // 静默：清理只是兜底；startup 期 a.emit 尚未注入，无处记日志
 		}
 	}()
+	// A8: 启动时恢复上次崩溃遗留的 backup-swap journal（OnShutdown 的恢复只覆盖
+	// 正常退出路径；崩溃/强杀后的残留 swap 只能靠下次启动收敛）。必须异步：
+	// RecoverSwaps 会按条目拨号主机，不可达主机的连接超时会挡住 startup（与上面
+	// .part 清理同一成因）。a.sftp 在紧随其后的 Init 里装配，goroutine 等 sftpReady
+	// 信号（Init 关闭它，close happens-after a.sftp 写入，读 a.sftp 无竞争）；
+	// ctx 取消（应用退出）时放弃等待，绝不 leak 到永久阻塞。
+	if a.sftpReady == nil {
+		a.sftpReady = make(chan struct{})
+	}
+	go func() {
+		select {
+		case <-a.sftpReady:
+		case <-ctx.Done():
+			return
+		}
+		n, err := recoverSwapsAtStartup(a.sftp)
+		if err != nil {
+			a.logf("启动恢复 swap journal 失败: %v", err)
+		} else if n > 0 {
+			a.logf("启动恢复了 %d 处中断提交", n)
+		}
+	}()
 	// 更新服务：注入全部外部依赖（HTTP/进程/配置读写/事件通道），Init 做残留自检
 	// 与轮询调度。必须放在 startup —— 这里才有 ctx，且 Init 会被测试直接调用。
 	a.updater = update.New(update.Options{
@@ -230,6 +267,11 @@ var cleanupStaleLocalPartsAt = func(roots []string) {
 // 真去扫删开发机的 /tmp。
 var cleanupClipboardTempDirsAt = clipboard.CleanStaleTempDirs
 
+// recoverSwapsAtStartup 是启动崩溃恢复的包级注入点（同 cleanupStaleLocalPartsAt
+// 风格）：单测注入计数 fake 钉住「startup 接线了 RecoverSwaps」，避免真去拨号
+// 主机。生产恒走 Ctrl.RecoverSwaps（internal/sftp 的 journal 恢复门面）。
+var recoverSwapsAtStartup = func(c *sftp.Ctrl) (int, error) { return c.RecoverSwaps() }
+
 // Init wires controllers. emit forwards subsystem events to the frontend.
 // forward needs a Spawner (long-lived ssh -N); sftp needs a blocking Runner (one-shot ops).
 func (a *App) Init(emit func(forward.Event)) {
@@ -241,6 +283,12 @@ func (a *App) Init(emit func(forward.Event)) {
 	if dir := stateDir(); dir != "" {
 		a.sftp.SetJournalDir(dir) // Task 8 的 backup-swap journal（S6）
 	}
+	// A8: a.sftp 装配完成，通知 startup 的崩溃恢复 goroutine 可以工作了。
+	a.sftpReadyOnce.Do(func() {
+		if a.sftpReady != nil {
+			close(a.sftpReady)
+		}
+	})
 	transfer, lister := sync.NewSftpAdapter(a.sftp)
 	a.sync = sync.NewCtrl(sync.Deps{
 		Spawner:  osutil.NewStreamer(),
@@ -308,10 +356,39 @@ func (a *App) ListHostsDetailed() []config.Host {
 }
 
 func (a *App) ListTunnels() []config.Tunnel {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
 	if a.cfg == nil {
 		return []config.Tunnel{}
 	}
-	return a.cfg.Tunnels
+	out := make([]config.Tunnel, len(a.cfg.Tunnels))
+	copy(out, a.cfg.Tunnels)
+	return out
+}
+
+// tunnelsSnapshot / syncsSnapshot 在读锁下复制一份 slice（新底层数组），供锁外
+// 迭代使用（AutoStartEnabled / OnShutdown）。与 snapshotConfig 的浅拷贝不同，
+// 这里连 slice 内容一起拷走：迭代期间发生的任何写入都换的是新数组，互不影响。
+func (a *App) tunnelsSnapshot() []config.Tunnel {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if a.cfg == nil {
+		return nil
+	}
+	out := make([]config.Tunnel, len(a.cfg.Tunnels))
+	copy(out, a.cfg.Tunnels)
+	return out
+}
+
+func (a *App) syncsSnapshot() []config.SyncRule {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if a.cfg == nil {
+		return nil
+	}
+	out := make([]config.SyncRule, len(a.cfg.Syncs))
+	copy(out, a.cfg.Syncs)
+	return out
 }
 
 // GetAppInfo returns app metadata (name/version/repo) for the help panel.
@@ -609,18 +686,27 @@ func (a *App) CreateTunnel(t config.Tunnel) error {
 	if err := forward.ValidateTunnel(t); err != nil {
 		return err
 	}
-	if a.cfg == nil {
-		a.cfg = &config.AppConfig{}
-	}
 	if t.ID == "" {
 		t.ID = config.NewTunnelID()
 	}
+	a.cfgMu.Lock()
+	if a.cfg == nil {
+		a.cfg = &config.AppConfig{}
+	}
 	// M7: 接线远端转发端口冲突检查——(host, bind, port) 已被其他规则占用即拒绝，
-	// 与 mode 无关（spec §4.5）。
+	// 与 mode 无关（spec §4.5）。纯函数，写锁内基于受保护的当前 slice 查重，
+	// 与下面的赋值原子完成（避免查-改间隙被并发创建钻空子）。
 	if err := forward.CheckRemoteConflict(a.cfg.Tunnels, t); err != nil {
+		a.cfgMu.Unlock()
 		return err
 	}
-	a.cfg.Tunnels = append(a.cfg.Tunnels, t)
+	// A1: 构造新数组（拷旧 + 追加）后整字段赋值；绝不原地 append（cap 有余量时
+	// 会写进 snapshotConfig 浅拷贝共享的底层数组，与锁外 TOML 编码构成数据竞争）。
+	nt := make([]config.Tunnel, 0, len(a.cfg.Tunnels)+1)
+	nt = append(nt, a.cfg.Tunnels...)
+	nt = append(nt, t)
+	a.cfg.Tunnels = nt
+	a.cfgMu.Unlock()
 	return a.saveConfig()
 }
 
@@ -634,6 +720,11 @@ func (a *App) UpdateTunnel(t config.Tunnel) error {
 	if err := forward.ValidateTunnel(t); err != nil {
 		return err
 	}
+	a.cfgMu.Lock()
+	if a.cfg == nil {
+		a.cfgMu.Unlock()
+		return errors.New("tunnel not found")
+	}
 	idx := -1
 	for i, e := range a.cfg.Tunnels {
 		if e.ID == t.ID {
@@ -642,17 +733,28 @@ func (a *App) UpdateTunnel(t config.Tunnel) error {
 		}
 	}
 	if idx < 0 {
+		a.cfgMu.Unlock()
 		return errors.New("tunnel not found")
 	}
 	// M7: 改动前查重——CheckRemoteConflict 跳过 e.ID==t.ID，保留自身键可放行。
 	if err := forward.CheckRemoteConflict(a.cfg.Tunnels, t); err != nil {
+		a.cfgMu.Unlock()
 		return err
 	}
-	if a.cfg.Tunnels[idx].Enabled {
-		_ = fc.Stop(t.ID)
+	wasEnabled := a.cfg.Tunnels[idx].Enabled
+	if wasEnabled {
 		t.Enabled = false
 	}
-	a.cfg.Tunnels[idx] = t
+	// A1: 拷旧数组后替换，整字段赋值；锁内无 IO。
+	nt := make([]config.Tunnel, len(a.cfg.Tunnels))
+	copy(nt, a.cfg.Tunnels)
+	nt[idx] = t
+	a.cfg.Tunnels = nt
+	a.cfgMu.Unlock()
+	// 运行中的隧道先停再存：Stop 是进程操作（可能阻塞），必须在解锁之后。
+	if wasEnabled {
+		_ = fc.Stop(t.ID)
+	}
 	return a.saveConfig()
 }
 
@@ -662,6 +764,11 @@ func (a *App) DeleteTunnel(id string) error {
 	if ferr != nil {
 		return ferr
 	}
+	a.cfgMu.Lock()
+	if a.cfg == nil {
+		a.cfgMu.Unlock()
+		return errors.New("tunnel not found")
+	}
 	idx := -1
 	for i, e := range a.cfg.Tunnels {
 		if e.ID == id {
@@ -670,12 +777,20 @@ func (a *App) DeleteTunnel(id string) error {
 		}
 	}
 	if idx < 0 {
+		a.cfgMu.Unlock()
 		return errors.New("tunnel not found")
 	}
-	if a.cfg.Tunnels[idx].Enabled {
+	wasEnabled := a.cfg.Tunnels[idx].Enabled
+	// A1: 构造新数组逐项拷贝（跳过 idx），绝不 `append(x[:idx], x[idx+1:]...)`
+	// 原地复用底层数组（与锁外 TOML 编码共享即数据竞争）。
+	nt := make([]config.Tunnel, 0, len(a.cfg.Tunnels)-1)
+	nt = append(nt, a.cfg.Tunnels[:idx]...)
+	nt = append(nt, a.cfg.Tunnels[idx+1:]...)
+	a.cfg.Tunnels = nt
+	a.cfgMu.Unlock()
+	if wasEnabled {
 		_ = fc.Stop(id)
 	}
-	a.cfg.Tunnels = append(a.cfg.Tunnels[:idx], a.cfg.Tunnels[idx+1:]...)
 	return a.saveConfig()
 }
 
@@ -684,10 +799,18 @@ func (a *App) ImportCommand(cmd string) ([]config.Tunnel, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A2: 逐条收集结果 —— 成功条保留并返回，失败条聚合进错误（列出条目与原因）。
+	// 绝不 `_ =` 吞错：那会让冲突/非法条目静默丢失，前端却以为全部导入成功。
+	var created []config.Tunnel
+	var errs []error
 	for _, t := range tunnels {
-		_ = a.CreateTunnel(t)
+		if err := a.CreateTunnel(t); err != nil {
+			errs = append(errs, fmt.Errorf("导入隧道 %s:%d 失败: %w", t.Host, t.ListenPort, err))
+			continue
+		}
+		created = append(created, t)
 	}
-	return tunnels, nil
+	return created, errors.Join(errs...)
 }
 
 func (a *App) StartTunnel(id string) error {
@@ -751,11 +874,20 @@ func (a *App) saveConfig() error {
 }
 
 func (a *App) updateTunnel(u config.Tunnel) {
-	for i := range a.cfg.Tunnels {
-		if a.cfg.Tunnels[i].ID == u.ID {
-			a.cfg.Tunnels[i] = u
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+	if a.cfg == nil {
+		return
+	}
+	// A1: 拷旧数组后替换匹配项，整字段赋值；落盘由调用方在解锁后负责。
+	nt := make([]config.Tunnel, len(a.cfg.Tunnels))
+	copy(nt, a.cfg.Tunnels)
+	for i := range nt {
+		if nt[i].ID == u.ID {
+			nt[i] = u
 		}
 	}
+	a.cfg.Tunnels = nt
 }
 
 // AutoStartEnabled starts all tunnels that were enabled at last run.
@@ -769,7 +901,8 @@ func (a *App) AutoStartEnabled() error {
 	// 控制器未装配（app.Init 还没跑）时跳过：auto-start 是尽力而为的启动动作，
 	// 绝不因生命周期时序 nil 解引用 panic（同 sftpCtrl 的成因，见其注释）。
 	if a.forward != nil {
-		for _, t := range a.cfg.Tunnels {
+		// A1: 锁内快照后再迭代——Start 是进程操作，绝不持 cfgMu 执行。
+		for _, t := range a.tunnelsSnapshot() {
 			if !t.Enabled {
 				continue
 			}
@@ -789,7 +922,7 @@ func (a *App) AutoStartEnabled() error {
 		}
 	}
 	if a.sync != nil {
-		for _, rule := range a.cfg.Syncs {
+		for _, rule := range a.syncsSnapshot() {
 			if !rule.Enabled {
 				continue
 			}
@@ -807,6 +940,8 @@ func (a *App) AutoStartEnabled() error {
 }
 
 func (a *App) findTunnel(id string) (config.Tunnel, bool) {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
 	if a.cfg == nil {
 		return config.Tunnel{}, false
 	}
@@ -1683,8 +1818,9 @@ func (a *App) OnShutdown() {
 	// OnShutdown 可能早于 Init 被调用（Wails 生命周期边界），此时 cfg 与三个
 	// 控制器都可能为 nil，必须逐项守卫而不是直接解引用。
 	// 1. 先停同步规则并关闭探测进程
-	if a.sync != nil && a.cfg != nil {
-		for _, rule := range a.cfg.Syncs {
+	if a.sync != nil {
+		// A1: 锁内快照后再迭代（Stop 可能阻塞，绝不持 cfgMu）。
+		for _, rule := range a.syncsSnapshot() {
 			_ = a.sync.Stop(rule.ID)
 		}
 	}
@@ -1752,22 +1888,28 @@ func stateDir() string {
 }
 
 func (a *App) ListSyncRules() []config.SyncRule {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
 	if a.cfg == nil || a.cfg.Syncs == nil {
 		return []config.SyncRule{}
 	}
-	return a.cfg.Syncs
+	out := make([]config.SyncRule, len(a.cfg.Syncs))
+	copy(out, a.cfg.Syncs)
+	return out
 }
 
 func (a *App) CreateSyncRule(r config.SyncRule) (config.SyncRule, error) {
 	if err := sync.ValidateSyncRule(r); err != nil {
 		return r, err
 	}
+	a.cfgMu.Lock()
 	if a.cfg == nil {
 		a.cfg = &config.AppConfig{}
 	}
 	for _, e := range a.cfg.Syncs {
 		if e.Host == r.Host && e.RemotePath == r.RemotePath &&
 			e.LocalPath == r.LocalPath && e.Kind == r.Kind {
+			a.cfgMu.Unlock()
 			return r, errors.New("已存在完全相同的同步规则")
 		}
 	}
@@ -1775,7 +1917,12 @@ func (a *App) CreateSyncRule(r config.SyncRule) (config.SyncRule, error) {
 		r.ID = config.NewSyncID()
 	}
 	r.Normalize()
-	a.cfg.Syncs = append(a.cfg.Syncs, r)
+	// A1: 构造新数组（拷旧 + 追加）后整字段赋值；锁内无 IO，解锁后落盘。
+	ns := make([]config.SyncRule, 0, len(a.cfg.Syncs)+1)
+	ns = append(ns, a.cfg.Syncs...)
+	ns = append(ns, r)
+	a.cfg.Syncs = ns
+	a.cfgMu.Unlock()
 	return r, a.saveConfig()
 }
 
@@ -1787,6 +1934,11 @@ func (a *App) UpdateSyncRule(r config.SyncRule) error {
 	if err := sync.ValidateSyncRule(r); err != nil {
 		return err
 	}
+	a.cfgMu.Lock()
+	if a.cfg == nil {
+		a.cfgMu.Unlock()
+		return errors.New("sync rule not found")
+	}
 	idx := -1
 	for i, e := range a.cfg.Syncs {
 		if e.ID == r.ID {
@@ -1795,12 +1947,19 @@ func (a *App) UpdateSyncRule(r config.SyncRule) error {
 		}
 	}
 	if idx < 0 {
+		a.cfgMu.Unlock()
 		return errors.New("sync rule not found")
 	}
-	// 运行中的规则先停再存（不做热更新：远端根路径可能整个换掉）。
-	_ = sc.Stop(r.ID)
 	r.Enabled = false
-	a.cfg.Syncs[idx] = r
+	// A1: 拷旧数组后替换，整字段赋值；锁内无 IO。
+	ns := make([]config.SyncRule, len(a.cfg.Syncs))
+	copy(ns, a.cfg.Syncs)
+	ns[idx] = r
+	a.cfg.Syncs = ns
+	a.cfgMu.Unlock()
+	// 运行中的规则先停再存（不做热更新：远端根路径可能整个换掉）。
+	// Stop 可能阻塞，必须在解锁之后。
+	_ = sc.Stop(r.ID)
 	return a.saveConfig()
 }
 
@@ -1808,6 +1967,11 @@ func (a *App) DeleteSyncRule(id string) error {
 	sc, serr := a.syncCtrl()
 	if serr != nil {
 		return serr
+	}
+	a.cfgMu.Lock()
+	if a.cfg == nil {
+		a.cfgMu.Unlock()
+		return errors.New("sync rule not found")
 	}
 	idx := -1
 	for i, e := range a.cfg.Syncs {
@@ -1817,14 +1981,20 @@ func (a *App) DeleteSyncRule(id string) error {
 		}
 	}
 	if idx < 0 {
+		a.cfgMu.Unlock()
 		return errors.New("sync rule not found")
 	}
 	rule := a.cfg.Syncs[idx]
+	// A1: 构造新数组逐项拷贝（跳过 idx），绝不原地复用底层数组。
+	ns := make([]config.SyncRule, 0, len(a.cfg.Syncs)-1)
+	ns = append(ns, a.cfg.Syncs[:idx]...)
+	ns = append(ns, a.cfg.Syncs[idx+1:]...)
+	a.cfg.Syncs = ns
+	a.cfgMu.Unlock()
 	_ = sc.Stop(id)
-	// 删除规则时一并清理状态文件与本地残留临时文件。
+	// 删除规则时一并清理状态文件与本地残留临时文件（IO 一律在锁外）。
 	_ = os.Remove(filepath.Join(stateDir(), "sync-"+id+".json"))
 	_, _ = sync.CleanupParts(rule.LocalPath, id)
-	a.cfg.Syncs = append(a.cfg.Syncs[:idx], a.cfg.Syncs[idx+1:]...)
 	return a.saveConfig()
 }
 
@@ -1890,7 +2060,12 @@ func (a *App) ResolveSyncConflict(id, relPath, action string) error {
 	if cerr != nil {
 		return cerr
 	}
-	local, err := localStateOf(a.cfg, id, relPath)
+	// A1: 基于读锁快照读 Syncs，绝不把共享的 a.cfg 直接交给锁外迭代。
+	snap := a.snapshotConfig()
+	if snap == nil {
+		return errors.New("sync rule not found")
+	}
+	local, err := localStateOf(snap, id, relPath)
 	if err != nil {
 		return err
 	}
@@ -1916,6 +2091,8 @@ func (a *App) RetrySyncRuleFailures(id string) error {
 }
 
 func (a *App) findSyncRule(id string) (config.SyncRule, bool) {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
 	if a.cfg == nil {
 		return config.SyncRule{}, false
 	}
@@ -1928,11 +2105,20 @@ func (a *App) findSyncRule(id string) (config.SyncRule, bool) {
 }
 
 func (a *App) updateSyncRule(u config.SyncRule) {
-	for i := range a.cfg.Syncs {
-		if a.cfg.Syncs[i].ID == u.ID {
-			a.cfg.Syncs[i] = u
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+	if a.cfg == nil {
+		return
+	}
+	// A1: 拷旧数组后替换匹配项，整字段赋值；落盘由调用方在解锁后负责。
+	ns := make([]config.SyncRule, len(a.cfg.Syncs))
+	copy(ns, a.cfg.Syncs)
+	for i := range ns {
+		if ns[i].ID == u.ID {
+			ns[i] = u
 		}
 	}
+	a.cfg.Syncs = ns
 }
 
 // localStateOf 读取本地文件现状，供冲突裁决使用（只读，不做传输）。
