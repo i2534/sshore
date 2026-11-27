@@ -19,6 +19,13 @@ type Ctrl struct {
 	journalDir string
 	forced     Backend // 仅供测试注入：backend() 优先返回它
 
+	// goMu 保护 goBackend 的懒构造与 journalDir 的读写（S3）。Wails 每个绑定调用各起
+	// goroutine，并发首发 backend() 若无锁会构造两个 GoBackend（取消分派失效、两个
+	// swapJournal 违反单写者、并发上限翻倍、指针数据竞争）。专用锁，**不与 probeMu 混用**：
+	// backend() 不取 probeMu；probeBatch 取 probeMu 后在放锁之后才调 c.List→backend()，
+	// 两锁无嵌套，无锁序问题。
+	goMu sync.Mutex
+
 	// probeMu 保护 probing：batch 后端探活的每 host 单飞表（规格 §8.2 / 审核 I5）。
 	// 只保护 map 本身，绝不在持锁时等结果（等待必须在放锁之后）。
 	probeMu sync.Mutex
@@ -109,6 +116,11 @@ func (c *Ctrl) Search(ctx context.Context, host, user, root, pattern string, max
 // SetJournalDir 由 app.go 装配时用 stateDir() 注入；若 GoBackend 已被懒构造，
 // 同步补进去，避免「先发生一次 sftp 操作、后设置 journal 目录」时丢配置。
 func (c *Ctrl) SetJournalDir(dir string) {
+	// S3：与 backend() 的懒构造共用 goMu，杜绝「并发 SetJournalDir / 懒构造」对 goBackend
+	// 与 journalDir 的数据竞争。gb.SetJournalDir 本身无锁，但在这里持 goMu 调用，与
+	// backend() 构造时的同一调用串行化。
+	c.goMu.Lock()
+	defer c.goMu.Unlock()
 	c.journalDir = dir
 	if c.goBackend != nil {
 		// 转发到 GoBackend.SetJournalDir（而不是裸写 journalDir）：这样 journal 实例
@@ -261,20 +273,29 @@ func (c *Ctrl) backend() Backend {
 	if c.forced != nil {
 		return c.forced
 	}
-	if c.TransportKind() == KindGo {
-		if c.goBackend == nil {
-			c.goBackend = NewGoBackend(c.sel, c.emit)
-			c.goBackend.SetJournalDir(c.journalDir)
-			if c.emit != nil {
-				c.emit(forward.Event{
-					SourceType: "sftp",
-					TS:         time.Now().Format(time.RFC3339),
-					Level:      "info",
-					Message:    "sftp transport=gosftp",
-				})
-			}
-		}
-		return c.goBackend
+	if c.TransportKind() != KindGo {
+		return c.batch
 	}
-	return c.batch
+	// S3：goMu 保护懒构造，并发首发只构造一个 GoBackend（见 goMu 字段注释的锁序说明）。
+	c.goMu.Lock()
+	gb := c.goBackend
+	constructed := false
+	if gb == nil {
+		gb = NewGoBackend(c.sel, c.emit)
+		gb.SetJournalDir(c.journalDir)
+		c.goBackend = gb
+		constructed = true
+	}
+	c.goMu.Unlock()
+	// emit 在**解锁后**做，且只有本次真正构造的那个 goroutine 发一次：避免持锁回调
+	// （emit 可能耗时或重入）造成锁序/死锁风险。
+	if constructed && c.emit != nil {
+		c.emit(forward.Event{
+			SourceType: "sftp",
+			TS:         time.Now().Format(time.RFC3339),
+			Level:      "info",
+			Message:    "sftp transport=gosftp",
+		})
+	}
+	return gb
 }

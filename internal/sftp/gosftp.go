@@ -558,6 +558,22 @@ func (g *GoBackend) GetTree(req TransferRequest, report func(Progress)) error {
 		}
 		return fail(&TransferError{Op: op, Host: req.Host, Path: req.Remote, Err: serr, RemoteMsg: remoteMsg})
 	}
+	// S2：消费 scanTree 结果前逐项校验远端相对路径（files 与 subdirs 都要）。POSIX 文件名可
+	// 合法含 \ : 控制字符，甚至单个文件名叫 `..\..\evil`；Windows 上 filepath.FromSlash 不处理
+	// \，Join 的 Clean 把 .. 当目录跳转 ⇒ 写到目标目录之外。命中危险名整项失败（fail-fast，
+	// 与仓库其它「拒绝」风格一致），错误指明问题文件名。此时尚未建任何本地目录/文件。
+	for _, d := range subdirs {
+		if verr := validateRemoteRel(d, transferGOOS); verr != nil {
+			return fail(&TransferError{Op: op, Host: req.Host, Path: path.Join(req.Remote, d),
+				Err: fmt.Errorf("拒绝下载危险远端路径 %q: %w", d, verr)})
+		}
+	}
+	for _, f := range files {
+		if verr := validateRemoteRel(f.rel, transferGOOS); verr != nil {
+			return fail(&TransferError{Op: op, Host: req.Host, Path: path.Join(req.Remote, f.rel),
+				Err: fmt.Errorf("拒绝下载危险远端路径 %q: %w", f.rel, verr)})
+		}
+	}
 	total, filesTotal := int64(0), len(files)
 	if degraded {
 		// D16：放弃枚举 ⇒ 分母未知（-1），但传输继续、Done/FilesDone 继续真实累加。
@@ -955,6 +971,18 @@ func commitRemote(s *Session, hasPosix bool, part, target string, j *swapJournal
 	bak := BakNameRemote(target) // 远端 POSIX 路径：必须用 Remote 家族
 	// 1) intent 先落盘；Begin 失败绝不进入破坏性改名。
 	if j != nil {
+		// S1 守卫：同键 (host,user,target) 旧条目可能处于「target→bak 已成功、part→target
+		// 失败、回滚也失败」的待恢复态（commitRemote 失败时明确保留条目），或上次崩溃现场。
+		// 旧 bak 是目标旧内容的唯一副本，Begin 的去重会把它顶掉成永久孤儿（RecoverSwaps 只在
+		// 退出时跑）。因此 Begin 之前必须先按决策表恢复旧条目：恢复成功才允许覆盖；恢复失败
+		// 则中止本次上传（此时尚未动 target、尚未 Begin，旧条目/旧 bak 原样保留）。
+		// 探测用本次会话（host/user 与旧条目同键，归属一致，符合 F1）；close 为 no-op，
+		// 绝不关掉归传输所有的在飞会话。
+		if old, ok := findPendingSwap(j, s.Host, s.User, target); ok {
+			if rerr := recoverSwapEntry(connRecoverProbe{c: s.Conn}, j, old, warn); rerr != nil {
+				return fmt.Errorf("目标 %s 存在未恢复的 swap 现场，恢复失败，已中止本次上传（旧条目保留）: %w", target, rerr)
+			}
+		}
 		// host/user 取自本次会话：条目自带归属，恢复时只在该主机上探测（修复轮 1 / F1）。
 		if err := j.Begin(s.Host, s.User, target, bak, part); err != nil {
 			return fmt.Errorf("登记 swap journal 失败，未改动目标: %w", err)
@@ -2237,6 +2265,91 @@ type reopenSession interface {
 	close()
 }
 
+// recoverSwapEntry 对**单条** swap 条目执行 RecoverSwaps 的决策表（S1：从组内循环体抽出，
+// 供 commitRemote 在 Begin 覆盖同键旧条目前复用，保证两处恢复语义逐字一致）：
+//
+//	bak 不存在            → W0：清条目（没有破坏性改动需要撤销）；
+//	bak 在、target 不在   → W1：回滚 bak→target（旧内容只在这个随机名里）；
+//	bak 在、target 也在   → W2：保留 target（新内容已成功提交）、删掉 bak 孤儿。
+//
+// 成功处理并清掉条目返回 nil；任何一步失败（探测/改名/删除/清条目）返回错误且**条目原样
+// 保留**（绝不动作、绝不删除），错误说明原因。warnf 记录「保留条目」的日志，语义与
+// RecoverSwaps 完全一致。调用方据此决定：RecoverSwaps 跳过该条继续下一条；commitRemote
+// 中止本次上传（绝不静默顶掉旧条目）。
+func recoverSwapEntry(sess reopenSession, j *swapJournal, e swapEntry, warnf func(format string, args ...any)) error {
+	bakExists, bakErr := sess.exists(e.Bak)
+	if bakErr != nil {
+		warnf("恢复 swap：探测备份 %s 失败，保留条目待下次启动: %v", e.Bak, bakErr)
+		return fmt.Errorf("探测备份 %s 失败: %w", e.Bak, bakErr)
+	}
+	// 步骤 1：bak 不存在 ⇒ rename 尚未发生（或已被人工清理），条目已无意义。
+	if !bakExists {
+		if derr := j.Done(e.Host, e.User, e.Target); derr != nil {
+			warnf("恢复 swap：清理条目 %s 失败: %v", e.Target, derr)
+			return fmt.Errorf("清理条目 %s 失败: %w", e.Target, derr)
+		}
+		return nil
+	}
+	// bak 在：探测 target。
+	targetExists, tErr := sess.exists(e.Target)
+	if tErr != nil {
+		warnf("恢复 swap：探测目标 %s 失败，保留条目待下次启动: %v", e.Target, tErr)
+		return fmt.Errorf("探测目标 %s 失败: %w", e.Target, tErr)
+	}
+	// 步骤 2：bak 在、target 不在 ⇒ 回滚。
+	if !targetExists {
+		if rerr := sess.rename(e.Bak, e.Target); rerr != nil {
+			warnf("恢复 swap：回滚 %s → %s 失败，保留条目待下次启动: %v", e.Bak, e.Target, rerr)
+			return fmt.Errorf("回滚 %s → %s 失败: %w", e.Bak, e.Target, rerr)
+		}
+		if derr := j.Done(e.Host, e.User, e.Target); derr != nil {
+			warnf("恢复 swap：回滚成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
+			return fmt.Errorf("回滚成功但清理条目 %s 失败: %w", e.Target, derr)
+		}
+		return nil
+	}
+	// 步骤 3：bak 在、target 也在 ⇒ W2（新内容已成功提交）。保留 target，删掉孤儿 bak。
+	if rerr := sess.remove(e.Bak); rerr != nil {
+		warnf("恢复 swap：删除孤儿备份 %s 失败，保留条目待下次启动: %v", e.Bak, rerr)
+		return fmt.Errorf("删除孤儿备份 %s 失败: %w", e.Bak, rerr)
+	}
+	if derr := j.Done(e.Host, e.User, e.Target); derr != nil {
+		warnf("恢复 swap：删备份成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
+		return fmt.Errorf("删备份成功但清理条目 %s 失败: %w", e.Target, derr)
+	}
+	return nil
+}
+
+// findPendingSwap 在 journal 里查同键 (host,user,target) 的未完成条目（S1 守卫用）。
+// 只读，不改 journal。找不到（含 journal 损坏时 Recover 返回 nil）返回 false。
+func findPendingSwap(j *swapJournal, host, user, target string) (swapEntry, bool) {
+	for _, e := range j.Recover() {
+		if e.Host == host && e.User == user && e.Target == target {
+			return e, true
+		}
+	}
+	return swapEntry{}, false
+}
+
+// connRecoverProbe 把**在飞传输会话**适配成恢复探测能力（commitRemote 的 S1 守卫用）。
+// 与 sessionReopener 的区别：close 是 no-op —— 会话归传输调用方所有（Put 结束才 Release），
+// 恢复绝不关它。rename/remove 走 renameRemote/removeRemote 注入点（与 backup-swap 同源），
+// 便于单测确定性构造「恢复失败」。exists 用 Conn.Stat，ENOENT 判为不存在。
+type connRecoverProbe struct{ c *sftp.Client }
+
+func (p connRecoverProbe) exists(path string) (bool, error) {
+	if _, err := p.c.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+func (p connRecoverProbe) remove(path string) error { return removeRemote(p.c, path) }
+func (p connRecoverProbe) rename(o, n string) error { return renameRemote(p.c, o, n) }
+func (p connRecoverProbe) close()                   {}
+
 // RecoverSwaps 按决策表恢复 backup-swap 的中断现场，返回实际处理的条目数。
 //
 // 为什么单凭 journal 条目不够（Task 8 重审 D1）：条目没有 phase 字段，而
@@ -2301,46 +2414,9 @@ func (g *GoBackend) RecoverSwaps() (int, error) {
 			continue
 		}
 		for _, e := range group {
-			bakExists, bakErr := sess.exists(e.Bak)
-			if bakErr != nil {
-				g.warnf(host, "恢复 swap：探测备份 %s 失败，保留条目待下次启动: %v", e.Bak, bakErr)
-				continue
-			}
-			// 步骤 1：bak 不存在 ⇒ rename 尚未发生（或已被人工清理），条目已无意义。
-			if !bakExists {
-				if derr := g.journal.Done(e.Host, e.User, e.Target); derr != nil {
-					g.warnf(host, "恢复 swap：清理条目 %s 失败: %v", e.Target, derr)
-					continue
-				}
-				n++
-				continue
-			}
-			// bak 在：探测 target（从 e.Target 拷贝一份错误变量，避免遮蔽循环外 err）。
-			targetExists, tErr := sess.exists(e.Target)
-			if tErr != nil {
-				g.warnf(host, "恢复 swap：探测目标 %s 失败，保留条目待下次启动: %v", e.Target, tErr)
-				continue
-			}
-			// 步骤 2：bak 在、target 不在 ⇒ 回滚。
-			if !targetExists {
-				if rerr := sess.rename(e.Bak, e.Target); rerr != nil {
-					g.warnf(host, "恢复 swap：回滚 %s → %s 失败，保留条目待下次启动: %v", e.Bak, e.Target, rerr)
-					continue
-				}
-				if derr := g.journal.Done(e.Host, e.User, e.Target); derr != nil {
-					g.warnf(host, "恢复 swap：回滚成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
-					continue
-				}
-				n++
-				continue
-			}
-			// 步骤 3：bak 在、target 也在 ⇒ W2（新内容已成功提交）。保留 target，删掉孤儿 bak。
-			if rerr := sess.remove(e.Bak); rerr != nil {
-				g.warnf(host, "恢复 swap：删除孤儿备份 %s 失败，保留条目待下次启动: %v", e.Bak, rerr)
-				continue
-			}
-			if derr := g.journal.Done(e.Host, e.User, e.Target); derr != nil {
-				g.warnf(host, "恢复 swap：删备份成功但清理条目 %s 失败，保留条目: %v", e.Target, derr)
+			// 单条目决策表抽成 recoverSwapEntry（S1：commitRemote 的 Begin 前守卫复用同一逻辑）。
+			// 失败已在 helper 内 warn 并保留条目，这里只跳过；成功才计数。
+			if err := recoverSwapEntry(sess, g.journal, e, func(f string, a ...any) { g.warnf(host, f, a...) }); err != nil {
 				continue
 			}
 			n++

@@ -8,9 +8,48 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
+
+// transferGOOS 是 GetTree 校验远端相对路径时使用的目标平台（注入点，默认 runtime.GOOS）。
+// 单测把它设成 "windows" 就能在 Linux 上验证 Windows 的路径穿越守卫（参照
+// internal/update/extract.go 的 goos 注入风格）。
+var transferGOOS = runtime.GOOS
+
+// validateRemoteRel 校验 scanTree 产出的 POSIX 相对路径（rel，分隔符恒为 /）在目标 goos
+// 上落盘是否安全（S2）。rel 的每个路径分量：
+//   - 不得为空、"." 或 ".."（任何平台）—— ".." 会被 filepath.Join 的 Clean 当目录跳转，
+//     把文件写到目标目录之外；
+//   - goos=windows 时还不得含 "\"、":" 与控制字符 —— POSIX 文件名可合法含这些字符，但
+//     Windows 上 filepath.FromSlash 不处理 "\"，Join 会把 "a\b" 拆成子目录、把 "C:x" 当
+//     盘符相对路径，单个名 `..\..\evil` 更会直接跳出目标目录。
+//
+// 命中危险分量返回指明该分量的错误（调用方据此 fail-fast 整项传输）。goos=linux 时反斜杠
+// 是普通字符，含反斜杠的合法名不受影响。
+func validateRemoteRel(rel, goos string) error {
+	if rel == "" {
+		return fmt.Errorf("空相对路径")
+	}
+	for _, comp := range strings.Split(rel, "/") {
+		if comp == "" || comp == "." || comp == ".." {
+			return fmt.Errorf("路径分量 %q 非法（空 / . / ..）", comp)
+		}
+		if goos == "windows" {
+			if strings.ContainsAny(comp, "\\:") {
+				return fmt.Errorf("路径分量 %q 含 Windows 非法字符 \\ 或 :", comp)
+			}
+			for _, r := range comp {
+				if r < 0x20 || r == 0x7f {
+					return fmt.Errorf("路径分量 %q 含控制字符", comp)
+				}
+			}
+		}
+	}
+	return nil
+}
 
 // commitDecision 是「是否允许把 .part 提升为最终目标」的判定结果（D15）。
 type commitDecision int
